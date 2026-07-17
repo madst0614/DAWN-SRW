@@ -661,7 +661,7 @@ def model_cfg_from_config(
 
 
 def admission_den_power_from_config(cfg: Dict[str, Any]) -> float:
-    """Resolve the model-owned v4171 value with legacy training fallback."""
+    """Resolve the model-owned v417x value with legacy training fallback."""
     model_cfg = cfg.get("model", {})
     training_cfg = cfg.get("training", {})
     return float(model_cfg.get(
@@ -932,10 +932,10 @@ def create_active_analysis_step(model, sharded_fns=None, *,
 
 def create_composition_analysis_step(
         model, sharded_fns=None, *, cfg: Optional[Dict[str, Any]] = None):
-    """Return the v4171 minimal-path composition diagnostics step.
+    """Return the v417x minimal-path composition diagnostics step.
 
     The trainer's full ``analysis=True`` path owns per-layer diagnostics, while
-    v4171's exact admission-mass/composition-denominator scalars are emitted by
+    v417x's exact admission-mass/composition-denominator scalars are emitted by
     its production minimal path. Run this only when the composition item is
     selected so other analysis presets do not pay for a second forward.
     """

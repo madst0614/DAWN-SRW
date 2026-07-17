@@ -1,8 +1,11 @@
-"""Immutable prepared-dataset contract for v4171 operator analysis.
+"""Immutable prepared-dataset contract for v417x operator analysis.
 
 This module deliberately contains no model evaluation.  It resolves a root
 pointer to an immutable build, validates the ``dawn_operator_pair_v2``
-contract, and downloads only the shards requested by an analysis host.
+contract, and downloads only the shards requested by an analysis host.  The
+historical v4171 bucket name is a data-build identity, not a model-version
+restriction; v4172 consumes the same tokenized examples after vocabulary
+validation.
 """
 
 from __future__ import annotations

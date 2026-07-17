@@ -12,6 +12,7 @@ import numpy as np
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    V417X_MODEL_VERSIONS,
     analysis_model_module,
     format_duration,
     load_eval_data,
@@ -76,7 +77,7 @@ def _srw_with_topk(state, operator_query, operator_keys, raw_tau,
         kwargs.pop(key, None)
     production_bfloat16 = (
         str(getattr(model_module, "MODEL_VERSION", ""))
-        in ("spatial-r1-v4.1.7.1", "spatial-r1-v4.1.7.2"))
+        in V417X_MODEL_VERSIONS)
     if production_bfloat16:
         operator_query_direction = model_module._forward_unit_direction(
             operator_query.astype(jnp.bfloat16).astype(jnp.float32)).astype(
@@ -336,10 +337,7 @@ def topk_trace_forward(params, model_cfg: Dict[str, Any], input_ids, *,
     topk_qk = int(topk if topk_qk is None else topk_qk)
     topk_v = int(topk if topk_v is None else topk_v)
     topk_rst = int(topk if topk_rst is None else topk_rst)
-    is_v417x = str(model_cfg.get("model_version", "")) in (
-        "spatial-r1-v4.1.7.1",
-        "spatial-r1-v4.1.7.2",
-    )
+    is_v417x = str(model_cfg.get("model_version", "")) in V417X_MODEL_VERSIONS
     if is_v417x:
         required = {
             "attn_qk_paired_minimal", "attn_v_single_minimal",

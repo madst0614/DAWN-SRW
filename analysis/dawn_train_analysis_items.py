@@ -76,8 +76,8 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
     },
     "composition_health": {
         "title": "Composition denominator health",
-        "measures": "v4171 admission mass, composition denominator range, floor fraction, and configured denominator power by pool.",
-        "summary": "COMPOSITION_HEALTH verifies that v4171 operator composition normalization is finite and not pinned to its floor.",
+        "measures": "v417x admission mass, composition denominator range, floor fraction, and configured denominator power by pool.",
+        "summary": "COMPOSITION_HEALTH verifies that v417x operator composition normalization is finite and not pinned to its floor.",
         "requires": ("active",),
     },
     "prompt_trace": {
@@ -165,64 +165,64 @@ TRAIN_ANALYSIS_ITEM_DEFS = {
         "requires": ("operator_datasets",),
     },
     "global_router_audit": {
-        "title": "v4171 global router audit",
+        "title": "v417x global router audit",
         "measures": "restored router/pool parameter paths, hidden block-local routing parameters, sharing, geometry, and composition settings.",
-        "summary": "GLOBAL_ROUTER_AUDIT fails loudly if v4171 is not using one global router and one global operator pool tree.",
-        "requires": ("v4171_transition",),
+        "summary": "GLOBAL_ROUTER_AUDIT fails loudly if v417x is not using one global router and one global operator pool tree.",
+        "requires": ("v417x_transition",),
     },
     "trajectory_trace": {
-        "title": "v4171 target-token trajectory trace",
+        "title": "v417x target-token trajectory trace",
         "measures": "target-span residual/query trajectories, sparse operator ids, captured mass, read responses, coefficients, Q/K/V SRW features, and actual attention/RST residual updates.",
         "summary": "TRAJECTORY_TRACE reuses one target-only transition cache and never returns the full gate tensor to the host.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "context_divergence": {
-        "title": "v4171 context divergence",
+        "title": "v417x context divergence",
         "measures": "same-surface pair state/query/sparse-gate/update similarity, first divergence, maximum divergence, and late reconvergence.",
         "summary": "CONTEXT_DIVERGENCE identifies where controlled lexical-ambiguity pairs separate, with captured-mass-qualified gate metrics.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "state_transition_decoupling": {
-        "title": "v4171 state-transition decoupling",
+        "title": "v417x state-transition decoupling",
         "measures": "state/query/gate/delta/path similarity, data-quantile quadrants, random null percentiles, correlations, effect, and bootstrap interval.",
         "summary": "STATE_TRANSITION_DECOUPLING tests whether distant representation states can share transition paths without using a fixed arbitrary threshold.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "causal_intervention": {
-        "title": "v4171 canonical causal intervention",
+        "title": "v417x canonical causal intervention",
         "measures": "target-token/layer/pool top-contribution, top-gate, active/inactive random, and matched-active contribution subtraction with sequence behavior, shifted next-token log-probability, KL, prediction, and residual effects.",
         "summary": "CAUSAL_INTERVENTION subtracts a selected post-denominator production contribution and blocks on exact zero-vector parity.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "causal_rerouting_trace": {
-        "title": "v4171 causal rerouting trace",
+        "title": "v417x causal rerouting trace",
         "measures": "Same-forward baseline/intervention residual, query, sparse routing, transition, attention-update, RST-update, divergence AUC, reconvergence, paired controls, and final causal effects.",
         "summary": "CAUSAL REROUTING TRACE tests whether an operator intervention changes the downstream computation path without transferring full gate tensors to the host.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "causal_recovery_trace": {
-        "title": "v4171 causal recovery trace",
+        "title": "v417x causal recovery trace",
         "measures": "Immediate target-state damage, downstream layer recovery/amplification, final residual/logit effects, and distribution-relative phenomena.",
         "summary": "CAUSAL RECOVERY TRACE separates small immediate effects from downstream compensation and amplification.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "operator_functional_graph": {
-        "title": "v4171 operator functional graph",
+        "title": "v417x operator functional graph",
         "measures": "Rank-1 RW functional similarity, address similarity, sparse activation/contribution profiles, reciprocal seed-local neighborhoods, and separate transitive-component percolation diagnostics.",
         "summary": "OPERATOR FUNCTIONAL GRAPH distinguishes reusable RW function from context-specialized addressing without treating percolated connected components as causal families.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "group_causal_intervention": {
-        "title": "v4171 group causal intervention",
+        "title": "v417x group causal intervention",
         "measures": "Fixed-width family/address/coactivation/random group suppression, dose response, recovery, and synergy against available single effects.",
         "summary": "GROUP CAUSAL INTERVENTION tests whether weak single effects are explained by functional redundancy.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "causal_ranking_calibration": {
-        "title": "v4171 causal ranking calibration",
+        "title": "v417x causal ranking calibration",
         "measures": "Gate/contribution/immediate/final causal Spearman inference, strategy win rates, and bootstrap/permutation judgments.",
         "summary": "CAUSAL RANKING CALIBRATION tests whether local gate and contribution rankings predict final causal importance.",
-        "requires": ("v4171_transition",),
+        "requires": ("v417x_transition",),
     },
     "decision_reason": {
         "title": "Decision reason",
@@ -267,7 +267,7 @@ V4166_1B_ITEMS = (
     "decision_reason",
 )
 
-V4171_SELF_ORGANIZATION_ITEMS = (
+V417X_SELF_ORGANIZATION_ITEMS = (
     "global_router_audit",
     "trajectory_trace",
     "context_divergence",
@@ -275,7 +275,7 @@ V4171_SELF_ORGANIZATION_ITEMS = (
     "causal_intervention",
 )
 
-V4171_OPERATOR_FAMILY_EXTRA_ITEMS = (
+V417X_OPERATOR_FAMILY_EXTRA_ITEMS = (
     "causal_rerouting_trace",
     "causal_recovery_trace",
     "operator_functional_graph",
@@ -283,15 +283,27 @@ V4171_OPERATOR_FAMILY_EXTRA_ITEMS = (
     "causal_ranking_calibration",
 )
 
-V4171_OPERATOR_FAMILY_ITEMS = (
-    V4171_SELF_ORGANIZATION_ITEMS + V4171_OPERATOR_FAMILY_EXTRA_ITEMS)
+V417X_OPERATOR_FAMILY_ITEMS = (
+    V417X_SELF_ORGANIZATION_ITEMS + V417X_OPERATOR_FAMILY_EXTRA_ITEMS)
 
-V4171_ITEMS = tuple(
+V417X_ITEMS = tuple(
     item for item in TRAIN_ANALYSIS_ITEM_DEFS
-    if item not in V4171_SELF_ORGANIZATION_ITEMS
-    and item not in V4171_OPERATOR_FAMILY_EXTRA_ITEMS
+    if item not in V417X_SELF_ORGANIZATION_ITEMS
+    and item not in V417X_OPERATOR_FAMILY_EXTRA_ITEMS
     and item not in OPERATOR_ANALYSIS_ITEM_IDS
 )
+V417X_COMPLETE_ITEMS = tuple(TRAIN_ANALYSIS_ITEM_DEFS)
+
+# Keep the old public names import-compatible while making the shared v417x
+# ownership explicit for new callers.
+V4171_SELF_ORGANIZATION_ITEMS = V417X_SELF_ORGANIZATION_ITEMS
+V4171_OPERATOR_FAMILY_EXTRA_ITEMS = V417X_OPERATOR_FAMILY_EXTRA_ITEMS
+V4171_OPERATOR_FAMILY_ITEMS = V417X_OPERATOR_FAMILY_ITEMS
+V4171_ITEMS = V417X_ITEMS
+V4172_SELF_ORGANIZATION_ITEMS = V417X_SELF_ORGANIZATION_ITEMS
+V4172_OPERATOR_FAMILY_EXTRA_ITEMS = V417X_OPERATOR_FAMILY_EXTRA_ITEMS
+V4172_OPERATOR_FAMILY_ITEMS = V417X_OPERATOR_FAMILY_ITEMS
+V4172_ITEMS = V417X_ITEMS
 
 TRAIN_ANALYSIS_PRESETS = {
     "minimal": ("target_ratio", "prune_breakdown", "decision_reason"),
@@ -315,16 +327,22 @@ TRAIN_ANALYSIS_PRESETS = {
     "operator_datasets": ("operator_dataset_manifest",),
     "operator_analysis": OPERATOR_ANALYSIS_ITEM_IDS,
     "v4171_operator_monitor": tuple(dict.fromkeys(
-        V4171_SELF_ORGANIZATION_ITEMS + OPERATOR_ANALYSIS_ITEM_IDS)),
-    "v4171_complete": tuple(dict.fromkeys(
-        V4171_ITEMS + V4171_SELF_ORGANIZATION_ITEMS + OPERATOR_ANALYSIS_ITEM_IDS)),
+        V417X_SELF_ORGANIZATION_ITEMS + OPERATOR_ANALYSIS_ITEM_IDS)),
+    "v4172_operator_monitor": tuple(dict.fromkeys(
+        V417X_SELF_ORGANIZATION_ITEMS + OPERATOR_ANALYSIS_ITEM_IDS)),
+    "v4171_complete": V417X_COMPLETE_ITEMS,
+    "v4172_complete": V417X_COMPLETE_ITEMS,
     "v4166_1b": V4166_1B_ITEMS,
-    "v4171": V4171_ITEMS,
-    "v4171_self_organization": V4171_SELF_ORGANIZATION_ITEMS,
-    "v4171_operator_family": V4171_OPERATOR_FAMILY_ITEMS,
-    "v4171_self_organization_extended": V4171_OPERATOR_FAMILY_ITEMS,
+    "v4171": V417X_ITEMS,
+    "v4172": V417X_ITEMS,
+    "v4171_self_organization": V417X_SELF_ORGANIZATION_ITEMS,
+    "v4172_self_organization": V417X_SELF_ORGANIZATION_ITEMS,
+    "v4171_operator_family": V417X_OPERATOR_FAMILY_ITEMS,
+    "v4172_operator_family": V417X_OPERATOR_FAMILY_ITEMS,
+    "v4171_self_organization_extended": V417X_OPERATOR_FAMILY_ITEMS,
+    "v4172_self_organization_extended": V417X_OPERATOR_FAMILY_ITEMS,
     "deep": V4166_1B_ITEMS,
-    "full": V4171_ITEMS,
+    "full": V417X_COMPLETE_ITEMS,
 }
 
 TRAIN_ANALYSIS_PRESET_ALIASES = {
@@ -336,6 +354,17 @@ TRAIN_ANALYSIS_PRESET_ALIASES = {
     "v4171-1p3b": "v4171",
     "v4171-400m-c4-40b-v4-64": "v4171",
     "v4171-1p3b-c4-20b-v4-64": "v4171",
+    "v4172-400m": "v4172",
+    "v4172-400m-c4-40b": "v4172",
+    "v4172-400m-c4-40b-v4-64": "v4172",
+    "v4172-400m-ver1": "v4172",
+    "v4172-400m-c4-40b-v4-64-ver1": "v4172",
+    "v4172-400m-ver1-den-qk0p5-v1p0-rst1p2": "v4172",
+    "v4172-400m-c4-40b-v4-64-ver1-den-qk0p5-v1p0-rst1p2": "v4172",
+    "v4172-1p3b": "v4172",
+    "v4172-1p3b-c4-20b": "v4172",
+    "v4172-1p3b-c4-20b-v4-64": "v4172",
+    "v4172-1p3b-c4-20b-v4-64-ver1-den-qk0p5-v1p0-rst1p2": "v4172",
     "operator": "operator_analysis",
     "operator-analysis": "operator_analysis",
     "operator-datasets": "operator_datasets",
@@ -965,12 +994,19 @@ def _item_lines_synthetic_binding_sanity(summary: Dict[str, Any], _fmt: TrainAna
     return ["  SYNTHETIC_BINDING_SANITY:"] + _operator_dataset_block(summary, "synthetic")
 
 
-def _v4171_item(summary: Dict[str, Any], item: str) -> Dict[str, Any]:
-    return dict((summary.get("v4171_transition_analysis") or {}).get(item) or {})
+def _transition_analysis(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(
+        summary.get("transition_analysis")
+        or summary.get("v4171_transition_analysis")
+        or {})
+
+
+def _transition_item(summary: Dict[str, Any], item: str) -> Dict[str, Any]:
+    return dict(_transition_analysis(summary).get(item) or {})
 
 
 def _item_lines_global_router_audit(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "global_router_audit")
+    data = _transition_item(summary, "global_router_audit")
     pools = data.get("pool_sizes", {})
     return [
         "  GLOBAL_ROUTER_AUDIT:",
@@ -991,8 +1027,8 @@ def _item_lines_global_router_audit(summary: Dict[str, Any], _fmt: TrainAnalysis
 
 
 def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "trajectory_trace")
-    decoupling = _v4171_item(summary, "state_transition_decoupling")
+    data = _transition_item(summary, "trajectory_trace")
+    decoupling = _transition_item(summary, "state_transition_decoupling")
     pair_counts = decoupling.get("counts", {})
     captured = data.get("captured_mass", {})
     captured_by_pool = data.get("captured_mass_by_pool", {})
@@ -1031,7 +1067,7 @@ def _item_lines_trajectory_trace(summary: Dict[str, Any], fmt: TrainAnalysisForm
 
 
 def _item_lines_context_divergence(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "context_divergence")
+    data = _transition_item(summary, "context_divergence")
     out = [
         "  CONTEXT_DIVERGENCE:",
         f"  status     : {data.get('status', 'missing')}",
@@ -1059,7 +1095,7 @@ def _item_lines_context_divergence(summary: Dict[str, Any], fmt: TrainAnalysisFo
 
 
 def _item_lines_state_transition_decoupling(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "state_transition_decoupling")
+    data = _transition_item(summary, "state_transition_decoupling")
     actual = data.get("path_similarity", {})
     null = data.get("random_null_path_similarity", {})
     counts = data.get("counts", {})
@@ -1089,7 +1125,7 @@ def _item_lines_state_transition_decoupling(summary: Dict[str, Any], fmt: TrainA
 
 
 def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "causal_intervention")
+    data = _transition_item(summary, "causal_intervention")
     selected = data.get("selected_behavior_score_drop", {})
     control = data.get("control_behavior_score_drop", {})
     parity = data.get("zero_suppression_parity") or {}
@@ -1127,7 +1163,7 @@ def _item_lines_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisF
 
 def _item_lines_causal_rerouting_trace(
         summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "causal_rerouting_trace")
+    data = _transition_item(summary, "causal_rerouting_trace")
     capture = data.get("capture_reliability") or {}
     path = data.get("path_dependence_supported") or {}
     important = data.get("important_intervention_control_evidence") or {}
@@ -1152,7 +1188,7 @@ def _item_lines_causal_rerouting_trace(
 
 
 def _item_lines_causal_recovery_trace(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "causal_recovery_trace")
+    data = _transition_item(summary, "causal_recovery_trace")
     overall = data.get("overall", {})
     return [
         "  CAUSAL RECOVERY TRACE:",
@@ -1170,7 +1206,7 @@ def _item_lines_causal_recovery_trace(summary: Dict[str, Any], fmt: TrainAnalysi
 
 
 def _item_lines_operator_functional_graph(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "operator_functional_graph")
+    data = _transition_item(summary, "operator_functional_graph")
     out = [
         "  OPERATOR FUNCTIONAL GRAPH:",
         f"  status/artifacts: {data.get('status', 'not_requested')} {data.get('artifacts', {})}",
@@ -1188,7 +1224,7 @@ def _item_lines_operator_functional_graph(summary: Dict[str, Any], fmt: TrainAna
 
 
 def _item_lines_group_causal_intervention(summary: Dict[str, Any], fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "group_causal_intervention")
+    data = _transition_item(summary, "group_causal_intervention")
     zero_parity = data.get("zero_size_group_parity") or {}
     size_one = data.get("size_one_exact_invariant") or {}
     out = [
@@ -1212,7 +1248,7 @@ def _item_lines_group_causal_intervention(summary: Dict[str, Any], fmt: TrainAna
 
 
 def _item_lines_causal_ranking_calibration(summary: Dict[str, Any], _fmt: TrainAnalysisFormatters) -> List[str]:
-    data = _v4171_item(summary, "causal_ranking_calibration")
+    data = _transition_item(summary, "causal_ranking_calibration")
     return [
         "  CAUSAL RANKING CALIBRATION:",
         f"  status/rows     : {data.get('status', 'not_requested')}/{data.get('row_count', 0)}",
@@ -1336,8 +1372,8 @@ def item_status(summary: Dict[str, Any], item: str) -> str:
     if item == "generation_samples":
         generation = summary.get("generation_samples", {})
         return str(generation.get("status") or "missing")
-    if item in V4171_OPERATOR_FAMILY_ITEMS:
-        data = (summary.get("v4171_transition_analysis") or {}).get(item, {})
+    if item in V417X_OPERATOR_FAMILY_ITEMS:
+        data = _transition_analysis(summary).get(item, {})
         status = str(data.get("status") or "not_requested")
         return status if status in {
             "ready", "partial", "not_requested", "failed"} else "partial"

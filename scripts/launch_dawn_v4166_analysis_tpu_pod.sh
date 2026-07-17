@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# TPU VM/Pod launcher for DAWN-SRW v4166/v4171 analysis
+# TPU VM/Pod launcher for DAWN-SRW v4166/v417x analysis
 # =============================================================================
 # This script does not create a TPU.  It launches the analysis process on an
 # already-created TPU VM/Pod, on every worker, with a dedicated analysis tmux
@@ -171,9 +171,53 @@ apply_preset() {
                 TRAIN_ANALYSIS_PRESET="v4171"
             fi
             ;;
+        v4172-400m|v4172-400m-c4-40b|v4172-400m-c4-40b-v4-64)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64"
+            fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4172_self_organization"
+            fi
+            ;;
+        v4172-400m-ver1|v4172-400m-c4-40b-v4-64-ver1)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1"
+            fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4172_self_organization"
+            fi
+            ;;
+        v4172-400m-ver1-den-qk0p5-v1p0-rst1p2|v4172-400m-c4-40b-v4-64-ver1-den-qk0p5-v1p0-rst1p2)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2"
+            fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4172_self_organization"
+            fi
+            ;;
+        v4172-1p3b|v4172-1p3b-c4-20b|v4172-1p3b-c4-20b-v4-64|v4172-1p3b-c4-20b-v4-64-ver1-den-qk0p5-v1p0-rst1p2)
+            if [[ "$MODE_EXPLICIT" == "0" ]]; then
+                MODE="train_analysis"
+            fi
+            if [[ "$CHECKPOINT_DIR_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_CHECKPOINT_DIR="gs://dawn-tpu-data-c4/checkpoints/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2"
+            fi
+            if [[ "$ANALYSIS_PRESET_EXPLICIT" == "0" ]]; then
+                TRAIN_ANALYSIS_PRESET="v4172"
+            fi
+            ;;
         *)
             echo "ERROR: unknown --preset $1" >&2
-            echo "Known presets: v4166-1B, v4171-400M, v4171-1p3B" >&2
+            echo "Known presets: v4166-1B, v4171-400M, v4171-1p3B, v4172-400M variants, v4172-1p3B" >&2
             exit 1
             ;;
     esac
@@ -205,7 +249,7 @@ while [[ $# -gt 0 ]]; do
         --from-scratch) ANALYSIS_ARGS="$ANALYSIS_ARGS --from-scratch"; shift ;;
         --retry-failed) ANALYSIS_ARGS="$ANALYSIS_ARGS --retry-failed"; shift ;;
         --fail-fast) ANALYSIS_ARGS="$ANALYSIS_ARGS --fail-fast"; shift ;;
-        --parity-only) ANALYSIS_ARGS="$ANALYSIS_ARGS --v4171-parity-only"; shift ;;
+        --parity-only) ANALYSIS_ARGS="$ANALYSIS_ARGS --v417x-parity-only"; shift ;;
         --mesh-data) ANALYSIS_ARGS="$ANALYSIS_ARGS --mesh-data $2"; shift 2 ;;
         --mesh-model) ANALYSIS_ARGS="$ANALYSIS_ARGS --mesh-model $2"; shift 2 ;;
         --eval-max-tokens) ANALYSIS_ARGS="$ANALYSIS_ARGS --eval-max-tokens $2"; shift 2 ;;
@@ -251,7 +295,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --tpu NAME"
             echo ""
             echo "Core:"
-            echo "  --preset NAME             Known: v4166-1B, v4171-400M, v4171-1p3B"
+            echo "  --preset NAME             Known: v4166-1B, v4171-400M, v4171-1p3B, v4172-400M variants, v4172-1p3B"
             echo "  --mode MODE               analysis, train, or train_analysis. Default: $MODE"
             echo "  --config PATH             Optional train_analysis fallback config. Default: checkpoint full_config"
             echo "  --checkpoint PATH_OR_GS   Default: $CHECKPOINT"
@@ -298,7 +342,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --from-scratch            Disable analysis artifact resume"
             echo "  --retry-failed"
             echo "  --fail-fast"
-            echo "  --parity-only             Run v4171 exact parity smoke and exit before traces"
+            echo "  --parity-only             Run v417x exact parity smoke and exit before traces"
             echo "  --mesh-data N"
             echo "  --mesh-model N"
             echo "  --max-jobs-per-stage N"
@@ -439,7 +483,7 @@ fi
 WATCH_LOG_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $TMUX_SESSION --summary"
 
 echo "============================================================"
-echo "DAWN-SRW v4166/v4171 analysis launcher"
+echo "DAWN-SRW v4166/v417x analysis launcher"
 echo "============================================================"
 echo "Run:"
 echo "  mode            : $MODE"
@@ -513,6 +557,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
         if [[ -n "$TRAIN_ANALYSIS_ITEMS" ]]; then
             DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD --train-analysis-items $TRAIN_ANALYSIS_ITEMS"
         fi
+        if [[ -n "$ANALYSIS_ARGS" ]]; then
+            DRY_RUN_ANALYSIS_CMD="$DRY_RUN_ANALYSIS_CMD $ANALYSIS_ARGS"
+        fi
         echo "  $DRY_RUN_ANALYSIS_CMD"
     else
         echo "Remote Python:"
@@ -582,9 +629,10 @@ done
 
 OVERLAY_ARCHIVE=""
 if [[ "$SYNC_LOCAL_ANALYSIS" == "1" ]]; then
-    OVERLAY_ARCHIVE="$(mktemp -t dawn_v4171_analysis_overlay_XXXXXX.tar.gz)"
+    OVERLAY_ARCHIVE="$(mktemp -t dawn_v417x_analysis_overlay_XXXXXX.tar.gz)"
     trap '[[ -z "${OVERLAY_ARCHIVE:-}" ]] || rm -f "$OVERLAY_ARCHIVE"' EXIT
     tar -czf "$OVERLAY_ARCHIVE" \
+        analysis/dawn_analysis_common.py \
         analysis/dawn_analysis_trace.py \
         analysis/dawn_analysis_usage.py \
         analysis/dawn_operator_analysis.py \
@@ -594,12 +642,13 @@ if [[ "$SYNC_LOCAL_ANALYSIS" == "1" ]]; then
         analysis/dawn_v4171_transition.py \
         analysis/prompts/v4171_transition_pairs.jsonl \
         models/dawn_srw_v4171.py \
+        models/dawn_srw_v4172.py \
         scripts/analyze_dawn_srw_v4166.py \
         scripts/launch_dawn_v4166_analysis_tpu_pod.sh
     echo "Syncing local analysis overlay to target worker(s)..."
     for worker in "${TARGET_WORKERS[@]}"; do
         gcloud compute tpus tpu-vm scp "$OVERLAY_ARCHIVE" \
-            "$TPU_NAME:~/dawn_v4171_analysis_overlay.tar.gz" \
+            "$TPU_NAME:~/dawn_v417x_analysis_overlay.tar.gz" \
             --zone="$ZONE" \
             --project="$PROJECT" \
             --worker="$worker"
@@ -792,7 +841,7 @@ else
 fi
 
 if [ "\$SYNC_LOCAL_ANALYSIS" = "1" ]; then
-    OVERLAY_PATH="\$HOME/dawn_v4171_analysis_overlay.tar.gz"
+    OVERLAY_PATH="\$HOME/dawn_v417x_analysis_overlay.tar.gz"
     if [ ! -f "\$OVERLAY_PATH" ]; then
         echo "ERROR: local analysis overlay missing: \$OVERLAY_PATH" >&2
         exit 1

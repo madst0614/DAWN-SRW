@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable DAWN-SRW v4166/v4171 analysis pipeline.
+"""Resumable DAWN-SRW v4166/v417x analysis pipeline.
 
 Example:
   python scripts/analyze_dawn_srw_v4166.py \
@@ -33,6 +33,7 @@ from analysis import ANALYSIS_VERSION
 from analysis.dawn_analysis_common import (
     AnalysisContext,
     V4166_MODEL_VERSION,
+    V4171_MODEL_VERSION,
     V417X_MODEL_VERSIONS,
     config_from_checkpoint_or_file,
     count_params,
@@ -75,6 +76,7 @@ from analysis.dawn_operator_analysis import run_operator_analysis
 from analysis.dawn_train_analysis_items import (
     DEFAULT_TRAIN_ANALYSIS_PRESET,
     TRAIN_ANALYSIS_PRESETS,
+    V417X_OPERATOR_FAMILY_ITEMS,
     TrainAnalysisFormatters,
     emit_train_analysis_item_progress,
     format_train_analysis_items,
@@ -89,9 +91,9 @@ from analysis.dawn_train_analysis_prompt import (
     run_train_prompt_trace,
 )
 from analysis.dawn_v4171_transition import (
-    DEFAULT_TRANSITION_PROMPT_SET,
-    run_v4171_parity_only_smoke,
-    run_v4171_transition_items,
+    DEFAULT_V417X_TRANSITION_PROMPT_SET,
+    run_v417x_parity_only_smoke,
+    run_v417x_transition_items,
 )
 
 
@@ -119,7 +121,7 @@ TRAIN_ANALYSIS_QK_SPLIT = {
     "q": "attn_q",
     "k": "attn_k",
 }
-V4171_COMPOSITION_METRICS = (
+V417X_COMPOSITION_METRICS = (
     "admission_mass_mean",
     "admission_mass_max",
     "composition_den_mean",
@@ -139,7 +141,9 @@ REFERENCE_400M = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Analyze DAWN-SRW spatial-r1-v4.1.6.6/v4.1.7.1 checkpoints.")
+        description=(
+            "Analyze DAWN-SRW spatial-r1-v4.1.6.6, v4.1.7.1, and "
+            "v4.1.7.2 checkpoints."))
     p.add_argument(
         "--config",
         default=None,
@@ -257,11 +261,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--transition-prompt-set",
         default=os.environ.get(
-            "DAWN_V4171_TRANSITION_PROMPT_SET", DEFAULT_TRANSITION_PROMPT_SET),
-        help="Controlled JSONL prompt pairs for v4171 transition items.",
+            "DAWN_V417X_TRANSITION_PROMPT_SET",
+            os.environ.get(
+                "DAWN_V4171_TRANSITION_PROMPT_SET",
+                DEFAULT_V417X_TRANSITION_PROMPT_SET)),
+        help="Controlled JSONL prompt pairs for v417x transition items.",
     )
     p.add_argument(
-        "--v4171-parity-only",
+        "--v417x-parity-only", "--v4171-parity-only",
+        dest="v417x_parity_only",
         action="store_true",
         help=(
             "Run blocking production-vs-suppression-disabled machine-exact "
@@ -271,24 +279,30 @@ def parse_args() -> argparse.Namespace:
         "--transition-max-prompts",
         type=int,
         default=None,
-        help="Optional deterministic cap for v4171 transition prompts.",
+        help="Optional deterministic cap for v417x transition prompts.",
     )
     p.add_argument(
         "--transition-topk-qk",
         type=int,
-        default=int(os.environ.get("DAWN_V4171_TRANSITION_TOPK_QK", 512)),
+        default=int(os.environ.get(
+            "DAWN_V417X_TRANSITION_TOPK_QK",
+            os.environ.get("DAWN_V4171_TRANSITION_TOPK_QK", 512))),
         help="Target-only sparse top-k for both Q and K transition traces.",
     )
     p.add_argument(
         "--transition-topk-v",
         type=int,
-        default=int(os.environ.get("DAWN_V4171_TRANSITION_TOPK_V", 2048)),
+        default=int(os.environ.get(
+            "DAWN_V417X_TRANSITION_TOPK_V",
+            os.environ.get("DAWN_V4171_TRANSITION_TOPK_V", 2048))),
         help="Target-only sparse top-k for V transition traces.",
     )
     p.add_argument(
         "--transition-topk-rst",
         type=int,
-        default=int(os.environ.get("DAWN_V4171_TRANSITION_TOPK_RST", 4096)),
+        default=int(os.environ.get(
+            "DAWN_V417X_TRANSITION_TOPK_RST",
+            os.environ.get("DAWN_V4171_TRANSITION_TOPK_RST", 4096))),
         help="Target-only sparse top-k for RST transition traces.",
     )
     p.add_argument(
@@ -307,7 +321,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--causal-max-prompts",
         type=int,
-        default=int(os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 6)),
+        default=int(os.environ.get(
+            "DAWN_V417X_CAUSAL_MAX_PROMPTS",
+            os.environ.get("DAWN_V4171_CAUSAL_MAX_PROMPTS", 6))),
         help="Maximum controlled prompts used by the causal_intervention item.",
     )
     p.add_argument(
@@ -1347,7 +1363,7 @@ def _run_active_dynamics(
             "selected_frac",
         ):
             wanted.add(f"per_layer_{prefix}_{metric}")
-        for metric in V4171_COMPOSITION_METRICS:
+        for metric in V417X_COMPOSITION_METRICS:
             wanted.add(f"{prefix}_{metric}")
     wanted.add("admission_den_power")
     for prefix in TRAIN_ANALYSIS_QK_SPLIT.values():
@@ -1467,7 +1483,7 @@ def _run_active_dynamics(
         "pools": {
             pool: {
                 metric: mean_key(f"{prefix}_{metric}")
-                for metric in V4171_COMPOSITION_METRICS
+                for metric in V417X_COMPOSITION_METRICS
             }
             for pool, prefix in TRAIN_ANALYSIS_POOLS.items()
         },
@@ -2111,7 +2127,7 @@ def _operator_family_decision(
     return judgments, lines
 
 
-def _append_v4171_analysis_warnings(
+def _append_v417x_analysis_warnings(
         warnings: List[str], analysis: Dict[str, Any],
         selected_items: List[str]) -> None:
     for item in selected_items:
@@ -2414,9 +2430,9 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             f"version={ctx.config.get('model', {}).get('model_version')} ",
             flush=True,
         )
-    if args.v4171_parity_only:
-        run_v4171_parity_only_smoke(ctx)
-        sync_hosts("dawn-srw-v4171-parity-only-done")
+    if args.v417x_parity_only:
+        run_v417x_parity_only_smoke(ctx)
+        sync_hosts("dawn-srw-v417x-parity-only-done")
         return 0
     max_batches = max(1, int(args.train_analysis_max_batches or DEFAULT_TRAIN_ANALYSIS_BATCHES))
     eps_values = _parse_float_list(args.prune_eps or DEFAULT_TRAIN_ANALYSIS_PRUNE_EPS)
@@ -2440,9 +2456,9 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
     prompt_trace = run_train_prompt_trace(ctx) if "prompt_trace" in required_sections else {}
     prompt_decision = build_train_prompt_decision(prompt_trace) if "prompt_trace" in required_sections and ctx.is_primary else {}
     generation_samples = run_train_generation_samples(ctx) if "generation" in required_sections else {}
-    v4171_transition_analysis = (
-        run_v4171_transition_items(ctx, analysis_items)
-        if "v4171_transition" in required_sections else {}
+    transition_analysis = (
+        run_v417x_transition_items(ctx, analysis_items)
+        if "v417x_transition" in required_sections else {}
     )
     operator_analysis = (
         run_operator_analysis(ctx, analysis_items)
@@ -2467,9 +2483,9 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         ]
         if all(_safe_float(value) is None for value in active_values):
             warnings.append("selection_calibration is enabled but no active_tau metrics were observed.")
-    if v4171_transition_analysis:
-        _append_v4171_analysis_warnings(
-            warnings, v4171_transition_analysis, list(analysis_items))
+    if transition_analysis:
+        _append_v417x_analysis_warnings(
+            warnings, transition_analysis, list(analysis_items))
     model_version = ctx.config.get("model", {}).get("model_version")
     if model_version == V4166_MODEL_VERSION:
         compare = _compare_400m(active)
@@ -2478,14 +2494,17 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         compare = {
             "label": "v4166 400M",
             "status": "not_applicable",
-            "reason": "reference ranges are calibrated for v4166, not v4171",
+            "reason": "reference ranges are calibrated only for v4166",
         }
     operator_family_decision: Dict[str, Any] = {}
     operator_family_decision_lines: List[str] = []
-    if args.train_analysis_preset == "v4171_operator_family":
+    operator_family_mode = (
+        len(analysis_items) == len(V417X_OPERATOR_FAMILY_ITEMS)
+        and set(analysis_items) == set(V417X_OPERATOR_FAMILY_ITEMS))
+    if operator_family_mode:
         (operator_family_decision,
          operator_family_decision_lines) = _operator_family_decision(
-            v4171_transition_analysis)
+            transition_analysis)
     summary = {
         "run": {
             "config": args.config or "checkpoint full_config",
@@ -2508,7 +2527,7 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
         "prompt_trace": prompt_trace,
         "prompt_decision": prompt_decision,
         "generation_samples": generation_samples,
-        "v4171_transition_analysis": v4171_transition_analysis,
+        "transition_analysis": transition_analysis,
         "operator_family_decision": operator_family_decision,
         "operator_analysis": operator_analysis,
         "operator_analysis_datasets": (
@@ -2518,26 +2537,28 @@ def run_train_analysis(args: argparse.Namespace, primary: bool) -> int:
             }),
         "reference_400m": compare,
         "causal_baseline": (
-            (v4171_transition_analysis.get("causal_intervention") or {}).get(
+            (transition_analysis.get("causal_intervention") or {}).get(
                 "causal_baseline", "canonical_suppression_disabled")
             if model_version in V417X_MODEL_VERSIONS else None),
         "effect_reference": (
-            (v4171_transition_analysis.get("causal_intervention") or {}).get(
+            (transition_analysis.get("causal_intervention") or {}).get(
                 "effect_reference", "canonical_suppression_disabled")
             if model_version in V417X_MODEL_VERSIONS else None),
         "canonical_parity_machine_exact": (
-            (v4171_transition_analysis.get("causal_intervention") or {}).get(
+            (transition_analysis.get("causal_intervention") or {}).get(
                 "canonical_parity_machine_exact")
             if model_version in V417X_MODEL_VERSIONS else None),
         "cross_graph_audit_blocking": (
             False if model_version in V417X_MODEL_VERSIONS else None),
         "warnings": warnings,
     }
+    if model_version == V4171_MODEL_VERSION:
+        summary["v4171_transition_analysis"] = transition_analysis
     scalar = _scalar_row(summary)
     summary["recent_trend"] = _trend_rows(store, scalar, warnings)
     summary["decision"] = (
         operator_family_decision_lines
-        if args.train_analysis_preset == "v4171_operator_family"
+        if operator_family_mode
         else _decision_lines(active, selection, progress))
     summary["warnings"] = warnings
     emit_train_analysis_item_progress(summary, analysis_items)
@@ -2564,9 +2585,9 @@ def main() -> int:
     if args.train_analysis:
         maybe_init_distributed(args, True)
         return run_train_analysis(args, is_primary_host())
-    if args.v4171_parity_only:
+    if args.v417x_parity_only:
         if args.output is None:
-            raise ValueError("--output is required for --v4171-parity-only")
+            raise ValueError("--output is required for --v417x-parity-only")
         maybe_init_distributed(args, True)
         primary = is_primary_host()
         store = AnalysisStore(
@@ -2575,8 +2596,8 @@ def main() -> int:
         set_default_store(store)
         store.ensure_layout()
         ctx = build_context(args, ["train_analysis"], store)
-        run_v4171_parity_only_smoke(ctx)
-        sync_hosts("dawn-srw-v4171-parity-only-done")
+        run_v417x_parity_only_smoke(ctx)
+        sync_hosts("dawn-srw-v417x-parity-only-done")
         return 0
     if args.output is None:
         raise ValueError("--output is required unless --train-analysis is used.")

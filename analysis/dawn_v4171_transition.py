@@ -24,6 +24,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
     AnalysisContext,
+    V4171_MODEL_VERSION,
+    V4172_MODEL_VERSION,
+    V417X_MODEL_VERSIONS,
     analysis_model_module,
     git_info,
     maybe_load_tokenizer,
@@ -47,20 +50,17 @@ from analysis.dawn_analysis_trace import (
     _srw_with_topk,
     topk_trace_forward,
 )
-V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
-V4172_MODEL_VERSION = "spatial-r1-v4.1.7.2"
-SUPPORTED_TRANSITION_MODEL_VERSIONS = frozenset({
-    V4171_MODEL_VERSION,
-    V4172_MODEL_VERSION,
-})
+SUPPORTED_TRANSITION_MODEL_VERSIONS = frozenset(V417X_MODEL_VERSIONS)
 OPERATOR_KEY_MODE_LEARNED = "learned_operator_embedding"
 OPERATOR_KEY_MODE_GENERALIZED_BILINEAR = "generalized_bilinear_rw"
 ANALYSIS_SCHEMA_VERSION = 4
 ANALYSIS_CODE_SCHEMA_HASH = hashlib.sha256(
     b"v417x-operator-family-analysis-schema-4-rerouting-inference").hexdigest()
-DEFAULT_TRANSITION_PROMPT_SET = str(
+DEFAULT_V417X_TRANSITION_PROMPT_SET = str(
     Path(__file__).resolve().parent / "prompts" / "v4171_transition_pairs.jsonl"
 )
+# Backward-compatible export for existing launchers and external callers.
+DEFAULT_TRANSITION_PROMPT_SET = DEFAULT_V417X_TRANSITION_PROMPT_SET
 CORE_TRANSITION_ITEMS = (
     "global_router_audit",
     "trajectory_trace",
@@ -6639,3 +6639,16 @@ def run_v4171_transition_items(
         ]
         write_jsonl_atomic(ctx.store.path("metrics.jsonl"), metrics_rows)
     return result
+
+
+def run_v417x_parity_only_smoke(ctx: AnalysisContext) -> Dict[str, Any]:
+    """Version-neutral entrypoint for the shared v4171/v4172 parity path."""
+    return run_v4171_parity_only_smoke(ctx)
+
+
+def run_v417x_transition_items(
+    ctx: AnalysisContext,
+    items: Sequence[str],
+) -> Dict[str, Any]:
+    """Version-neutral entrypoint for shared v4171/v4172 transition items."""
+    return run_v4171_transition_items(ctx, items)

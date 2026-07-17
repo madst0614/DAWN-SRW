@@ -1,4 +1,4 @@
-"""Actual checkpoint evaluation for prepared v4171 operator datasets.
+"""Actual checkpoint evaluation for prepared v417x operator datasets.
 
 The prepared-data contract lives in :mod:`analysis.dawn_operator_datasets`.
 This module performs production model forwards, target-only sparse traces,
@@ -1779,11 +1779,19 @@ def run_operator_analysis(ctx: AnalysisContext, items: Sequence[str]) -> Dict[st
         raise ValueError(
             f"Prepared tokenizer/model vocabulary mismatch: prepared={prepared_vocab} model={model_vocab}")
     code_digest = hashlib.sha256()
+    model_module = analysis_model_module(ctx.model_cfg)
+    model_source_paths = [Path(model_module.__file__).resolve()]
+    shared_core = getattr(model_module, "_core", None)
+    shared_core_path = getattr(shared_core, "__file__", None)
+    if shared_core_path is not None:
+        shared_core_path = Path(shared_core_path).resolve()
+        if shared_core_path not in model_source_paths:
+            model_source_paths.append(shared_core_path)
     for path in (
         Path(__file__),
         Path(__file__).with_name("dawn_operator_datasets.py"),
         Path(__file__).with_name("dawn_analysis_trace.py"),
-        Path(__file__).parents[1] / "models" / "dawn_srw_v4171.py",
+        *model_source_paths,
     ):
         code_digest.update(path.name.encode("utf-8"))
         code_digest.update(path.read_bytes())
