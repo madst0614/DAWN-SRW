@@ -25,12 +25,13 @@ model:
   admission_den_power_v: 1.0
   admission_den_power_rst: 1.2
 
-  # Parameter-matched to the v4171 1.3B pool budget.
+  # Total-parameter matched to the official v4171 1.3B config.
   # v4172 source ratio: 4600:14500:29300 (QK:V:RST).
-  # Counts are adjusted to preserve mesh/chunk divisibility.
-  n_qk: 8586
-  n_v: 27072
-  n_rst: 54704
+  # Closest mesh/chunk-divisible total is 1,272,038,404 parameters,
+  # 4,352 below the v4171 reference total of 1,272,042,756.
+  n_qk: 8534
+  n_v: 26904
+  n_rst: 54352
 
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
