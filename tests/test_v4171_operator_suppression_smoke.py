@@ -74,12 +74,14 @@ def main() -> None:
     single_neutral = canonical_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         jnp.full((batch,), -1, dtype=jnp.int32),
-        jnp.full((batch,), -1, dtype=jnp.int32), jnp.bool_(False))
+        jnp.full((batch,), -1, dtype=jnp.int32), jnp.bool_(False),
+        jnp.ones((dim,), dtype=jnp.bool_),
+        jnp.ones((batch, seq), dtype=jnp.bool_), jnp.int32(0))
     single_disabled = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False))
     assert _all_exact(single_base, single_neutral)
-    assert _all_exact(single_base, single_disabled)
+    assert _all_exact(single_base[:-1], single_disabled[:-1])
 
     single_changed = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
@@ -123,17 +125,22 @@ def main() -> None:
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         jnp.full((batch,), -1, dtype=jnp.int32),
         jnp.full((batch,), -1, dtype=jnp.int32),
-        jnp.bool_(False), jnp.int32(-1))
+        jnp.bool_(False), jnp.int32(-1),
+        jnp.ones((2, dim), dtype=jnp.bool_),
+        jnp.ones((batch, seq), dtype=jnp.bool_), jnp.int32(0))
     paired_disabled = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False), jnp.int32(0))
     assert _all_exact(paired_base, paired_neutral)
-    assert _all_exact(paired_base, paired_disabled)
+    assert _all_exact(paired_base[:-1], paired_disabled[:-1])
 
     paired_non_target_route = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(True), jnp.int32(3))
-    assert _all_exact(paired_disabled, paired_non_target_route)
+    # The final leaf is the route-selected analysis sidecar.  It is expected
+    # to be zero for an out-of-range route while all production outputs remain
+    # machine exact.
+    assert _all_exact(paired_disabled[:-1], paired_non_target_route[:-1])
 
     q_changed = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,

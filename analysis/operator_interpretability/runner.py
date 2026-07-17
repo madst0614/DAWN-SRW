@@ -1,0 +1,1321 @@
+"""End-to-end, protocol-bound operator interpretability execution."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any, Mapping, Sequence
+
+import jax
+import numpy as np
+from transformers import AutoTokenizer
+
+from analysis.dawn_analysis_common import analysis_model_module
+from analysis.operator_interpretability.artifacts import (
+    load_benchmark_examples,
+    load_protocol_bound_artifact,
+    resolve_benchmark_build,
+    write_protocol_bound_artifact,
+)
+from analysis.operator_interpretability.benchmark_registry import (
+    PRIMARY_BENCHMARK_IDS,
+    assert_benchmark_support,
+    benchmark_spec,
+)
+from analysis.operator_interpretability.benchmark_schema import canonical_hash
+from analysis.operator_interpretability.capture import (
+    capture_discovery_candidates,
+    capture_held_out_paths,
+    ranked_site_objects,
+)
+from analysis.operator_interpretability.circuit import (
+    bootstrap_faithfulness_ci,
+    faithfulness_curve,
+    necessity_effect,
+    normalized_faithfulness,
+    select_on_validation,
+)
+from analysis.operator_interpretability.claim_gate import evaluate_claims
+from analysis.operator_interpretability.eligibility import tokenizer_vocab_hash
+from analysis.operator_interpretability.interchange import (
+    normalized_mediation_effect,
+    score_interchange_rows,
+)
+from analysis.operator_interpretability.intervention import (
+    all_ones_retention_parity,
+    evaluate_behavior,
+    evaluate_circuit_necessity,
+    evaluate_circuit_retention,
+    evaluate_operator_interchange,
+)
+from analysis.operator_interpretability.protocol import (
+    CIRCUIT_FRACTIONS,
+    ProtocolConfig,
+    protocol_record,
+    validate_model_version,
+)
+from analysis.operator_interpretability.space import (
+    address_confirmation,
+    discover_functional_families,
+    operator_pool_provenance,
+)
+from analysis.operator_interpretability.statistics import (
+    benjamini_hochberg,
+    bootstrap_mean_ci,
+    paired_permutation_test,
+)
+from analysis.operator_interpretability.trajectory import (
+    held_out_trajectory_confirmation,
+)
+from analysis.operator_interpretability.units import (
+    OperatorCircuit,
+    OperatorSpaceShape,
+    nested_circuits,
+)
+from analysis.train_analysis_pool_items import dependency_closure
+
+
+MIB_CIRCUIT_BENCHMARKS = (
+    "mib_ioi", "mib_mcqa", "mib_arithmetic", "mib_arc",
+)
+
+
+def _mean(values: Sequence[float]) -> float | None:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    return float(finite.mean()) if finite.size else None
+
+
+def _parameter_schema_record(params: Any) -> list[dict[str, Any]]:
+    rows = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(params)[0]:
+        rows.append({
+            "path": jax.tree_util.keystr(path),
+            "shape": [int(value) for value in leaf.shape],
+            "dtype": str(leaf.dtype),
+        })
+    return rows
+
+
+class OperatorInterpretabilityRunner:
+    """One canonical scientific path; no legacy artifacts or prompt aliases."""
+
+    def __init__(
+            self, ctx: Any, *, benchmark_root: str,
+            benchmark_ids: Sequence[str], protocol_config: ProtocolConfig,
+            resume: bool = True) -> None:
+        self.ctx = ctx
+        self.store = ctx.store
+        self.config = protocol_config.validate()
+        self.resume = bool(resume)
+        self.model_version = validate_model_version(
+            str(ctx.model_cfg["model_version"]))
+        self.shape = OperatorSpaceShape.from_model_cfg(ctx.model_cfg)
+        self.build = resolve_benchmark_build(benchmark_root)
+        self.benchmark_ids = tuple(dict.fromkeys(
+            str(value).strip().lower() for value in benchmark_ids))
+        if not self.benchmark_ids:
+            raise ValueError("at least one benchmark id is required")
+        for benchmark_id in self.benchmark_ids:
+            assert_benchmark_support(benchmark_id, self.model_version)
+            if benchmark_id not in self.build.manifest["benchmarks"]:
+                raise FileNotFoundError(
+                    f"benchmark build lacks requested id={benchmark_id}")
+
+        tokenizer_record = dict(self.build.manifest["tokenizer"])
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            str(tokenizer_record["name"]),
+            revision=str(tokenizer_record["resolved_revision"]),
+            use_fast=True,
+        )
+        actual_vocab_hash = tokenizer_vocab_hash(self.tokenizer)
+        if actual_vocab_hash != tokenizer_record["vocab_hash"]:
+            raise ValueError("runtime tokenizer vocabulary hash mismatch")
+        if int(self.tokenizer.pad_token_id) != int(tokenizer_record["pad_token_id"]):
+            raise ValueError("runtime tokenizer pad id mismatch")
+        logical_vocab_size = int(ctx.model_cfg.get(
+            "logical_vocab_size", ctx.model_cfg["vocab_size"]))
+        if logical_vocab_size != int(tokenizer_record["vocab_size"]):
+            raise ValueError(
+                "checkpoint logical vocabulary and benchmark tokenizer differ: "
+                f"checkpoint={logical_vocab_size} "
+                f"benchmark={tokenizer_record['vocab_size']}")
+        configured_tokenizer = ctx.config.get("tokenizer")
+        if isinstance(configured_tokenizer, str) and (
+                configured_tokenizer != tokenizer_record["name"]):
+            raise ValueError("checkpoint tokenizer name and benchmark tokenizer differ")
+
+        parameter_schema_hash = canonical_hash(
+            _parameter_schema_record(ctx.params))
+        checkpoint_identity_record = {
+            "path": str(ctx.checkpoint_path),
+            "step": int(ctx.checkpoint_step),
+            "run_id": (
+                str(ctx.checkpoint_metadata["run_id"])
+                if ctx.checkpoint_metadata.get("run_id") is not None
+                else None),
+            "training_git_commit": (
+                str(ctx.checkpoint_metadata.get("git_commit")
+                    or ctx.checkpoint_metadata.get("train_script_git_commit"))
+                if (ctx.checkpoint_metadata.get("git_commit")
+                    or ctx.checkpoint_metadata.get("train_script_git_commit"))
+                else None),
+            "parameter_schema_hash": parameter_schema_hash,
+            "identity_algorithm": (
+                "resolved_path_step_run_metadata_and_parameter_schema"),
+            "parameter_content_hash_included": False,
+        }
+        checkpoint_identity = canonical_hash(checkpoint_identity_record)
+        model_config_hash = canonical_hash(dict(ctx.model_cfg))
+        self.protocol = protocol_record(
+            self.config,
+            model_version=self.model_version,
+            benchmark_manifest_hash=self.build.manifest_hash,
+            checkpoint_identity=checkpoint_identity,
+            model_config_hash=model_config_hash,
+        )
+        self.contract = {
+            "status": "ready",
+            "model_version": self.model_version,
+            "supported_model_versions": list(
+                benchmark_spec(self.benchmark_ids[0]).supported_model_versions),
+            "checkpoint_path": str(ctx.checkpoint_path),
+            "checkpoint_step": int(ctx.checkpoint_step),
+            "checkpoint_identity": checkpoint_identity,
+            "checkpoint_identity_record": checkpoint_identity_record,
+            "parameter_schema_hash": parameter_schema_hash,
+            "checkpoint_parameter_content_hash_included": False,
+            "model_config_hash": model_config_hash,
+            "benchmark_build_id": self.build.build_id,
+            "benchmark_manifest_path": self.build.manifest_path,
+            "benchmark_manifest_hash": self.build.manifest_hash,
+            "benchmark_ids": list(self.benchmark_ids),
+            "tokenizer": tokenizer_record,
+            "protocol": self.protocol,
+        }
+        self.results: dict[str, dict[str, Any]] = {}
+        self._examples: dict[str, dict[str, list[Any]]] = {}
+        self._pool_host: dict[str, np.ndarray] | None = None
+
+    def _print(self, message: str) -> None:
+        if self.ctx.is_primary:
+            print(message, flush=True)
+
+    def _artifact_path(self, item: str) -> str:
+        return self.store.path("items", f"{item}.json")
+
+    def _persist(self, item: str, result: Mapping[str, Any]) -> None:
+        if self.ctx.is_primary:
+            write_protocol_bound_artifact(
+                self.store, f"items/{item}.json", result,
+                protocol=self.protocol)
+
+    def _ensure(self, item: str) -> dict[str, Any]:
+        if item in self.results:
+            return self.results[item]
+        if self.resume:
+            existing = load_protocol_bound_artifact(
+                self._artifact_path(item), protocol=self.protocol)
+            if existing is not None:
+                self.results[item] = existing
+                self._print(f"TRAIN_ANALYSIS_POOL item={item} status=resume")
+                return existing
+        method = getattr(self, f"_run_{item}")
+        self._print(f"TRAIN_ANALYSIS_POOL item={item} status=running")
+        result = dict(method())
+        self.results[item] = result
+        self._persist(item, result)
+        self._print(
+            f"TRAIN_ANALYSIS_POOL item={item} status={result.get('status')}")
+        return result
+
+    def run(self, items: Sequence[str]) -> dict[str, Any]:
+        executed = dependency_closure(items)
+        for item in executed:
+            self._ensure(item)
+        summary = {
+            "status": "complete",
+            "requested_items": list(items),
+            "executed_items": executed,
+            "model_version": self.model_version,
+            "checkpoint_step": int(self.ctx.checkpoint_step),
+            "benchmark_build_id": self.build.build_id,
+            "protocol_hash": canonical_hash(self.protocol),
+            "item_status": {
+                item: self.results[item].get("status") for item in executed
+            },
+            "strongest_supported_claim": (
+                self.results.get("scientific_claims", {}).get(
+                    "strongest_supported_claim")),
+        }
+        if self.ctx.is_primary:
+            write_protocol_bound_artifact(
+                self.store, "summary.json", summary, protocol=self.protocol)
+        return summary
+
+    def _load_examples(self, benchmark_id: str) -> dict[str, list[Any]]:
+        if benchmark_id not in self._examples:
+            phases = {}
+            for phase in ("discovery", "validation", "test"):
+                values = load_benchmark_examples(
+                    self.build, benchmark_id, phase=phase)
+                if benchmark_id == "ravel":
+                    grouped: dict[str, list[Any]] = defaultdict(list)
+                    for example in values:
+                        group_id = str(example.metadata["pair_group_id"])
+                        grouped[group_id].append(example)
+                    selected = []
+                    ordered_groups = sorted(grouped.items(), key=lambda row: (
+                        canonical_hash(row[0]), row[0]))
+                    for group_id, group in ordered_groups:
+                        if (len(group) != 2
+                                or {example.pair_type for example in group} != {
+                                    "cause", "isolation"}):
+                            raise ValueError(
+                                "RAVEL phase group must contain exactly one "
+                                f"cause and one isolation row: {group_id}")
+                        group.sort(key=lambda example: example.pair_type)
+                        if (len(selected) + len(group)
+                                > self.config.max_examples_per_phase):
+                            continue
+                        selected.extend(group)
+                    if not selected:
+                        raise ValueError(
+                            "max_examples_per_phase is too small for one "
+                            "atomic RAVEL cause/isolation group")
+                    phases[phase] = selected
+                else:
+                    values.sort(key=lambda example: (
+                        canonical_hash(example.example_id), example.example_id))
+                    phases[phase] = values[
+                        :self.config.max_examples_per_phase]
+            self._examples[benchmark_id] = phases
+        return self._examples[benchmark_id]
+
+    @staticmethod
+    def _independent_capture_examples(
+            benchmark_id: str, examples: Sequence[Any]) -> list[Any]:
+        if benchmark_id != "ravel":
+            return list(examples)
+        selected: dict[str, Any] = {}
+        for example in examples:
+            group_id = str(example.metadata["pair_group_id"])
+            current = selected.get(group_id)
+            if current is None or example.example_id < current.example_id:
+                selected[group_id] = example
+        return [selected[key] for key in sorted(selected)]
+
+    def _known_correct(self, benchmark_id: str, phase: str) -> list[Any]:
+        behavior = self.results["behavioral_eligibility"]["benchmarks"][
+            benchmark_id]["phases"][phase]
+        mask = list(behavior["known_correct"])
+        examples = self._load_examples(benchmark_id)[phase]
+        if len(mask) != len(examples):
+            raise ValueError("behavior mask and benchmark examples are misaligned")
+        return [example for example, keep in zip(examples, mask) if keep]
+
+    def _behavior_margins(
+            self, benchmark_id: str, phase: str,
+            examples: Sequence[Any]) -> tuple[np.ndarray, np.ndarray]:
+        result = self.results["behavioral_eligibility"]["benchmarks"][
+            benchmark_id]["phases"][phase]
+        index = {
+            example_id: row for row, example_id in enumerate(result["example_ids"])
+        }
+        rows = [index[example.example_id] for example in examples]
+        return (
+            np.asarray(result["base_margin"], dtype=np.float64)[rows],
+            np.asarray(result["corrupted_margin"], dtype=np.float64)[rows],
+        )
+
+    def _run_benchmark_contract(self) -> dict[str, Any]:
+        return self.contract
+
+    def _run_behavioral_eligibility(self) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for benchmark_id in self.benchmark_ids:
+            phase_results = {}
+            for phase, examples in self._load_examples(benchmark_id).items():
+                result = evaluate_behavior(
+                    self.ctx, examples,
+                    pad_token_id=int(self.tokenizer.pad_token_id))
+                known_correct_examples = [
+                    example for example, keep in zip(
+                        examples, result["known_correct"])
+                    if keep
+                ]
+                independent_count = len(self._independent_capture_examples(
+                    benchmark_id, known_correct_examples))
+                result["known_correct_independent_unit_count"] = (
+                    independent_count)
+                result["eligible_for_mechanistic_claims"] = (
+                    independent_count
+                    >= self.config.minimum_known_correct)
+                result["minimum_known_correct"] = (
+                    self.config.minimum_known_correct)
+                phase_results[phase] = result
+            output[benchmark_id] = {
+                "status": "ready",
+                "track": benchmark_spec(benchmark_id).track,
+                "phases": phase_results,
+            }
+        return {"status": "ready", "benchmarks": output}
+
+    def _capture_kwargs(self) -> dict[str, Any]:
+        return {
+            "pad_token_id": int(self.tokenizer.pad_token_id),
+            "topk_qk": self.config.capture_topk_qk,
+            "topk_v": self.config.capture_topk_v,
+            "topk_rst": self.config.capture_topk_rst,
+            "max_topk_qk": self.config.capture_max_topk_qk,
+            "max_topk_v": self.config.capture_max_topk_v,
+            "max_topk_rst": self.config.capture_max_topk_rst,
+            "capture_threshold": self.config.capture_threshold,
+            "max_examples": self.config.max_examples_per_phase,
+        }
+
+    def _run_operator_localization(self) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        causal_ids = [
+            benchmark_id for benchmark_id in self.benchmark_ids
+            if benchmark_id in PRIMARY_BENCHMARK_IDS
+        ]
+        for offset, benchmark_id in enumerate(causal_ids):
+            examples = self._independent_capture_examples(
+                benchmark_id,
+                self._known_correct(benchmark_id, "discovery"))
+            if len(examples) < self.config.minimum_known_correct:
+                output[benchmark_id] = {
+                    "status": "insufficient_behavior",
+                    "known_correct_count": len(examples),
+                    "minimum_known_correct": self.config.minimum_known_correct,
+                }
+                continue
+            output[benchmark_id] = capture_discovery_candidates(
+                self.ctx, examples,
+                seed=self.config.seed + offset * 1009,
+                **self._capture_kwargs())
+        ready = [row for row in output.values() if row.get("status") == "ready"]
+        complete = bool(causal_ids) and len(ready) == len(causal_ids)
+        rank_values = [
+            float(row["rank_stability"]) for row in ready
+            if row.get("rank_stability") is not None
+        ]
+        return {
+            "status": "ready" if complete else "insufficient_behavior",
+            "benchmarks": output,
+            "qualified_fraction": (
+                min(float(row["qualified_fraction"]) for row in ready)
+                if ready else 0.0),
+            "rank_stability": min(rank_values) if rank_values else None,
+            "all_primary_benchmarks_ready": complete,
+            "ranking_phase": "discovery",
+        }
+
+    def _circuits(self, benchmark_id: str):
+        capture = self.results["operator_localization"]["benchmarks"][benchmark_id]
+        if capture.get("status") != "ready":
+            raise ValueError(f"localization is not ready for {benchmark_id}")
+        return nested_circuits(
+            ranked_site_objects(capture), shape=self.shape,
+            benchmark_id=benchmark_id, fractions=CIRCUIT_FRACTIONS)
+
+    def _circuit_curve(
+            self, benchmark_id: str, *, mode: str) -> dict[str, Any]:
+        validation = self._known_correct(benchmark_id, "validation")
+        test = self._known_correct(benchmark_id, "test")
+        if min(len(validation), len(test)) < self.config.minimum_known_correct:
+            return {
+                "status": "insufficient_behavior",
+                "validation_known_correct": len(validation),
+                "test_known_correct": len(test),
+            }
+        validation_base, validation_corrupt = self._behavior_margins(
+            benchmark_id, "validation", validation)
+        test_base, test_corrupt = self._behavior_margins(
+            benchmark_id, "test", test)
+        if abs(float(validation_base.mean() - validation_corrupt.mean())) <= 1e-12:
+            return {"status": "undefined_validation_behavior_contrast"}
+        if abs(float(test_base.mean() - test_corrupt.mean())) <= 1e-12:
+            return {"status": "undefined_test_behavior_contrast"}
+        circuits = self._circuits(benchmark_id)
+        parity = all_ones_retention_parity(
+            self.ctx, validation[:min(2, len(validation))],
+            shape=self.shape,
+            pad_token_id=int(self.tokenizer.pad_token_id), mode=mode)
+
+        def evaluate(examples, baseline, corrupted, *, seed_offset):
+            rows = []
+            for index, (fraction, circuit) in enumerate(circuits):
+                retained = evaluate_circuit_retention(
+                    self.ctx, examples, circuit, shape=self.shape, mode=mode,
+                    pad_token_id=int(self.tokenizer.pad_token_id))
+                rows.append({
+                    "fraction": fraction,
+                    "site_count": circuit.site_count,
+                    "circuit_hash": circuit.circuit_hash,
+                    "mean_margin": retained["mean_margin"],
+                    "accuracy": retained["accuracy"],
+                    "faithfulness": normalized_faithfulness(
+                        retained["mean_margin"], float(baseline.mean()),
+                        float(corrupted.mean())),
+                    "faithfulness_ci": bootstrap_faithfulness_ci(
+                        retained["margin"], baseline, corrupted,
+                        samples=self.config.bootstrap_samples,
+                        alpha=self.config.alpha,
+                        seed=self.config.seed + seed_offset + index),
+                })
+            return rows
+
+        validation_rows = evaluate(
+            validation, validation_base, validation_corrupt,
+            seed_offset=2000)
+        selection = select_on_validation(
+            validation_rows,
+            minimum_faithfulness=self.config.circuit_faithfulness_min)
+        # Test is evaluated only after the validation decision is frozen.
+        test_rows = evaluate(
+            test, test_base, test_corrupt, seed_offset=3000)
+        selected_test = next((
+            row for row in test_rows
+            if row["fraction"] == selection.get("selected_fraction")), None)
+        selected_circuit = next((
+            circuit for fraction, circuit in circuits
+            if fraction == selection.get("selected_fraction")), None)
+        return {
+            "status": (
+                "ready" if selection["status"] == "selected"
+                else selection["status"]),
+            "mode": mode,
+            "all_ones_parity": parity,
+            "validation": {
+                "phase": "validation",
+                "baseline_mean": float(validation_base.mean()),
+                "corrupted_mean": float(validation_corrupt.mean()),
+                "rows": validation_rows,
+                "curve": faithfulness_curve(validation_rows),
+            },
+            "selection": selection,
+            "test": {
+                "phase": "test",
+                "selection_frozen_before_evaluation": True,
+                "test_used_for_selection": False,
+                "baseline_mean": float(test_base.mean()),
+                "corrupted_mean": float(test_corrupt.mean()),
+                "rows": test_rows,
+                "curve": faithfulness_curve(test_rows),
+            },
+            "selected_test_faithfulness": (
+                selected_test["faithfulness"] if selected_test else None),
+            "selected_test_faithfulness_ci": (
+                selected_test["faithfulness_ci"] if selected_test else None),
+            "selected_circuit": (
+                selected_circuit.to_dict() if selected_circuit else None),
+        }
+
+    def _run_sufficiency(self, mode: str) -> dict[str, Any]:
+        output = {}
+        for benchmark_id in self.benchmark_ids:
+            if benchmark_id not in MIB_CIRCUIT_BENCHMARKS:
+                continue
+            capture = self.results["operator_localization"]["benchmarks"].get(
+                benchmark_id, {})
+            if capture.get("status") != "ready":
+                output[benchmark_id] = {"status": "localization_not_ready"}
+            else:
+                output[benchmark_id] = self._circuit_curve(
+                    benchmark_id, mode=mode)
+        complete = bool(output) and all(
+            row.get("status") == "ready" for row in output.values())
+        return {
+            "status": "ready" if complete else "incomplete",
+            "mode": mode,
+            "benchmarks": output,
+            "selection_phase": "validation",
+            "evaluation_phase": "test",
+            "test_used_for_selection": False,
+        }
+
+    def _run_conditional_circuit_sufficiency(self) -> dict[str, Any]:
+        return self._run_sufficiency("conditional_execution_sufficiency")
+
+    def _run_autonomous_circuit_sufficiency(self) -> dict[str, Any]:
+        return self._run_sufficiency("autonomous_subcircuit_sufficiency")
+
+    def _selected_conditional_circuit(
+            self, benchmark_id: str) -> OperatorCircuit | None:
+        result = self.results["conditional_circuit_sufficiency"]["benchmarks"][
+            benchmark_id]
+        fraction = result.get("selection", {}).get("selected_fraction")
+        if fraction is None:
+            return None
+        return next(
+            circuit for value, circuit in self._circuits(benchmark_id)
+            if value == fraction)
+
+    def _run_circuit_necessity(self) -> dict[str, Any]:
+        output = {}
+        for benchmark_id, sufficiency in self.results[
+                "conditional_circuit_sufficiency"]["benchmarks"].items():
+            circuit = self._selected_conditional_circuit(benchmark_id)
+            if circuit is None:
+                output[benchmark_id] = {
+                    "status": "no_validation_selected_circuit"}
+                continue
+            examples = self._known_correct(benchmark_id, "test")
+            baseline, _ = self._behavior_margins(
+                benchmark_id, "test", examples)
+            intervention = evaluate_circuit_necessity(
+                self.ctx, examples, circuit, shape=self.shape,
+                pad_token_id=int(self.tokenizer.pad_token_id))
+            effect = necessity_effect(baseline, intervention["margin"])
+            margin_drop = (
+                baseline - np.asarray(intervention["margin"], dtype=np.float64))
+            effect_ci = bootstrap_mean_ci(
+                margin_drop, samples=self.config.bootstrap_samples,
+                alpha=self.config.alpha, seed=self.config.seed + 4001)
+            null = paired_permutation_test(
+                baseline, intervention["margin"],
+                samples=self.config.permutation_samples,
+                seed=self.config.seed + 4003)
+            output[benchmark_id] = {
+                "status": "ready",
+                "selection_phase": "validation",
+                "evaluation_phase": "test",
+                "test_used_for_selection": False,
+                "selected_fraction": sufficiency["selection"][
+                    "selected_fraction"],
+                "circuit_hash": circuit.circuit_hash,
+                "intervention": intervention,
+                "effect": effect,
+                "effect_ci": effect_ci,
+                "paired_null": null,
+            }
+        ready = [row for row in output.values() if row.get("status") == "ready"]
+        if ready:
+            correction = benjamini_hochberg(
+                [row["paired_null"]["p_value_two_sided"] for row in ready],
+                self.config.alpha)
+            for row, adjusted, reject in zip(
+                    ready, correction["adjusted_p_values"],
+                    correction["reject"]):
+                row["paired_null"]["adjusted_p_value"] = adjusted
+                row["paired_null"]["reject_after_bh"] = reject
+        else:
+            correction = {"adjusted_p_values": [], "reject": []}
+        return {
+            "status": (
+                "ready" if output and len(ready) == len(output) else "incomplete"),
+            "benchmarks": output,
+            "mean_margin_drop": _mean([
+                row["effect"]["mean_margin_drop"] for row in ready]),
+            "all_significant_after_bh": bool(ready) and all(
+                row["paired_null"]["reject_after_bh"]
+                and row["effect_ci"]["ci_low"] > 0.0
+                for row in ready),
+            "multiple_comparison_correction": "benjamini_hochberg",
+            "bh": correction,
+        }
+
+    def _materialize_pool(self) -> dict[str, np.ndarray]:
+        if self._pool_host is None:
+            module = analysis_model_module(self.ctx.model_cfg)
+            params = module._squeeze_params(self.ctx.params)
+            pool = module._pool_params_with_operator_keys(
+                params["neuron_pool"],
+                self.ctx.model_cfg.get("operator_key_mode"))
+            names = (
+                "attn_qk_read", "attn_qk_write", "attn_qk_op_key",
+                "attn_v_read", "attn_v_write", "attn_v_op_key",
+                "rst_read", "rst_write", "rst_op_key",
+            )
+            self._pool_host = {
+                name: np.asarray(jax.device_get(pool[name]), dtype=np.float64)
+                for name in names
+            }
+        return self._pool_host
+
+    def _candidate_ids(self, route: str) -> list[int]:
+        pool_size = self.shape.pool_size(route)
+        ranked = []
+        for result in self.results["operator_localization"]["benchmarks"].values():
+            if result.get("status") != "ready":
+                continue
+            ranked.extend(
+                row for row in result["ranked_sites"]
+                if row["route"] == route)
+        ranked.sort(key=lambda row: (
+            -abs(float(row["importance"])), int(row["operator_id"])))
+        selected: list[int] = []
+        if "ravel" in self.benchmark_ids:
+            ravel_capture = self.results["operator_localization"][
+                "benchmarks"].get("ravel", {})
+            if ravel_capture.get("status") == "ready":
+                selected.extend(
+                    seed["operator_id"]
+                    for seed in self._ravel_variable_seeds().values()
+                    if (seed.get("status") == "ready"
+                        and seed.get("route") == route))
+        selected = list(dict.fromkeys(selected))
+        if len(selected) > self.config.space_max_operators:
+            raise ValueError(
+                "space_max_operators cannot contain all preselected "
+                f"RAVEL variable seeds for route={route}")
+        for row in ranked:
+            operator_id = int(row["operator_id"])
+            if operator_id not in selected:
+                selected.append(operator_id)
+            if len(selected) >= self.config.space_max_operators:
+                return selected
+        width = min(pool_size, self.config.space_max_operators)
+        for operator_id in np.linspace(
+                0, pool_size - 1, num=width, dtype=np.int64):
+            value = int(operator_id)
+            if value not in selected:
+                selected.append(value)
+            if len(selected) >= width:
+                break
+        if len(selected) < 2:
+            raise ValueError("operator-space candidate set has fewer than two ids")
+        return selected
+
+    def _run_operator_space_structure(self) -> dict[str, Any]:
+        pool = self._materialize_pool()
+        key_prefix = {"q": "attn_qk", "k": "attn_qk",
+                      "v": "attn_v", "rst": "rst"}
+        output = {}
+        for offset, route in enumerate(("q", "k", "v", "rst")):
+            ids = self._candidate_ids(route)
+            prefix = key_prefix[route]
+            read = pool[f"{prefix}_read"][ids]
+            write = pool[f"{prefix}_write"][ids]
+            address = pool[f"{prefix}_op_key"][ids]
+            discovered = discover_functional_families(
+                read, write,
+                neighbor_k=self.config.family_neighbor_k,
+                similarity_quantile=self.config.family_similarity_quantile)
+            local_families = discovered.pop("families")
+            global_families = [
+                [ids[index] for index in family] for family in local_families
+            ]
+            output[route] = {
+                "status": "ready",
+                **discovered,
+                "candidate_operator_ids": ids,
+                "candidate_selection": (
+                    "discovery_contribution_then_preregistered_even_pool_coverage"),
+                "candidate_funnel_limited": len(ids) < self.shape.pool_size(route),
+                "families_global_operator_ids": global_families,
+                "address_confirmation": address_confirmation(
+                    local_families, address,
+                    seed=self.config.seed + offset * 37),
+            }
+        return {
+            "status": "ready",
+            "routes": output,
+            "family_count": int(sum(
+                row["family_count"] for row in output.values())),
+            "address_used_for_discovery": False,
+            "unit": "reciprocal_local_rw_function_family",
+            "pool_provenance": operator_pool_provenance(self.ctx),
+            "full_pool_exhaustive": all(
+                not row["candidate_funnel_limited"] for row in output.values()),
+        }
+
+    def _ravel_variable_seeds(self) -> dict[str, dict[str, Any]]:
+        capture = self.results["operator_localization"]["benchmarks"]["ravel"]
+        variables = benchmark_spec("ravel").causal_variables
+        output = {}
+        for variable in variables:
+            denominators: dict[tuple[int, str], int] = defaultdict(int)
+            totals: dict[tuple[int, str, int], float] = defaultdict(float)
+            counts: dict[tuple[int, str, int], int] = defaultdict(int)
+            for row in capture["rows"]:
+                if (not row["qualified"]
+                        or row["causal_variable"] != variable):
+                    continue
+                layer, route = int(row["layer"]), str(row["route"])
+                denominators[(layer, route)] += 1
+                for operator_id, weight in zip(
+                        row["operator_ids"], row["weights"]):
+                    key = (layer, route, int(operator_id))
+                    totals[key] += abs(float(weight))
+                    counts[key] += 1
+            if not totals:
+                output[variable] = {"status": "no_qualified_discovery_site"}
+                continue
+            ranked = sorted([
+                (
+                    total / denominators[(key[0], key[1])], key,
+                    counts[key]
+                )
+                for key, total in totals.items()
+            ], key=lambda value: (-value[0], value[1]))
+            importance, (layer, route, operator_id), discovery_count = ranked[0]
+            output[variable] = {
+                "status": "ready",
+                "layer": layer,
+                "route": route,
+                "operator_id": operator_id,
+                "importance": importance,
+                "discovery_count": discovery_count,
+                "selection_phase": "discovery",
+            }
+        return output
+
+    def _family_for_seed(
+            self, seed: Mapping[str, Any]) -> tuple[int, str, list[int]]:
+        if seed.get("status") != "ready":
+            raise ValueError("RAVEL variable has no discovery seed")
+        layer, route, operator_id = (
+            int(seed["layer"]), str(seed["route"]), int(seed["operator_id"]))
+        families = self.results["operator_space_structure"]["routes"][route][
+            "families_global_operator_ids"]
+        containing = [family for family in families if operator_id in family]
+        family = min(containing, key=lambda value: (len(value), value)) if containing else [operator_id]
+        return layer, route, family
+
+    def _matched_nonfamily_control(
+            self, variable: str, *, layer: int, route: str,
+            family: Sequence[int]) -> dict[str, Any]:
+        capture = self.results["operator_localization"]["benchmarks"]["ravel"]
+        qualified_rows = [
+            row for row in capture["rows"]
+            if row["qualified"] and row["causal_variable"] == variable
+            and int(row["layer"]) == int(layer) and row["route"] == route
+        ]
+        if not qualified_rows:
+            raise ValueError(
+                f"no qualified RAVEL discovery rows for {variable}/{layer}/{route}")
+        totals: dict[int, float] = defaultdict(float)
+        for row in qualified_rows:
+            for operator_id, weight in zip(row["operator_ids"], row["weights"]):
+                totals[int(operator_id)] += float(weight)
+        denominator = len(qualified_rows)
+        importance = {
+            operator_id: total / denominator
+            for operator_id, total in totals.items()
+        }
+        family_ids = [int(value) for value in family]
+        available = set(range(self.shape.pool_size(route))) - set(family_ids)
+        if len(available) < len(family_ids):
+            raise ValueError("operator pool cannot provide a disjoint control")
+        matched = []
+        absolute_errors = []
+        for operator_id in sorted(
+                family_ids,
+                key=lambda value: (-importance.get(value, 0.0), value)):
+            target = importance.get(operator_id, 0.0)
+            selected = min(
+                available,
+                key=lambda value: (
+                    abs(importance.get(value, 0.0) - target), value))
+            available.remove(selected)
+            matched.append(selected)
+            absolute_errors.append(
+                abs(importance.get(selected, 0.0) - target))
+        return {
+            "operator_ids": matched,
+            "matching_feature": (
+                "variable_specific_discovery_mean_absolute_contribution"),
+            "matching_without_replacement": True,
+            "family_excluded": True,
+            "mean_absolute_importance_match_error": float(np.mean(
+                absolute_errors)),
+        }
+
+    def _paired_interchange_advantage(
+            self, candidate: Mapping[str, Any],
+            comparator: Mapping[str, Any], *, seed: int) -> dict[str, Any]:
+        candidate_rows = {
+            str(row["example_id"]): row for row in candidate["rows"]
+            if row["pair_type"] == "cause"
+        }
+        comparator_rows = {
+            str(row["example_id"]): row for row in comparator["rows"]
+            if row["pair_type"] == "cause"
+        }
+        if set(candidate_rows) != set(comparator_rows):
+            raise ValueError("interchange control rows are not paired")
+        example_ids = sorted(candidate_rows)
+        candidate_effect = np.asarray([
+            float(candidate_rows[example_id]["patched_source_margin"])
+            - float(candidate_rows[example_id]["base_source_margin"])
+            for example_id in example_ids
+        ], dtype=np.float64)
+        comparator_effect = np.asarray([
+            float(comparator_rows[example_id]["patched_source_margin"])
+            - float(comparator_rows[example_id]["base_source_margin"])
+            for example_id in example_ids
+        ], dtype=np.float64)
+        difference = candidate_effect - comparator_effect
+        return {
+            "status": "ready",
+            "n": len(example_ids),
+            "effect": "cause_margin_improvement_difference",
+            "candidate_mean": float(candidate_effect.mean()),
+            "comparator_mean": float(comparator_effect.mean()),
+            "difference_ci": bootstrap_mean_ci(
+                difference, samples=self.config.bootstrap_samples,
+                alpha=self.config.alpha, seed=seed),
+            "paired_null": paired_permutation_test(
+                candidate_effect, comparator_effect,
+                samples=self.config.permutation_samples, seed=seed + 1),
+        }
+
+    def _interchange_phase(
+            self, examples: Sequence[Any], *, phase: str,
+            layer: int, route: str, family: Sequence[int],
+            seed_offset: int = 0) -> dict[str, Any]:
+        rows = evaluate_operator_interchange(
+            self.ctx, examples, layer=layer, route=route,
+            operator_ids=family,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        score = score_interchange_rows(rows)
+        mediation = [
+            normalized_mediation_effect(
+                row["base_source_margin"], row["source_source_margin"],
+                row["patched_source_margin"])
+            for row in rows if row["pair_type"] == "cause"
+        ]
+        variable_results = {}
+        p_value_variables = []
+        for offset, variable in enumerate(sorted({
+                str(row["causal_variable"]) for row in rows})):
+            cause_rows = [
+                row for row in rows
+                if row["pair_type"] == "cause"
+                and row["causal_variable"] == variable]
+            isolation_rows = [
+                row for row in rows
+                if row["pair_type"] == "isolation"
+                and row["causal_variable"] == variable]
+            if min(len(cause_rows), len(isolation_rows)) < 2:
+                variable_results[variable] = {
+                    "status": "insufficient_pairs",
+                    "cause_pair_count": len(cause_rows),
+                    "isolation_pair_count": len(isolation_rows),
+                }
+                continue
+            cause_base = [row["base_source_margin"] for row in cause_rows]
+            cause_patched = [row["patched_source_margin"] for row in cause_rows]
+            cause_delta = np.asarray(cause_patched) - np.asarray(cause_base)
+            isolation_delta = [
+                abs(float(row["patched_base_margin"])
+                    - float(row["base_base_margin"]))
+                for row in isolation_rows
+            ]
+            null = paired_permutation_test(
+                cause_patched, cause_base,
+                samples=self.config.permutation_samples,
+                seed=self.config.seed + seed_offset + 5000 + offset)
+            variable_results[variable] = {
+                "status": "ready",
+                "cause_pair_count": len(cause_rows),
+                "isolation_pair_count": len(isolation_rows),
+                "cause_effect_ci": bootstrap_mean_ci(
+                    cause_delta, samples=self.config.bootstrap_samples,
+                    alpha=self.config.alpha,
+                    seed=self.config.seed + seed_offset + 5100 + offset),
+                "cause_paired_null": null,
+                "isolation_effect_ci": bootstrap_mean_ci(
+                    isolation_delta, samples=self.config.bootstrap_samples,
+                    alpha=self.config.alpha,
+                    seed=self.config.seed + seed_offset + 5200 + offset),
+            }
+            p_value_variables.append(variable)
+        if p_value_variables:
+            correction = benjamini_hochberg([
+                variable_results[variable]["cause_paired_null"][
+                    "p_value_two_sided"]
+                for variable in p_value_variables
+            ], self.config.alpha)
+            for variable, adjusted, reject in zip(
+                    p_value_variables, correction["adjusted_p_values"],
+                    correction["reject"]):
+                variable_results[variable]["cause_paired_null"].update({
+                    "adjusted_p_value": adjusted,
+                    "reject_after_bh": reject,
+                })
+        ready_variables = [
+            value for value in variable_results.values()
+            if value.get("status") == "ready"
+        ]
+        score.update({
+            "phase": phase,
+            "rows": rows,
+            "normalized_mediation_ci": bootstrap_mean_ci(
+                [value for value in mediation if value is not None],
+                samples=self.config.bootstrap_samples,
+                alpha=self.config.alpha,
+                seed=self.config.seed + seed_offset + 101),
+            "isolation_effect_ci": bootstrap_mean_ci(
+                [
+                    abs(float(row["patched_base_margin"])
+                        - float(row["base_base_margin"]))
+                    for row in rows if row["pair_type"] == "isolation"
+                ],
+                samples=self.config.bootstrap_samples,
+                alpha=self.config.alpha,
+                seed=self.config.seed + seed_offset + 103),
+            "causal_variables": variable_results,
+            "all_variables_causal_after_bh": bool(ready_variables) and all(
+                value["cause_paired_null"]["reject_after_bh"]
+                and value["cause_effect_ci"]["ci_low"] > 0.0
+                for value in ready_variables)
+                and len(ready_variables) == len(variable_results),
+            "all_variables_isolated": bool(ready_variables) and all(
+                value["isolation_effect_ci"]["ci_high"]
+                <= self.config.isolation_max_absolute_effect
+                for value in ready_variables)
+                and len(ready_variables) == len(variable_results),
+            "multiple_comparison_correction": "benjamini_hochberg",
+        })
+        return score
+
+    def _aggregate_ravel_phase(
+            self, per_variable: Mapping[str, Mapping[str, Any]], *,
+            phase: str) -> dict[str, Any]:
+        expected = benchmark_spec("ravel").causal_variables
+        ready = {
+            variable: dict(per_variable.get(variable) or {})
+            for variable in expected
+            if (per_variable.get(variable) or {}).get("status") == "ready"
+        }
+        if not ready:
+            return {
+                "status": "insufficient_variable_evidence",
+                "phase": phase,
+                "per_variable": dict(per_variable),
+            }
+        rows = [
+            row for result in ready.values() for row in result["rows"]
+        ]
+        aggregate = score_interchange_rows(rows)
+        mediation = [
+            normalized_mediation_effect(
+                row["base_source_margin"], row["source_source_margin"],
+                row["patched_source_margin"])
+            for row in rows if row["pair_type"] == "cause"
+        ]
+        p_values = [
+            ready[variable]["causal_variables"][variable][
+                "cause_paired_null"]["p_value_two_sided"]
+            for variable in expected if variable in ready
+        ]
+        correction = benjamini_hochberg(p_values, self.config.alpha)
+        variable_evidence = {}
+        for index, variable in enumerate(
+                item for item in expected if item in ready):
+            evidence = dict(ready[variable]["causal_variables"][variable])
+            evidence["cause_paired_null"] = dict(
+                evidence["cause_paired_null"])
+            evidence["cause_paired_null"].update({
+                "adjusted_p_value": correction["adjusted_p_values"][index],
+                "reject_after_bh": correction["reject"][index],
+            })
+            variable_evidence[variable] = evidence
+        complete = len(ready) == len(expected)
+        advantage_evidence = {
+            variable: {
+                "family_size": int(ready[variable]["family_advantage"][
+                    "family_size"]),
+                "vs_seed": {
+                    **ready[variable]["family_advantage"]["vs_seed"],
+                    "paired_null": dict(ready[variable]["family_advantage"][
+                        "vs_seed"]["paired_null"]),
+                },
+                "vs_matched_nonfamily": {
+                    **ready[variable]["family_advantage"][
+                        "vs_matched_nonfamily"],
+                    "paired_null": dict(ready[variable]["family_advantage"][
+                        "vs_matched_nonfamily"]["paired_null"]),
+                },
+            }
+            for variable in expected if variable in ready
+        }
+        advantage_tests = [
+            (variable, comparison)
+            for variable in expected if variable in advantage_evidence
+            for comparison in ("vs_seed", "vs_matched_nonfamily")
+        ]
+        advantage_correction = benjamini_hochberg([
+            advantage_evidence[variable][comparison]["paired_null"][
+                "p_value_two_sided"]
+            for variable, comparison in advantage_tests
+        ], self.config.alpha)
+        for index, (variable, comparison) in enumerate(advantage_tests):
+            advantage_evidence[variable][comparison]["paired_null"].update({
+                "adjusted_p_value": advantage_correction[
+                    "adjusted_p_values"][index],
+                "reject_after_bh": advantage_correction["reject"][index],
+            })
+        all_family_advantages = complete and all(
+            evidence["family_size"] > 1
+            and all(
+                evidence[comparison]["paired_null"]["reject_after_bh"]
+                and evidence[comparison]["difference_ci"]["ci_low"] > 0.0
+                for comparison in ("vs_seed", "vs_matched_nonfamily"))
+            for evidence in advantage_evidence.values())
+        aggregate.update({
+            "status": "ready" if complete else "incomplete",
+            "phase": phase,
+            "per_variable": dict(per_variable),
+            "causal_variables": variable_evidence,
+            "normalized_mediation_ci": bootstrap_mean_ci(
+                [value for value in mediation if value is not None],
+                samples=self.config.bootstrap_samples,
+                alpha=self.config.alpha, seed=self.config.seed + 6001),
+            "isolation_effect_ci": bootstrap_mean_ci([
+                abs(float(row["patched_base_margin"])
+                    - float(row["base_base_margin"]))
+                for row in rows if row["pair_type"] == "isolation"
+            ], samples=self.config.bootstrap_samples,
+                alpha=self.config.alpha, seed=self.config.seed + 6003),
+            "all_variables_causal_after_bh": complete and all(
+                evidence["cause_paired_null"]["reject_after_bh"]
+                and evidence["cause_effect_ci"]["ci_low"] > 0.0
+                for evidence in variable_evidence.values()),
+            "all_variables_isolated": complete and all(
+                evidence["isolation_effect_ci"]["ci_high"]
+                <= self.config.isolation_max_absolute_effect
+                for evidence in variable_evidence.values()),
+            "family_advantage_by_variable": advantage_evidence,
+            "all_variables_family_advantage_after_bh": (
+                all_family_advantages),
+            "family_advantage_multiple_comparison_correction": (
+                "benjamini_hochberg_across_variables_and_controls"),
+            "family_advantage_bh": advantage_correction,
+            "multiple_comparison_correction": "benjamini_hochberg",
+            "rows": rows,
+        })
+        return aggregate
+
+    def _run_ravel_causal_mediation(self) -> dict[str, Any]:
+        if "ravel" not in self.benchmark_ids:
+            return {"status": "not_requested", "benchmark": "ravel"}
+        capture = self.results["operator_localization"]["benchmarks"].get(
+            "ravel", {})
+        if capture.get("status") != "ready":
+            return {"status": "localization_not_ready", "benchmark": "ravel"}
+        seeds = self._ravel_variable_seeds()
+        expected_variables = benchmark_spec("ravel").causal_variables
+        selected_units = {}
+        for variable in expected_variables:
+            seed = seeds.get(variable, {})
+            if seed.get("status") != "ready":
+                selected_units[variable] = dict(seed)
+                continue
+            layer, route, family = self._family_for_seed(seed)
+            matched_control = self._matched_nonfamily_control(
+                variable, layer=layer, route=route, family=family)
+            selected_units[variable] = {
+                **dict(seed),
+                "operator_ids": family,
+                "family_size": len(family),
+                "seed_only_operator_ids": [int(seed["operator_id"])],
+                "matched_nonfamily_control": matched_control,
+                "unit_selection_rule": (
+                    "smallest_reciprocal_local_rw_family_containing_"
+                    "variable_specific_top_discovery_site"),
+            }
+        phases = {}
+        for phase_index, phase in enumerate(("validation", "test")):
+            examples = self._known_correct("ravel", phase)
+            per_variable = {}
+            for variable_index, variable in enumerate(expected_variables):
+                unit = selected_units.get(variable, {})
+                selected = [
+                    example for example in examples
+                    if example.causal_variable == variable]
+                counts = {
+                    pair_type: sum(
+                        example.pair_type == pair_type for example in selected)
+                    for pair_type in ("cause", "isolation")
+                }
+                if (unit.get("status") != "ready"
+                        or min(counts.values())
+                        < self.config.minimum_pairs_per_causal_variable):
+                    per_variable[variable] = {
+                        "status": "insufficient_behavior_or_discovery_unit",
+                        "known_correct_pair_counts": counts,
+                        "minimum_pairs_per_causal_variable": (
+                            self.config.minimum_pairs_per_causal_variable),
+                    }
+                    continue
+                base_offset = phase_index * 10_000 + variable_index * 1_000
+                family_result = self._interchange_phase(
+                    selected, phase=phase,
+                    layer=int(unit["layer"]), route=str(unit["route"]),
+                    family=unit["operator_ids"],
+                    seed_offset=base_offset)
+                seed_result = self._interchange_phase(
+                    selected, phase=phase,
+                    layer=int(unit["layer"]), route=str(unit["route"]),
+                    family=unit["seed_only_operator_ids"],
+                    seed_offset=base_offset + 100)
+                matched_result = self._interchange_phase(
+                    selected, phase=phase,
+                    layer=int(unit["layer"]), route=str(unit["route"]),
+                    family=unit["matched_nonfamily_control"]["operator_ids"],
+                    seed_offset=base_offset + 200)
+                family_result.update({
+                    "intervention_unit": {
+                        "layer": int(unit["layer"]),
+                        "route": str(unit["route"]),
+                        "operator_ids": list(unit["operator_ids"]),
+                    },
+                    "controls": {
+                        "seed_only": seed_result,
+                        "matched_nonfamily": matched_result,
+                    },
+                    "family_advantage": {
+                        "family_size": int(unit["family_size"]),
+                        "vs_seed": self._paired_interchange_advantage(
+                            family_result, seed_result,
+                            seed=self.config.seed + base_offset + 700),
+                        "vs_matched_nonfamily": (
+                            self._paired_interchange_advantage(
+                                family_result, matched_result,
+                                seed=self.config.seed + base_offset + 800)),
+                    },
+                })
+                per_variable[variable] = family_result
+            phases[phase] = self._aggregate_ravel_phase(
+                per_variable, phase=phase)
+        complete = all(
+            phases.get(phase, {}).get("status") == "ready"
+            for phase in ("validation", "test"))
+        return {
+            "status": "ready" if complete else "incomplete",
+            "benchmark": "ravel",
+            "selection_phase": "discovery",
+            "selected_units_by_causal_variable": selected_units,
+            "validation": phases["validation"],
+            "test": phases["test"],
+            "official_ravel_featurizer_equivalence_claimed": False,
+        }
+
+    def _run_multilayer_trajectory(self) -> dict[str, Any]:
+        if "ravel" not in self.benchmark_ids:
+            return {"status": "not_requested", "benchmark": "ravel"}
+        examples = self._known_correct("ravel", "test")
+        examples = self._independent_capture_examples("ravel", examples)
+        if len(examples) < self.config.minimum_known_correct:
+            return {
+                "status": "insufficient_behavior",
+                "known_correct_count": len(examples),
+            }
+        capture = capture_held_out_paths(
+            self.ctx, examples, phase="test",
+            seed=self.config.seed + 7919,
+            **self._capture_kwargs())
+        confirmation = held_out_trajectory_confirmation(
+            capture["rows"], phase="test",
+            capture_threshold=self.config.capture_threshold,
+            bootstrap_samples=self.config.bootstrap_samples,
+            permutation_samples=self.config.permutation_samples,
+            alpha=self.config.alpha, seed=self.config.seed + 7927)
+        return {
+            "status": confirmation["status"],
+            "benchmark": "ravel",
+            "capture": capture,
+            "confirmation": confirmation,
+            "candidate_ranking_performed_on_test": False,
+        }
+
+    def _run_scientific_claims(self) -> dict[str, Any]:
+        conditional = self.results["conditional_circuit_sufficiency"]
+        autonomous = self.results["autonomous_circuit_sufficiency"]
+        necessity = self.results["circuit_necessity"]
+        circuit_ids = list(conditional["benchmarks"])
+
+        def sufficiency_evidence(result):
+            values = [
+                result["benchmarks"][benchmark_id].get(
+                    "selected_test_faithfulness")
+                for benchmark_id in circuit_ids
+            ]
+            funnel_limited = {
+                benchmark_id: bool(
+                    (result["benchmarks"][benchmark_id].get(
+                        "selected_circuit") or {}).get(
+                            "metadata", {}).get("candidate_funnel_limited", True))
+                for benchmark_id in circuit_ids
+            }
+            confidence_intervals = {
+                benchmark_id: result["benchmarks"][benchmark_id].get(
+                    "selected_test_faithfulness_ci")
+                for benchmark_id in circuit_ids
+            }
+            ready = (
+                all(value is not None for value in values)
+                and bool(values) and not any(funnel_limited.values())
+                and all(
+                    interval is not None
+                    and interval["ci_low"]
+                    >= self.config.circuit_faithfulness_min
+                    for interval in confidence_intervals.values()))
+            return {
+                "status": "ready" if ready else "incomplete",
+                "test_faithfulness": min(values) if ready else None,
+                "per_benchmark": {
+                    benchmark_id: result["benchmarks"][benchmark_id].get(
+                        "selected_test_faithfulness")
+                    for benchmark_id in circuit_ids
+                },
+                "candidate_funnel_limited": funnel_limited,
+                "faithfulness_confidence_intervals": confidence_intervals,
+                "selection_phase": "validation",
+                "evaluation_phase": "test",
+            }
+
+        necessity_ready = [
+            row for row in necessity["benchmarks"].values()
+            if row.get("status") == "ready"
+        ]
+        necessity_evidence = {
+            "status": (
+                "ready" if necessity_ready
+                and len(necessity_ready) == len(necessity["benchmarks"])
+                else "incomplete"),
+            "mean_margin_drop": necessity.get("mean_margin_drop"),
+            "all_significant_after_bh": necessity.get(
+                "all_significant_after_bh", False),
+            "per_benchmark": necessity["benchmarks"],
+        }
+        ravel = self.results["ravel_causal_mediation"]
+        interchange = dict(ravel.get("test") or {})
+        trajectory = self.results["multilayer_trajectory"]
+        trajectory_evidence = dict(trajectory.get("confirmation") or {})
+        held_out = {
+            "status": (
+                "ready" if conditional.get("status") == "ready"
+                and necessity.get("status") == "ready" else "incomplete"),
+            "selection_phase": "validation",
+            "evaluation_phase": "test",
+            "test_used_for_selection": False,
+        }
+        evidence = {
+            "capture": self.results["operator_localization"],
+            "localization": {
+                "status": self.results["operator_localization"]["status"],
+                "unit": "layer_route_operator_site",
+            },
+            "necessity": necessity_evidence,
+            "conditional_sufficiency": sufficiency_evidence(conditional),
+            "autonomous_sufficiency": sufficiency_evidence(autonomous),
+            "interchange": interchange,
+            "held_out": held_out,
+            "spatial_confirmation": self.results["operator_space_structure"],
+            "trajectory_confirmation": trajectory_evidence,
+        }
+        result = evaluate_claims(evidence, self.config)
+        result.update({
+            "evidence": evidence,
+            "benchmark_scope": list(self.benchmark_ids),
+            "checkpoint_identity": self.protocol["checkpoint_identity"],
+            "single_checkpoint_only": True,
+            "official_transformerlens_edge_equivalence_claimed": False,
+            "official_ravel_featurizer_equivalence_claimed": False,
+        })
+        return result

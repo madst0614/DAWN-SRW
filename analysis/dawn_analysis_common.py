@@ -36,14 +36,10 @@ from analysis.dawn_analysis_storage import (
     write_json_atomic,
 )
 
-V4166_MODEL_VERSION = "spatial-r1-v4.1.6.6"
 V4171_MODEL_VERSION = "spatial-r1-v4.1.7.1"
 V4172_MODEL_VERSION = "spatial-r1-v4.1.7.2"
 V417X_MODEL_VERSIONS = (V4171_MODEL_VERSION, V4172_MODEL_VERSION)
-SUPPORTED_ANALYSIS_MODEL_VERSIONS = (
-    V4166_MODEL_VERSION,
-    *V417X_MODEL_VERSIONS,
-)
+SUPPORTED_ANALYSIS_MODEL_VERSIONS = V417X_MODEL_VERSIONS
 _TRAIN = None
 
 
@@ -190,11 +186,6 @@ def verify_analysis_config(cfg: Dict[str, Any]) -> None:
         )
 
 
-def verify_v4166_config(cfg: Dict[str, Any]) -> None:
-    """Backward-compatible name for the supported-version validator."""
-    verify_analysis_config(cfg)
-
-
 def analysis_model_module(model_cfg: Dict[str, Any]):
     """Return the exact model module declared by an analysis config."""
     version = model_cfg.get("model_version")
@@ -212,11 +203,6 @@ def build_analysis_model(cfg: Dict[str, Any]):
     verify_analysis_config(cfg)
     train = get_train()
     return train.build_model_from_config(cfg)
-
-
-def build_v4166_model(cfg: Dict[str, Any]):
-    """Backward-compatible wrapper; dispatches supported versions exactly."""
-    return build_analysis_model(cfg)
 
 
 def init_target_params(model: Any, cfg: Dict[str, Any]):
@@ -617,8 +603,11 @@ def model_cfg_from_config(
     t = cfg.get("training", {})
     legacy_den_power = float(m.get(
         "admission_den_power", t.get("admission_den_power", 1.0)))
+    model_version = m.get("model_version")
+    if model_version is None:
+        raise ValueError("analysis config requires model.model_version")
     model_cfg = {
-        "model_version": m.get("model_version", V4166_MODEL_VERSION),
+        "model_version": model_version,
         "vocab_size": int(m.get("vocab_size", 30522)),
         "d_model": int(m.get("d_model", 384)),
         "n_layers": int(m.get("n_layers", 12)),

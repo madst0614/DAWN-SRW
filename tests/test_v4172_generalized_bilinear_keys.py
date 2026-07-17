@@ -9,10 +9,9 @@ import pytest
 import yaml
 from jax.sharding import Mesh, PartitionSpec
 
-from analysis.dawn_v4171_transition import (
-    V4172_MODEL_VERSION,
-    _candidate_pool_vectors,
-    run_global_router_audit,
+from analysis.operator_interpretability.space import (
+    candidate_pool_vectors,
+    operator_pool_provenance,
 )
 from models import dawn_srw_v4171 as core
 from models.dawn_srw_v4171 import (
@@ -34,7 +33,10 @@ from models.dawn_srw_v4171 import (
     materialize_generalized_bilinear_operator_keys,
     symbolic_parameter_count,
 )
-from models.dawn_srw_v4172 import DAWN_SRW_V4172
+from models.dawn_srw_v4172 import (
+    DAWN_SRW_V4172,
+    MODEL_VERSION as V4172_MODEL_VERSION,
+)
 
 
 def _tiny_kwargs(n_layers: int = 1) -> dict:
@@ -510,17 +512,14 @@ def test_v4172_analysis_candidate_address_and_router_provenance() -> None:
         params=params,
         is_primary=False,
     )
-    selected = _candidate_pool_vectors(ctx, "qk", [0, 2])
+    selected = candidate_pool_vectors(ctx, "qk", [0, 2])
     pool = params["neuron_pool"]
     selected_ids = jnp.asarray([0, 2], dtype=jnp.int32)
-    expected = materialize_generalized_bilinear_operator_keys(
-        pool["attn_qk_read"][selected_ids],
-        pool["attn_qk_write"][selected_ids],
-        pool["rw_key_read_probe"],
-        pool["rw_key_write_probe"],
-    )
+    expected = core._pool_params_with_operator_keys(
+        pool, OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
+    )["attn_qk_op_key"][selected_ids]
     np.testing.assert_allclose(selected["address"], np.asarray(expected))
-    audit = run_global_router_audit(ctx)
+    audit = operator_pool_provenance(ctx)
     assert audit["operator_key_mode"] == OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
     assert audit["operator_key_source"] == "live_rw_plus_shared_probes"
     assert audit["learned_operator_key_tables"] is False

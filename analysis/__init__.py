@@ -1,3 +1,3 @@
-"""Resumable DAWN-SRW analysis pipeline."""
+"""DAWN-SRW analysis support."""
 
-ANALYSIS_VERSION = "dawn-srw-analysis-0.2.0"
+ANALYSIS_VERSION = "train_analysis_pool"

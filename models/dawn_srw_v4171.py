@@ -2996,7 +2996,8 @@ def _make_sharded_srw_minimal_impl(
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression):
+            target_positions, apply_suppression, retain_mask_local,
+            position_mask, retention_mode):
         del soft_gate_t_final, soft_gate_boundary_power_final
         N_local = operator_keys_local.shape[0]
         selected_global_operator_id = jnp.asarray(
@@ -3008,6 +3009,9 @@ def _make_sharded_srw_minimal_impl(
         if target_positions.ndim == 0:
             target_positions = jnp.broadcast_to(
                 target_positions, (x.shape[0],))
+        retain_mask_local = jnp.asarray(retain_mask_local, dtype=jnp.bool_)
+        position_mask = jnp.asarray(position_mask, dtype=jnp.bool_)
+        retention_mode = jnp.asarray(retention_mode, dtype=jnp.int32)
         global_start = (
             jax.lax.axis_index('model').astype(jnp.int32)
             * jnp.int32(N_local))
@@ -3017,6 +3021,8 @@ def _make_sharded_srw_minimal_impl(
         pad_n = N_pad - int(N_local)
 
         B, S, D = x.shape
+        retain_padded = jnp.pad(
+            retain_mask_local, ((0, pad_n),), constant_values=False)
         x_bf = x.astype(jnp.bfloat16)
         operator_keys_padded = jnp.pad(operator_keys_local, ((0, pad_n), (0, 0)))
         read_padded = jnp.pad(read_vectors_local, ((0, pad_n), (0, 0)))
@@ -3073,7 +3079,7 @@ def _make_sharded_srw_minimal_impl(
         def gate_srw_step(carry, i):
             (raw_out, total_gate_mass, total_gate_sq,
              total_gate_max, total_active_count,
-             total_angular_amplitude) = carry
+             total_angular_amplitude, selected_raw_out) = carry
             s = i * cs
             operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
             valid_bsn = valid_chunk[None, None, :]
@@ -3091,33 +3097,53 @@ def _make_sharded_srw_minimal_impl(
             suppress_mask = (
                 jnp.asarray(apply_suppression, dtype=jnp.bool_)
                 & token_match & operator_match & route_match & valid_bsn)
+            retain_chunk = jax.lax.dynamic_slice_in_dim(
+                retain_padded, s, cs, axis=0)[None, None, :]
+            position_selected = position_mask[:, :, None]
+            effective_keep = (
+                ~position_selected | retain_chunk) & valid_bsn
+            retention_enabled = retention_mode > jnp.int32(0)
+            autonomous_retention = retention_mode == jnp.int32(2)
+            numerator_keep = (~retention_enabled) | effective_keep
             execution_for_numerator = jnp.where(
-                suppress_mask, jnp.float32(0.0), execution_weight)
+                suppress_mask | ~numerator_keep,
+                jnp.float32(0.0), execution_weight)
+            admission_for_den = jnp.where(
+                autonomous_retention & ~effective_keep,
+                jnp.float32(0.0), admission)
             xr = x_bf @ rc.T
             a = execution_for_numerator * xr.astype(jnp.float32)
             c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-            chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
-            chunk_gate_sq = jnp.square(admission).sum(
+            selected_execution = jnp.where(
+                token_match & operator_match & valid_bsn,
+                execution_weight, jnp.float32(0.0))
+            selected_a = selected_execution * xr.astype(jnp.float32)
+            selected_c_out = (
+                selected_a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
+            chunk_gate_mass = admission_for_den.sum(axis=-1, keepdims=True)
+            chunk_gate_sq = jnp.square(admission_for_den).sum(
                 axis=-1, keepdims=True)
-            chunk_gate_max = admission.max(axis=-1, keepdims=True)
+            chunk_gate_max = admission_for_den.max(axis=-1, keepdims=True)
             return (raw_out + c_out,
                     total_gate_mass + chunk_gate_mass,
                     total_gate_sq + chunk_gate_sq,
                     jnp.maximum(total_gate_max, chunk_gate_max),
                     total_active_count + chunk_active_count,
                     total_angular_amplitude + angular_amplitude.sum(
-                        axis=-1, keepdims=True)), None
+                        axis=-1, keepdims=True),
+                    selected_raw_out + selected_c_out), None
 
         (raw_out, total_gate_mass, total_gate_sq,
          total_gate_max, total_active_count,
-         total_angular_amplitude), _ = jax.lax.scan(
+         total_angular_amplitude, selected_raw_out), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32)),
+             jnp.zeros((B, S, 1), dtype=jnp.float32),
+             jnp.zeros((B, S, D), dtype=jnp.float32)),
             jnp.arange(nc))
 
         global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
@@ -3158,6 +3184,11 @@ def _make_sharded_srw_minimal_impl(
         tau_mean = jax.lax.stop_gradient(tau).mean()
         out = raw_out / gate_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        selected_out = jax.lax.psum(
+            (selected_raw_out / gate_den).astype(jnp.bfloat16), 'model')
+        selected_target = selected_out[
+            jnp.arange(B, dtype=jnp.int32),
+            jnp.clip(target_positions, 0, S - 1), :]
         raw_out_global = jax.lax.psum(
             jax.lax.stop_gradient(raw_out).astype(jnp.bfloat16), 'model'
         ).astype(jnp.float32)
@@ -3184,6 +3215,7 @@ def _make_sharded_srw_minimal_impl(
             jax.lax.stop_gradient(composition_den_max.astype(jnp.float32)),
             jax.lax.stop_gradient(raw_srw_out_norm.astype(jnp.float32)),
             jax.lax.stop_gradient(normalized_srw_out_norm.astype(jnp.float32)),
+            jax.lax.stop_gradient(selected_target.astype(jnp.float32)),
         )
 
     common_in_specs = (
@@ -3192,23 +3224,26 @@ def _make_sharded_srw_minimal_impl(
         P(), P(), P(), P(), P())
     out_specs = (
         P('data', None, None), P(), P(), P(), P(), P(), P(), P(), P(), P(),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P(), P(), P('data', None))
     @partial(
         shard_map, mesh=mesh,
-        in_specs=common_in_specs + (P('data'), P('data'), P()),
+        in_specs=common_in_specs + (
+            P('data'), P('data'), P(), P('model'), P('data', None), P()),
         out_specs=out_specs, check_rep=False)
     def canonical_single_kernel(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression):
+            target_positions, apply_suppression, retain_mask_local,
+            position_mask, retention_mode):
         return _sharded_srw_minimal_core(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression)
+            target_positions, apply_suppression, retain_mask_local,
+            position_mask, retention_mode)
 
     def fused_gate_srw_minimal(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
@@ -3223,20 +3258,30 @@ def _make_sharded_srw_minimal_impl(
             execution_prune_eps,
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.full((batch_size,), -1, dtype=jnp.int32),
-            jnp.bool_(False))
+            jnp.bool_(False),
+            jnp.ones((operator_keys_local.shape[0],), dtype=jnp.bool_),
+            jnp.ones(x.shape[:2], dtype=jnp.bool_),
+            jnp.int32(0))
 
     def fused_gate_srw_suppression_minimal(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression):
+            target_positions, apply_suppression, retain_mask_local=None,
+            position_mask=None, retention_mode=0):
+        if retain_mask_local is None:
+            retain_mask_local = jnp.ones(
+                (operator_keys_local.shape[0],), dtype=jnp.bool_)
+        if position_mask is None:
+            position_mask = jnp.ones(x.shape[:2], dtype=jnp.bool_)
         return canonical_single_kernel(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression)
+            target_positions, apply_suppression, retain_mask_local,
+            position_mask, retention_mode)
 
     factory_token = object()
     for wrapper in (
@@ -3315,7 +3360,8 @@ def _make_sharded_srw_paired_minimal_impl(
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression, route_selector):
+            target_positions, apply_suppression, route_selector,
+            retain_mask_local, position_mask, retention_mode):
         del soft_gate_t_final, soft_gate_boundary_power_final
         N_local = operator_keys_local.shape[0]
         selected_global_operator_id = jnp.asarray(
@@ -3327,6 +3373,9 @@ def _make_sharded_srw_paired_minimal_impl(
         if target_positions.ndim == 0:
             target_positions = jnp.broadcast_to(
                 target_positions, (x.shape[0],))
+        retain_mask_local = jnp.asarray(retain_mask_local, dtype=jnp.bool_)
+        position_mask = jnp.asarray(position_mask, dtype=jnp.bool_)
+        retention_mode = jnp.asarray(retention_mode, dtype=jnp.int32)
         global_start = (
             jax.lax.axis_index('model').astype(jnp.int32)
             * jnp.int32(N_local))
@@ -3341,6 +3390,9 @@ def _make_sharded_srw_paired_minimal_impl(
         operator_keys_padded = jnp.pad(operator_keys_local, ((0, pad_n), (0, 0)))
         read_padded = jnp.pad(read_vectors_local, ((0, pad_n), (0, 0)))
         write_padded = jnp.pad(write_vectors_local, ((0, pad_n), (0, 0)))
+        retain_padded = jnp.pad(
+            retain_mask_local, ((0, 0), (0, pad_n)),
+            constant_values=False)
         valid_padded = jnp.arange(N_pad) < N_local
         operator_query_unit_bf = _forward_unit_direction(
             operator_query.astype(jnp.bfloat16).astype(jnp.float32)
@@ -3394,7 +3446,7 @@ def _make_sharded_srw_paired_minimal_impl(
         def gate_srw_step(carry, i):
             (raw_out, total_gate_mass, total_gate_sq,
              total_gate_max, total_active_count,
-             total_angular_amplitude) = carry
+             total_angular_amplitude, selected_raw_out) = carry
             s = i * cs
             operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
             valid_bsrn = valid_chunk[None, None, None, :]
@@ -3415,36 +3467,58 @@ def _make_sharded_srw_paired_minimal_impl(
             suppress_mask = (
                 jnp.asarray(apply_suppression, dtype=jnp.bool_)
                 & token_match & operator_match & route_match & valid_bsrn)
+            retain_chunk = jax.lax.dynamic_slice_in_dim(
+                retain_padded, s, cs, axis=1)[None, None, :, :]
+            position_selected = position_mask[:, :, None, None]
+            effective_keep = (
+                ~position_selected | retain_chunk) & valid_bsrn
+            retention_enabled = retention_mode > jnp.int32(0)
+            autonomous_retention = retention_mode == jnp.int32(2)
+            numerator_keep = (~retention_enabled) | effective_keep
             execution_for_numerator = jnp.where(
-                suppress_mask, jnp.float32(0.0), execution_weight)
+                suppress_mask | ~numerator_keep,
+                jnp.float32(0.0), execution_weight)
+            admission_for_den = jnp.where(
+                autonomous_retention & ~effective_keep,
+                jnp.float32(0.0), admission)
             xr = x_bf @ rc.T
             a = execution_for_numerator * xr.astype(jnp.float32)[:, :, None, :]
             c_out = jnp.einsum(
                 'bsrn,nd->bsrd',
                 a.astype(jnp.bfloat16),
                 wc).astype(jnp.float32)
-            chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
-            chunk_gate_sq = jnp.square(admission).sum(
+            selected_execution = jnp.where(
+                token_match & operator_match & route_match & valid_bsrn,
+                execution_weight, jnp.float32(0.0))
+            selected_a = (
+                selected_execution * xr.astype(jnp.float32)[:, :, None, :])
+            selected_c_out = jnp.einsum(
+                'bsrn,nd->bsrd', selected_a.astype(jnp.bfloat16),
+                wc).astype(jnp.float32)
+            chunk_gate_mass = admission_for_den.sum(axis=-1, keepdims=True)
+            chunk_gate_sq = jnp.square(admission_for_den).sum(
                 axis=-1, keepdims=True)
-            chunk_gate_max = admission.max(axis=-1, keepdims=True)
+            chunk_gate_max = admission_for_den.max(axis=-1, keepdims=True)
             return (raw_out + c_out,
                     total_gate_mass + chunk_gate_mass,
                     total_gate_sq + chunk_gate_sq,
                     jnp.maximum(total_gate_max, chunk_gate_max),
                     total_active_count + chunk_active_count,
                     total_angular_amplitude + angular_amplitude.sum(
-                        axis=-1, keepdims=True)), None
+                        axis=-1, keepdims=True),
+                    selected_raw_out + selected_c_out), None
 
         (raw_out, total_gate_mass, total_gate_sq,
          total_gate_max, total_active_count,
-         total_angular_amplitude), _ = jax.lax.scan(
+         total_angular_amplitude, selected_raw_out), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
              jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, 1), dtype=jnp.float32)),
+             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+             jnp.zeros((B, S, 2, D), dtype=jnp.float32)),
             jnp.arange(nc))
 
         global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
@@ -3503,6 +3577,11 @@ def _make_sharded_srw_paired_minimal_impl(
         k_tau_mean = tau_sg[:, :, 1, :].mean()
         out = raw_out / gate_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        selected_out = jax.lax.psum(
+            (selected_raw_out / gate_den).astype(jnp.bfloat16), 'model')
+        selected_target = selected_out[
+            jnp.arange(B, dtype=jnp.int32),
+            jnp.clip(target_positions, 0, S - 1), :, :]
         raw_out_global = jax.lax.psum(
             jax.lax.stop_gradient(raw_out).astype(jnp.bfloat16), 'model'
         ).astype(jnp.float32)
@@ -3548,6 +3627,7 @@ def _make_sharded_srw_paired_minimal_impl(
             jax.lax.stop_gradient(raw_norm_by_route[1]),
             jax.lax.stop_gradient(normalized_norm_by_route[0]),
             jax.lax.stop_gradient(normalized_norm_by_route[1]),
+            jax.lax.stop_gradient(selected_target.astype(jnp.float32)),
         )
 
     common_in_specs = (
@@ -3557,23 +3637,27 @@ def _make_sharded_srw_paired_minimal_impl(
     out_specs = (
         P('data', None, None, None), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
-        P(), P(), P(), P(), P(), P(), P())
+        P(), P(), P(), P(), P(), P(), P(), P('data', None, None))
     @partial(
         shard_map, mesh=mesh,
-        in_specs=common_in_specs + (P('data'), P('data'), P(), P()),
+        in_specs=common_in_specs + (
+            P('data'), P('data'), P(), P(), P(None, 'model'),
+            P('data', None), P()),
         out_specs=out_specs, check_rep=False)
     def canonical_paired_kernel(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression, route_selector):
+            target_positions, apply_suppression, route_selector,
+            retain_mask_local, position_mask, retention_mode):
         return _sharded_srw_paired_minimal_core(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression, route_selector)
+            target_positions, apply_suppression, route_selector,
+            retain_mask_local, position_mask, retention_mode)
 
     def fused_gate_srw_paired_minimal(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
@@ -3588,20 +3672,29 @@ def _make_sharded_srw_paired_minimal_impl(
             execution_prune_eps,
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.full((batch_size,), -1, dtype=jnp.int32),
-            jnp.bool_(False), jnp.int32(-1))
+            jnp.bool_(False), jnp.int32(-1),
+            jnp.ones((2, operator_keys_local.shape[0]), dtype=jnp.bool_),
+            jnp.ones(x.shape[:2], dtype=jnp.bool_), jnp.int32(0))
 
     def fused_gate_srw_paired_suppression_minimal(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression, route_selector):
+            target_positions, apply_suppression, route_selector,
+            retain_mask_local=None, position_mask=None, retention_mode=0):
+        if retain_mask_local is None:
+            retain_mask_local = jnp.ones(
+                (2, operator_keys_local.shape[0]), dtype=jnp.bool_)
+        if position_mask is None:
+            position_mask = jnp.ones(x.shape[:2], dtype=jnp.bool_)
         return canonical_paired_kernel(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
-            target_positions, apply_suppression, route_selector)
+            target_positions, apply_suppression, route_selector,
+            retain_mask_local, position_mask, retention_mode)
 
     factory_token = object()
     for wrapper in (
@@ -3798,6 +3891,12 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           analysis_target_positions=0,
                           analysis_target_route=-1,
                           analysis_intervention_enabled=False,
+                          analysis_keep_qk=None,
+                          analysis_keep_v=None,
+                          analysis_position_mask=None,
+                          analysis_retention_mode=0,
+                          analysis_interchange_source=None,
+                          analysis_interchange_enabled=False,
                           parity_debug=False):
     """Canonical shared v417x minimal attention path."""
     del n_qk, n_v
@@ -3815,6 +3914,17 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     v_operator_keys = pool_params['attn_v_op_key']
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
+    if analysis_keep_qk is None:
+        analysis_keep_qk = jnp.ones(
+            (2, qk_operator_keys.shape[0]), dtype=jnp.bool_)
+    if analysis_keep_v is None:
+        analysis_keep_v = jnp.ones(
+            (v_operator_keys.shape[0],), dtype=jnp.bool_)
+    if analysis_position_mask is None:
+        analysis_position_mask = jnp.ones((B, S), dtype=jnp.bool_)
+    if analysis_interchange_source is None:
+        analysis_interchange_source = jnp.zeros(
+            (B, D), dtype=jnp.float32)
 
     rng, rng_drop = jax.random.split(rng)
     attn_operator_queries = (
@@ -3860,7 +3970,8 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
         analysis_selected_operator_id, analysis_target_positions,
-        apply_qk, analysis_target_route)
+        apply_qk, analysis_target_route, analysis_keep_qk,
+        analysis_position_mask, analysis_retention_mode)
     (qk_state_transitions,
      q_active_frac, k_active_frac,
      q_active_n_mean, k_active_n_mean,
@@ -3875,9 +3986,12 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      q_composition_den_min, k_composition_den_min,
      q_composition_den_max, k_composition_den_max,
      q_raw_srw_out_norm, k_raw_srw_out_norm,
-     q_normalized_srw_out_norm, k_normalized_srw_out_norm) = qk_result
+     q_normalized_srw_out_norm, k_normalized_srw_out_norm,
+     qk_selected_target) = qk_result
     attention_q = qk_state_transitions[:, :, 0, :] * qk_scale
     attention_k = qk_state_transitions[:, :, 1, :] * qk_scale
+    q_selected_target = qk_selected_target[:, 0, :] * qk_scale
+    k_selected_target = qk_selected_target[:, 1, :] * qk_scale
     apply_v = (
         jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
@@ -3887,14 +4001,47 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         x, v_operator_query, v_operator_keys, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
-        analysis_selected_operator_id, analysis_target_positions, apply_v)
+        analysis_selected_operator_id, analysis_target_positions, apply_v,
+        analysis_keep_v, analysis_position_mask, analysis_retention_mode)
     (attention_v, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
      v_den_floor_frac, v_tau_mean,
      v_admission_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
-     v_normalized_srw_out_norm) = v_result
+     v_normalized_srw_out_norm, v_selected_target) = v_result
     attention_v = attention_v * v_scale
+    v_selected_target = v_selected_target * v_scale
+
+    interchange_at_layer = (
+        jnp.asarray(analysis_interchange_enabled, dtype=jnp.bool_)
+        & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+           == jnp.asarray(analysis_target_layer, dtype=jnp.int32)))
+    interchange_token_mask = (
+        jnp.arange(S, dtype=jnp.int32)[None, :]
+        == jnp.asarray(analysis_target_positions, dtype=jnp.int32)[:, None])
+
+    def interchange_route(route_value, selected_value, route_index):
+        apply_route = (
+            interchange_at_layer
+            & (jnp.asarray(analysis_target_route, dtype=jnp.int32)
+               == jnp.int32(route_index)))
+        delta = (
+            jnp.asarray(analysis_interchange_source, dtype=jnp.float32)
+            - selected_value.astype(jnp.float32))
+        patch = interchange_token_mask[:, :, None] * delta[:, None, :]
+        same_source = jnp.all(delta == jnp.float32(0.0), axis=-1)
+        apply_mask = (
+            apply_route & ~same_source[:, None, None]
+            & interchange_token_mask[:, :, None])
+        patched = route_value + patch
+        return jnp.where(apply_mask, patched, route_value)
+
+    attention_q = interchange_route(
+        attention_q, q_selected_target, 0)
+    attention_k = interchange_route(
+        attention_k, k_selected_target, 1)
+    attention_v = interchange_route(
+        attention_v, v_selected_target, 2)
     q_debug = attention_q
     k_debug = attention_k
     v_debug = attention_v
@@ -3975,6 +4122,9 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         v_raw_srw_out_norm,
         v_normalized_srw_out_norm,
         v_normalized_srw_out_norm * v_scale,
+        q_selected_target,
+        k_selected_target,
+        v_selected_target,
     )
     if parity_debug:
         return result + ((
@@ -4003,6 +4153,11 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          analysis_target_positions=0,
                          analysis_target_route=-1,
                          analysis_intervention_enabled=False,
+                         analysis_keep_rst=None,
+                         analysis_position_mask=None,
+                         analysis_retention_mode=0,
+                         analysis_interchange_source=None,
+                         analysis_interchange_enabled=False,
                          parity_debug=False):
     """Canonical shared v417x minimal RST path."""
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
@@ -4015,6 +4170,14 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     rst_operator_keys = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
+    if analysis_keep_rst is None:
+        analysis_keep_rst = jnp.ones(
+            (rst_operator_keys.shape[0],), dtype=jnp.bool_)
+    if analysis_position_mask is None:
+        analysis_position_mask = jnp.ones(x.shape[:2], dtype=jnp.bool_)
+    if analysis_interchange_source is None:
+        analysis_interchange_source = jnp.zeros(
+            (x.shape[0], x.shape[-1]), dtype=jnp.float32)
 
     rng, rng_drop = jax.random.split(rng)
     operator_query = (
@@ -4046,14 +4209,36 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         x, operator_query, rst_operator_keys, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
-        analysis_selected_operator_id, analysis_target_positions, apply_rst)
+        analysis_selected_operator_id, analysis_target_positions, apply_rst,
+        analysis_keep_rst, analysis_position_mask, analysis_retention_mode)
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
      rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
      rst_admission_mass_max, rst_composition_den_min,
      rst_composition_den_max, rst_raw_srw_out_norm,
-     rst_normalized_srw_out_norm) = rst_result
+     rst_normalized_srw_out_norm, rst_selected_target) = rst_result
     out = out * rst_scale
+    rst_selected_target = rst_selected_target * rst_scale
+    apply_interchange = (
+        jnp.asarray(analysis_interchange_enabled, dtype=jnp.bool_)
+        & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+           == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
+        & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == jnp.int32(3)))
+    interchange_token_mask = (
+        jnp.arange(x.shape[1], dtype=jnp.int32)[None, :]
+        == jnp.asarray(analysis_target_positions, dtype=jnp.int32)[:, None])
+    interchange_delta = (
+        jnp.asarray(analysis_interchange_source, dtype=jnp.float32)
+        - rst_selected_target.astype(jnp.float32))
+    interchange_patch = (
+        interchange_token_mask[:, :, None] * interchange_delta[:, None, :])
+    same_source = jnp.all(
+        interchange_delta == jnp.float32(0.0), axis=-1)
+    apply_mask = (
+        apply_interchange & ~same_source[:, None, None]
+        & interchange_token_mask[:, :, None])
+    patched_out = out + interchange_patch
+    out = jnp.where(apply_mask, patched_out, out)
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     rst_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
@@ -4075,6 +4260,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_raw_srw_out_norm,
         rst_normalized_srw_out_norm,
         rst_normalized_srw_out_norm * rst_scale,
+        rst_selected_target,
     )
     if parity_debug:
         return result + ((out, x, operator_query, raw_tau),)
@@ -4805,7 +4991,15 @@ class DAWN_SRW_V4171(nn.Module):
                  analysis_return_residual=False,
                  analysis_return_logits=False,
                  analysis_parity_debug=False,
-                 analysis_causal_trace=False):
+                 analysis_causal_trace=False,
+                 analysis_keep_qk=None,
+                 analysis_keep_v=None,
+                 analysis_keep_rst=None,
+                 analysis_position_mask=None,
+                 analysis_retention_mode=0,
+                 analysis_capture_contribution=False,
+                 analysis_interchange_source=None,
+                 analysis_interchange_enabled=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -4908,6 +5102,72 @@ class DAWN_SRW_V4171(nn.Module):
                     analysis_target_route, dtype=jnp.int32)
                 analysis_intervention_enabled = jnp.asarray(
                     analysis_intervention_enabled, dtype=jnp.bool_)
+            if analysis_keep_qk is None:
+                analysis_keep_qk = jnp.ones(
+                    (self.n_layers, 2, self.n_qk), dtype=jnp.bool_)
+            else:
+                analysis_keep_qk = jnp.asarray(
+                    analysis_keep_qk, dtype=jnp.bool_)
+            if analysis_keep_v is None:
+                analysis_keep_v = jnp.ones(
+                    (self.n_layers, self.n_v), dtype=jnp.bool_)
+            else:
+                analysis_keep_v = jnp.asarray(
+                    analysis_keep_v, dtype=jnp.bool_)
+            if analysis_keep_rst is None:
+                analysis_keep_rst = jnp.ones(
+                    (self.n_layers, n_rst_eff), dtype=jnp.bool_)
+            else:
+                analysis_keep_rst = jnp.asarray(
+                    analysis_keep_rst, dtype=jnp.bool_)
+            expected_qk = (self.n_layers, 2, self.n_qk)
+            expected_v = (self.n_layers, self.n_v)
+            expected_rst = (self.n_layers, n_rst_eff)
+            if analysis_keep_qk.shape != expected_qk:
+                raise ValueError(
+                    "analysis_keep_qk shape mismatch: "
+                    f"expected={expected_qk} actual={analysis_keep_qk.shape}")
+            if analysis_keep_v.shape != expected_v:
+                raise ValueError(
+                    "analysis_keep_v shape mismatch: "
+                    f"expected={expected_v} actual={analysis_keep_v.shape}")
+            if analysis_keep_rst.shape != expected_rst:
+                raise ValueError(
+                    "analysis_keep_rst shape mismatch: "
+                    f"expected={expected_rst} actual={analysis_keep_rst.shape}")
+            if analysis_position_mask is None:
+                analysis_position_mask = jnp.ones((B, S), dtype=jnp.bool_)
+            else:
+                analysis_position_mask = jnp.asarray(
+                    analysis_position_mask, dtype=jnp.bool_)
+            if analysis_position_mask.shape != (B, S):
+                raise ValueError(
+                    "analysis_position_mask shape mismatch: "
+                    f"expected={(B, S)} actual={analysis_position_mask.shape}")
+            analysis_retention_mode = jnp.asarray(
+                analysis_retention_mode, dtype=jnp.int32)
+            if analysis_interchange_source is None:
+                analysis_interchange_source = jnp.zeros(
+                    (B, self.d_model), dtype=jnp.float32)
+            else:
+                analysis_interchange_source = jnp.asarray(
+                    analysis_interchange_source, dtype=jnp.float32)
+            if analysis_interchange_source.shape != (B, self.d_model):
+                raise ValueError(
+                    "analysis_interchange_source shape mismatch: "
+                    f"expected={(B, self.d_model)} "
+                    f"actual={analysis_interchange_source.shape}")
+            analysis_interchange_enabled = jnp.asarray(
+                analysis_interchange_enabled, dtype=jnp.bool_)
+            selected_sidecar_enabled = (
+                analysis_intervention_enabled
+                | jnp.asarray(
+                    analysis_capture_contribution, dtype=jnp.bool_)
+                | analysis_interchange_enabled)
+            analysis_contribution = jnp.where(
+                selected_sidecar_enabled,
+                analysis_contribution,
+                jnp.full_like(analysis_contribution, -1))
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         vp_embed = (
@@ -5211,6 +5471,14 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_target_route=analysis_target_route,
                         analysis_intervention_enabled=(
                             analysis_intervention_enabled),
+                        analysis_keep_qk=analysis_keep_qk[layer_index],
+                        analysis_keep_v=analysis_keep_v[layer_index],
+                        analysis_position_mask=analysis_position_mask,
+                        analysis_retention_mode=analysis_retention_mode,
+                        analysis_interchange_source=(
+                            analysis_interchange_source),
+                        analysis_interchange_enabled=(
+                            analysis_interchange_enabled),
                         parity_debug=trace_minimal_layers)
                     if trace_minimal_layers:
                         attn_values = attn_result[:-1]
@@ -5237,7 +5505,10 @@ class DAWN_SRW_V4171(nn.Module):
                      v_admission_mass_max, v_composition_den_min,
                      v_composition_den_max, v_raw_srw_out_norm,
                      v_normalized_srw_out_norm,
-                     v_pool_scaled_srw_out_norm) = attn_values
+                     v_pool_scaled_srw_out_norm,
+                     selected_q_contribution,
+                     selected_k_contribution,
+                     selected_v_contribution) = attn_values
                     x = x + attn_out
                     post_attention_residual = x
 
@@ -5264,6 +5535,13 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_target_route=analysis_target_route,
                         analysis_intervention_enabled=(
                             analysis_intervention_enabled),
+                        analysis_keep_rst=analysis_keep_rst[layer_index],
+                        analysis_position_mask=analysis_position_mask,
+                        analysis_retention_mode=analysis_retention_mode,
+                        analysis_interchange_source=(
+                            analysis_interchange_source),
+                        analysis_interchange_enabled=(
+                            analysis_interchange_enabled),
                         parity_debug=trace_minimal_layers)
                     if trace_minimal_layers:
                         rst_values = rst_result[:-1]
@@ -5278,7 +5556,8 @@ class DAWN_SRW_V4171(nn.Module):
                      rst_admission_mass_max, rst_composition_den_min,
                      rst_composition_den_max, rst_raw_srw_out_norm,
                      rst_normalized_srw_out_norm,
-                     rst_pool_scaled_srw_out_norm) = rst_values
+                     rst_pool_scaled_srw_out_norm,
+                     selected_rst_contribution) = rst_values
                     x_next = x + rst_out
                     residual_norm = jnp.linalg.norm(
                         x_next.astype(jnp.float32), axis=-1).mean()
@@ -5342,6 +5621,13 @@ class DAWN_SRW_V4171(nn.Module):
                         jax.lax.stop_gradient(
                             residual_norm.astype(jnp.float32)),
                     )
+                    if analysis_capture_contribution:
+                        layer_stats += (
+                            selected_q_contribution,
+                            selected_k_contribution,
+                            selected_v_contribution,
+                            selected_rst_contribution,
+                        )
                     if trace_minimal_layers:
                         trace_values = (
                             pre_layer_residual,
@@ -5406,6 +5692,15 @@ class DAWN_SRW_V4171(nn.Module):
                      parity_post_layer_residual_all) = minimal_stats[-18:]
                 else:
                     minimal_values = minimal_stats
+                route_contributions = None
+                if analysis_capture_contribution:
+                    route_contributions = {
+                        'q': minimal_values[-4],
+                        'k': minimal_values[-3],
+                        'v': minimal_values[-2],
+                        'rst': minimal_values[-1],
+                    }
+                    minimal_values = minimal_values[:-4]
                 (q_active_all, k_active_all, v_active_all, rst_active_all,
                  q_active_n_all, k_active_n_all, v_active_n_all,
                  rst_active_n_all,
@@ -5518,6 +5813,9 @@ class DAWN_SRW_V4171(nn.Module):
                             }
                         if analysis_causal_trace:
                             output['causal_trace'] = causal_trace
+                        if analysis_capture_contribution:
+                            output['operator_route_contributions'] = (
+                                route_contributions)
                         return output
                     if vp_embed is not None:
                         raise NotImplementedError(
@@ -5544,6 +5842,9 @@ class DAWN_SRW_V4171(nn.Module):
                         }
                     if analysis_causal_trace:
                         output['causal_trace'] = causal_trace
+                    if analysis_capture_contribution:
+                        output['operator_route_contributions'] = (
+                            route_contributions)
                     return output
 
                 (loss, per_token_ce, correct, valid_count,
@@ -5726,6 +6027,9 @@ class DAWN_SRW_V4171(nn.Module):
                     }
                 if analysis_causal_trace:
                     output['causal_trace'] = causal_trace
+                if analysis_capture_contribution:
+                    output['operator_route_contributions'] = (
+                        route_contributions)
                 return output
 
             def scan_body(carry, xs):
@@ -6774,6 +7078,95 @@ class DAWN_SRW_V4171(nn.Module):
             analysis_target_positions=target_positions,
             analysis_target_route=route_selector,
             analysis_intervention_enabled=apply_suppression,
+            analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
+
+    def analysis_forward_with_circuit_retention(
+            self, input_ids, keep_qk, keep_v, keep_rst, *,
+            mode, position_mask=None, labels=None, attention_mask=None,
+            return_residual=True, **production_kwargs):
+        """Retain a circuit across every layer and route in one forward.
+
+        ``conditional_execution_sufficiency`` keeps the selected execution
+        numerator while retaining the production admission denominator.
+        ``autonomous_subcircuit_sufficiency`` restricts both numerator and
+        admission denominator to the selected circuit.  Operator masks are
+        dense boolean arrays with shapes ``[L,2,Nqk]``, ``[L,Nv]``, and
+        ``[L,Nrst]``.  ``position_mask`` selects positions where retention is
+        active; unselected positions execute the full model.
+        """
+        modes = {
+            "conditional_execution_sufficiency": 1,
+            "autonomous_subcircuit_sufficiency": 2,
+        }
+        if mode not in modes:
+            raise ValueError(
+                f"Unsupported circuit retention mode={mode!r}; "
+                f"known={','.join(modes)}")
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_keep_qk=keep_qk,
+            analysis_keep_v=keep_v,
+            analysis_keep_rst=keep_rst,
+            analysis_position_mask=position_mask,
+            analysis_retention_mode=modes[mode],
+            analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
+
+    def analysis_capture_operator_group_contribution(
+            self, input_ids, selected_global_operator_ids, target_layer,
+            target_positions, route_selector, *, labels=None,
+            attention_mask=None, return_residual=False,
+            **production_kwargs):
+        """Capture the selected route-native post-denominator contribution.
+
+        The returned ``operator_route_contributions`` are already multiplied
+        by the learned pool scale and are taken from the exact Q/K/V/RST
+        production site before attention head reshaping or residual addition.
+        """
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_contribution=selected_global_operator_ids,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=route_selector,
+            analysis_intervention_enabled=False,
+            analysis_capture_contribution=True,
+            analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
+
+    def analysis_forward_with_operator_interchange(
+            self, input_ids, selected_global_operator_ids, target_layer,
+            target_positions, route_selector, source_contribution, *,
+            labels=None, attention_mask=None, return_residual=True,
+            **production_kwargs):
+        """Patch ``base - selected(base) + selected(source)`` in production.
+
+        ``source_contribution`` must come from
+        :meth:`analysis_capture_operator_group_contribution` for the same
+        layer, route, operator group, and benchmark-audited token position.
+        """
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_contribution=selected_global_operator_ids,
+            analysis_target_layer=target_layer,
+            analysis_target_positions=target_positions,
+            analysis_target_route=route_selector,
+            analysis_intervention_enabled=False,
+            analysis_interchange_source=source_contribution,
+            analysis_interchange_enabled=True,
             analysis_return_residual=return_residual,
             **production_kwargs,
         )

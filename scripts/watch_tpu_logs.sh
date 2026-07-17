@@ -19,9 +19,9 @@ PRIMARY_DETECT_SLEEP=5
 PANE_COLS="${WATCH_TPU_LOG_COLS:-240}"
 PANE_ROWS="${WATCH_TPU_LOG_ROWS:-60}"
 
-SUMMARY_PATTERN='EVAL |PRUNE .*SUMMARY|PRUNE eps=.*(SKIP|SUMMARY)|USAGE (REDUCE|SUMMARY|HOST DONE)|TRACE (START|prompt|SUMMARY)|ABLATION (START|BASE|job|SUMMARY)|REPORT|Epoch .*complete|Training complete|Val loss|Pruned eval|Best val|Final step|ERROR|FAILED|Traceback|RuntimeError|AssertionError|RESOURCE_EXHAUSTED'
+SUMMARY_PATTERN='TRAIN_ANALYSIS_POOL|EVAL |Epoch .*complete|Training complete|Val loss|Best val|Final step|ERROR|FAILED|Traceback|RuntimeError|AssertionError|RESOURCE_EXHAUSTED'
 ERROR_PATTERN='Traceback|RuntimeError|AssertionError|FAILED|ERROR|RESOURCE_EXHAUSTED|OutOfMemory|SIGABRT|Aborted|Terminating process|unhealthy|CONSUMER_INVALID|PERMISSION_DENIED'
-PRIMARY_DETECT_PATTERN='primary=True|host=0/[0-9]+|process_index=0|Host ID: 0|USAGE (REDUCE|SUMMARY)|PRUNE SUMMARY|TRACE SUMMARY|ABLATION SUMMARY|REPORT'
+PRIMARY_DETECT_PATTERN='primary=True|host=0/[0-9]+|process_index=0|Host ID: 0|TRAIN_ANALYSIS_POOL (load|item=.*status=|COMPLETE)'
 
 usage() {
     printf '%s\n' \
@@ -270,7 +270,7 @@ build_status_cmd() {
         'echo "TMUX:"' \
         'tmux list-sessions 2>/dev/null || true' \
         'echo "PROCS:"' \
-        'pgrep -af "train_jax|train_jax_minimal|analyze_dawn_srw_v4166" | head -n 8 || true' \
+        'pgrep -af "train_jax|train_jax_minimal|analyze_train_analysis_pool" | head -n 8 || true' \
         'echo "LAST_LOG:"' \
         "tail -n 5 $remote_log_q 2>/dev/null || echo \"no log at $REMOTE_LOG\"" \
         'echo "PANE:"' \
