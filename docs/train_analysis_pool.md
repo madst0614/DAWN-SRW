@@ -1,11 +1,95 @@
-# DAWN-SRW v4166 Train Analysis Pool
+# DAWN-SRW Train Analysis Pool
 
 This document describes the reusable item pool used by
 `scripts/analyze_dawn_srw_v4166.py --train-analysis`.
 
+The analyzer entrypoint retains its historical script name for compatibility,
+but the registry is shared by v4166, v4171, and v4172. The canonical source of
+truth is `TRAIN_ANALYSIS_ITEM_DEFS` in
+`analysis/dawn_train_analysis_items.py`. It currently contains **35 canonical
+items**; the inventory below groups that complete set by runtime section.
+
 The full analysis pipeline still uses stage names such as `eval`, `prune`,
 `geometry`, `usage`, `trace`, `ablation`, and `report`. The item pool below is
 only for the lightweight checkpoint-state `train_analysis` mode.
+
+## Canonical Item Inventory and Version Support
+
+Version labels map to these exact checkpoint identities:
+
+| Label | `model.model_version` |
+| --- | --- |
+| v4166 | `spatial-r1-v4.1.6.6` |
+| v4171 | `spatial-r1-v4.1.7.1` |
+| v4172 | `spatial-r1-v4.1.7.2` |
+
+"Supported" means that the item has a valid model/runtime path for that
+version. An item that is merely selectable but returns `not_applicable` is not
+listed as supported. v417x-only items are not silently aliased to a v4166
+implementation.
+
+### Checkpoint, prompt, and generation items (14)
+
+| Item | Supported versions |
+| --- | --- |
+| `target_ratio` | v4166, v4171, v4172 |
+| `layer_selectivity` | v4166, v4171, v4172 |
+| `target_quantile_gap` | v4166, v4171, v4172 |
+| `calibration_state` | v4166, v4171, v4172 |
+| `qk_split` | v4166, v4171, v4172 |
+| `concentration_max` | v4166, v4171, v4172 |
+| `prune_breakdown` | v4166, v4171, v4172 |
+| `execution_profile` | v4166, v4171, v4172 |
+| `num_health` | v4166, v4171, v4172 |
+| `composition_health` | v4171, v4172 |
+| `prompt_trace` | v4166, v4171, v4172 |
+| `prompt_decision` | v4166, v4171, v4172 |
+| `generation_samples` | v4166, v4171, v4172 |
+| `decision_reason` | v4166, v4171, v4172 |
+
+`composition_health` is intentionally `not_applicable` on v4166 because that
+checkpoint family does not emit v417x composition-denominator telemetry.
+
+### Dataset-backed operator items (11)
+
+| Item | Supported versions |
+| --- | --- |
+| `operator_dataset_manifest` | v4166, v4171, v4172 |
+| `operator_behavior_eval` | v4171, v4172 |
+| `ravel_operator_disentanglement` | v4171, v4172 |
+| `ioi_operator_circuit` | v4171, v4172 |
+| `blimp_operator_grammar` | v4171, v4172 |
+| `lama_counterfact_factual_recall` | v4171, v4172 |
+| `synthetic_binding_sanity` | v4171, v4172 |
+| `operator_function_reuse` | v4171, v4172 |
+| `operator_route_specificity` | v4171, v4172 |
+| `operator_causal_specificity` | v4171, v4172 |
+| `operator_analysis_summary` | v4171, v4172 |
+
+The manifest item is model-independent. The other ten items require the
+v417x production tracing and operator-suppression hooks.
+
+### Transition and causal items (10)
+
+| Item | Supported versions |
+| --- | --- |
+| `global_router_audit` | v4171, v4172 |
+| `trajectory_trace` | v4171, v4172 |
+| `context_divergence` | v4171, v4172 |
+| `state_transition_decoupling` | v4171, v4172 |
+| `causal_intervention` | v4171, v4172 |
+| `causal_rerouting_trace` | v4171, v4172 |
+| `causal_recovery_trace` | v4171, v4172 |
+| `operator_functional_graph` | v4171, v4172 |
+| `group_causal_intervention` | v4171, v4172 |
+| `causal_ranking_calibration` | v4171, v4172 |
+
+These ten items share the v417x transition implementation. An incompatible
+checkpoint produces a failed item status instead of a legacy fallback.
+
+Total: **14 + 11 + 10 = 35 canonical items**. v4171 and v4172 support all 35;
+v4166 supports 14 items (13 common items plus
+`operator_dataset_manifest`).
 
 ## Log Shape
 
@@ -58,17 +142,16 @@ List the available presets, aliases, and items:
 python3 -u scripts/analyze_dawn_srw_v4166.py --list-train-analysis-items
 ```
 
-Prepare the public/operator datasets on a Google Cloud VM and mirror them into
-the default dataset folder:
+Prepare the immutable operator-analysis datasets on a Google Cloud VM:
 
 ```bash
-python3 -u scripts/prepare_v4166_operator_datasets.py
+python3 -u scripts/prepare_operator_analysis_datasets.py --publish-latest
 ```
 
 Default dataset root:
 
 ```text
-gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis
+gs://dawn-tpu-data-c4/dataset/v4171_operator_analysis_v2
 ```
 
 Run with a preset:
@@ -105,10 +188,11 @@ python3 -u scripts/analyze_dawn_srw_v4166.py \
 
 `health`
 : Selector and numerical-health preset.
-  Items: `target_ratio`, `layer_selectivity`, `num_health`, `decision_reason`
+  Items: `target_ratio`, `layer_selectivity`, `num_health`,
+  `composition_health`, `decision_reason`
 
 `prompt_debug`
-: v4166 prompt-side selector diagnosis.
+: Prompt-side selector diagnosis.
   Items: `target_ratio`, `layer_selectivity`, `prompt_trace`,
   `prompt_decision`, `decision_reason`
 
@@ -121,12 +205,37 @@ python3 -u scripts/analyze_dawn_srw_v4166.py \
   Items: `operator_dataset_manifest`
 
 `operator_analysis`
-: Dataset-backed operator-family experiment plan. It does not run the full
-  experiments by itself; it exposes the exact GCS paths and behavior metrics
-  that TPU-side RAVEL/IOI/BLiMP/LAMA/CounterFact/synthetic analyses should use.
-  Items: `operator_dataset_manifest`, `ravel_operator_disentanglement`,
-  `ioi_operator_circuit`, `blimp_operator_grammar`,
-  `lama_counterfact_factual_recall`, `synthetic_binding_sanity`
+: Complete dataset-backed operator analysis for v4171 and v4172.
+  Items: `operator_dataset_manifest`, `operator_behavior_eval`,
+  `ravel_operator_disentanglement`, `ioi_operator_circuit`,
+  `blimp_operator_grammar`, `lama_counterfact_factual_recall`,
+  `synthetic_binding_sanity`, `operator_function_reuse`,
+  `operator_route_specificity`, `operator_causal_specificity`,
+  `operator_analysis_summary`
+
+`v4171`, `v4172`
+: Shared v417x checkpoint/prompt base preset.
+  Items: all 14 checkpoint, prompt, and generation items listed above.
+
+`v4171_self_organization`, `v4172_self_organization`
+: Core v417x transition preset.
+  Items: `global_router_audit`, `trajectory_trace`, `context_divergence`,
+  `state_transition_decoupling`, `causal_intervention`
+
+`v4171_operator_family`, `v4172_operator_family`
+: Complete v417x transition and causal preset.
+  Items: all 10 v417x transition and causal items listed above.
+
+`v4171_self_organization_extended`, `v4172_self_organization_extended`
+: Compatibility names for the corresponding `*_operator_family` preset.
+
+`v4171_operator_monitor`, `v4172_operator_monitor`
+: Core five self-organization items plus all 11 dataset-backed operator items
+  (16 items total).
+
+`v4171_complete`, `v4172_complete`
+: Every canonical item in the pool (35 items). Use `v4172_complete` when a
+  v4172 run must explicitly request full item coverage.
 
 `v4166_1b`
 : Default item preset selected by launcher `--preset v4166-1B`.
@@ -136,14 +245,12 @@ python3 -u scripts/analyze_dawn_srw_v4166.py \
   `prompt_decision`, `generation_samples`, `decision_reason`
 
 `deep`
-: Broad checkpoint-state, prompt-route, and sample-generation check.
-  Items: `target_ratio`, `layer_selectivity`, `target_quantile_gap`,
-  `calibration_state`, `qk_split`, `concentration_max`, `prune_breakdown`,
-  `execution_profile`, `prompt_trace`,
-  `prompt_decision`, `generation_samples`, `decision_reason`
+: Compatibility preset with the same 12 items as `v4166_1b`.
 
 `full`
-: Every canonical item in the pool.
+: Every canonical item in the pool (35 items), identical to
+  `v4171_complete` and `v4172_complete`. Use only with v4171 or v4172;
+  v4166 does not support the v417x transition and production-suppression items.
 
 ## Aliases
 
@@ -362,12 +469,21 @@ NUM_HEALTH:
   no_nan                         True
 ```
 
+### composition_health
+
+Measures v417x admission mass, composition-denominator minimum/maximum,
+floor-hit fraction, and configured denominator power for QK, V, and RST.
+Use this to verify that generalized operator composition remains finite and is
+not pinned to its numerical floor. On model versions without composition
+telemetry, the item reports the unavailable fields explicitly instead of
+silently substituting zeros.
+
 ### prompt_trace
 
-Measures v4166 prompt-token routing without generating text. It reuses the
-compact top-k trace path and reports pool-size-normalized q/k/v/rst active
-fractions, gate mass, top1 concentration, top operator ids, and attention/RST
-output norms.
+Measures version-matched prompt-token routing without generating text. It
+reuses the compact top-k trace path and reports pool-size-normalized q/k/v/rst
+active fractions, gate mass, top1 concentration, top operator ids, and
+attention/RST output norms.
 
 Summary example:
 
@@ -382,8 +498,8 @@ PROMPT_TRACE:
 
 Derived from `prompt_trace`. It flags prompt-local route imbalance using qk/v/rst
 pool-size-normalized activity balance, selector concentration, and
-RST-vs-attention norm ratio. This is the lightweight v4166 replacement for
-older broad decision-probe scripts.
+RST-vs-attention norm ratio. This is the lightweight replacement for older
+broad decision-probe scripts.
 
 Summary example:
 
@@ -395,8 +511,8 @@ PROMPT_DECISION:
 
 ### generation_samples
 
-Uses the v4166 `prefill` and `decode_step` KV-cache inference API to generate a
-few short continuations. Defaults are intentionally small and deterministic:
+Uses the selected model version's `prefill` and `decode_step` KV-cache inference
+API to generate a few short continuations. Defaults are intentionally small and deterministic:
 three prompts, seeded top-k sampling with temperature 0.8, and 64 new tokens.
 If the tokenizer is not available on the TPU worker, it falls back to validation
 token prompts and prints generated token ids instead of skipping the item.
@@ -418,24 +534,34 @@ GENERATION_SAMPLES:
 ### operator_dataset_manifest
 
 Reports the configured dataset root, the manifest path, and the per-dataset GCS
-roots prepared by `scripts/prepare_v4166_operator_datasets.py`.
+roots prepared by `scripts/prepare_operator_analysis_datasets.py`. The
+historical `v4171` path segment is the immutable dataset-build identity; it is
+not a restriction on v4172 checkpoints.
 
 Default root:
 
 ```text
-gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis
+gs://dawn-tpu-data-c4/dataset/v4171_operator_analysis_v2
 ```
 
 Summary example:
 
 ```text
 OPERATOR_DATASET_MANIFEST:
-  root     : gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis
-  manifest : gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis/manifest.json
-  prepare  : python3 -u scripts/prepare_v4166_operator_datasets.py
+  root     : gs://dawn-tpu-data-c4/dataset/v4171_operator_analysis_v2
+  pointer  : gs://dawn-tpu-data-c4/dataset/v4171_operator_analysis_v2/LATEST.json
+  manifest : .../builds/<build-id>/manifest.json
+  prepare  : python3 -u scripts/prepare_operator_analysis_datasets.py --publish-latest
   id          root
-  ravel       gs://dawn-tpu-data-c4/dataset/v4166_operator_analysis/ravel
+  ravel       .../builds/<build-id>/ravel
 ```
+
+### operator_behavior_eval
+
+Runs the restored production checkpoint on every selected prepared behavior
+row. It reports teacher-forced full-sequence and continuation margins,
+accuracy, known-correct subsets, and logical-example bootstrap intervals.
+Behavior competence is measured before route or causal claims are accepted.
 
 ### ravel_operator_disentanglement
 
@@ -467,6 +593,98 @@ operator ablations.
 
 Generated controlled binding-retrieval examples. This is a sanity-check
 dataset for entity binding, attribute query, and residual write decomposition.
+
+### operator_function_reuse
+
+Compares same-function transition-path similarity against a length-matched
+cross-function random null. It reports the reuse effect and a logical-pair
+bootstrap interval rather than treating raw path overlap as sufficient.
+
+### operator_route_specificity
+
+Measures within-group versus between-group routing and transition overlap,
+captured mass, the specificity gap, and enriched operators. Route evidence is
+reported only when its captured-mass qualification passes.
+
+### operator_causal_specificity
+
+Measures task-margin drops for selected, matched-active, active-random,
+inactive-random, and cross-function suppression strategies. It uses production
+contribution subtraction and blocks the result if the zero-vector parity check
+fails.
+
+### operator_analysis_summary
+
+Combines behavior competence, function reuse, route specificity, causal
+specificity, validity checks, and limitations into the artifact-backed
+cross-dataset result.
+
+### global_router_audit
+
+Audits restored router and pool parameter paths, hidden block-local routing
+parameters, global sharing, geometry, and composition settings. It fails
+loudly if a v417x checkpoint does not expose one global router and one global
+operator-pool tree.
+
+### trajectory_trace
+
+Captures target-span residual/query trajectories, sparse operator ids,
+captured mass, read responses, coefficients, Q/K/V SRW features, and actual
+attention/RST residual updates. It reuses one target-only transition cache and
+does not return the full gate tensor to the host.
+
+### context_divergence
+
+Compares controlled same-surface pairs across state, query, sparse gate, and
+update similarity. It reports first divergence, maximum divergence, and late
+reconvergence using captured-mass-qualified gate metrics.
+
+### state_transition_decoupling
+
+Tests whether distant representation states can share transition paths. It
+reports state/query/gate/delta/path similarities, data-quantile quadrants,
+random-null percentiles, correlations, effect size, and a bootstrap interval
+without relying on a fixed arbitrary threshold.
+
+### causal_intervention
+
+Runs canonical target-token/layer/pool interventions for top contribution,
+top gate, active/inactive random, and matched-active controls. It subtracts a
+selected post-denominator production contribution and blocks on exact
+zero-vector parity.
+
+### causal_rerouting_trace
+
+Compares same-forward baseline and intervention traces across residual, query,
+sparse routing, transition, attention update, and RST update. It reports
+divergence AUC, reconvergence, paired controls, and final causal effects without
+transferring full gate tensors to the host.
+
+### causal_recovery_trace
+
+Measures immediate target-state damage, downstream recovery or amplification,
+and final residual/logit effects. Distribution-relative judgments distinguish
+small local effects from later compensation.
+
+### operator_functional_graph
+
+Builds seed-local reciprocal neighborhoods from rank-1 RW functional
+similarity, address similarity, and sparse activation/contribution profiles.
+Transitive-component percolation remains a separate diagnostic and is not
+treated as a causal operator family.
+
+### group_causal_intervention
+
+Runs fixed-width family, address, coactivation, and random group suppression.
+It reports dose response, recovery, and synergy against available single
+effects to test whether weak single interventions reflect functional
+redundancy.
+
+### causal_ranking_calibration
+
+Tests whether local gate and contribution rankings predict final causal
+importance. It reports gate/contribution/immediate/final causal Spearman
+inference, strategy win rates, and bootstrap/permutation judgments.
 
 ### decision_reason
 
