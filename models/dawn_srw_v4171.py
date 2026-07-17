@@ -813,6 +813,20 @@ def _composition_den_floor_mass(
     return 1.0
 
 
+def _analysis_int32_array(value, *, name):
+    """Convert an integer analysis input without accepting lossy casts."""
+    source_dtype = getattr(value, "dtype", None)
+    if (source_dtype is not None
+            and not jnp.issubdtype(source_dtype, jnp.integer)):
+        raise TypeError(
+            f"{name} must have an integer dtype, got {source_dtype}")
+    array = jnp.asarray(value)
+    if not jnp.issubdtype(array.dtype, jnp.integer):
+        raise TypeError(
+            f"{name} must have an integer dtype, got {array.dtype}")
+    return array.astype(jnp.int32)
+
+
 def analysis_operator_membership(global_operator_ids, selected_operator_ids):
     """Build the analysis-only single/group suppression membership mask.
 
@@ -821,9 +835,10 @@ def analysis_operator_membership(global_operator_ids, selected_operator_ids):
     changes only which execution numerators are zeroed; admission and every
     production denominator/statistic remain untouched.
     """
-    global_operator_ids = jnp.asarray(global_operator_ids, dtype=jnp.int32)
-    selected_operator_ids = jnp.asarray(
-        selected_operator_ids, dtype=jnp.int32)
+    global_operator_ids = _analysis_int32_array(
+        global_operator_ids, name="global_operator_ids")
+    selected_operator_ids = _analysis_int32_array(
+        selected_operator_ids, name="selected_operator_ids")
     if selected_operator_ids.ndim == 1:
         return (
             global_operator_ids[None, None, :]
@@ -837,6 +852,63 @@ def analysis_operator_membership(global_operator_ids, selected_operator_ids):
     raise ValueError(
         "selected operator ids must have shape [B] or [B, M], got "
         f"{selected_operator_ids.shape}")
+
+
+def _analysis_group_nonempty(selected_operator_ids):
+    """Return one membership bit per example for ``-1`` padded groups."""
+    selected_operator_ids = _analysis_int32_array(
+        selected_operator_ids, name="selected_operator_ids")
+    if selected_operator_ids.ndim == 1:
+        return selected_operator_ids >= jnp.int32(0)
+    if selected_operator_ids.ndim == 2:
+        return jnp.any(
+            selected_operator_ids >= jnp.int32(0), axis=-1)
+    raise ValueError(
+        "selected operator ids must have shape [B] or [B, M], got "
+        f"{selected_operator_ids.shape}")
+
+
+def _validate_concrete_analysis_interchange(
+        target_positions, target_layer, target_route,
+        selected_operator_ids, *, batch_size, sequence_length, n_layers,
+        n_qk, n_v, n_rst, enabled):
+    """Validate values before JIT; traced callers use their host validator."""
+    values = (
+        enabled, target_positions, target_layer, target_route,
+        selected_operator_ids)
+    if any(isinstance(value, jax.core.Tracer) for value in values):
+        return
+    if not bool(jax.device_get(enabled)):
+        return
+    positions = tuple(
+        int(value) for value in
+        jax.device_get(target_positions).reshape(-1).tolist())
+    layer = int(jax.device_get(target_layer))
+    route = int(jax.device_get(target_route))
+    operator_ids = tuple(
+        int(value) for value in
+        jax.device_get(selected_operator_ids).reshape(-1).tolist())
+    if len(positions) != int(batch_size):
+        raise ValueError(
+            "analysis target position batch mismatch: "
+            f"expected={batch_size} actual={len(positions)}")
+    if any(not 0 <= value < int(sequence_length) for value in positions):
+        raise ValueError(
+            "analysis target position is out of range: "
+            f"positions={positions}")
+    if not 0 <= layer < int(n_layers):
+        raise ValueError(
+            f"analysis target layer is out of range: layer={layer}")
+    if not 0 <= route < 4:
+        raise ValueError(
+            f"analysis target route is out of range: route={route}")
+    pool_size = (n_qk if route <= 1 else n_v if route == 2 else n_rst)
+    if any(
+            value != -1 and not 0 <= value < int(pool_size)
+            for value in operator_ids):
+        raise ValueError(
+            "analysis operator group contains an invalid id for its route: "
+            f"route={route} operator_ids={operator_ids}")
 
 
 def _pool_params_with_operator_keys(pool_params, operator_key_mode=None):
@@ -3188,7 +3260,7 @@ def _make_sharded_srw_minimal_impl(
             (selected_raw_out / gate_den).astype(jnp.bfloat16), 'model')
         selected_target = selected_out[
             jnp.arange(B, dtype=jnp.int32),
-            jnp.clip(target_positions, 0, S - 1), :]
+            target_positions, :]
         raw_out_global = jax.lax.psum(
             jax.lax.stop_gradient(raw_out).astype(jnp.bfloat16), 'model'
         ).astype(jnp.float32)
@@ -3581,7 +3653,7 @@ def _make_sharded_srw_paired_minimal_impl(
             (selected_raw_out / gate_den).astype(jnp.bfloat16), 'model')
         selected_target = selected_out[
             jnp.arange(B, dtype=jnp.int32),
-            jnp.clip(target_positions, 0, S - 1), :, :]
+            target_positions, :, :]
         raw_out_global = jax.lax.psum(
             jax.lax.stop_gradient(raw_out).astype(jnp.bfloat16), 'model'
         ).astype(jnp.float32)
@@ -3988,10 +4060,6 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      q_raw_srw_out_norm, k_raw_srw_out_norm,
      q_normalized_srw_out_norm, k_normalized_srw_out_norm,
      qk_selected_target) = qk_result
-    attention_q = qk_state_transitions[:, :, 0, :] * qk_scale
-    attention_k = qk_state_transitions[:, :, 1, :] * qk_scale
-    q_selected_target = qk_selected_target[:, 0, :] * qk_scale
-    k_selected_target = qk_selected_target[:, 1, :] * qk_scale
     apply_v = (
         jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
@@ -4009,8 +4077,90 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      v_admission_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm, v_selected_target) = v_result
+
+    capture_at_layer = (
+        jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+        == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
+    target_route = jnp.asarray(analysis_target_route, dtype=jnp.int32)
+    group_nonempty = _analysis_group_nonempty(
+        analysis_selected_operator_id)
+    effective_reference_enabled = (
+        capture_at_layer
+        & ~jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+        & jnp.any(group_nonempty))
+
+    # Capture the effective contribution at the exact production precision:
+    # production route minus the same route with only this family suppressed.
+    # Computing the suppression counterfactual only at the requested analysis
+    # layer avoids changing or slowing the disabled production path.
+    def qk_suppression_reference(_):
+        return canonical_paired(
+            x, qk_operator_queries, qk_operator_keys, raw_tau_QK,
+            qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, analysis_selected_operator_id,
+            analysis_target_positions, jnp.bool_(True), target_route,
+            analysis_keep_qk, analysis_position_mask,
+            analysis_retention_mode)[0]
+
+    qk_suppressed_transitions = jax.lax.cond(
+        effective_reference_enabled & (target_route < jnp.int32(2)),
+        qk_suppression_reference,
+        lambda _: qk_state_transitions,
+        operand=None)
+
+    def v_suppression_reference(_):
+        return canonical_single_v(
+            x, v_operator_query, v_operator_keys,
+            raw_tau_all[:, :, 2:3], v_read, v_write,
+            soft_gate_T_v, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, analysis_selected_operator_id,
+            analysis_target_positions, jnp.bool_(True), analysis_keep_v,
+            analysis_position_mask, analysis_retention_mode)[0]
+
+    v_suppressed_transition = jax.lax.cond(
+        effective_reference_enabled & (target_route == jnp.int32(2)),
+        v_suppression_reference,
+        lambda _: attention_v,
+        operand=None)
+
+    attention_q = qk_state_transitions[:, :, 0, :] * qk_scale
+    attention_k = qk_state_transitions[:, :, 1, :] * qk_scale
     attention_v = attention_v * v_scale
-    v_selected_target = v_selected_target * v_scale
+    suppressed_q = qk_suppressed_transitions[:, :, 0, :] * qk_scale
+    suppressed_k = qk_suppressed_transitions[:, :, 1, :] * qk_scale
+    suppressed_v = v_suppressed_transition * v_scale
+    batch_indices = jnp.arange(B, dtype=jnp.int32)
+    target_positions = jnp.asarray(
+        analysis_target_positions, dtype=jnp.int32)
+    effective_q_target = (
+        attention_q[batch_indices, target_positions, :]
+        - suppressed_q[batch_indices, target_positions, :])
+    effective_k_target = (
+        attention_k[batch_indices, target_positions, :]
+        - suppressed_k[batch_indices, target_positions, :])
+    effective_v_target = (
+        attention_v[batch_indices, target_positions, :]
+        - suppressed_v[batch_indices, target_positions, :])
+    q_selected_target = jnp.where(
+        effective_reference_enabled, effective_q_target,
+        qk_selected_target[:, 0, :] * qk_scale)
+    k_selected_target = jnp.where(
+        effective_reference_enabled, effective_k_target,
+        qk_selected_target[:, 1, :] * qk_scale)
+    v_selected_target = jnp.where(
+        effective_reference_enabled, effective_v_target,
+        v_selected_target * v_scale)
+    q_selected_target = jnp.where(
+        capture_at_layer & (target_route == jnp.int32(0)),
+        q_selected_target, jnp.zeros_like(q_selected_target))
+    k_selected_target = jnp.where(
+        capture_at_layer & (target_route == jnp.int32(1)),
+        k_selected_target, jnp.zeros_like(k_selected_target))
+    v_selected_target = jnp.where(
+        capture_at_layer & (target_route == jnp.int32(2)),
+        v_selected_target, jnp.zeros_like(v_selected_target))
 
     interchange_at_layer = (
         jnp.asarray(analysis_interchange_enabled, dtype=jnp.bool_)
@@ -4020,28 +4170,35 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         jnp.arange(S, dtype=jnp.int32)[None, :]
         == jnp.asarray(analysis_target_positions, dtype=jnp.int32)[:, None])
 
-    def interchange_route(route_value, selected_value, route_index):
+    def interchange_route(
+            route_value, suppressed_value, selected_value, route_index):
         apply_route = (
             interchange_at_layer
             & (jnp.asarray(analysis_target_route, dtype=jnp.int32)
                == jnp.int32(route_index)))
-        delta = (
-            jnp.asarray(analysis_interchange_source, dtype=jnp.float32)
-            - selected_value.astype(jnp.float32))
-        patch = interchange_token_mask[:, :, None] * delta[:, None, :]
-        same_source = jnp.all(delta == jnp.float32(0.0), axis=-1)
+        source_value = jnp.asarray(analysis_interchange_source)
+        selected_value = selected_value.astype(jnp.float32)
+        source_matches_base = jnp.all(
+            source_value == selected_value, axis=-1)
         apply_mask = (
-            apply_route & ~same_source[:, None, None]
+            apply_route
+            & group_nonempty[:, None, None]
+            & ~source_matches_base[:, None, None]
             & interchange_token_mask[:, :, None])
-        patched = route_value + patch
+        # suppressed_value is the exact production implementation of
+        # ``base - selected(base)``. Insert the captured source contribution
+        # at this route-native site; zero source therefore equals suppression.
+        patched = (
+            suppressed_value.astype(jnp.float32)
+            + source_value[:, None, :])
         return jnp.where(apply_mask, patched, route_value)
 
     attention_q = interchange_route(
-        attention_q, q_selected_target, 0)
+        attention_q, suppressed_q, q_selected_target, 0)
     attention_k = interchange_route(
-        attention_k, k_selected_target, 1)
+        attention_k, suppressed_k, k_selected_target, 1)
     attention_v = interchange_route(
-        attention_v, v_selected_target, 2)
+        attention_v, suppressed_v, v_selected_target, 2)
     q_debug = attention_q
     k_debug = attention_k
     v_debug = attention_v
@@ -4217,8 +4374,47 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
      rst_admission_mass_max, rst_composition_den_min,
      rst_composition_den_max, rst_raw_srw_out_norm,
      rst_normalized_srw_out_norm, rst_selected_target) = rst_result
+    capture_at_layer = (
+        jnp.asarray(analysis_layer_index, dtype=jnp.int32)
+        == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
+    target_route = jnp.asarray(analysis_target_route, dtype=jnp.int32)
+    group_nonempty = _analysis_group_nonempty(
+        analysis_selected_operator_id)
+    effective_reference_enabled = (
+        capture_at_layer
+        & ~jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
+        & jnp.any(group_nonempty)
+        & (target_route == jnp.int32(3)))
+
+    def rst_suppression_reference(_):
+        return canonical_single(
+            x, operator_query, rst_operator_keys, raw_tau, rst_read,
+            rst_write, soft_gate_T_rst, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, analysis_selected_operator_id,
+            analysis_target_positions, jnp.bool_(True), analysis_keep_rst,
+            analysis_position_mask, analysis_retention_mode)[0]
+
+    suppressed_out = jax.lax.cond(
+        effective_reference_enabled,
+        rst_suppression_reference,
+        lambda _: out,
+        operand=None)
     out = out * rst_scale
-    rst_selected_target = rst_selected_target * rst_scale
+    suppressed_out = suppressed_out * rst_scale
+    batch_indices = jnp.arange(x.shape[0], dtype=jnp.int32)
+    target_positions = jnp.asarray(
+        analysis_target_positions, dtype=jnp.int32)
+    effective_rst_target = (
+        out[batch_indices, target_positions, :]
+        - suppressed_out[batch_indices, target_positions, :])
+    rst_selected_target = jnp.where(
+        effective_reference_enabled,
+        effective_rst_target,
+        rst_selected_target * rst_scale)
+    rst_selected_target = jnp.where(
+        capture_at_layer & (target_route == jnp.int32(3)),
+        rst_selected_target, jnp.zeros_like(rst_selected_target))
     apply_interchange = (
         jnp.asarray(analysis_interchange_enabled, dtype=jnp.bool_)
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
@@ -4227,17 +4423,18 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     interchange_token_mask = (
         jnp.arange(x.shape[1], dtype=jnp.int32)[None, :]
         == jnp.asarray(analysis_target_positions, dtype=jnp.int32)[:, None])
-    interchange_delta = (
-        jnp.asarray(analysis_interchange_source, dtype=jnp.float32)
-        - rst_selected_target.astype(jnp.float32))
-    interchange_patch = (
-        interchange_token_mask[:, :, None] * interchange_delta[:, None, :])
-    same_source = jnp.all(
-        interchange_delta == jnp.float32(0.0), axis=-1)
+    source_value = jnp.asarray(analysis_interchange_source)
+    rst_selected_target = rst_selected_target.astype(jnp.float32)
+    source_matches_base = jnp.all(
+        source_value == rst_selected_target, axis=-1)
     apply_mask = (
-        apply_interchange & ~same_source[:, None, None]
+        apply_interchange
+        & group_nonempty[:, None, None]
+        & ~source_matches_base[:, None, None]
         & interchange_token_mask[:, :, None])
-    patched_out = out + interchange_patch
+    patched_out = (
+        suppressed_out.astype(jnp.float32)
+        + source_value[:, None, :])
     out = jnp.where(apply_mask, patched_out, out)
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -5086,40 +5283,71 @@ class DAWN_SRW_V4171(nn.Module):
                 analysis_intervention_enabled = jnp.asarray(
                     False, dtype=jnp.bool_)
             else:
-                analysis_contribution = jnp.asarray(
-                    analysis_contribution, dtype=jnp.int32)
+                analysis_contribution = _analysis_int32_array(
+                    analysis_contribution,
+                    name="analysis_contribution")
                 if analysis_contribution.ndim == 0:
                     analysis_contribution = jnp.full(
                         (B,), analysis_contribution, dtype=jnp.int32)
-                analysis_target_positions = jnp.asarray(
-                    analysis_target_positions, dtype=jnp.int32)
+                if (analysis_contribution.ndim not in (1, 2)
+                        or analysis_contribution.shape[0] != B
+                        or (analysis_contribution.ndim == 2
+                            and analysis_contribution.shape[1] <= 0)):
+                    raise ValueError(
+                        "analysis_contribution must have shape [B] or "
+                        "non-empty fixed-width [B, M], got "
+                        f"{analysis_contribution.shape}")
+                analysis_target_positions = _analysis_int32_array(
+                    analysis_target_positions,
+                    name="analysis_target_positions")
                 if analysis_target_positions.ndim == 0:
                     analysis_target_positions = jnp.full(
                         (B,), analysis_target_positions, dtype=jnp.int32)
-                analysis_target_layer = jnp.asarray(
-                    analysis_target_layer, dtype=jnp.int32)
-                analysis_target_route = jnp.asarray(
-                    analysis_target_route, dtype=jnp.int32)
+                if analysis_target_positions.shape != (B,):
+                    raise ValueError(
+                        "analysis_target_positions shape mismatch: "
+                        f"expected={(B,)} "
+                        f"actual={analysis_target_positions.shape}")
+                analysis_target_layer = _analysis_int32_array(
+                    analysis_target_layer,
+                    name="analysis_target_layer")
+                analysis_target_route = _analysis_int32_array(
+                    analysis_target_route,
+                    name="analysis_target_route")
+                if analysis_target_layer.shape != ():
+                    raise ValueError(
+                        "analysis_target_layer must be a scalar, got "
+                        f"{analysis_target_layer.shape}")
+                if analysis_target_route.shape != ():
+                    raise ValueError(
+                        "analysis_target_route must be a scalar, got "
+                        f"{analysis_target_route.shape}")
                 analysis_intervention_enabled = jnp.asarray(
                     analysis_intervention_enabled, dtype=jnp.bool_)
+                if analysis_intervention_enabled.shape != ():
+                    raise ValueError(
+                        "analysis_intervention_enabled must be a scalar")
             if analysis_keep_qk is None:
                 analysis_keep_qk = jnp.ones(
                     (self.n_layers, 2, self.n_qk), dtype=jnp.bool_)
             else:
-                analysis_keep_qk = jnp.asarray(
-                    analysis_keep_qk, dtype=jnp.bool_)
+                analysis_keep_qk = jnp.asarray(analysis_keep_qk)
+                if analysis_keep_qk.dtype != jnp.bool_:
+                    raise TypeError("analysis_keep_qk must have bool dtype")
             if analysis_keep_v is None:
                 analysis_keep_v = jnp.ones(
                     (self.n_layers, self.n_v), dtype=jnp.bool_)
             else:
-                analysis_keep_v = jnp.asarray(
-                    analysis_keep_v, dtype=jnp.bool_)
+                analysis_keep_v = jnp.asarray(analysis_keep_v)
+                if analysis_keep_v.dtype != jnp.bool_:
+                    raise TypeError("analysis_keep_v must have bool dtype")
             if analysis_keep_rst is None:
                 analysis_keep_rst = jnp.ones(
                     (self.n_layers, n_rst_eff), dtype=jnp.bool_)
             else:
-                analysis_keep_rst = jnp.asarray(
-                    analysis_keep_rst, dtype=jnp.bool_)
+                analysis_keep_rst = jnp.asarray(analysis_keep_rst)
+                if analysis_keep_rst.dtype != jnp.bool_:
+                    raise TypeError("analysis_keep_rst must have bool dtype")
             expected_qk = (self.n_layers, 2, self.n_qk)
             expected_v = (self.n_layers, self.n_v)
             expected_rst = (self.n_layers, n_rst_eff)
@@ -5138,8 +5366,10 @@ class DAWN_SRW_V4171(nn.Module):
             if analysis_position_mask is None:
                 analysis_position_mask = jnp.ones((B, S), dtype=jnp.bool_)
             else:
-                analysis_position_mask = jnp.asarray(
-                    analysis_position_mask, dtype=jnp.bool_)
+                analysis_position_mask = jnp.asarray(analysis_position_mask)
+                if analysis_position_mask.dtype != jnp.bool_:
+                    raise TypeError(
+                        "analysis_position_mask must have bool dtype")
             if analysis_position_mask.shape != (B, S):
                 raise ValueError(
                     "analysis_position_mask shape mismatch: "
@@ -5150,8 +5380,20 @@ class DAWN_SRW_V4171(nn.Module):
                 analysis_interchange_source = jnp.zeros(
                     (B, self.d_model), dtype=jnp.float32)
             else:
+                source_dtype = getattr(
+                    analysis_interchange_source, "dtype", None)
+                if source_dtype is None or source_dtype != jnp.float32:
+                    raise TypeError(
+                        "analysis_interchange_source must be an explicit "
+                        "float32 array, got "
+                        f"{source_dtype}")
                 analysis_interchange_source = jnp.asarray(
-                    analysis_interchange_source, dtype=jnp.float32)
+                    analysis_interchange_source)
+                if analysis_interchange_source.dtype != jnp.float32:
+                    raise TypeError(
+                        "analysis_interchange_source must have float32 "
+                        "dtype, got "
+                        f"{analysis_interchange_source.dtype}")
             if analysis_interchange_source.shape != (B, self.d_model):
                 raise ValueError(
                     "analysis_interchange_source shape mismatch: "
@@ -5159,11 +5401,31 @@ class DAWN_SRW_V4171(nn.Module):
                     f"actual={analysis_interchange_source.shape}")
             analysis_interchange_enabled = jnp.asarray(
                 analysis_interchange_enabled, dtype=jnp.bool_)
+            if analysis_interchange_enabled.shape != ():
+                raise ValueError(
+                    "analysis_interchange_enabled must be a scalar")
             selected_sidecar_enabled = (
                 analysis_intervention_enabled
                 | jnp.asarray(
                     analysis_capture_contribution, dtype=jnp.bool_)
                 | analysis_interchange_enabled)
+            interchange_contract_enabled = (
+                jnp.asarray(
+                    analysis_capture_contribution, dtype=jnp.bool_)
+                | analysis_interchange_enabled)
+
+            _validate_concrete_analysis_interchange(
+                analysis_target_positions,
+                analysis_target_layer,
+                analysis_target_route,
+                analysis_contribution,
+                batch_size=B,
+                sequence_length=S,
+                n_layers=self.n_layers,
+                n_qk=self.n_qk,
+                n_v=self.n_v,
+                n_rst=n_rst_eff,
+                enabled=interchange_contract_enabled)
             analysis_contribution = jnp.where(
                 selected_sidecar_enabled,
                 analysis_contribution,
@@ -7062,8 +7324,9 @@ class DAWN_SRW_V4171(nn.Module):
         attention_q/attention_k route selection and all production admission/denominator semantics
         are identical to single-operator suppression.
         """
-        selected_global_operator_ids = jnp.asarray(
-            selected_global_operator_ids, dtype=jnp.int32)
+        selected_global_operator_ids = _analysis_int32_array(
+            selected_global_operator_ids,
+            name="selected_global_operator_ids")
         if selected_global_operator_ids.ndim != 2:
             raise ValueError(
                 "group operator ids must have shape [B, M], got "
@@ -7125,9 +7388,11 @@ class DAWN_SRW_V4171(nn.Module):
             **production_kwargs):
         """Capture the selected route-native post-denominator contribution.
 
-        The returned ``operator_route_contributions`` are already multiplied
-        by the learned pool scale and are taken from the exact Q/K/V/RST
-        production site before attention head reshaping or residual addition.
+        The returned ``operator_route_contributions`` are defined by the exact
+        production route minus its same-denominator group-suppressed
+        counterfactual. They are float32, already multiplied by the learned
+        pool scale, and taken before attention head reshaping or residual
+        addition.
         """
         return self(
             input_ids,
@@ -7154,6 +7419,8 @@ class DAWN_SRW_V4171(nn.Module):
         ``source_contribution`` must come from
         :meth:`analysis_capture_operator_group_contribution` for the same
         layer, route, operator group, and benchmark-audited token position.
+        The first two terms use the exact production suppression
+        counterfactual, so an explicit zero source is suppression, not no-op.
         """
         return self(
             input_ids,

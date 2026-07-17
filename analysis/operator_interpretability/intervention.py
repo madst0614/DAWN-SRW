@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numbers
 from typing import Any, Mapping, Sequence
 
 import jax
@@ -21,6 +22,9 @@ def _runtime_kwargs(ctx: Any) -> dict[str, Any]:
     cfg = ctx.model_cfg
     temperature = float(cfg["soft_gate_temperature"])
     boundary = float(cfg["soft_gate_boundary_power"])
+    # QK/V/RST denominator powers are immutable constructor fields on the
+    # restored v417x model. The forward accepts only the legacy scalar and
+    # internally resolves each production pool from those constructor fields.
     return {
         "deterministic": True,
         "rngs": {"dropout": jax.random.PRNGKey(0)},
@@ -41,6 +45,39 @@ def _runtime_kwargs(ctx: Any) -> dict[str, Any]:
             float(cfg.get("execution_prune_eps", 0.0) or 0.0)),
         "compute_accuracy": False,
     }
+
+
+def validate_operator_interchange_request(
+        model_cfg: Mapping[str, Any], examples: Sequence[BenchmarkExample], *,
+        layer: int, route: str,
+        operator_ids: Sequence[int]) -> tuple[int, ...]:
+    """Host contract required before staging the production JAX hook."""
+    if not examples:
+        raise ValueError("interchange evaluation has no examples")
+    if route not in ROUTE_INDEX:
+        raise ValueError(f"unknown interchange route: {route}")
+    if not operator_ids:
+        raise ValueError("interchange operator family is empty")
+    shape = OperatorSpaceShape.from_model_cfg(model_cfg)
+    if (isinstance(layer, bool) or not isinstance(layer, numbers.Integral)
+            or not 0 <= int(layer) < shape.n_layers):
+        raise ValueError(f"interchange layer is out of range: {layer!r}")
+    normalized_operator_ids: list[int] = []
+    for value in operator_ids:
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise TypeError(
+                f"interchange operator id must be an integer: {value!r}")
+        operator_id = int(value)
+        if not 0 <= operator_id < shape.pool_size(route):
+            raise ValueError(
+                "interchange operator id is out of range for route "
+                f"{route}: {operator_id}")
+        normalized_operator_ids.append(operator_id)
+    if len(set(normalized_operator_ids)) != len(normalized_operator_ids):
+        raise ValueError("interchange operator family contains duplicate ids")
+    for example in examples:
+        example.validate()
+    return tuple(normalized_operator_ids)
 
 
 def _sequence_arrays(examples: Sequence[BenchmarkExample], *,
@@ -104,9 +141,13 @@ def _plain_score_executable(ctx: Any):
 
     @jax.jit
     def score(params, input_ids, labels):
+        # The v417x core applies its causal mask internally and currently does
+        # not consume attention_mask. Right-padding is excluded from scoring by
+        # labels=-100, so use the same all-ones placeholder as every analysis
+        # route instead of implying that token id 0 is model-level padding.
         result = ctx.model.apply(
             {"params": params}, input_ids, labels=labels,
-            attention_mask=(input_ids >= 0).astype(jnp.int32),
+            attention_mask=jnp.ones_like(input_ids),
             minimal_train=True, **kwargs)
         return _score_from_result(result)
 
@@ -236,6 +277,8 @@ def evaluate_circuit_necessity(
         *, shape: OperatorSpaceShape, pad_token_id: int) -> dict[str, Any]:
     """Suppress the complete circuit numerator while preserving full admission."""
     masks = circuit.dense_masks(shape)
+    if any(value.dtype != np.bool_ for value in masks.values()):
+        raise TypeError("circuit necessity masks must have bool dtype")
     complement = {key: ~value for key, value in masks.items()}
     # Invoke the dense masks directly; materializing millions of complement
     # OperatorSite objects would add no scientific information.
@@ -319,10 +362,9 @@ def evaluate_operator_interchange(
         ctx: Any, examples: Sequence[BenchmarkExample], *,
         layer: int, route: str, operator_ids: Sequence[int],
         pad_token_id: int) -> list[dict[str, Any]]:
-    if route not in ROUTE_INDEX:
-        raise ValueError(f"unknown interchange route: {route}")
-    if not operator_ids:
-        raise ValueError("interchange operator family is empty")
+    normalized_operator_ids = validate_operator_interchange_request(
+        ctx.model_cfg, examples, layer=layer, route=route,
+        operator_ids=operator_ids)
     multiple = max(1, int(ctx.mesh.shape["data"]))
     source_arrays = _prompt_arrays(
         examples, side="source", pad_token_id=pad_token_id,
@@ -331,9 +373,8 @@ def evaluate_operator_interchange(
         jnp.asarray(source_arrays[0]), NamedSharding(ctx.mesh, P("data", None)))
     source_positions = jax.device_put(
         jnp.asarray(source_arrays[1]), NamedSharding(ctx.mesh, P("data")))
-    width = len(operator_ids)
     selected = np.tile(
-        np.asarray(operator_ids, dtype=np.int32)[None, :],
+        np.asarray(normalized_operator_ids, dtype=np.int32)[None, :],
         (source_arrays[0].shape[0], 1))
     selected_ids = jax.device_put(
         jnp.asarray(selected), NamedSharding(ctx.mesh, P("data", None)))
@@ -353,6 +394,17 @@ def evaluate_operator_interchange(
 
     source_contribution = capture(
         ctx.params, source_ids, source_positions, selected_ids)
+    expected_source_shape = (
+        source_arrays[0].shape[0], int(ctx.model_cfg["d_model"]))
+    if source_contribution.shape != expected_source_shape:
+        raise RuntimeError(
+            "captured interchange contribution shape mismatch: "
+            f"expected={expected_source_shape} "
+            f"actual={source_contribution.shape}")
+    if source_contribution.dtype != jnp.float32:
+        raise RuntimeError(
+            "captured interchange contribution must be post-scale float32, "
+            f"got {source_contribution.dtype}")
 
     @jax.jit
     def patched_score(params, ids, labels, positions, selected_group, source):
@@ -406,7 +458,7 @@ def evaluate_operator_interchange(
             "causal_variable": example.causal_variable,
             "layer": int(layer),
             "route": route,
-            "operator_ids": [int(value) for value in operator_ids],
+            "operator_ids": list(normalized_operator_ids),
             "position_kind": example.metadata.get("position_kind"),
             "base_base_margin": float(base_base[index]),
             "base_source_margin": float(base_source[index]),

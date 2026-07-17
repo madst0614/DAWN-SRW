@@ -422,69 +422,57 @@ class OperatorInterpretabilityRunner:
     def _circuit_curve(
             self, benchmark_id: str, *, mode: str) -> dict[str, Any]:
         validation = self._known_correct(benchmark_id, "validation")
-        test = self._known_correct(benchmark_id, "test")
-        if min(len(validation), len(test)) < self.config.minimum_known_correct:
+        if len(validation) < self.config.minimum_known_correct:
             return {
-                "status": "insufficient_behavior",
+                "status": "insufficient_validation_behavior",
                 "validation_known_correct": len(validation),
-                "test_known_correct": len(test),
+                "test_evaluated": False,
             }
         validation_base, validation_corrupt = self._behavior_margins(
             benchmark_id, "validation", validation)
-        test_base, test_corrupt = self._behavior_margins(
-            benchmark_id, "test", test)
         if abs(float(validation_base.mean() - validation_corrupt.mean())) <= 1e-12:
-            return {"status": "undefined_validation_behavior_contrast"}
-        if abs(float(test_base.mean() - test_corrupt.mean())) <= 1e-12:
-            return {"status": "undefined_test_behavior_contrast"}
+            return {
+                "status": "undefined_validation_behavior_contrast",
+                "test_evaluated": False,
+            }
         circuits = self._circuits(benchmark_id)
         parity = all_ones_retention_parity(
             self.ctx, validation[:min(2, len(validation))],
             shape=self.shape,
             pad_token_id=int(self.tokenizer.pad_token_id), mode=mode)
 
-        def evaluate(examples, baseline, corrupted, *, seed_offset):
-            rows = []
-            for index, (fraction, circuit) in enumerate(circuits):
-                retained = evaluate_circuit_retention(
-                    self.ctx, examples, circuit, shape=self.shape, mode=mode,
-                    pad_token_id=int(self.tokenizer.pad_token_id))
-                rows.append({
-                    "fraction": fraction,
-                    "site_count": circuit.site_count,
-                    "circuit_hash": circuit.circuit_hash,
-                    "mean_margin": retained["mean_margin"],
-                    "accuracy": retained["accuracy"],
-                    "faithfulness": normalized_faithfulness(
-                        retained["mean_margin"], float(baseline.mean()),
-                        float(corrupted.mean())),
-                    "faithfulness_ci": bootstrap_faithfulness_ci(
-                        retained["margin"], baseline, corrupted,
-                        samples=self.config.bootstrap_samples,
-                        alpha=self.config.alpha,
-                        seed=self.config.seed + seed_offset + index),
-                })
-            return rows
+        def evaluate_one(examples, baseline, corrupted, *, fraction,
+                         circuit, seed):
+            retained = evaluate_circuit_retention(
+                self.ctx, examples, circuit, shape=self.shape, mode=mode,
+                pad_token_id=int(self.tokenizer.pad_token_id))
+            return {
+                "fraction": fraction,
+                "site_count": circuit.site_count,
+                "circuit_hash": circuit.circuit_hash,
+                "mean_margin": retained["mean_margin"],
+                "accuracy": retained["accuracy"],
+                "faithfulness": normalized_faithfulness(
+                    retained["mean_margin"], float(baseline.mean()),
+                    float(corrupted.mean())),
+                "faithfulness_ci": bootstrap_faithfulness_ci(
+                    retained["margin"], baseline, corrupted,
+                    samples=self.config.bootstrap_samples,
+                    alpha=self.config.alpha, seed=seed),
+            }
 
-        validation_rows = evaluate(
-            validation, validation_base, validation_corrupt,
-            seed_offset=2000)
+        validation_rows = [
+            evaluate_one(
+                validation, validation_base, validation_corrupt,
+                fraction=fraction, circuit=circuit,
+                seed=self.config.seed + 2000 + index)
+            for index, (fraction, circuit) in enumerate(circuits)
+        ]
         selection = select_on_validation(
             validation_rows,
             minimum_faithfulness=self.config.circuit_faithfulness_min)
-        # Test is evaluated only after the validation decision is frozen.
-        test_rows = evaluate(
-            test, test_base, test_corrupt, seed_offset=3000)
-        selected_test = next((
-            row for row in test_rows
-            if row["fraction"] == selection.get("selected_fraction")), None)
-        selected_circuit = next((
-            circuit for fraction, circuit in circuits
-            if fraction == selection.get("selected_fraction")), None)
-        return {
-            "status": (
-                "ready" if selection["status"] == "selected"
-                else selection["status"]),
+        result = {
+            "status": selection["status"],
             "mode": mode,
             "all_ones_parity": parity,
             "validation": {
@@ -497,20 +485,63 @@ class OperatorInterpretabilityRunner:
             "selection": selection,
             "test": {
                 "phase": "test",
+                "status": "not_evaluated_validation_rejected",
                 "selection_frozen_before_evaluation": True,
                 "test_used_for_selection": False,
+                "rows": [],
+            },
+            "selected_test_faithfulness": None,
+            "selected_test_faithfulness_ci": None,
+            "selected_circuit": None,
+        }
+        if selection["status"] != "selected":
+            return result
+
+        selected_circuit = next((
+            circuit for fraction, circuit in circuits
+            if fraction == selection.get("selected_fraction")), None)
+        if selected_circuit is None:
+            raise RuntimeError("validation selected an unknown circuit fraction")
+        result["selected_circuit"] = selected_circuit.to_dict()
+
+        # The test phase is unopened until the validation choice is frozen,
+        # and only that one frozen circuit is evaluated on test.
+        test = self._known_correct(benchmark_id, "test")
+        if len(test) < self.config.minimum_known_correct:
+            result["status"] = "insufficient_test_behavior"
+            result["test"].update({
+                "status": "insufficient_behavior",
+                "known_correct": len(test),
+            })
+            return result
+        test_base, test_corrupt = self._behavior_margins(
+            benchmark_id, "test", test)
+        if abs(float(test_base.mean() - test_corrupt.mean())) <= 1e-12:
+            result["status"] = "undefined_test_behavior_contrast"
+            result["test"]["status"] = "undefined_behavior_contrast"
+            return result
+        selected_test = evaluate_one(
+            test, test_base, test_corrupt,
+            fraction=float(selection["selected_fraction"]),
+            circuit=selected_circuit,
+            seed=self.config.seed + 3000)
+        result.update({
+            "status": "ready",
+            "test": {
+                "phase": "test",
+                "status": "ready",
+                "selection_frozen_before_evaluation": True,
+                "test_used_for_selection": False,
+                "evaluation_scope": "validation_selected_circuit_only",
                 "baseline_mean": float(test_base.mean()),
                 "corrupted_mean": float(test_corrupt.mean()),
-                "rows": test_rows,
-                "curve": faithfulness_curve(test_rows),
+                "rows": [selected_test],
             },
-            "selected_test_faithfulness": (
-                selected_test["faithfulness"] if selected_test else None),
-            "selected_test_faithfulness_ci": (
-                selected_test["faithfulness_ci"] if selected_test else None),
-            "selected_circuit": (
-                selected_circuit.to_dict() if selected_circuit else None),
-        }
+            "selected_test_faithfulness": selected_test["faithfulness"],
+            "selected_test_faithfulness_ci": selected_test[
+                "faithfulness_ci"],
+        })
+        return result
 
     def _run_sufficiency(self, mode: str) -> dict[str, Any]:
         output = {}
@@ -545,6 +576,8 @@ class OperatorInterpretabilityRunner:
             self, benchmark_id: str) -> OperatorCircuit | None:
         result = self.results["conditional_circuit_sufficiency"]["benchmarks"][
             benchmark_id]
+        if result.get("status") != "ready":
+            return None
         fraction = result.get("selection", {}).get("selected_fraction")
         if fraction is None:
             return None
@@ -556,6 +589,10 @@ class OperatorInterpretabilityRunner:
         output = {}
         for benchmark_id, sufficiency in self.results[
                 "conditional_circuit_sufficiency"]["benchmarks"].items():
+            if sufficiency.get("status") != "ready":
+                output[benchmark_id] = {
+                    "status": "conditional_sufficiency_not_ready"}
+                continue
             circuit = self._selected_conditional_circuit(benchmark_id)
             if circuit is None:
                 output[benchmark_id] = {
@@ -1093,6 +1130,19 @@ class OperatorInterpretabilityRunner:
     def _run_ravel_causal_mediation(self) -> dict[str, Any]:
         if "ravel" not in self.benchmark_ids:
             return {"status": "not_requested", "benchmark": "ravel"}
+        behavior = self.results["behavioral_eligibility"]["benchmarks"][
+            "ravel"]["phases"]
+        ineligible_phases = [
+            phase for phase in ("validation", "test")
+            if not behavior[phase].get(
+                "eligible_for_mechanistic_claims", False)
+        ]
+        if ineligible_phases:
+            return {
+                "status": "behavior_not_eligible",
+                "benchmark": "ravel",
+                "ineligible_phases": ineligible_phases,
+            }
         capture = self.results["operator_localization"]["benchmarks"].get(
             "ravel", {})
         if capture.get("status") != "ready":
@@ -1198,6 +1248,19 @@ class OperatorInterpretabilityRunner:
     def _run_multilayer_trajectory(self) -> dict[str, Any]:
         if "ravel" not in self.benchmark_ids:
             return {"status": "not_requested", "benchmark": "ravel"}
+        behavior = self.results["behavioral_eligibility"]["benchmarks"][
+            "ravel"]["phases"]["test"]
+        if not behavior.get("eligible_for_mechanistic_claims", False):
+            return {
+                "status": "behavior_not_eligible",
+                "benchmark": "ravel",
+                "known_correct_independent_unit_count": behavior.get(
+                    "known_correct_independent_unit_count", 0),
+            }
+        localization = self.results["operator_localization"]["benchmarks"].get(
+            "ravel", {})
+        if localization.get("status") != "ready":
+            return {"status": "localization_not_ready", "benchmark": "ravel"}
         examples = self._known_correct("ravel", "test")
         examples = self._independent_capture_examples("ravel", examples)
         if len(examples) < self.config.minimum_known_correct:

@@ -131,12 +131,19 @@ def tokenize_adapted_pair(
     source_ids = _encode(tokenizer, source_prompt)
     positive_ids = _encode(tokenizer, str(adapted["positive_answer"]))
     negative_ids = _encode(tokenizer, str(adapted["negative_answer"]))
+    missing_source_answers = [
+        name for name in (
+            "source_positive_answer", "source_negative_answer")
+        if name not in adapted or not str(adapted[name])
+    ]
+    if missing_source_answers:
+        raise ValueError(
+            f"{adapted['example_id']}: missing source answer fields: "
+            f"{','.join(missing_source_answers)}")
     source_positive_ids = _encode(
-        tokenizer, str(adapted.get(
-            "source_positive_answer", adapted["positive_answer"])))
+        tokenizer, str(adapted["source_positive_answer"]))
     source_negative_ids = _encode(
-        tokenizer, str(adapted.get(
-            "source_negative_answer", adapted["negative_answer"])))
+        tokenizer, str(adapted["source_negative_answer"]))
     if not all((positive_ids, negative_ids, source_positive_ids,
                 source_negative_ids)):
         raise ValueError(f"{adapted['example_id']}: answer tokenization is empty")

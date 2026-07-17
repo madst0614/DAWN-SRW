@@ -119,6 +119,21 @@ def validate_examples(examples: Sequence[BenchmarkExample]) -> None:
         raise ValueError(
             "benchmark build must physically separate discovery/validation/test; "
             f"empty={','.join(missing)}")
+    ravel_groups: dict[tuple[str, str], list[BenchmarkExample]] = {}
+    for example in examples:
+        if example.benchmark_id != "ravel":
+            continue
+        key = (example.phase, str(example.metadata["pair_group_id"]))
+        ravel_groups.setdefault(key, []).append(example)
+    for (phase, group_id), group in ravel_groups.items():
+        if (len(group) != 2
+                or {example.pair_type for example in group}
+                != {"cause", "isolation"}
+                or len({example.causal_variable for example in group}) != 1):
+            raise ValueError(
+                "RAVEL phase group must contain one cause and one isolation "
+                "row for one causal variable: "
+                f"phase={phase} group={group_id}")
 
 
 def examples_hash(examples: Iterable[BenchmarkExample]) -> str:

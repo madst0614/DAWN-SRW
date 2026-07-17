@@ -108,12 +108,22 @@ def parse_train_analysis_pool_items(
 
 def dependency_closure(items: Iterable[str]) -> list[str]:
     ordered: list[str] = []
+    visiting: list[str] = []
 
     def visit(item: str) -> None:
+        if item not in TRAIN_ANALYSIS_POOL_ITEMS:
+            raise ValueError(f"unknown train_analysis_pool item: {item}")
+        if item in visiting:
+            cycle = " -> ".join((*visiting, item))
+            raise ValueError(
+                f"train_analysis_pool dependency cycle: {cycle}")
+        if item in ordered:
+            return
+        visiting.append(item)
         for dependency in TRAIN_ANALYSIS_POOL_ITEMS[item]["requires"]:
             visit(dependency)
-        if item not in ordered:
-            ordered.append(item)
+        visiting.pop()
+        ordered.append(item)
 
     for item in items:
         visit(item)
