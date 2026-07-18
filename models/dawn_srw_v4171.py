@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import math
 import numbers
+import numpy as np
 from typing import Optional, Dict
 from functools import partial
 from jax.sharding import PartitionSpec as P
@@ -827,31 +828,49 @@ def _analysis_int32_array(value, *, name):
     return array.astype(jnp.int32)
 
 
+def _analysis_sorted_operator_membership(
+        global_operator_ids, sorted_selected_operator_ids):
+    """Match a pool chunk without materializing ``pool x selected``."""
+    def row_membership(row):
+        insertion = jnp.searchsorted(
+            row, global_operator_ids, side="left")
+        insertion = jnp.clip(insertion, 0, row.shape[0] - 1)
+        return row[insertion] == global_operator_ids
+
+    if sorted_selected_operator_ids.ndim == 1:
+        return (
+            global_operator_ids[None, None, :]
+            == sorted_selected_operator_ids[:, None, None])
+    if sorted_selected_operator_ids.ndim == 2:
+        return jax.vmap(row_membership)(
+            sorted_selected_operator_ids)[:, None, :]
+    if sorted_selected_operator_ids.ndim == 3:
+        return jax.vmap(jax.vmap(row_membership))(
+            sorted_selected_operator_ids)
+    raise ValueError(
+        "selected operator ids must have shape [B], [B, M], or "
+        "[B, route, M], got "
+        f"{sorted_selected_operator_ids.shape}")
+
+
 def analysis_operator_membership(global_operator_ids, selected_operator_ids):
-    """Build the analysis-only single/group suppression membership mask.
+    """Build a chunk-local analysis membership mask.
 
     The existing single-id shape is ``[B]``.  Group analysis uses one static,
-    ``-1`` padded ``[B, M]`` shape for every requested group size.  This helper
-    changes only which execution numerators are zeroed; admission and every
-    production denominator/statistic remain untouched.
+    ``-1`` padded ``[B, M]`` shape for every requested group size. Membership
+    uses sorted indexed lookup, not a dense ``B x pool x M`` one-hot tensor.
+    This changes only execution numerators; admission and every production
+    denominator/statistic remain untouched.
     """
     global_operator_ids = _analysis_int32_array(
         global_operator_ids, name="global_operator_ids")
     selected_operator_ids = _analysis_int32_array(
         selected_operator_ids, name="selected_operator_ids")
-    if selected_operator_ids.ndim == 1:
-        return (
-            global_operator_ids[None, None, :]
-            == selected_operator_ids[:, None, None])
-    if selected_operator_ids.ndim == 2:
-        return jnp.any(
-            global_operator_ids[None, None, :, None]
-            == selected_operator_ids[:, None, None, :],
-            axis=-1,
-        )
-    raise ValueError(
-        "selected operator ids must have shape [B] or [B, M], got "
-        f"{selected_operator_ids.shape}")
+    sorted_ids = (
+        jnp.sort(selected_operator_ids, axis=-1)
+        if selected_operator_ids.ndim == 2 else selected_operator_ids)
+    return _analysis_sorted_operator_membership(
+        global_operator_ids, sorted_ids)
 
 
 def _analysis_group_nonempty(selected_operator_ids):
@@ -909,6 +928,56 @@ def _validate_concrete_analysis_interchange(
         raise ValueError(
             "analysis operator group contains an invalid id for its route: "
             f"route={route} operator_ids={operator_ids}")
+
+
+def _validate_concrete_analysis_program(
+        *, program_mode, target_positions,
+        selected_ids_q, selected_ids_k, selected_ids_v, selected_ids_rst,
+        selected_valid_q, selected_valid_k, selected_valid_v,
+        selected_valid_rst, batch_size, sequence_length, n_layers,
+        n_qk, n_v, n_rst, enabled):
+    """Fail loudly on concrete dynamic-program values before compilation."""
+    values = (
+        program_mode, target_positions,
+        selected_ids_q, selected_ids_k, selected_ids_v, selected_ids_rst,
+        selected_valid_q, selected_valid_k, selected_valid_v,
+        selected_valid_rst,
+    )
+    if not enabled or any(isinstance(value, jax.core.Tracer) for value in values):
+        return
+    mode = int(jax.device_get(program_mode))
+    if not 0 <= mode <= 4:
+        raise ValueError(f"analysis program mode is out of range: {mode}")
+    positions = np.asarray(jax.device_get(target_positions), dtype=np.int64)
+    if positions.shape != (int(batch_size),):
+        raise ValueError("analysis program target-position batch mismatch")
+    if np.any(positions < 0) or np.any(positions >= int(sequence_length)):
+        raise ValueError("analysis program target position is out of range")
+    route_values = (
+        ("q", selected_ids_q, selected_valid_q, n_qk),
+        ("k", selected_ids_k, selected_valid_k, n_qk),
+        ("v", selected_ids_v, selected_valid_v, n_v),
+        ("rst", selected_ids_rst, selected_valid_rst, n_rst),
+    )
+    for route, ids_value, valid_value, pool_size in route_values:
+        ids = np.asarray(jax.device_get(ids_value))
+        valid = np.asarray(jax.device_get(valid_value))
+        if ids.shape[:2] != (int(n_layers), int(batch_size)):
+            raise ValueError(f"analysis program {route} shape mismatch")
+        if np.any(ids[~valid] != 0):
+            raise ValueError(
+                f"analysis program {route} invalid padding must use id 0")
+        selected = ids[valid]
+        if selected.size and (
+                int(selected.min()) < 0 or int(selected.max()) >= int(pool_size)):
+            raise ValueError(
+                f"analysis program {route} contains an out-of-range id")
+        for layer in range(ids.shape[0]):
+            for batch_index in range(ids.shape[1]):
+                row = ids[layer, batch_index, valid[layer, batch_index]]
+                if len(set(int(value) for value in row.tolist())) != row.size:
+                    raise ValueError(
+                        f"analysis program {route} contains duplicate ids")
 
 
 def _pool_params_with_operator_keys(pool_params, operator_key_mode=None):
@@ -3077,6 +3146,10 @@ def _make_sharded_srw_minimal_impl(
         if selected_global_operator_id.ndim == 0:
             selected_global_operator_id = jnp.broadcast_to(
                 selected_global_operator_id, (x.shape[0],))
+        selected_global_operator_id_sorted = (
+            jnp.sort(selected_global_operator_id, axis=-1)
+            if selected_global_operator_id.ndim == 2
+            else selected_global_operator_id)
         target_positions = jnp.asarray(target_positions, dtype=jnp.int32)
         if target_positions.ndim == 0:
             target_positions = jnp.broadcast_to(
@@ -3163,8 +3236,8 @@ def _make_sharded_srw_minimal_impl(
             token_match = (
                 jnp.arange(S, dtype=jnp.int32)[None, :, None]
                 == target_positions[:, None, None])
-            operator_match = analysis_operator_membership(
-                global_ids, selected_global_operator_id)
+            operator_match = _analysis_sorted_operator_membership(
+                global_ids, selected_global_operator_id_sorted)
             route_match = jnp.bool_(True)
             suppress_mask = (
                 jnp.asarray(apply_suppression, dtype=jnp.bool_)
@@ -3449,6 +3522,10 @@ def _make_sharded_srw_paired_minimal_impl(
         if selected_global_operator_id.ndim == 0:
             selected_global_operator_id = jnp.broadcast_to(
                 selected_global_operator_id, (x.shape[0],))
+        selected_global_operator_id_sorted = (
+            jnp.sort(selected_global_operator_id, axis=-1)
+            if selected_global_operator_id.ndim == 2
+            else selected_global_operator_id)
         target_positions = jnp.asarray(target_positions, dtype=jnp.int32)
         if target_positions.ndim == 0:
             target_positions = jnp.broadcast_to(
@@ -3539,11 +3616,24 @@ def _make_sharded_srw_paired_minimal_impl(
             token_match = (
                 jnp.arange(S, dtype=jnp.int32)[None, :, None, None]
                 == target_positions[:, None, None, None])
-            operator_match = analysis_operator_membership(
-                global_ids, selected_global_operator_id)[:, :, None, :]
-            route_match = (
-                jnp.arange(2, dtype=jnp.int32)[None, None, :, None]
-                == jnp.asarray(route_selector, dtype=jnp.int32))
+            if selected_global_operator_id_sorted.ndim == 3:
+                operator_match = jnp.stack((
+                    _analysis_sorted_operator_membership(
+                        global_ids,
+                        selected_global_operator_id_sorted[:, 0, :]),
+                    _analysis_sorted_operator_membership(
+                        global_ids,
+                        selected_global_operator_id_sorted[:, 1, :]),
+                ), axis=2)
+                route_match = jnp.ones(
+                    (1, 1, 2, 1), dtype=jnp.bool_)
+            else:
+                operator_match = _analysis_sorted_operator_membership(
+                    global_ids,
+                    selected_global_operator_id_sorted)[:, :, None, :]
+                route_match = (
+                    jnp.arange(2, dtype=jnp.int32)[None, None, :, None]
+                    == jnp.asarray(route_selector, dtype=jnp.int32))
             suppress_mask = (
                 jnp.asarray(apply_suppression, dtype=jnp.bool_)
                 & token_match & operator_match & route_match & valid_bsrn)
@@ -3984,6 +4074,15 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           analysis_retention_mode=0,
                           analysis_interchange_source=None,
                           analysis_interchange_enabled=False,
+                          analysis_program_enabled=False,
+                          analysis_program_ids_q=None,
+                          analysis_program_ids_k=None,
+                          analysis_program_ids_v=None,
+                          analysis_program_target_positions=None,
+                          analysis_program_mode=0,
+                          analysis_program_source_q=None,
+                          analysis_program_source_k=None,
+                          analysis_program_source_v=None,
                           parity_debug=False):
     """Canonical shared v417x minimal attention path."""
     del n_qk, n_v
@@ -4012,6 +4111,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     if analysis_interchange_source is None:
         analysis_interchange_source = jnp.zeros(
             (B, D), dtype=jnp.float32)
+    if analysis_program_enabled:
+        if any(value is None for value in (
+                analysis_program_ids_q, analysis_program_ids_k,
+                analysis_program_ids_v, analysis_program_target_positions,
+                analysis_program_source_q, analysis_program_source_k,
+                analysis_program_source_v)):
+            raise ValueError("attention program schedule is incomplete")
 
     rng, rng_drop = jax.random.split(rng)
     attn_operator_queries = (
@@ -4052,12 +4158,35 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
            == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
         & (jnp.asarray(analysis_target_route, dtype=jnp.int32) < 2))
+    qk_selected_ids = analysis_selected_operator_id
+    qk_selected_positions = analysis_target_positions
+    qk_apply_suppression = apply_qk
+    qk_selected_route = analysis_target_route
+    if analysis_program_enabled:
+        qk_program_width = max(
+            analysis_program_ids_q.shape[-1],
+            analysis_program_ids_k.shape[-1])
+        program_ids_q = jnp.pad(
+            analysis_program_ids_q,
+            ((0, 0), (0, qk_program_width
+                      - analysis_program_ids_q.shape[-1])),
+            constant_values=qk_operator_keys.shape[0])
+        program_ids_k = jnp.pad(
+            analysis_program_ids_k,
+            ((0, 0), (0, qk_program_width
+                      - analysis_program_ids_k.shape[-1])),
+            constant_values=qk_operator_keys.shape[0])
+        qk_selected_ids = jnp.stack(
+            (program_ids_q, program_ids_k), axis=1)
+        qk_selected_positions = analysis_program_target_positions
+        qk_apply_suppression = jnp.bool_(False)
+        qk_selected_route = jnp.int32(-1)
     qk_result = canonical_paired(
         x, qk_operator_queries, qk_operator_keys, raw_tau_QK, qk_read, qk_write,
         soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
-        analysis_selected_operator_id, analysis_target_positions,
-        apply_qk, analysis_target_route, analysis_keep_qk,
+        qk_selected_ids, qk_selected_positions,
+        qk_apply_suppression, qk_selected_route, analysis_keep_qk,
         analysis_position_mask, analysis_retention_mode)
     (qk_state_transitions,
      q_active_frac, k_active_frac,
@@ -4080,11 +4209,18 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
            == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
         & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 2))
+    v_selected_ids = analysis_selected_operator_id
+    v_selected_positions = analysis_target_positions
+    v_apply_suppression = apply_v
+    if analysis_program_enabled:
+        v_selected_ids = analysis_program_ids_v
+        v_selected_positions = analysis_program_target_positions
+        v_apply_suppression = jnp.bool_(False)
     v_result = canonical_single_v(
         x, v_operator_query, v_operator_keys, raw_tau_all[:, :, 2:3], v_read, v_write,
         soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
-        analysis_selected_operator_id, analysis_target_positions, apply_v,
+        v_selected_ids, v_selected_positions, v_apply_suppression,
         analysis_keep_v, analysis_position_mask, analysis_retention_mode)
     (attention_v, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
@@ -4092,6 +4228,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      v_admission_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm, v_selected_target) = v_result
+    program_selected_q = jnp.zeros((B, D), dtype=jnp.float32)
+    program_selected_k = jnp.zeros((B, D), dtype=jnp.float32)
+    program_selected_v = jnp.zeros((B, D), dtype=jnp.float32)
+    if analysis_program_enabled:
+        program_selected_q = qk_selected_target[:, 0, :] * qk_scale
+        program_selected_k = qk_selected_target[:, 1, :] * qk_scale
+        program_selected_v = v_selected_target * v_scale
 
     capture_at_layer = (
         jnp.asarray(analysis_layer_index, dtype=jnp.int32)
@@ -4214,6 +4357,54 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         attention_k, suppressed_k, k_selected_target, 1)
     attention_v = interchange_route(
         attention_v, suppressed_v, v_selected_target, 2)
+
+    if analysis_program_enabled:
+        program_mode = jnp.asarray(
+            analysis_program_mode, dtype=jnp.int32)
+        program_positions = jnp.asarray(
+            analysis_program_target_positions, dtype=jnp.int32)
+        program_position_mask = (
+            jnp.arange(S, dtype=jnp.int32)[None, :]
+            == program_positions[:, None])
+        program_batch = jnp.arange(B, dtype=jnp.int32)
+
+        def apply_program_route(
+                production_value, selected_value, source_value):
+            production_target = production_value[
+                program_batch, program_positions, :]
+            suppressed_target = (
+                production_target - selected_value.astype(jnp.float32))
+            source_value = jnp.asarray(source_value, dtype=jnp.float32)
+            replay_mode = (
+                (program_mode == jnp.int32(1))
+                | (program_mode == jnp.int32(3)))
+            patched_target = jnp.where(
+                replay_mode, selected_value, production_target)
+            patched_target = jnp.where(
+                program_mode == jnp.int32(2),
+                suppressed_target, patched_target)
+            transplanted_target = suppressed_target + source_value
+            source_matches_base = jnp.all(
+                source_value == selected_value, axis=-1)
+            transplanted_target = jnp.where(
+                source_matches_base[:, None],
+                production_target, transplanted_target)
+            patched_target = jnp.where(
+                program_mode == jnp.int32(4),
+                transplanted_target, patched_target)
+            return jnp.where(
+                program_position_mask[:, :, None],
+                patched_target[:, None, :], production_value)
+
+        attention_q = apply_program_route(
+            attention_q, program_selected_q,
+            analysis_program_source_q)
+        attention_k = apply_program_route(
+            attention_k, program_selected_k,
+            analysis_program_source_k)
+        attention_v = apply_program_route(
+            attention_v, program_selected_v,
+            analysis_program_source_v)
     q_debug = attention_q
     k_debug = attention_k
     v_debug = attention_v
@@ -4297,6 +4488,9 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         q_selected_target,
         k_selected_target,
         v_selected_target,
+        program_selected_q,
+        program_selected_k,
+        program_selected_v,
     )
     if parity_debug:
         return result + ((
@@ -4330,6 +4524,11 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          analysis_retention_mode=0,
                          analysis_interchange_source=None,
                          analysis_interchange_enabled=False,
+                         analysis_program_enabled=False,
+                         analysis_program_ids_rst=None,
+                         analysis_program_target_positions=None,
+                         analysis_program_mode=0,
+                         analysis_program_source_rst=None,
                          parity_debug=False):
     """Canonical shared v417x minimal RST path."""
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
@@ -4350,6 +4549,10 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     if analysis_interchange_source is None:
         analysis_interchange_source = jnp.zeros(
             (x.shape[0], x.shape[-1]), dtype=jnp.float32)
+    if analysis_program_enabled and any(value is None for value in (
+            analysis_program_ids_rst, analysis_program_target_positions,
+            analysis_program_source_rst)):
+        raise ValueError("RST program schedule is incomplete")
 
     rng, rng_drop = jax.random.split(rng)
     operator_query = (
@@ -4377,11 +4580,18 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
            == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
         & (jnp.asarray(analysis_target_route, dtype=jnp.int32) == 3))
+    rst_selected_ids = analysis_selected_operator_id
+    rst_selected_positions = analysis_target_positions
+    rst_apply_suppression = apply_rst
+    if analysis_program_enabled:
+        rst_selected_ids = analysis_program_ids_rst
+        rst_selected_positions = analysis_program_target_positions
+        rst_apply_suppression = jnp.bool_(False)
     rst_result = canonical_single(
         x, operator_query, rst_operator_keys, raw_tau, rst_read, rst_write,
         soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
         soft_gate_boundary_power_final, execution_prune_eps,
-        analysis_selected_operator_id, analysis_target_positions, apply_rst,
+        rst_selected_ids, rst_selected_positions, rst_apply_suppression,
         analysis_keep_rst, analysis_position_mask, analysis_retention_mode)
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
@@ -4389,6 +4599,10 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
      rst_admission_mass_max, rst_composition_den_min,
      rst_composition_den_max, rst_raw_srw_out_norm,
      rst_normalized_srw_out_norm, rst_selected_target) = rst_result
+    program_selected_rst = jnp.zeros(
+        (x.shape[0], x.shape[-1]), dtype=jnp.float32)
+    if analysis_program_enabled:
+        program_selected_rst = rst_selected_target * rst_scale
     capture_at_layer = (
         jnp.asarray(analysis_layer_index, dtype=jnp.int32)
         == jnp.asarray(analysis_target_layer, dtype=jnp.int32))
@@ -4451,6 +4665,39 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         suppressed_out.astype(jnp.float32)
         + source_value[:, None, :])
     out = jnp.where(apply_mask, patched_out, out)
+    if analysis_program_enabled:
+        program_mode = jnp.asarray(
+            analysis_program_mode, dtype=jnp.int32)
+        program_positions = jnp.asarray(
+            analysis_program_target_positions, dtype=jnp.int32)
+        program_batch = jnp.arange(x.shape[0], dtype=jnp.int32)
+        production_target = out[program_batch, program_positions, :]
+        suppressed_target = production_target - program_selected_rst
+        program_source = jnp.asarray(
+            analysis_program_source_rst, dtype=jnp.float32)
+        replay_mode = (
+            (program_mode == jnp.int32(1))
+            | (program_mode == jnp.int32(3)))
+        patched_target = jnp.where(
+            replay_mode, program_selected_rst, production_target)
+        patched_target = jnp.where(
+            program_mode == jnp.int32(2),
+            suppressed_target, patched_target)
+        transplanted_target = suppressed_target + program_source
+        source_matches_base = jnp.all(
+            program_source == program_selected_rst, axis=-1)
+        transplanted_target = jnp.where(
+            source_matches_base[:, None],
+            production_target, transplanted_target)
+        patched_target = jnp.where(
+            program_mode == jnp.int32(4),
+            transplanted_target, patched_target)
+        program_position_mask = (
+            jnp.arange(x.shape[1], dtype=jnp.int32)[None, :]
+            == program_positions[:, None])
+        out = jnp.where(
+            program_position_mask[:, :, None],
+            patched_target[:, None, :], out)
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     rst_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
@@ -4473,6 +4720,7 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_normalized_srw_out_norm,
         rst_normalized_srw_out_norm * rst_scale,
         rst_selected_target,
+        program_selected_rst,
     )
     if parity_debug:
         return result + ((out, x, operator_query, raw_tau),)
@@ -5211,7 +5459,22 @@ class DAWN_SRW_V4171(nn.Module):
                  analysis_retention_mode=0,
                  analysis_capture_contribution=False,
                  analysis_interchange_source=None,
-                 analysis_interchange_enabled=False):
+                 analysis_interchange_enabled=False,
+                 analysis_program_ids_q=None,
+                 analysis_program_ids_k=None,
+                 analysis_program_ids_v=None,
+                 analysis_program_ids_rst=None,
+                 analysis_program_valid_q=None,
+                 analysis_program_valid_k=None,
+                 analysis_program_valid_v=None,
+                 analysis_program_valid_rst=None,
+                 analysis_program_target_positions=None,
+                 analysis_program_mode=0,
+                 analysis_program_source_q=None,
+                 analysis_program_source_k=None,
+                 analysis_program_source_v=None,
+                 analysis_program_source_rst=None,
+                 analysis_program_capture_contribution=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -5287,7 +5550,124 @@ class DAWN_SRW_V4171(nn.Module):
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
 
+        analysis_program_values = (
+            analysis_program_ids_q, analysis_program_ids_k,
+            analysis_program_ids_v, analysis_program_ids_rst,
+            analysis_program_valid_q, analysis_program_valid_k,
+            analysis_program_valid_v, analysis_program_valid_rst,
+            analysis_program_target_positions,
+        )
+        analysis_program_enabled = any(
+            value is not None for value in analysis_program_values)
+        if analysis_program_enabled and not minimal_train:
+            raise ValueError(
+                "analysis operator programs require the canonical minimal scan")
+        if analysis_program_enabled and any(
+                value is None for value in analysis_program_values):
+            raise ValueError(
+                "analysis operator program requires ids, validity, and target "
+                "positions for q,k,v,rst")
+        if (analysis_program_capture_contribution
+                and not analysis_program_enabled):
+            raise ValueError(
+                "program contribution capture requires a program schedule")
+        if (not analysis_program_enabled
+                and isinstance(analysis_program_mode, numbers.Integral)
+                and not isinstance(analysis_program_mode, bool)
+                and int(analysis_program_mode) != 0):
+            raise ValueError("non-production program mode lacks a schedule")
+
         if minimal_train:
+            if analysis_program_enabled:
+                def normalize_program_route(ids, valid, route):
+                    ids = _analysis_int32_array(
+                        ids, name=f"analysis_program_ids_{route}")
+                    valid = jnp.asarray(valid)
+                    if valid.dtype != jnp.bool_:
+                        raise TypeError(
+                            f"analysis_program_valid_{route} must have bool "
+                            f"dtype, got {valid.dtype}")
+                    if (ids.ndim != 3 or ids.shape[:2] != (
+                            self.n_layers, B) or ids.shape[2] <= 0):
+                        raise ValueError(
+                            f"analysis_program_ids_{route} must have shape "
+                            "[layers,batch,positive_width], got "
+                            f"{ids.shape}")
+                    if valid.shape != ids.shape:
+                        raise ValueError(
+                            f"analysis_program_valid_{route} shape mismatch")
+                    return ids, valid
+
+                (analysis_program_ids_q,
+                 analysis_program_valid_q) = normalize_program_route(
+                     analysis_program_ids_q, analysis_program_valid_q, "q")
+                (analysis_program_ids_k,
+                 analysis_program_valid_k) = normalize_program_route(
+                     analysis_program_ids_k, analysis_program_valid_k, "k")
+                (analysis_program_ids_v,
+                 analysis_program_valid_v) = normalize_program_route(
+                     analysis_program_ids_v, analysis_program_valid_v, "v")
+                (analysis_program_ids_rst,
+                 analysis_program_valid_rst) = normalize_program_route(
+                     analysis_program_ids_rst, analysis_program_valid_rst,
+                     "rst")
+                analysis_program_target_positions = _analysis_int32_array(
+                    analysis_program_target_positions,
+                    name="analysis_program_target_positions")
+                if analysis_program_target_positions.shape != (B,):
+                    raise ValueError(
+                        "analysis_program_target_positions shape mismatch: "
+                        f"expected={(B,)} actual="
+                        f"{analysis_program_target_positions.shape}")
+                analysis_program_mode = _analysis_int32_array(
+                    analysis_program_mode, name="analysis_program_mode")
+                if analysis_program_mode.shape != ():
+                    raise ValueError("analysis_program_mode must be a scalar")
+
+                def normalize_program_source(value, route):
+                    if value is None:
+                        return jnp.zeros(
+                            (self.n_layers, B, self.d_model),
+                            dtype=jnp.float32)
+                    source_dtype = getattr(value, "dtype", None)
+                    if source_dtype is None or source_dtype != jnp.float32:
+                        raise TypeError(
+                            f"analysis_program_source_{route} must be an "
+                            f"explicit float32 array, got {source_dtype}")
+                    source = jnp.asarray(value)
+                    expected = (self.n_layers, B, self.d_model)
+                    if source.shape != expected:
+                        raise ValueError(
+                            f"analysis_program_source_{route} shape mismatch: "
+                            f"expected={expected} actual={source.shape}")
+                    return source
+
+                analysis_program_source_q = normalize_program_source(
+                    analysis_program_source_q, "q")
+                analysis_program_source_k = normalize_program_source(
+                    analysis_program_source_k, "k")
+                analysis_program_source_v = normalize_program_source(
+                    analysis_program_source_v, "v")
+                analysis_program_source_rst = normalize_program_source(
+                    analysis_program_source_rst, "rst")
+                _validate_concrete_analysis_program(
+                    program_mode=analysis_program_mode,
+                    target_positions=analysis_program_target_positions,
+                    selected_ids_q=analysis_program_ids_q,
+                    selected_ids_k=analysis_program_ids_k,
+                    selected_ids_v=analysis_program_ids_v,
+                    selected_ids_rst=analysis_program_ids_rst,
+                    selected_valid_q=analysis_program_valid_q,
+                    selected_valid_k=analysis_program_valid_k,
+                    selected_valid_v=analysis_program_valid_v,
+                    selected_valid_rst=analysis_program_valid_rst,
+                    batch_size=B,
+                    sequence_length=S,
+                    n_layers=self.n_layers,
+                    n_qk=self.n_qk,
+                    n_v=self.n_v,
+                    n_rst=n_rst_eff,
+                    enabled=True)
             if analysis_contribution is None:
                 analysis_contribution = jnp.full(
                     (B,), -1, dtype=jnp.int32)
@@ -5721,6 +6101,35 @@ class DAWN_SRW_V4171(nn.Module):
                     bp = xs['params']
                     rng = xs['rng']
                     layer_index = xs['layer_index']
+                    if analysis_program_enabled:
+                        # The public schedule uses logical id 0 plus a false
+                        # validity bit. Indexed membership receives a sorted
+                        # out-of-pool sentinel so padding cannot match id 0.
+                        program_ids_q = jnp.where(
+                            xs['program_valid_q'], xs['program_ids_q'],
+                            jnp.int32(self.n_qk))
+                        program_ids_k = jnp.where(
+                            xs['program_valid_k'], xs['program_ids_k'],
+                            jnp.int32(self.n_qk))
+                        program_ids_v = jnp.where(
+                            xs['program_valid_v'], xs['program_ids_v'],
+                            jnp.int32(self.n_v))
+                        program_ids_rst = jnp.where(
+                            xs['program_valid_rst'], xs['program_ids_rst'],
+                            jnp.int32(n_rst_eff))
+                        program_source_q = xs['program_source_q']
+                        program_source_k = xs['program_source_k']
+                        program_source_v = xs['program_source_v']
+                        program_source_rst = xs['program_source_rst']
+                    else:
+                        program_ids_q = None
+                        program_ids_k = None
+                        program_ids_v = None
+                        program_ids_rst = None
+                        program_source_q = None
+                        program_source_k = None
+                        program_source_v = None
+                        program_source_rst = None
                     rng, rng_attn, rng_rst = jax.random.split(rng, 3)
 
                     normed = _layer_norm(
@@ -5756,6 +6165,16 @@ class DAWN_SRW_V4171(nn.Module):
                             analysis_interchange_source),
                         analysis_interchange_enabled=(
                             analysis_interchange_enabled),
+                        analysis_program_enabled=analysis_program_enabled,
+                        analysis_program_ids_q=program_ids_q,
+                        analysis_program_ids_k=program_ids_k,
+                        analysis_program_ids_v=program_ids_v,
+                        analysis_program_target_positions=(
+                            analysis_program_target_positions),
+                        analysis_program_mode=analysis_program_mode,
+                        analysis_program_source_q=program_source_q,
+                        analysis_program_source_k=program_source_k,
+                        analysis_program_source_v=program_source_v,
                         parity_debug=trace_minimal_layers)
                     if trace_minimal_layers:
                         attn_values = attn_result[:-1]
@@ -5785,7 +6204,10 @@ class DAWN_SRW_V4171(nn.Module):
                      v_pool_scaled_srw_out_norm,
                      selected_q_contribution,
                      selected_k_contribution,
-                     selected_v_contribution) = attn_values
+                     selected_v_contribution,
+                     program_selected_q_contribution,
+                     program_selected_k_contribution,
+                     program_selected_v_contribution) = attn_values
                     x = x + attn_out
                     post_attention_residual = x
 
@@ -5819,6 +6241,12 @@ class DAWN_SRW_V4171(nn.Module):
                             analysis_interchange_source),
                         analysis_interchange_enabled=(
                             analysis_interchange_enabled),
+                        analysis_program_enabled=analysis_program_enabled,
+                        analysis_program_ids_rst=program_ids_rst,
+                        analysis_program_target_positions=(
+                            analysis_program_target_positions),
+                        analysis_program_mode=analysis_program_mode,
+                        analysis_program_source_rst=program_source_rst,
                         parity_debug=trace_minimal_layers)
                     if trace_minimal_layers:
                         rst_values = rst_result[:-1]
@@ -5834,7 +6262,8 @@ class DAWN_SRW_V4171(nn.Module):
                      rst_composition_den_max, rst_raw_srw_out_norm,
                      rst_normalized_srw_out_norm,
                      rst_pool_scaled_srw_out_norm,
-                     selected_rst_contribution) = rst_values
+                     selected_rst_contribution,
+                     program_selected_rst_contribution) = rst_values
                     x_next = x + rst_out
                     residual_norm = jnp.linalg.norm(
                         x_next.astype(jnp.float32), axis=-1).mean()
@@ -5905,6 +6334,13 @@ class DAWN_SRW_V4171(nn.Module):
                             selected_v_contribution,
                             selected_rst_contribution,
                         )
+                    if analysis_program_capture_contribution:
+                        layer_stats += (
+                            program_selected_q_contribution,
+                            program_selected_k_contribution,
+                            program_selected_v_contribution,
+                            program_selected_rst_contribution,
+                        )
                     if trace_minimal_layers:
                         trace_values = (
                             pre_layer_residual,
@@ -5951,6 +6387,21 @@ class DAWN_SRW_V4171(nn.Module):
                     'rng': layer_rngs,
                     'layer_index': jnp.arange(self.n_layers, dtype=jnp.int32),
                 }
+                if analysis_program_enabled:
+                    xs_minimal.update({
+                        'program_ids_q': analysis_program_ids_q,
+                        'program_ids_k': analysis_program_ids_k,
+                        'program_ids_v': analysis_program_ids_v,
+                        'program_ids_rst': analysis_program_ids_rst,
+                        'program_valid_q': analysis_program_valid_q,
+                        'program_valid_k': analysis_program_valid_k,
+                        'program_valid_v': analysis_program_valid_v,
+                        'program_valid_rst': analysis_program_valid_rst,
+                        'program_source_q': analysis_program_source_q,
+                        'program_source_k': analysis_program_source_k,
+                        'program_source_v': analysis_program_source_v,
+                        'program_source_rst': analysis_program_source_rst,
+                    })
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
                 if trace_minimal_layers:
@@ -5969,6 +6420,15 @@ class DAWN_SRW_V4171(nn.Module):
                      parity_post_layer_residual_all) = minimal_stats[-18:]
                 else:
                     minimal_values = minimal_stats
+                program_route_contributions = None
+                if analysis_program_capture_contribution:
+                    program_route_contributions = {
+                        'q': minimal_values[-4],
+                        'k': minimal_values[-3],
+                        'v': minimal_values[-2],
+                        'rst': minimal_values[-1],
+                    }
+                    minimal_values = minimal_values[:-4]
                 route_contributions = None
                 if analysis_capture_contribution:
                     route_contributions = {
@@ -6093,6 +6553,9 @@ class DAWN_SRW_V4171(nn.Module):
                         if analysis_capture_contribution:
                             output['operator_route_contributions'] = (
                                 route_contributions)
+                        if analysis_program_capture_contribution:
+                            output['operator_program_contributions'] = (
+                                program_route_contributions)
                         return output
                     if vp_embed is not None:
                         raise NotImplementedError(
@@ -6122,6 +6585,9 @@ class DAWN_SRW_V4171(nn.Module):
                     if analysis_capture_contribution:
                         output['operator_route_contributions'] = (
                             route_contributions)
+                    if analysis_program_capture_contribution:
+                        output['operator_program_contributions'] = (
+                            program_route_contributions)
                     return output
 
                 (loss, per_token_ce, correct, valid_count,
@@ -6307,6 +6773,9 @@ class DAWN_SRW_V4171(nn.Module):
                 if analysis_capture_contribution:
                     output['operator_route_contributions'] = (
                         route_contributions)
+                if analysis_program_capture_contribution:
+                    output['operator_program_contributions'] = (
+                        program_route_contributions)
                 return output
 
             def scan_body(carry, xs):
@@ -7449,6 +7918,76 @@ class DAWN_SRW_V4171(nn.Module):
             analysis_intervention_enabled=False,
             analysis_interchange_source=source_contribution,
             analysis_interchange_enabled=True,
+            analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
+
+    def analysis_capture_operator_program_contributions(
+            self, input_ids, *, selected_ids_q, selected_ids_k,
+            selected_ids_v, selected_ids_rst, selected_valid_q,
+            selected_valid_k, selected_valid_v, selected_valid_rst,
+            target_positions, labels=None, attention_mask=None,
+            **production_kwargs):
+        """Capture every layer/route selected contribution in one scan.
+
+        IDs are evaluated against each layer's current unpatched production
+        state. Invalid padding is represented by id 0 plus a false validity
+        bit and therefore contributes exactly zero.
+        """
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_program_ids_q=selected_ids_q,
+            analysis_program_ids_k=selected_ids_k,
+            analysis_program_ids_v=selected_ids_v,
+            analysis_program_ids_rst=selected_ids_rst,
+            analysis_program_valid_q=selected_valid_q,
+            analysis_program_valid_k=selected_valid_k,
+            analysis_program_valid_v=selected_valid_v,
+            analysis_program_valid_rst=selected_valid_rst,
+            analysis_program_target_positions=target_positions,
+            analysis_program_mode=jnp.int32(0),
+            analysis_program_capture_contribution=True,
+            **production_kwargs,
+        )
+
+    def analysis_forward_with_operator_program(
+            self, input_ids, *, selected_ids_q, selected_ids_k,
+            selected_ids_v, selected_ids_rst, selected_valid_q,
+            selected_valid_k, selected_valid_v, selected_valid_rst,
+            target_positions, program_mode,
+            source_contribution_q=None, source_contribution_k=None,
+            source_contribution_v=None, source_contribution_rst=None,
+            labels=None, attention_mask=None, return_residual=False,
+            **production_kwargs):
+        """Execute dynamic replay, ablation, or transplant in production.
+
+        ``program_mode`` is a dynamic scalar shared by one compiled forward:
+        0 production, 1 own-ID replay, 2 own-ID ablation, 3 source-ID replay,
+        and 4 source-contribution transplant. Only each example's target
+        answer position is patched; all other positions remain production.
+        """
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_program_ids_q=selected_ids_q,
+            analysis_program_ids_k=selected_ids_k,
+            analysis_program_ids_v=selected_ids_v,
+            analysis_program_ids_rst=selected_ids_rst,
+            analysis_program_valid_q=selected_valid_q,
+            analysis_program_valid_k=selected_valid_k,
+            analysis_program_valid_v=selected_valid_v,
+            analysis_program_valid_rst=selected_valid_rst,
+            analysis_program_target_positions=target_positions,
+            analysis_program_mode=program_mode,
+            analysis_program_source_q=source_contribution_q,
+            analysis_program_source_k=source_contribution_k,
+            analysis_program_source_v=source_contribution_v,
+            analysis_program_source_rst=source_contribution_rst,
             analysis_return_residual=return_residual,
             **production_kwargs,
         )

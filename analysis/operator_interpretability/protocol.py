@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 PROTOCOL_ID = "dawn_operator_interpretability"
-PROTOCOL_SCHEMA_VERSION = 5
+PROTOCOL_SCHEMA_VERSION = 6
 ANALYSIS_ENGINE = "train_analysis_pool"
 SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
@@ -33,6 +33,12 @@ CLAIM_LADDER = (
     "non_target_isolation",
     "held_out_generalization",
     "spatial_trajectory_confirmation",
+)
+NATIVE_PROGRAM_CLAIM_LADDER = (
+    "descriptive_program",
+    "compact_dynamic_sufficiency",
+    "causal_dynamic_program",
+    "counterfactual_program_transplant",
 )
 
 # MIB circuit-track fractions, including the mandatory full-model endpoint.
@@ -68,6 +74,19 @@ class ProtocolConfig:
     circuit_faithfulness_min: float = 0.80
     interchange_success_min: float = 0.60
     isolation_max_absolute_effect: float = 0.10
+    program_mass_candidates: tuple[float, ...] = (
+        0.50, 0.70, 0.80, 0.90, 0.95)
+    program_replay_faithfulness_min: float = 0.80
+    program_replay_agreement_min: float = 0.90
+    program_compact_fraction_max: float = 0.20
+    program_transplant_flip_min: float = 0.50
+    program_position_scope: str = "answer_position_only"
+    program_routes: tuple[str, ...] = ("q", "k", "v", "rst")
+    program_denominator_policy: str = "full_production_denominator"
+    program_mismatch_matching: str = (
+        "same_template_nearest_site_count_seeded")
+    program_faithfulness_endpoint: str = (
+        "paired_counterfactual_source_prompt_base_answer_margin")
 
     def validate(self) -> "ProtocolConfig":
         if self.max_examples_per_phase <= 0:
@@ -105,11 +124,47 @@ class ProtocolConfig:
             raise ValueError("family_neighbor_k must be positive")
         if not 0.0 < self.family_similarity_quantile < 1.0:
             raise ValueError("family_similarity_quantile must be in (0, 1)")
+        masses = tuple(float(value) for value in self.program_mass_candidates)
+        if (not masses or tuple(sorted(set(masses))) != masses
+                or any(not 0.0 < value <= 1.0 for value in masses)):
+            raise ValueError(
+                "program_mass_candidates must be unique, increasing values "
+                "in (0, 1]")
+        for name, value in (
+                ("program_replay_faithfulness_min",
+                 self.program_replay_faithfulness_min),
+                ("program_replay_agreement_min",
+                 self.program_replay_agreement_min),
+                ("program_compact_fraction_max",
+                 self.program_compact_fraction_max),
+                ("program_transplant_flip_min",
+                 self.program_transplant_flip_min)):
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.program_position_scope != "answer_position_only":
+            raise ValueError(
+                "program_position_scope must be 'answer_position_only'")
+        if tuple(self.program_routes) != ("q", "k", "v", "rst"):
+            raise ValueError("program_routes must be exactly q,k,v,rst")
+        if self.program_denominator_policy != "full_production_denominator":
+            raise ValueError(
+                "program_denominator_policy must preserve the full "
+                "production denominator")
+        if self.program_mismatch_matching != (
+                "same_template_nearest_site_count_seeded"):
+            raise ValueError("unsupported program_mismatch_matching")
+        if self.program_faithfulness_endpoint != (
+                "paired_counterfactual_source_prompt_base_answer_margin"):
+            raise ValueError("unsupported program_faithfulness_endpoint")
         return self
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
-        return asdict(self)
+        value = asdict(self)
+        value["program_mass_candidates"] = list(
+            self.program_mass_candidates)
+        value["program_routes"] = list(self.program_routes)
+        return value
 
     def max_examples_for(self, benchmark_id: str) -> int:
         self.validate()
@@ -145,6 +200,7 @@ def protocol_record(config: ProtocolConfig, *, model_version: str,
         "unit_levels": list(UNIT_LEVELS),
         "retention_modes": list(RETENTION_MODES),
         "claim_ladder": list(CLAIM_LADDER),
+        "native_program_claim_ladder": list(NATIVE_PROGRAM_CLAIM_LADDER),
         "circuit_fractions": list(CIRCUIT_FRACTIONS),
         "config": config.to_dict(),
         "test_selection_forbidden": True,

@@ -33,17 +33,27 @@ def _digest_block(digest: Any, payload: bytes) -> None:
 
 
 def _pad_examples(examples: Sequence[BenchmarkExample], *, pad_token_id: int,
-                  multiple: int) -> tuple[np.ndarray, np.ndarray, int]:
+                  multiple: int, prompt_side: str = "base") -> tuple[
+                      np.ndarray, np.ndarray, int]:
     if not examples:
         raise ValueError("capture batch is empty")
-    length = max(len(example.input_ids_base) for example in examples)
+    if prompt_side not in {"base", "source"}:
+        raise ValueError("capture prompt_side must be base or source")
+    prompts = [
+        example.input_ids_base if prompt_side == "base"
+        else example.input_ids_source
+        for example in examples
+    ]
+    length = max(len(prompt) for prompt in prompts)
     batch_size = ((len(examples) + multiple - 1) // multiple) * multiple
     input_ids = np.full((batch_size, length), int(pad_token_id), dtype=np.int32)
     positions = np.zeros((batch_size,), dtype=np.int32)
-    for index, example in enumerate(examples):
-        ids = np.asarray(example.input_ids_base, dtype=np.int32)
+    for index, (example, prompt) in enumerate(zip(examples, prompts)):
+        ids = np.asarray(prompt, dtype=np.int32)
         input_ids[index, :len(ids)] = ids
-        positions[index] = int(example.trace_position_base)
+        positions[index] = int(
+            example.trace_position_base if prompt_side == "base"
+            else example.trace_position_source)
     for index in range(len(examples), batch_size):
         input_ids[index] = input_ids[0]
         positions[index] = positions[0]
@@ -190,7 +200,10 @@ def _capture_operator_paths(
         capture_threshold: float, seed: int,
         required_phase: str, rank_candidates: bool,
         retain_rows: bool,
-        max_examples: int | None = None) -> dict[str, Any]:
+        max_examples: int | None = None,
+        prompt_side: str = "base",
+        require_all_qualified: bool = False,
+        bind_prompt_side_in_digest: bool = False) -> dict[str, Any]:
     selected = list(examples[:max_examples] if max_examples else examples)
     if not selected or any(
             example.phase != required_phase for example in selected):
@@ -200,7 +213,8 @@ def _capture_operator_paths(
         raise ValueError("operator candidates may only be ranked on discovery")
     data_replicas = max(1, int(ctx.mesh.shape["data"]))
     input_np, position_np, real_count = _pad_examples(
-        selected, pad_token_id=pad_token_id, multiple=data_replicas)
+        selected, pad_token_id=pad_token_id, multiple=data_replicas,
+        prompt_side=prompt_side)
     input_ids = jax.device_put(
         jnp.asarray(input_np), NamedSharding(ctx.mesh, P("data", None)))
     positions = jax.device_put(
@@ -238,6 +252,7 @@ def _capture_operator_paths(
     final_widths = initial
     retries = 0
     capture_history: list[dict[str, Any]] = []
+    final_qualified = {route: False for route in ROUTES}
     for widths in _capture_tiers(initial, maxima):
         candidate = materialize_global_tree(executable(widths)(
             ctx.params, input_ids, positions))
@@ -256,11 +271,20 @@ def _capture_operator_paths(
         capture_history.append(capture_row)
         trace = candidate
         final_widths = widths
+        final_qualified = qualified
         if all(qualified.values()):
             break
         retries += 1
     if trace is None:
         raise RuntimeError("capture produced no trace")
+    if require_all_qualified and not all(final_qualified.values()):
+        failed = ",".join(
+            route for route in ROUTES if not final_qualified[route])
+        raise RuntimeError(
+            "native operator program capture failed closed at maximum width: "
+            f"phase={required_phase} prompt_side={prompt_side} "
+            f"capture_threshold={capture_threshold} failed_routes={failed} "
+            f"final_widths={final_widths}")
 
     aggregate: dict[OperatorSite, list[float]] = defaultdict(list)
     split_aggregate = (defaultdict(list), defaultdict(list))
@@ -319,6 +343,8 @@ def _capture_operator_paths(
                     "route": route,
                     "captured_mass": mass,
                     "qualified": is_qualified,
+                    **({"prompt_side": prompt_side}
+                       if bind_prompt_side_in_digest else {}),
                 }, sort_keys=True, separators=(",", ":"),
                     ensure_ascii=False).encode("utf-8")
                 _digest_block(raw_capture_digest, header)
@@ -342,6 +368,8 @@ def _capture_operator_paths(
                         "route": route,
                         "captured_mass": mass,
                         "qualified": is_qualified,
+                        **({"prompt_side": prompt_side}
+                           if bind_prompt_side_in_digest else {}),
                         "operator_ids": operator_ids.tolist(),
                         "weights": weights.tolist(),
                     })
@@ -476,6 +504,8 @@ def _capture_operator_paths(
         "raw_rows_materialized_for_runtime": bool(retain_rows),
         "phase": required_phase,
         "ranking_eligible": bool(rank_candidates),
+        **({"prompt_side": prompt_side}
+           if bind_prompt_side_in_digest else {}),
     }
     if is_ravel:
         result.update({
@@ -550,6 +580,37 @@ def capture_held_out_paths(
                 or key.startswith("pooled_rank_stability")):
             result.pop(key, None)
     return result
+
+
+def capture_program_paths(
+        ctx: Any, examples: Sequence[BenchmarkExample], *, phase: str,
+        prompt_side: str, pad_token_id: int,
+        topk_qk: int, topk_v: int, topk_rst: int,
+        max_topk_qk: int, max_topk_v: int, max_topk_rst: int,
+        capture_threshold: float, seed: int,
+        max_examples: int | None = None) -> dict[str, Any]:
+    """Capture one native program side with fail-closed adaptive coverage."""
+    if phase not in {"discovery", "validation", "test"}:
+        raise ValueError("operator program capture has an invalid phase")
+    return _capture_operator_paths(
+        ctx, examples,
+        pad_token_id=pad_token_id,
+        topk_qk=topk_qk,
+        topk_v=topk_v,
+        topk_rst=topk_rst,
+        max_topk_qk=max_topk_qk,
+        max_topk_v=max_topk_v,
+        max_topk_rst=max_topk_rst,
+        capture_threshold=capture_threshold,
+        seed=seed,
+        required_phase=phase,
+        rank_candidates=False,
+        retain_rows=True,
+        max_examples=max_examples,
+        prompt_side=prompt_side,
+        require_all_qualified=True,
+        bind_prompt_side_in_digest=True,
+    )
 
 
 def ranked_site_objects(result: Mapping[str, Any]) -> list[RankedSite]:

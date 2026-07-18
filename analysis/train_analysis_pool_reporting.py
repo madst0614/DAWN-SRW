@@ -175,6 +175,13 @@ def format_item_text(payload: Mapping[str, Any], *, artifact_path: str,
         lines.append(f"  benchmark: {payload.get('benchmark_id')}")
     if payload.get("task_id") is not None:
         lines.append(f"  task: {payload.get('task_id')}")
+    if payload.get("analysis_kind") == "native_operator_program":
+        human_summary = result.get("human_summary")
+        if isinstance(human_summary, Mapping):
+            lines.extend([
+                "Native operator program decision:",
+                *_result_lines(human_summary),
+            ])
     lines.extend([
         f"  artifact: {artifact_path}",
         "Result:",

@@ -10,8 +10,29 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from analysis.dawn_analysis_common import materialize_global_array
+from analysis.dawn_analysis_common import (
+    materialize_global_array,
+    materialize_global_tree,
+)
 from analysis.operator_interpretability.benchmark_schema import BenchmarkExample
+from analysis.operator_interpretability.circuit import (
+    bootstrap_faithfulness_ci,
+    normalized_faithfulness,
+)
+from analysis.operator_interpretability.program import (
+    PROGRAM_MODES,
+    PROGRAM_ROUTES,
+    OperatorProgramSchedule,
+    compactness_metrics,
+    deterministic_mismatch_mapping,
+    random_program_schedule,
+    reindex_program_schedule,
+)
+from analysis.operator_interpretability.protocol import ProtocolConfig
+from analysis.operator_interpretability.statistics import (
+    bootstrap_mean_ci,
+    paired_permutation_test,
+)
 from analysis.operator_interpretability.units import (
     OperatorCircuit,
     OperatorSpaceShape,
@@ -581,3 +602,594 @@ def evaluate_operator_interchange(
         }
         for index, example in enumerate(examples)
     ]
+
+
+def _pad_program_schedule(
+        schedule: OperatorProgramSchedule, batch_size: int) -> tuple[
+            dict[str, np.ndarray], dict[str, np.ndarray]]:
+    if batch_size < schedule.batch_size:
+        raise ValueError("program batch is smaller than its real examples")
+    ids = {}
+    valid = {}
+    for route in PROGRAM_ROUTES:
+        source_ids = np.asarray(schedule.ids[route], dtype=np.int32)
+        source_valid = np.asarray(schedule.valid[route], dtype=np.bool_)
+        ids[route] = np.zeros(
+            (source_ids.shape[0], batch_size, source_ids.shape[2]),
+            dtype=np.int32)
+        valid[route] = np.zeros_like(ids[route], dtype=np.bool_)
+        ids[route][:, :schedule.batch_size] = source_ids
+        valid[route][:, :schedule.batch_size] = source_valid
+        if batch_size > schedule.batch_size:
+            ids[route][:, schedule.batch_size:] = source_ids[:, :1]
+            valid[route][:, schedule.batch_size:] = source_valid[:, :1]
+    return ids, valid
+
+
+def _pad_program_source(
+        source: Mapping[str, np.ndarray] | None, *, n_layers: int,
+        real_count: int, batch_size: int, d_model: int) -> dict[str, np.ndarray]:
+    output = {}
+    for route in PROGRAM_ROUTES:
+        if source is None:
+            values = np.zeros(
+                (n_layers, real_count, d_model), dtype=np.float32)
+        else:
+            values = np.asarray(source[route])
+            expected = (n_layers, real_count, d_model)
+            if values.dtype != np.float32 or values.shape != expected:
+                raise ValueError(
+                    f"program source contribution {route} must be float32 "
+                    f"with shape {expected}, got {values.dtype}/{values.shape}")
+        padded = np.zeros((n_layers, batch_size, d_model), dtype=np.float32)
+        padded[:, :real_count] = values
+        if batch_size > real_count:
+            padded[:, real_count:] = values[:, :1]
+        output[route] = padded
+    return output
+
+
+def _program_device_arrays(
+        ctx: Any, schedule: OperatorProgramSchedule, *, batch_size: int,
+        source: Mapping[str, np.ndarray] | None = None):
+    ids, valid = _pad_program_schedule(schedule, batch_size)
+    source_values = _pad_program_source(
+        source,
+        n_layers=int(ctx.model_cfg["n_layers"]),
+        real_count=schedule.batch_size,
+        batch_size=batch_size,
+        d_model=int(ctx.model_cfg["d_model"]),
+    )
+    ids_device = {
+        route: jax.device_put(
+            jnp.asarray(ids[route]),
+            NamedSharding(ctx.mesh, P(None, "data", None)))
+        for route in PROGRAM_ROUTES
+    }
+    valid_device = {
+        route: jax.device_put(
+            jnp.asarray(valid[route]),
+            NamedSharding(ctx.mesh, P(None, "data", None)))
+        for route in PROGRAM_ROUTES
+    }
+    source_device = {
+        route: jax.device_put(
+            jnp.asarray(source_values[route]),
+            NamedSharding(ctx.mesh, P(None, "data", None)))
+        for route in PROGRAM_ROUTES
+    }
+    return ids_device, valid_device, source_device
+
+
+def _program_target_positions(
+        ctx: Any, examples: Sequence[BenchmarkExample], *, prompt_side: str,
+        batch_size: int):
+    values = np.asarray([
+        example.trace_position_base if prompt_side == "base"
+        else example.trace_position_source
+        for example in examples], dtype=np.int32)
+    padded = np.empty((batch_size,), dtype=np.int32)
+    padded[:len(examples)] = values
+    if batch_size > len(examples):
+        padded[len(examples):] = values[0]
+    return jax.device_put(
+        jnp.asarray(padded), NamedSharding(ctx.mesh, P("data")))
+
+
+def _program_score_executable(
+        ctx: Any, normalization: str = "sum_log_probability"):
+    cache = getattr(ctx, "_operator_interpretability_executables", None)
+    if cache is None:
+        cache = {}
+        setattr(ctx, "_operator_interpretability_executables", cache)
+    key = f"native_program_score:{normalization}"
+    if key in cache:
+        return cache[key]
+    kwargs = _runtime_kwargs(ctx)
+
+    @jax.jit
+    def score(
+            params, input_ids, labels, target_positions,
+            ids_q, ids_k, ids_v, ids_rst,
+            valid_q, valid_k, valid_v, valid_rst,
+            source_q, source_k, source_v, source_rst, program_mode):
+        result = ctx.model.apply(
+            {"params": params}, input_ids,
+            selected_ids_q=ids_q,
+            selected_ids_k=ids_k,
+            selected_ids_v=ids_v,
+            selected_ids_rst=ids_rst,
+            selected_valid_q=valid_q,
+            selected_valid_k=valid_k,
+            selected_valid_v=valid_v,
+            selected_valid_rst=valid_rst,
+            target_positions=target_positions,
+            program_mode=program_mode,
+            source_contribution_q=source_q,
+            source_contribution_k=source_k,
+            source_contribution_v=source_v,
+            source_contribution_rst=source_rst,
+            labels=labels,
+            attention_mask=jnp.ones_like(input_ids),
+            return_residual=False,
+            method=ctx.model.analysis_forward_with_operator_program,
+            **kwargs)
+        return _score_from_result(result, normalization)
+
+    cache[key] = score
+    return score
+
+
+def _program_capture_executable(ctx: Any):
+    cache = getattr(ctx, "_operator_interpretability_executables", None)
+    if cache is None:
+        cache = {}
+        setattr(ctx, "_operator_interpretability_executables", cache)
+    key = "native_program_capture"
+    if key in cache:
+        return cache[key]
+    kwargs = _runtime_kwargs(ctx)
+
+    @jax.jit
+    def capture(
+            params, input_ids, target_positions,
+            ids_q, ids_k, ids_v, ids_rst,
+            valid_q, valid_k, valid_v, valid_rst):
+        result = ctx.model.apply(
+            {"params": params}, input_ids,
+            selected_ids_q=ids_q,
+            selected_ids_k=ids_k,
+            selected_ids_v=ids_v,
+            selected_ids_rst=ids_rst,
+            selected_valid_q=valid_q,
+            selected_valid_k=valid_k,
+            selected_valid_v=valid_v,
+            selected_valid_rst=valid_rst,
+            target_positions=target_positions,
+            labels=input_ids,
+            attention_mask=jnp.ones_like(input_ids),
+            method=ctx.model.analysis_capture_operator_program_contributions,
+            **kwargs)
+        return result["operator_program_contributions"]
+
+    cache[key] = capture
+    return capture
+
+
+def capture_operator_program_contributions(
+        ctx: Any, examples: Sequence[BenchmarkExample],
+        schedule: OperatorProgramSchedule, *, prompt_side: str,
+        pad_token_id: int) -> dict[str, np.ndarray]:
+    """Capture post-denominator selected transitions on an unpatched path."""
+    if not examples or len(examples) != schedule.batch_size:
+        raise ValueError("program contribution examples and schedule differ")
+    multiple = max(1, int(ctx.mesh.shape["data"]))
+    arrays = _prompt_arrays(
+        examples, side=prompt_side, pad_token_id=pad_token_id,
+        multiple=multiple)
+    input_ids = jax.device_put(
+        jnp.asarray(arrays[0]), NamedSharding(ctx.mesh, P("data", None)))
+    positions = _program_target_positions(
+        ctx, examples, prompt_side=prompt_side,
+        batch_size=arrays[0].shape[0])
+    ids, valid, _ = _program_device_arrays(
+        ctx, schedule, batch_size=arrays[0].shape[0])
+    result = materialize_global_tree(_program_capture_executable(ctx)(
+        ctx.params, input_ids, positions,
+        ids["q"], ids["k"], ids["v"], ids["rst"],
+        valid["q"], valid["k"], valid["v"], valid["rst"]))
+    output = {}
+    for route in PROGRAM_ROUTES:
+        values = np.asarray(result[route])[:, :arrays[2]].astype(
+            np.float32, copy=False)
+        expected = (
+            int(ctx.model_cfg["n_layers"]), arrays[2],
+            int(ctx.model_cfg["d_model"]))
+        if values.shape != expected or not np.all(np.isfinite(values)):
+            raise RuntimeError(
+                f"captured {route} program contribution is invalid: "
+                f"expected={expected} actual={values.shape}")
+        output[route] = values
+    return output
+
+
+def _score_operator_program(
+        ctx: Any, examples: Sequence[BenchmarkExample],
+        schedule: OperatorProgramSchedule, *, prompt_side: str,
+        answer_side: str, pad_token_id: int, program_mode: int,
+        source: Mapping[str, np.ndarray] | None = None) -> np.ndarray:
+    multiple = max(1, int(ctx.mesh.shape["data"]))
+    arrays = _sequence_arrays(
+        examples, prompt_side=prompt_side, answer_side=answer_side,
+        pad_token_id=pad_token_id, multiple=multiple)
+    ids_batch, labels = _device_batch(ctx, arrays[0], arrays[1])
+    positions = _program_target_positions(
+        ctx, examples, prompt_side=prompt_side,
+        batch_size=arrays[0].shape[0])
+    ids, valid, source_values = _program_device_arrays(
+        ctx, schedule, batch_size=arrays[0].shape[0], source=source)
+    score = _program_score_executable(
+        ctx, _candidate_score_normalization(examples))
+    values = score(
+        ctx.params, ids_batch, labels, positions,
+        ids["q"], ids["k"], ids["v"], ids["rst"],
+        valid["q"], valid["k"], valid["v"], valid["rst"],
+        source_values["q"], source_values["k"],
+        source_values["v"], source_values["rst"],
+        jnp.asarray(program_mode, dtype=jnp.int32))
+    return materialize_global_array(values)[:arrays[2]].astype(np.float64)
+
+
+def _program_margin(
+        ctx: Any, examples: Sequence[BenchmarkExample],
+        schedule: OperatorProgramSchedule, *, prompt_side: str,
+        positive_side: str, negative_side: str, pad_token_id: int,
+        program_mode: int,
+        source: Mapping[str, np.ndarray] | None = None) -> np.ndarray:
+    positive = _score_operator_program(
+        ctx, examples, schedule,
+        prompt_side=prompt_side, answer_side=positive_side,
+        pad_token_id=pad_token_id, program_mode=program_mode,
+        source=source)
+    negative = _score_operator_program(
+        ctx, examples, schedule,
+        prompt_side=prompt_side, answer_side=negative_side,
+        pad_token_id=pad_token_id, program_mode=program_mode,
+        source=source)
+    return positive - negative
+
+
+def _ablation_metrics(
+        full_margin: np.ndarray, ablated_margin: np.ndarray, *,
+        config: ProtocolConfig, seed: int) -> dict[str, Any]:
+    drop = np.asarray(full_margin) - np.asarray(ablated_margin)
+    return {
+        "mean_margin": float(np.mean(ablated_margin)),
+        "mean_margin_drop": float(np.mean(drop)),
+        "median_margin_drop": float(np.median(drop)),
+        "positive_drop_fraction": float(np.mean(drop > 0.0)),
+        "margin_drop_ci": bootstrap_mean_ci(
+            drop, samples=config.bootstrap_samples, alpha=config.alpha,
+            seed=seed),
+        "permutation": paired_permutation_test(
+            full_margin, ablated_margin,
+            samples=config.permutation_samples, seed=seed + 1),
+    }
+
+
+def _direction_metrics(before: np.ndarray, after: np.ndarray) -> dict[str, Any]:
+    improvement = np.asarray(after) - np.asarray(before)
+    flips = (np.asarray(before) <= 0.0) & (np.asarray(after) > 0.0)
+    return {
+        "counterfactual_margin_before_mean": float(np.mean(before)),
+        "counterfactual_margin_after_mean": float(np.mean(after)),
+        "margin_improvement_mean": float(np.mean(improvement)),
+        "answer_flip_fraction": float(np.mean(flips)),
+    }
+
+
+def evaluate_native_operator_program_candidate(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        base_schedule: OperatorProgramSchedule,
+        source_schedule: OperatorProgramSchedule,
+        shape: OperatorSpaceShape, pad_token_id: int,
+        config: ProtocolConfig, seed: int,
+) -> tuple[dict[str, Any], dict[str, OperatorProgramSchedule]]:
+    """Evaluate one mass with paired, mismatched, and random programs."""
+    if not examples or any(
+            example.benchmark_id != "mib_ioi"
+            or example.pair_type != "s2_io_flip_counterfactual"
+            for example in examples):
+        raise ValueError(
+            "native operator programs require official paired IOI examples")
+    if tuple(example.example_id for example in examples) != (
+            base_schedule.example_ids) or base_schedule.example_ids != (
+                source_schedule.example_ids):
+        raise ValueError("base/source programs are not example-aligned")
+    base_schedule.validate(shape)
+    source_schedule.validate(shape)
+    if base_schedule.program_mass != source_schedule.program_mass:
+        raise ValueError("base/source program masses differ")
+    if _candidate_score_normalization(examples) != "sum_log_probability":
+        raise ValueError(
+            "IOI native program requires sum_log_probability scoring")
+
+    mismatch = deterministic_mismatch_mapping(
+        examples, source_schedule, seed=seed + 101)
+    donor_indices = mismatch["donor_indices"]
+    recipient_ids = [example.example_id for example in examples]
+    mismatch_source = reindex_program_schedule(
+        source_schedule, donor_indices,
+        recipient_example_ids=recipient_ids,
+        prompt_side="mismatched_source", shape=shape)
+    mismatch_base = reindex_program_schedule(
+        base_schedule, donor_indices,
+        recipient_example_ids=recipient_ids,
+        prompt_side="mismatched_base", shape=shape)
+    random_source = random_program_schedule(
+        source_schedule, shape=shape, seed=seed + 211)
+    random_base = random_program_schedule(
+        base_schedule, shape=shape, seed=seed + 223)
+    donor_examples = [examples[int(index)] for index in donor_indices]
+
+    paired_source_contribution = capture_operator_program_contributions(
+        ctx, examples, source_schedule, prompt_side="source",
+        pad_token_id=pad_token_id)
+    paired_base_contribution = capture_operator_program_contributions(
+        ctx, examples, base_schedule, prompt_side="base",
+        pad_token_id=pad_token_id)
+    mismatch_source_contribution = capture_operator_program_contributions(
+        ctx, donor_examples, mismatch_source, prompt_side="source",
+        pad_token_id=pad_token_id)
+    mismatch_base_contribution = capture_operator_program_contributions(
+        ctx, donor_examples, mismatch_base, prompt_side="base",
+        pad_token_id=pad_token_id)
+    random_source_contribution = capture_operator_program_contributions(
+        ctx, examples, random_source, prompt_side="source",
+        pad_token_id=pad_token_id)
+    random_base_contribution = capture_operator_program_contributions(
+        ctx, examples, random_base, prompt_side="base",
+        pad_token_id=pad_token_id)
+
+    mode0 = PROGRAM_MODES["production"]
+    full_base_margin = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    corrupted_margin = _program_margin(
+        ctx, examples, source_schedule, prompt_side="source",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    replay_margin = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id,
+        program_mode=PROGRAM_MODES["own_id_replay"])
+    faithfulness = normalized_faithfulness(
+        float(np.mean(replay_margin)), float(np.mean(full_base_margin)),
+        float(np.mean(corrupted_margin)))
+    if faithfulness is None:
+        raise RuntimeError("native program faithfulness endpoint is undefined")
+    replay = {
+        "full_base_margin_mean": float(np.mean(full_base_margin)),
+        "replay_base_margin_mean": float(np.mean(replay_margin)),
+        "answer_agreement_with_full": float(np.mean(
+            (replay_margin > 0.0) == (full_base_margin > 0.0))),
+        "accuracy": float(np.mean(replay_margin > 0.0)),
+        "normalized_faithfulness": float(faithfulness),
+        "faithfulness_ci": bootstrap_faithfulness_ci(
+            replay_margin, full_base_margin, corrupted_margin,
+            samples=config.bootstrap_samples, alpha=config.alpha,
+            seed=seed + 307),
+        "faithfulness_endpoint": config.program_faithfulness_endpoint,
+    }
+
+    own_ablated = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id,
+        program_mode=PROGRAM_MODES["own_id_ablation"])
+    mismatch_ablated = _program_margin(
+        ctx, examples, mismatch_source, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id,
+        program_mode=PROGRAM_MODES["own_id_ablation"])
+    random_ablated = _program_margin(
+        ctx, examples, random_source, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id,
+        program_mode=PROGRAM_MODES["own_id_ablation"])
+    ablation = {
+        "own_program": _ablation_metrics(
+            full_base_margin, own_ablated, config=config, seed=seed + 401),
+        "mismatched_program": _ablation_metrics(
+            full_base_margin, mismatch_ablated,
+            config=config, seed=seed + 419),
+        "random_program": _ablation_metrics(
+            full_base_margin, random_ablated,
+            config=config, seed=seed + 431),
+    }
+
+    before_b2s = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="intervention_positive",
+        negative_side="intervention_negative",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    before_s2b = _program_margin(
+        ctx, examples, source_schedule, prompt_side="source",
+        positive_side="source_negative", negative_side="source_positive",
+        pad_token_id=pad_token_id, program_mode=mode0)
+
+    def direction(
+            schedule, prompt_side, positive_side, negative_side, mode,
+            source=None):
+        return _program_margin(
+            ctx, examples, schedule, prompt_side=prompt_side,
+            positive_side=positive_side, negative_side=negative_side,
+            pad_token_id=pad_token_id, program_mode=mode, source=source)
+
+    paired_id_b2s = direction(
+        source_schedule, "base", "intervention_positive",
+        "intervention_negative", PROGRAM_MODES["source_id_replay"])
+    paired_id_s2b = direction(
+        base_schedule, "source", "source_negative", "source_positive",
+        PROGRAM_MODES["source_id_replay"])
+    mismatch_id_b2s = direction(
+        mismatch_source, "base", "intervention_positive",
+        "intervention_negative", PROGRAM_MODES["source_id_replay"])
+    mismatch_id_s2b = direction(
+        mismatch_base, "source", "source_negative", "source_positive",
+        PROGRAM_MODES["source_id_replay"])
+    random_id_b2s = direction(
+        random_source, "base", "intervention_positive",
+        "intervention_negative", PROGRAM_MODES["source_id_replay"])
+    random_id_s2b = direction(
+        random_base, "source", "source_negative", "source_positive",
+        PROGRAM_MODES["source_id_replay"])
+
+    paired_b2s = direction(
+        source_schedule, "base", "intervention_positive",
+        "intervention_negative",
+        PROGRAM_MODES["source_contribution_transplant"],
+        paired_source_contribution)
+    paired_s2b = direction(
+        base_schedule, "source", "source_negative", "source_positive",
+        PROGRAM_MODES["source_contribution_transplant"],
+        paired_base_contribution)
+    mismatch_b2s = direction(
+        mismatch_source, "base", "intervention_positive",
+        "intervention_negative",
+        PROGRAM_MODES["source_contribution_transplant"],
+        mismatch_source_contribution)
+    mismatch_s2b = direction(
+        mismatch_base, "source", "source_negative", "source_positive",
+        PROGRAM_MODES["source_contribution_transplant"],
+        mismatch_base_contribution)
+    random_b2s = direction(
+        random_source, "base", "intervention_positive",
+        "intervention_negative",
+        PROGRAM_MODES["source_contribution_transplant"],
+        random_source_contribution)
+    random_s2b = direction(
+        random_base, "source", "source_negative", "source_positive",
+        PROGRAM_MODES["source_contribution_transplant"],
+        random_base_contribution)
+
+    paired_improvement = 0.5 * (
+        (paired_b2s - before_b2s) + (paired_s2b - before_s2b))
+    mismatch_improvement = 0.5 * (
+        (mismatch_b2s - before_b2s) + (mismatch_s2b - before_s2b))
+    random_improvement = 0.5 * (
+        (random_b2s - before_b2s) + (random_s2b - before_s2b))
+    paired_vs_mismatch = paired_improvement - mismatch_improvement
+    paired_flip_b2s = (before_b2s <= 0.0) & (paired_b2s > 0.0)
+    paired_flip_s2b = (before_s2b <= 0.0) & (paired_s2b > 0.0)
+    source_id = {
+        "paired": {
+            "base_to_source": _direction_metrics(before_b2s, paired_id_b2s),
+            "source_to_base": _direction_metrics(before_s2b, paired_id_s2b),
+            "bidirectional_answer_flip_fraction": float(np.mean(
+                (paired_id_b2s > 0.0) & (paired_id_s2b > 0.0))),
+        },
+        "mismatched": {
+            "base_to_source": _direction_metrics(
+                before_b2s, mismatch_id_b2s),
+            "source_to_base": _direction_metrics(
+                before_s2b, mismatch_id_s2b),
+        },
+        "random": {
+            "base_to_source": _direction_metrics(before_b2s, random_id_b2s),
+            "source_to_base": _direction_metrics(before_s2b, random_id_s2b),
+        },
+    }
+    transplant = {
+        "paired": {
+            "base_to_source": _direction_metrics(before_b2s, paired_b2s),
+            "source_to_base": _direction_metrics(before_s2b, paired_s2b),
+            "mean_bidirectional_improvement": float(
+                np.mean(paired_improvement)),
+        },
+        "mismatched": {
+            "base_to_source": _direction_metrics(before_b2s, mismatch_b2s),
+            "source_to_base": _direction_metrics(before_s2b, mismatch_s2b),
+            "mean_bidirectional_improvement": float(
+                np.mean(mismatch_improvement)),
+        },
+        "random": {
+            "base_to_source": _direction_metrics(before_b2s, random_b2s),
+            "source_to_base": _direction_metrics(before_s2b, random_s2b),
+            "mean_bidirectional_improvement": float(
+                np.mean(random_improvement)),
+        },
+        "paired_vs_mismatch": {
+            "mean_effect": float(np.mean(paired_vs_mismatch)),
+            "effect_ci": bootstrap_mean_ci(
+                paired_vs_mismatch, samples=config.bootstrap_samples,
+                alpha=config.alpha, seed=seed + 607),
+            "permutation": paired_permutation_test(
+                paired_improvement, mismatch_improvement,
+                samples=config.permutation_samples, seed=seed + 613),
+        },
+        "bidirectional_answer_flip_fraction": float(np.mean(
+            paired_flip_b2s & paired_flip_s2b)),
+    }
+    compactness = compactness_metrics(
+        base_schedule, shape=shape, paired_schedule=source_schedule,
+        mismatched_schedule=mismatch_source)
+    result = {
+        "status": "ready",
+        "phase": examples[0].phase,
+        "program_mass": float(base_schedule.program_mass),
+        "example_count": len(examples),
+        "program_position_scope": config.program_position_scope,
+        "program_routes": list(config.program_routes),
+        "program_denominator_policy": config.program_denominator_policy,
+        "candidate_score_normalization": "sum_log_probability",
+        "compactness": compactness,
+        "replay": replay,
+        "ablation": ablation,
+        "source_id_replay": source_id,
+        "transplant": transplant,
+        "mismatch_mapping": mismatch,
+        "random_control": {
+            "seed_source": seed + 211,
+            "seed_base": seed + 223,
+            "count_preserved_per_example_layer_route": True,
+            "without_replacement": True,
+        },
+        "primary_effect_vectors_persisted_in_item_json": False,
+        "_effect_vectors": {
+            "example_ids": np.asarray(
+                [example.example_id for example in examples]),
+            "full_base_margin": full_base_margin,
+            "corrupted_endpoint_margin": corrupted_margin,
+            "replay_base_margin": replay_margin,
+            "own_ablated_margin": own_ablated,
+            "mismatched_ablated_margin": mismatch_ablated,
+            "random_ablated_margin": random_ablated,
+            "counterfactual_before_base_to_source": before_b2s,
+            "counterfactual_before_source_to_base": before_s2b,
+            "source_id_paired_base_to_source": paired_id_b2s,
+            "source_id_paired_source_to_base": paired_id_s2b,
+            "source_id_mismatched_base_to_source": mismatch_id_b2s,
+            "source_id_mismatched_source_to_base": mismatch_id_s2b,
+            "source_id_random_base_to_source": random_id_b2s,
+            "source_id_random_source_to_base": random_id_s2b,
+            "transplant_paired_base_to_source": paired_b2s,
+            "transplant_paired_source_to_base": paired_s2b,
+            "transplant_mismatched_base_to_source": mismatch_b2s,
+            "transplant_mismatched_source_to_base": mismatch_s2b,
+            "transplant_random_base_to_source": random_b2s,
+            "transplant_random_source_to_base": random_s2b,
+            "paired_vs_mismatch_improvement": paired_vs_mismatch,
+            "bidirectional_pair_success": (
+                paired_flip_b2s & paired_flip_s2b),
+        },
+    }
+    controls = {
+        "mismatch_source": mismatch_source,
+        "mismatch_base": mismatch_base,
+        "random_source": random_source,
+        "random_base": random_base,
+    }
+    return result, controls

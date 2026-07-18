@@ -14,9 +14,11 @@ from analysis.dawn_analysis_common import (
     git_info,
     materialize_global_array,
 )
+from analysis.dawn_analysis_storage import write_npz_atomic
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
     resolve_benchmark_build,
+    sha256_path,
     write_protocol_bound_artifact,
 )
 from analysis.operator_interpretability.benchmark_registry import (
@@ -32,6 +34,7 @@ from analysis.operator_interpretability.benchmark_schema import (
 from analysis.operator_interpretability.capture import (
     capture_discovery_candidates,
     capture_held_out_paths,
+    capture_program_paths,
     ranked_site_objects,
 )
 from analysis.operator_interpretability.circuit import (
@@ -49,7 +52,19 @@ from analysis.operator_interpretability.intervention import (
     evaluate_behavior,
     evaluate_circuit_necessity,
     evaluate_circuit_retention,
+    evaluate_native_operator_program_candidate,
     evaluate_operator_interchange,
+)
+from analysis.operator_interpretability.program import (
+    PROGRAM_ALGORITHM_VERSION,
+    build_program_schedule,
+    capture_schedule_widths,
+    compactness_metrics,
+    deterministic_mismatch_mapping,
+    evaluate_native_program_claims,
+    reindex_program_schedule,
+    select_validation_program,
+    write_program_schedule_artifact,
 )
 from analysis.operator_interpretability.protocol import (
     CIRCUIT_FRACTIONS,
@@ -392,6 +407,8 @@ class OperatorInterpretabilityRunner:
                 result["intervention"] = intervention_output
         elif kind in {"ravel_causal_mediation", "multilayer_trajectory"}:
             result = self._strip_nested_rows(result)
+        elif kind == "native_operator_program":
+            result = self._strip_nested_rows(result)
         elif kind == "scientific_claims":
             result = self._compact_scientific_claims(item_id, result)
         output["result"] = result
@@ -463,6 +480,8 @@ class OperatorInterpretabilityRunner:
             },
             "strongest_supported_claim": (
                 self.results.get("scientific_claims", {}).get(
+                    "strongest_supported_claim")
+                or self.results.get("native_operator_program", {}).get(
                     "strongest_supported_claim")),
         }
         if self.ctx.is_primary:
@@ -635,6 +654,361 @@ class OperatorInterpretabilityRunner:
             "max_topk_rst": self.config.capture_max_topk_rst,
             "capture_threshold": self.config.capture_threshold,
             "max_examples": self.config.max_examples_for(benchmark_id),
+        }
+
+    def _program_capture_kwargs(self) -> dict[str, Any]:
+        values = self._capture_kwargs("mib_ioi")
+        values["capture_threshold"] = max(
+            float(value) for value in self.config.program_mass_candidates)
+        return values
+
+    @staticmethod
+    def _compact_program_capture(capture: Mapping[str, Any]) -> dict[str, Any]:
+        output = dict(capture)
+        rows = list(output.pop("rows", ()))
+        output["raw_capture_row_count"] = len(rows)
+        output["raw_capture_rows_persisted_in_item_json"] = False
+        output["raw_capture_retention"] = (
+            "program_schedule_binary_artifact_and_capture_digest")
+        return output
+
+    @staticmethod
+    def _program_mass_label(program_mass: float) -> str:
+        return f"{float(program_mass):.2f}".replace(".", "p")
+
+    def _write_program_artifacts(
+            self, *, phase: str, program_mass: float,
+            schedules: Mapping[str, Any]) -> dict[str, Any]:
+        records = {}
+        mass_label = self._program_mass_label(program_mass)
+        for name, schedule in schedules.items():
+            record = write_program_schedule_artifact(
+                self.store,
+                f"programs/{phase}/mass_{mass_label}/{name}.npz",
+                schedule,
+                shape=self.shape,
+                protocol=self.protocol,
+            )
+            if record is not None:
+                records[str(name)] = record
+        return records
+
+    def _write_program_effect_artifact(
+            self, *, phase: str, program_mass: float,
+            vectors: Mapping[str, Any]) -> dict[str, Any] | None:
+        if not self.ctx.is_primary:
+            return None
+        mass_label = self._program_mass_label(program_mass)
+        path = self.store.path(
+            "programs", phase, f"mass_{mass_label}", "effects.npz")
+        arrays = {
+            "protocol_hash": np.asarray(canonical_hash(self.protocol)),
+            "program_algorithm_version": np.asarray(
+                PROGRAM_ALGORITHM_VERSION),
+            "program_mass": np.asarray(program_mass, dtype=np.float64),
+            **{str(key): np.asarray(value)
+               for key, value in vectors.items()},
+        }
+        write_npz_atomic(path, **arrays)
+        return {
+            "path": path,
+            "sha256": sha256_path(path),
+            "program_mass": float(program_mass),
+            "phase": str(phase),
+            "vector_names": sorted(str(key) for key in vectors),
+            "per_example_primary_effects_persisted": True,
+            "primary_effects_embedded_in_item_json": False,
+        }
+
+    def _capture_program_phase(
+            self, examples: Sequence[Any], *, phase: str,
+            seed: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, int]]:
+        base = capture_program_paths(
+            self.ctx, examples, phase=phase, prompt_side="base",
+            seed=seed, **self._program_capture_kwargs())
+        source = capture_program_paths(
+            self.ctx, examples, phase=phase, prompt_side="source",
+            seed=seed + 1, **self._program_capture_kwargs())
+        widths = capture_schedule_widths((base, source))
+        return base, source, widths
+
+    def _run_native_operator_program(self) -> dict[str, Any]:
+        if self._scope("native_operator_program") != ("mib_ioi",):
+            raise ValueError(
+                "native operator program is registered only for mib_ioi")
+        candidate_masses = tuple(
+            float(value) for value in self.config.program_mass_candidates)
+        minimum = int(self.config.minimum_known_correct)
+
+        discovery_examples = self._known_correct("mib_ioi", "discovery")
+        validation_examples = self._known_correct("mib_ioi", "validation")
+        if len(discovery_examples) < minimum or len(validation_examples) < minimum:
+            return {
+                "status": "insufficient_behavior",
+                "passed": False,
+                "strongest_supported_claim": None,
+                "discovery_known_correct": len(discovery_examples),
+                "validation_known_correct": len(validation_examples),
+                "minimum_known_correct": minimum,
+                "test_evaluated": False,
+            }
+
+        discovery_base_capture, discovery_source_capture, discovery_widths = (
+            self._capture_program_phase(
+                discovery_examples, phase="discovery",
+                seed=self.config.seed + 10001))
+        discovery_curve = []
+        discovery_artifacts = {}
+        for mass_index, program_mass in enumerate(candidate_masses):
+            base_schedule = build_program_schedule(
+                discovery_base_capture, discovery_examples,
+                shape=self.shape, program_mass=program_mass,
+                prompt_side="base", widths=discovery_widths)
+            source_schedule = build_program_schedule(
+                discovery_source_capture, discovery_examples,
+                shape=self.shape, program_mass=program_mass,
+                prompt_side="source", widths=discovery_widths)
+            mismatch = deterministic_mismatch_mapping(
+                discovery_examples, source_schedule,
+                seed=self.config.seed + 11003 + mass_index)
+            mismatch_schedule = reindex_program_schedule(
+                source_schedule, mismatch["donor_indices"],
+                recipient_example_ids=[
+                    example.example_id for example in discovery_examples],
+                prompt_side="mismatched_source", shape=self.shape)
+            compactness = compactness_metrics(
+                base_schedule, shape=self.shape,
+                paired_schedule=source_schedule,
+                mismatched_schedule=mismatch_schedule)
+            artifacts = self._write_program_artifacts(
+                phase="discovery", program_mass=program_mass,
+                schedules={
+                    "base": base_schedule,
+                    "source": source_schedule,
+                })
+            discovery_artifacts[str(program_mass)] = artifacts
+            discovery_curve.append({
+                "program_mass": program_mass,
+                "median_site_fraction": compactness[
+                    "median_site_fraction"],
+                "mean_site_fraction": compactness[
+                    "mean_site_fraction"],
+                "per_route_site_fraction": compactness[
+                    "per_route_site_fraction"],
+                "same_pair_route_overlap": compactness[
+                    "same_pair_route_overlap"],
+                "mismatched_route_overlap": compactness[
+                    "mismatched_route_overlap"],
+            })
+
+        validation_base_capture, validation_source_capture, validation_widths = (
+            self._capture_program_phase(
+                validation_examples, phase="validation",
+                seed=self.config.seed + 20011))
+        validation_candidates = []
+        validation_artifacts = {}
+        for mass_index, program_mass in enumerate(candidate_masses):
+            base_schedule = build_program_schedule(
+                validation_base_capture, validation_examples,
+                shape=self.shape, program_mass=program_mass,
+                prompt_side="base", widths=validation_widths)
+            source_schedule = build_program_schedule(
+                validation_source_capture, validation_examples,
+                shape=self.shape, program_mass=program_mass,
+                prompt_side="source", widths=validation_widths)
+            candidate, controls = evaluate_native_operator_program_candidate(
+                self.ctx, validation_examples,
+                base_schedule=base_schedule,
+                source_schedule=source_schedule,
+                shape=self.shape,
+                pad_token_id=int(self.tokenizer.pad_token_id),
+                config=self.config,
+                seed=self.config.seed + 21013 + mass_index * 101,
+            )
+            effect_vectors = candidate.pop("_effect_vectors")
+            effect_artifact = self._write_program_effect_artifact(
+                phase="validation", program_mass=program_mass,
+                vectors=effect_vectors)
+            if effect_artifact is not None:
+                candidate["effect_artifact"] = effect_artifact
+            validation_candidates.append(candidate)
+            validation_artifacts[str(program_mass)] = (
+                self._write_program_artifacts(
+                    phase="validation", program_mass=program_mass,
+                    schedules={
+                        "base": base_schedule,
+                        "source": source_schedule,
+                        **controls,
+                    }))
+
+        selection = select_validation_program(
+            validation_candidates, config=self.config)
+        common = {
+            "program_algorithm_version": PROGRAM_ALGORITHM_VERSION,
+            "program_mass_candidates": list(candidate_masses),
+            "program_position_scope": self.config.program_position_scope,
+            "program_routes": list(self.config.program_routes),
+            "program_denominator_policy": (
+                self.config.program_denominator_policy),
+            "program_mismatch_matching": (
+                self.config.program_mismatch_matching),
+            "discovery": {
+                "status": "ready",
+                "example_count": len(discovery_examples),
+                "mass_curve": discovery_curve,
+                "base_capture": self._compact_program_capture(
+                    discovery_base_capture),
+                "source_capture": self._compact_program_capture(
+                    discovery_source_capture),
+                "schedule_artifacts": discovery_artifacts,
+            },
+            "validation": {
+                "status": "ready",
+                "example_count": len(validation_examples),
+                "candidates": validation_candidates,
+                "selection": selection,
+                "base_capture": self._compact_program_capture(
+                    validation_base_capture),
+                "source_capture": self._compact_program_capture(
+                    validation_source_capture),
+                "schedule_artifacts": validation_artifacts,
+            },
+            "test_used_for_selection": False,
+            "test_program_executable_called_before_selection": False,
+        }
+        if selection["status"] != "selected":
+            return {
+                **common,
+                "status": "no_compact_validation_program",
+                "ready": True,
+                "passed": False,
+                "selected_program_mass": None,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "strongest_supported_claim": "descriptive_program",
+                "checkpoint_specific_claim": True,
+                "scientific_claims_primary_modified": False,
+            }
+
+        selected_mass = float(selection["selected_program_mass"])
+        # The test program path is deliberately unreachable until the
+        # validation selection record above has been frozen.
+        test_examples = self._known_correct("mib_ioi", "test")
+        if len(test_examples) < minimum:
+            return {
+                **common,
+                "status": "insufficient_test_behavior",
+                "ready": True,
+                "passed": False,
+                "selected_program_mass": selected_mass,
+                "test_known_correct": len(test_examples),
+                "minimum_known_correct": minimum,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "strongest_supported_claim": "descriptive_program",
+                "checkpoint_specific_claim": True,
+                "scientific_claims_primary_modified": False,
+            }
+        test_base_capture, test_source_capture, test_widths = (
+            self._capture_program_phase(
+                test_examples, phase="test",
+                seed=self.config.seed + 30029))
+        test_base_schedule = build_program_schedule(
+            test_base_capture, test_examples,
+            shape=self.shape, program_mass=selected_mass,
+            prompt_side="base", widths=test_widths)
+        test_source_schedule = build_program_schedule(
+            test_source_capture, test_examples,
+            shape=self.shape, program_mass=selected_mass,
+            prompt_side="source", widths=test_widths)
+        test_result, test_controls = evaluate_native_operator_program_candidate(
+            self.ctx, test_examples,
+            base_schedule=test_base_schedule,
+            source_schedule=test_source_schedule,
+            shape=self.shape,
+            pad_token_id=int(self.tokenizer.pad_token_id),
+            config=self.config,
+            seed=self.config.seed + 31033,
+        )
+        test_effect_vectors = test_result.pop("_effect_vectors")
+        test_effect_artifact = self._write_program_effect_artifact(
+            phase="test", program_mass=selected_mass,
+            vectors=test_effect_vectors)
+        if test_effect_artifact is not None:
+            test_result["effect_artifact"] = test_effect_artifact
+        test_artifacts = self._write_program_artifacts(
+            phase="test", program_mass=selected_mass,
+            schedules={
+                "base": test_base_schedule,
+                "source": test_source_schedule,
+                **test_controls,
+            })
+        claims = evaluate_native_program_claims(
+            test_result, config=self.config)
+        human_summary = {
+            "selected_program_mass": selected_mass,
+            "median_site_fraction": test_result["compactness"][
+                "median_site_fraction"],
+            "mean_site_fraction": test_result["compactness"][
+                "mean_site_fraction"],
+            "per_route_site_fraction": test_result["compactness"][
+                "per_route_site_fraction"],
+            "replay_faithfulness": test_result["replay"][
+                "normalized_faithfulness"],
+            "replay_faithfulness_ci": test_result["replay"][
+                "faithfulness_ci"],
+            "replay_agreement": test_result["replay"][
+                "answer_agreement_with_full"],
+            "ablation_margin_drop": test_result["ablation"][
+                "own_program"]["mean_margin_drop"],
+            "ablation_margin_drop_ci": test_result["ablation"][
+                "own_program"]["margin_drop_ci"],
+            "ablation_permutation_p": test_result["ablation"][
+                "own_program"]["permutation"]["p_value_two_sided"],
+            "source_id_replay_flip": test_result["source_id_replay"][
+                "paired"]["base_to_source"]["answer_flip_fraction"],
+            "source_contribution_transplant_flip": test_result[
+                "transplant"]["paired"]["base_to_source"][
+                    "answer_flip_fraction"],
+            "mismatched_flip": test_result["transplant"][
+                "mismatched"]["base_to_source"]["answer_flip_fraction"],
+            "random_flip": test_result["transplant"][
+                "random"]["base_to_source"]["answer_flip_fraction"],
+            "paired_vs_mismatch_effect": test_result["transplant"][
+                "paired_vs_mismatch"]["mean_effect"],
+            "paired_vs_mismatch_effect_ci": test_result["transplant"][
+                "paired_vs_mismatch"]["effect_ci"],
+            "paired_vs_mismatch_permutation_p": test_result["transplant"][
+                "paired_vs_mismatch"]["permutation"][
+                    "p_value_two_sided"],
+            "bidirectional_success": test_result["transplant"][
+                "bidirectional_answer_flip_fraction"],
+            "strongest_supported_native_program_claim": claims[
+                "strongest_supported_claim"],
+        }
+        return {
+            **common,
+            "status": "ready",
+            "ready": True,
+            "passed": claims["passed"],
+            "selected_program_mass": selected_mass,
+            "frozen_selection": selection,
+            "test": {
+                **test_result,
+                "base_capture": self._compact_program_capture(
+                    test_base_capture),
+                "source_capture": self._compact_program_capture(
+                    test_source_capture),
+                "schedule_artifacts": test_artifacts,
+            },
+            "test_evaluated": True,
+            "test_evaluation_count": 1,
+            "claims": claims["claims"],
+            "strongest_supported_claim": claims[
+                "strongest_supported_claim"],
+            "checkpoint_specific_claim": True,
+            "scientific_claims_primary_modified": False,
+            "human_summary": human_summary,
         }
 
     def _reduce_ravel_capture(
