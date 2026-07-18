@@ -26,7 +26,13 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 from transformers import AutoTokenizer
 
-from analysis.dawn_analysis_storage import exists, join_path, open_path
+from analysis.dawn_analysis_storage import (
+    exists,
+    join_path,
+    open_path,
+    read_json,
+    write_json_atomic,
+)
 from analysis.operator_interpretability.benchmark_registry import (
     BENCHMARK_SPECS,
     PRIMARY_BENCHMARK_IDS,
@@ -39,6 +45,7 @@ from analysis.operator_interpretability.benchmark_schema import (
     BenchmarkExample,
     canonical_hash,
     validate_examples,
+    validate_manifest,
 )
 from analysis.operator_interpretability.eligibility import (
     shared_split_phase,
@@ -84,6 +91,14 @@ def _selected(value: str) -> tuple[str, ...]:
 
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_path(path: str) -> str:
+    digest = hashlib.sha256()
+    with open_path(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _hf_source_rows(spec: Any) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
@@ -285,6 +300,32 @@ def _copy_to(path: Path, destination: str) -> None:
             target.write(block)
 
 
+def _publish_immutable_file(path: Path, destination: str,
+                            expected_sha256: str) -> None:
+    if exists(destination):
+        actual_sha256 = _sha256_path(destination)
+        if actual_sha256 != expected_sha256:
+            raise FileExistsError(
+                "immutable benchmark artifact collision: "
+                f"path={destination} expected={expected_sha256} "
+                f"actual={actual_sha256}")
+        print(f"PREPARE REUSE path={destination}", flush=True)
+        return
+    _copy_to(path, destination)
+    actual_sha256 = _sha256_path(destination)
+    if actual_sha256 != expected_sha256:
+        raise IOError(
+            "published benchmark artifact hash mismatch: "
+            f"path={destination} expected={expected_sha256} "
+            f"actual={actual_sha256}")
+
+
+def _manifest_identity(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(manifest)
+    value.pop("created_at", None)
+    return value
+
+
 def main() -> int:
     args = parse_args()
     benchmark_ids = _selected(args.benchmarks)
@@ -329,7 +370,7 @@ def main() -> int:
         "max_seq_len": int(args.max_seq_len),
     }
     build_id = canonical_hash(build_material)[:24]
-    manifest = {
+    manifest: dict[str, Any] = {
         "schema": BENCHMARK_SCHEMA,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "status": "complete",
@@ -352,33 +393,57 @@ def main() -> int:
         "registry": registry_record(),
         "max_seq_len": int(args.max_seq_len),
     }
-    manifest_path = work_root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8")
-    manifest_hash = canonical_hash(manifest)
     build_root = join_path(
         str(args.output_root).rstrip("/\\"), "builds", build_id)
-    for benchmark_id, path in files.items():
-        destination = join_path(build_root, path.name)
-        if exists(destination):
+    manifest_destination = join_path(build_root, "manifest.json")
+    if exists(manifest_destination):
+        existing = read_json(manifest_destination, None)
+        if not isinstance(existing, Mapping):
+            raise ValueError(
+                f"invalid existing benchmark manifest: {manifest_destination}")
+        existing_manifest = validate_manifest(existing)
+        existing_identity_hash = canonical_hash(
+            _manifest_identity(existing_manifest))
+        requested_identity_hash = canonical_hash(_manifest_identity(manifest))
+        if existing_identity_hash != requested_identity_hash:
             raise FileExistsError(
-                f"immutable benchmark artifact already exists: {destination}")
-        _copy_to(path, destination)
-    _copy_to(manifest_path, join_path(build_root, "manifest.json"))
+                "immutable benchmark build identity collision: "
+                f"build_id={build_id} manifest={manifest_destination}")
+        manifest = existing_manifest
+        print(
+            f"PREPARE REUSE build_id={build_id} manifest={manifest_destination}",
+            flush=True)
+    else:
+        for benchmark_id, path in files.items():
+            _publish_immutable_file(
+                path,
+                join_path(build_root, path.name),
+                str(entries[benchmark_id]["sha256"]),
+            )
+        write_json_atomic(manifest_destination, manifest)
+
+    for benchmark_id, entry in manifest["benchmarks"].items():
+        shard_path = join_path(
+            build_root,
+            *str(entry["path"]).replace("\\", "/").split("/"),
+        )
+        if not exists(shard_path):
+            raise FileNotFoundError(
+                f"benchmark manifest references a missing shard: {shard_path}")
+        if _sha256_path(shard_path) != str(entry["sha256"]):
+            raise ValueError(f"benchmark shard hash mismatch: {benchmark_id}")
+
+    manifest_hash = canonical_hash(manifest)
     if args.publish_latest:
         pointer = {
             "build_id": build_id,
             "build_path": f"builds/{build_id}",
             "manifest_hash": manifest_hash,
         }
-        latest_local = work_root / "LATEST.json"
-        latest_local.write_text(
-            json.dumps(pointer, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8")
-        _copy_to(
-            latest_local,
-            join_path(str(args.output_root).rstrip("/\\"), "LATEST.json"))
+        write_json_atomic(
+            join_path(str(args.output_root).rstrip("/\\"), "LATEST.json"),
+            pointer,
+        )
     print(
         "PREPARE COMPLETE "
         f"build_id={build_id} manifest_hash={manifest_hash} root={build_root}",

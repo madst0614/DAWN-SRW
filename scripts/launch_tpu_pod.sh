@@ -198,6 +198,11 @@ GH_TOKEN='${GH_TOKEN}'
 TRAIN_ARGS='${TRAIN_ARGS}'
 export TPU_WORKER_INDEX BRANCH CONFIG TRAIN_SCRIPT GH_TOKEN TRAIN_ARGS
 
+tmux kill-session -t train 2>/dev/null || true
+: > "\$HOME/train.log"
+export TRAIN_LOG_INITIALIZED=1
+exec > >(tee -a "\$HOME/train.log") 2>&1
+
 echo "=== Launching TPU worker index \$TPU_WORKER_INDEX ==="
 echo "TPU_WORKER_INDEX=\$TPU_WORKER_INDEX"
 echo "HOSTNAME=\$(hostname)"

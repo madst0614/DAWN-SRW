@@ -337,6 +337,11 @@ ALLOW_MODEL_VERSION_OVERRIDE=${ALLOW_MODEL_VERSION_OVERRIDE_Q}
 GH_TOKEN=${GH_TOKEN_Q}
 export TPU_WORKER_INDEX BRANCH CONFIG GH_TOKEN
 
+tmux kill-session -t train 2>/dev/null || true
+: > "\$HOME/train.log"
+export TRAIN_LOG_INITIALIZED=1
+exec > >(tee -a "\$HOME/train.log") 2>&1
+
 echo "=== Launching SRW benchmark worker \$TPU_WORKER_INDEX ==="
 echo "HOSTNAME=\$(hostname)"
 echo "DATE=\$(date -Is)"

@@ -146,6 +146,10 @@ SINGLE_DEVICE='${SINGLE_DEVICE}'
 INCLUDE_HARD_T101='${INCLUDE_HARD_T101}'
 WORK_DIR="\$HOME/dawn-spatial"
 
+tmux kill-session -t train 2>/dev/null || true
+: > "\$HOME/train.log"
+exec > >(tee -a "\$HOME/train.log") 2>&1
+
 echo "[setup] host=\$(hostname) branch=\$BRANCH"
 if [ -d "\$WORK_DIR/.git" ]; then
     cd "\$WORK_DIR"
@@ -193,12 +197,12 @@ if [ "\$DETACH" = "1" ]; then
     echo "[run] starting tmux session train"
     tmux kill-session -t train 2>/dev/null || true
     tmux new-session -d -s train \
-        "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee ~/train.log; echo 'Paper eval finished. Press enter to close.'; read"
+        "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee -a ~/train.log; echo 'Paper eval finished. Press enter to close.'; read"
     echo "[run] detached. log=~/train.log"
 else
     echo "[run] foreground eval; combined stream below"
     cd "\$WORK_DIR"
-    "\${RUN_CMD[@]}" 2>&1 | tee ~/train.log
+    "\${RUN_CMD[@]}"
 fi
 EOFCMD
 

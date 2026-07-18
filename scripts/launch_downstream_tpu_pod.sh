@@ -116,6 +116,11 @@ DOWNSTREAM_RUN_ID='${DOWNSTREAM_RUN_ID}'
 CONFIGS='${CONFIGS_JOINED}'
 export BRANCH INIT_FROM DOWNSTREAM_RUN_ID CONFIGS
 
+tmux kill-session -t train 2>/dev/null || true
+: > "\$HOME/train.log"
+export TRAIN_LOG_INITIALIZED=1
+exec > >(tee -a "\$HOME/train.log") 2>&1
+
 if [ -d "\$HOME/dawn-spatial/.git" ]; then
   cd "\$HOME/dawn-spatial"
   git fetch origin "\$BRANCH" --depth 1

@@ -122,6 +122,11 @@ BATCH_SIZE='${BATCH_SIZE}'
 LIMIT='${LIMIT}'
 FOREGROUND='${FOREGROUND}'
 WORK_DIR="\$HOME/dawn-spatial"
+REMOTE_LOG="\$HOME/train.log"
+
+tmux kill-session -t train 2>/dev/null || true
+: > "\$REMOTE_LOG"
+exec > >(tee -a "\$REMOTE_LOG") 2>&1
 
 if [ -d "\$WORK_DIR/.git" ]; then
   cd "\$WORK_DIR"
@@ -140,7 +145,7 @@ python3 -m pip install \
   "jax[tpu]==0.6.2" \
   "flax==0.10.7" \
   "optax==0.2.8" \
-  "numpy==2.5.1" \
+  "numpy==2.2.6" \
   pyyaml sentencepiece google-cloud-storage \
   -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
 python3 -m pip install -r requirements_zero_shot_eval.txt -q
@@ -150,7 +155,7 @@ import datasets, flax, fsspec, jax, optax, orbax.checkpoint, pyarrow, transforme
 assert jax.__version__ == '0.6.2'
 assert metadata.version('flax') == '0.10.7'
 assert metadata.version('optax') == '0.2.8'
-assert metadata.version('numpy') == '2.5.1'
+assert metadata.version('numpy') == '2.2.6'
 assert metadata.version('lm_eval') == '0.4.2'
 assert metadata.version('orbax-checkpoint') == '0.11.24'
 assert metadata.version('transformers') == '4.40.2'
@@ -164,6 +169,7 @@ print('orbax-checkpoint=' + metadata.version('orbax-checkpoint'), flush=True)
 print('jax=' + jax.__version__, flush=True)
 print('flax=' + flax.__version__, flush=True)
 print('optax=' + optax.__version__, flush=True)
+print('numpy=' + metadata.version('numpy'), flush=True)
 print('datasets=' + datasets.__version__, flush=True)
 print('pyarrow=' + pyarrow.__version__, flush=True)
 print('transformers=' + transformers.__version__, flush=True)
@@ -182,11 +188,10 @@ if [ -n "\$LIMIT" ]; then RUN_CMD+=(--limit "\$LIMIT"); fi
 RUN_CMD_STR=\$(printf '%q ' "\${RUN_CMD[@]}")
 
 if [ "\$FOREGROUND" = "1" ]; then
-  "\${RUN_CMD[@]}" 2>&1 | tee "\$HOME/train.log"
+  "\${RUN_CMD[@]}"
 else
-  tmux kill-session -t train 2>/dev/null || true
   tmux new-session -d -s train \
-    "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee '\$HOME/train.log'"
+    "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee -a '\$REMOTE_LOG'"
   echo "train tmux session started on \$(hostname)"
 fi
 EOFCMD

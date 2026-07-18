@@ -121,6 +121,10 @@ SHOW_PATHS='${SHOW_PATHS}'
 DETACH='${DETACH}'
 WORK_DIR="\$HOME/dawn-spatial"
 
+tmux kill-session -t train 2>/dev/null || true
+: > "\$HOME/train.log"
+exec > >(tee -a "\$HOME/train.log") 2>&1
+
 echo "[setup] host=\$(hostname) branch=\$BRANCH"
 if [ -d "\$WORK_DIR/.git" ]; then
     cd "\$WORK_DIR"
@@ -161,12 +165,12 @@ if [ "\$DETACH" = "1" ]; then
     echo "[run] starting tmux session train"
     tmux kill-session -t train 2>/dev/null || true
     tmux new-session -d -s train \
-        "cd '\$WORK_DIR'; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; \$ANALYSIS_CMD_STR 2>&1 | tee ~/train.log; echo 'Analysis finished. Press enter to close.'; read"
+        "cd '\$WORK_DIR'; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; \$ANALYSIS_CMD_STR 2>&1 | tee -a ~/train.log; echo 'Analysis finished. Press enter to close.'; read"
     echo "[run] detached. log=~/train.log"
 else
     echo "[run] foreground analysis; combined stream below"
     cd "\$WORK_DIR"
-    "\${ANALYSIS_CMD[@]}" 2>&1 | tee ~/train.log
+    "\${ANALYSIS_CMD[@]}"
 fi
 EOFCMD
 

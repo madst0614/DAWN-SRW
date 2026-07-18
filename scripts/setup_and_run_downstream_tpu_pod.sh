@@ -7,6 +7,13 @@ INIT_FROM="${INIT_FROM:-}"
 DOWNSTREAM_RUN_ID="${DOWNSTREAM_RUN_ID:?ERROR: DOWNSTREAM_RUN_ID env var not set}"
 WORK_DIR="$HOME/dawn-spatial"
 
+if [ "${TRAIN_LOG_INITIALIZED:-0}" != "1" ]; then
+  tmux kill-session -t train 2>/dev/null || true
+  : > "$HOME/train.log"
+  export TRAIN_LOG_INITIALIZED=1
+  exec > >(tee -a "$HOME/train.log") 2>&1
+fi
+
 IFS='|' read -r -a CONFIG_ARRAY <<< "$CONFIGS"
 
 resolve_config_path() {
@@ -103,7 +110,7 @@ tmux new-session -d -s train \
    export DOWNSTREAM_RUN_ID='$DOWNSTREAM_RUN_ID'; \
    export XLA_FLAGS='$XLA_FLAGS'; \
    cd '$WORK_DIR'; \
-   $CMD 2>&1 | tee ~/train.log; \
+   $CMD 2>&1 | tee -a ~/train.log; \
    echo 'Downstream sequence finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."

@@ -39,6 +39,7 @@ from analysis.dawn_analysis_storage import (
 )
 from analysis.operator_interpretability.artifacts import (
     DEFAULT_BENCHMARK_ROOT,
+    resolve_benchmark_build,
     write_protocol_bound_artifact,
 )
 from analysis.operator_interpretability.benchmark_schema import canonical_hash
@@ -536,7 +537,27 @@ def main() -> int:
     mechanistic_items = items_for_backend(
         items, "operator_interpretability")
     zero_shot_items = items_for_backend(items, "stock_zero_shot")
+    mechanistic_executed = dependency_closure(mechanistic_items)
+    mechanistic_benchmark_ids = benchmark_ids_for_items(
+        mechanistic_executed)
     _initialize_distributed(args)
+    if mechanistic_items:
+        benchmark_build = resolve_benchmark_build(args.benchmark_root)
+        missing_benchmarks = sorted(
+            set(mechanistic_benchmark_ids)
+            - set(benchmark_build.manifest["benchmarks"]))
+        if missing_benchmarks:
+            raise FileNotFoundError(
+                "published benchmark build lacks required ids: "
+                f"build_id={benchmark_build.build_id} "
+                f"missing={','.join(missing_benchmarks)}")
+        if is_primary_host():
+            print(
+                "TRAIN_ANALYSIS_POOL benchmark "
+                f"build_id={benchmark_build.build_id} "
+                f"manifest={benchmark_build.manifest_path}",
+                flush=True,
+            )
     (selection, checkpoint_dir, checkpoint_step, checkpoint_metadata,
      config, checkpoint_mesh, checkpoint_config_hash) = _resolve_source(args)
     output = args.output or _default_output(checkpoint_dir, checkpoint_step)
@@ -568,11 +589,10 @@ def main() -> int:
             args, selection, checkpoint_dir, checkpoint_step,
             checkpoint_metadata, config, checkpoint_mesh)
         sync_hosts("train_analysis_pool_loaded")
-        mechanistic_executed = dependency_closure(mechanistic_items)
         runner = OperatorInterpretabilityRunner(
             context,
             benchmark_root=args.benchmark_root,
-            benchmark_ids=benchmark_ids_for_items(mechanistic_executed),
+            benchmark_ids=mechanistic_benchmark_ids,
             protocol_config=_protocol_config(args),
             resume=args.resume,
         )

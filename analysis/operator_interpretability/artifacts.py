@@ -61,13 +61,30 @@ def resolve_benchmark_build(root: str | None = None) -> BenchmarkBuild:
             build_path if build_path.startswith("gs://")
             else join_path(root, *build_path.replace("\\", "/").split("/")))
         manifest_path = join_path(build_root, "manifest.json")
-        manifest = validate_manifest(read_json(manifest_path, None) or {})
+        if not exists(manifest_path):
+            raise FileNotFoundError(
+                "benchmark LATEST pointer references a missing manifest: "
+                f"pointer={latest_path} manifest={manifest_path}")
+        manifest_value = read_json(manifest_path, None)
+        if not isinstance(manifest_value, Mapping):
+            raise ValueError(f"invalid benchmark manifest: {manifest_path}")
+        manifest = validate_manifest(manifest_value)
         manifest_hash = canonical_hash(manifest)
         if manifest_hash != latest.get("manifest_hash"):
             raise ValueError("benchmark LATEST manifest hash mismatch")
     else:
         manifest_path = join_path(root, "manifest.json")
-        manifest = validate_manifest(read_json(manifest_path, None) or {})
+        if not exists(manifest_path):
+            raise FileNotFoundError(
+                "no immutable interpretability benchmark build is published; "
+                f"expected pointer={latest_path} or manifest={manifest_path}. "
+                "Prepare and publish one with "
+                "scripts/prepare_interpretability_benchmarks.py "
+                f"--output-root {root} --benchmarks primary --publish-latest")
+        manifest_value = read_json(manifest_path, None)
+        if not isinstance(manifest_value, Mapping):
+            raise ValueError(f"invalid benchmark manifest: {manifest_path}")
+        manifest = validate_manifest(manifest_value)
         build_id = str(manifest["build_id"])
         build_root = root
         manifest_hash = canonical_hash(manifest)

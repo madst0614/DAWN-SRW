@@ -149,6 +149,18 @@ REMOTE_LOG=$Q_LOG
 WORK_DIR="\$HOME/DAWN-SRW"
 REMOTE_LOG="\${REMOTE_LOG/#\~/\$HOME}"
 
+mkdir -p "\$(dirname "\$REMOTE_LOG")"
+if tmux has-session -t "\$SESSION" 2>/dev/null; then
+    if [[ "$REPLACE" == "1" ]]; then
+        tmux kill-session -t "\$SESSION"
+    else
+        echo "ERROR: tmux session \$SESSION already exists; use --replace" >&2
+        exit 1
+    fi
+fi
+: > "\$REMOTE_LOG"
+exec > >(tee -a "\$REMOTE_LOG") 2>&1
+
 if [[ "$UPDATE_REPO" == "1" ]]; then
     if [[ -d "\$WORK_DIR/.git" ]]; then
         cd "\$WORK_DIR"
@@ -175,8 +187,23 @@ if [[ "$INSTALL_DEPS" == "1" ]]; then
     python3 -m pip install "jax[tpu]==0.6.2" \
         -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
     python3 -m pip install \
-        flax optax numpy pyyaml google-cloud-storage requests sentencepiece -q
+        "flax==0.10.7" "optax==0.2.8" "numpy==2.2.6" \
+        pyyaml google-cloud-storage requests sentencepiece -q
     python3 -m pip install -r requirements_zero_shot_eval.txt -q
+    python3 - <<'PYCHK'
+from importlib import metadata
+import jax
+assert jax.__version__ == '0.6.2'
+assert metadata.version('flax') == '0.10.7'
+assert metadata.version('optax') == '0.2.8'
+assert metadata.version('numpy') == '2.2.6'
+print(
+    'analysis-runtime '
+    f'jax={jax.__version__} flax={metadata.version("flax")} '
+    f'optax={metadata.version("optax")} numpy={metadata.version("numpy")}',
+    flush=True,
+)
+PYCHK
 fi
 
 CMD=(
@@ -198,24 +225,15 @@ fi
 [[ -z "$MESH_MODEL" ]] || CMD+=(--mesh-model "$MESH_MODEL")
 [[ "$RESUME" == "1" ]] || CMD+=(--no-resume)
 
-mkdir -p "\$(dirname "\$REMOTE_LOG")"
-if tmux has-session -t "\$SESSION" 2>/dev/null; then
-    if [[ "$REPLACE" == "1" ]]; then
-        tmux kill-session -t "\$SESSION"
-    else
-        echo "ERROR: tmux session \$SESSION already exists; use --replace" >&2
-        exit 1
-    fi
-fi
 CMD_TEXT=\$(printf '%q ' "\${CMD[@]}")
 echo "TRAIN_ANALYSIS_POOL worker=\$(hostname) branch=\$BRANCH"
 echo "TRAIN_ANALYSIS_POOL command=\$CMD_TEXT"
 if [[ "$DETACH" == "1" ]]; then
     tmux new-session -d -x 240 -y 60 -s "\$SESSION" \
-        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; { \$CMD_TEXT; } 2>&1 | tee '\$REMOTE_LOG'"
+        "cd '\$WORK_DIR'; export PYTHONUNBUFFERED=1; { \$CMD_TEXT; } 2>&1 | tee -a '\$REMOTE_LOG'"
     echo "TRAIN_ANALYSIS_POOL launched session=\$SESSION log=\$REMOTE_LOG"
 else
-    "\${CMD[@]}" 2>&1 | tee "\$REMOTE_LOG"
+    "\${CMD[@]}"
 fi
 EOF
 

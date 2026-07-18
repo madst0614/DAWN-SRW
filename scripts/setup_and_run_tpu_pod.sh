@@ -29,6 +29,13 @@ TMUX_COLS="${TMUX_COLS:-240}"
 TMUX_ROWS="${TMUX_ROWS:-60}"
 export PYTHONUNBUFFERED=1
 
+if [ "${TRAIN_LOG_INITIALIZED:-0}" != "1" ]; then
+    tmux kill-session -t train 2>/dev/null || true
+    : > "$HOME/train.log"
+    export TRAIN_LOG_INITIALIZED=1
+    exec > >(tee -a "$HOME/train.log") 2>&1
+fi
+
 echo "=== TPU worker startup ==="
 echo "HOSTNAME=$(hostname)"
 echo "DATE=$(date -Is)"
@@ -149,9 +156,9 @@ else
     echo "  XLA HLO dump: disabled (set ENABLE_XLA_DUMP=1 to enable)"
 fi
 
-# Start new tmux session running the target process, tee to ~/train.log
+# Start the target in tmux and append it to the setup stream in ~/train.log.
 tmux new-session -d -x "$TMUX_COLS" -y "$TMUX_ROWS" -s train \
-    "${XLA_DUMP_EXPORT}export PYTHONUNBUFFERED=1; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}{ echo \"=== TPU $RUN_KIND process startup ===\"; echo \"TRAIN_SCRIPT=$TRAIN_SCRIPT\"; echo \"CONFIG=$CONFIG\"; echo \"TRAIN_ARGS=$TRAIN_ARGS\"; echo \"RUN_KIND=$RUN_KIND\"; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"PYTHONUNBUFFERED=\$PYTHONUNBUFFERED\"; python3 -u \"$TRAIN_SCRIPT\" --config \"$CONFIG\" $TRAIN_ARGS; } 2>&1 | tee ~/train.log; echo 'Process finished. Press enter to close.'; read"
+    "${XLA_DUMP_EXPORT}export PYTHONUNBUFFERED=1; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='$TF_CPP_MIN_LOG_LEVEL'; ${XLA_FLAGS_EXPORT}{ echo \"=== TPU $RUN_KIND process startup ===\"; echo \"TRAIN_SCRIPT=$TRAIN_SCRIPT\"; echo \"CONFIG=$CONFIG\"; echo \"TRAIN_ARGS=$TRAIN_ARGS\"; echo \"RUN_KIND=$RUN_KIND\"; echo \"HOSTNAME=\$(hostname)\"; echo \"DATE=\$(date -Is)\"; echo \"PYTHONUNBUFFERED=\$PYTHONUNBUFFERED\"; python3 -u \"$TRAIN_SCRIPT\" --config \"$CONFIG\" $TRAIN_ARGS; } 2>&1 | tee -a ~/train.log; echo 'Process finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"
