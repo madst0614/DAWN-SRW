@@ -106,8 +106,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zero-shot-batch-size", type=int, default=32)
     parser.add_argument("--zero-shot-limit", type=int, default=None)
     parser.add_argument(
-        "--resume", action=argparse.BooleanOptionalAction, default=True,
-        help="Resume only artifacts with an exactly matching protocol/checkpoint hash")
+        "--from-scratch", dest="resume", action="store_false", default=True,
+        help="Recompute instead of resuming protocol-matched artifacts")
     parser.add_argument(
         "--mesh-data", type=int, default=None,
         help="Ad-hoc checkpoint assertion; registered target mesh cannot be overridden")

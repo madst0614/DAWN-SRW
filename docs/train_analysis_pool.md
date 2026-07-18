@@ -220,7 +220,7 @@ summary.json
 
 Mechanistic item protocol에는 checkpoint identity, model config, benchmark manifest, target, runtime, checkpoint/effective mesh가 포함된다. Zero-shot item protocol에는 concrete checkpoint, parameter identity, stock task config hash, dataset fingerprint, tokenizer 정책, target/runtime mesh가 포함된다.
 
-`--resume`은 item protocol이 정확히 일치할 때만 허용한다. 기존 artifact가 있지만 target, concrete checkpoint, runtime, code revision 또는 protocol이 다르면 덮어쓰지 않고 실패하며, 의도적으로 다시 계산할 때만 `--no-resume`을 사용한다.
+기본 실행은 item protocol이 정확히 일치할 때만 resume한다. 기존 artifact가 있지만 target, concrete checkpoint, runtime, code revision 또는 protocol이 다르면 덮어쓰지 않고 실패하며, 의도적으로 다시 계산할 때만 `--from-scratch`를 사용한다.
 
 ## 과학적 경계
 
