@@ -3174,8 +3174,16 @@ def _make_sharded_srw_minimal_impl(
             position_selected = position_mask[:, :, None]
             effective_keep = (
                 ~position_selected | retain_chunk) & valid_bsn
-            retention_enabled = retention_mode > jnp.int32(0)
-            autonomous_retention = retention_mode == jnp.int32(2)
+            # A route with no removed local operator is production, exactly.
+            # Disable retention before the numerator/denominator selects so
+            # an all-ones mask cannot lower to a different masked reduction
+            # on TPU.  Other model shards may still remove their own local
+            # operators; preserving this shard is the correct global result.
+            route_has_removal = ~jnp.all(retain_mask_local)
+            retention_enabled = (
+                (retention_mode > jnp.int32(0)) & route_has_removal)
+            autonomous_retention = (
+                (retention_mode == jnp.int32(2)) & route_has_removal)
             numerator_keep = (~retention_enabled) | effective_keep
             execution_for_numerator = jnp.where(
                 suppress_mask | ~numerator_keep,
@@ -3544,8 +3552,15 @@ def _make_sharded_srw_paired_minimal_impl(
             position_selected = position_mask[:, :, None, None]
             effective_keep = (
                 ~position_selected | retain_chunk) & valid_bsrn
-            retention_enabled = retention_mode > jnp.int32(0)
-            autonomous_retention = retention_mode == jnp.int32(2)
+            # Q and K have independent retention contracts even though they
+            # share one paired kernel.  A fully retained sibling route must
+            # remain the exact production route when the other is reduced.
+            route_has_removal = (
+                ~jnp.all(retain_mask_local, axis=-1))[None, None, :, None]
+            retention_enabled = (
+                (retention_mode > jnp.int32(0)) & route_has_removal)
+            autonomous_retention = (
+                (retention_mode == jnp.int32(2)) & route_has_removal)
             numerator_keep = (~retention_enabled) | effective_keep
             execution_for_numerator = jnp.where(
                 suppress_mask | ~numerator_keep,

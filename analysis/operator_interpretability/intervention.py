@@ -185,79 +185,46 @@ def _candidate_score_normalization(
     return normalization
 
 
-def _retention_score_executable(ctx: Any, mode: str):
+def _retention_mode_code(mode: str) -> int:
+    modes = {
+        "conditional_execution_sufficiency": 1,
+        "autonomous_subcircuit_sufficiency": 2,
+    }
+    if mode not in modes:
+        raise ValueError(f"unknown circuit retention mode: {mode}")
+    return modes[mode]
+
+
+def _retention_score_executable(ctx: Any):
     cache = getattr(ctx, "_operator_interpretability_executables", None)
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = f"retention_score:{mode}"
+    key = "retention_score:dynamic_mode"
     if key in cache:
         return cache[key]
     kwargs = _runtime_kwargs(ctx)
 
     @jax.jit
-    def score(params, input_ids, labels, keep_qk, keep_v, keep_rst):
+    def score(params, input_ids, labels, keep_qk, keep_v, keep_rst,
+              retention_mode):
         result = ctx.model.apply(
-            {"params": params}, input_ids, keep_qk, keep_v, keep_rst,
-            mode=mode,
-            position_mask=jnp.ones_like(input_ids, dtype=jnp.bool_),
-            labels=labels,
+            {"params": params}, input_ids, labels=labels,
             attention_mask=jnp.ones_like(input_ids),
-            return_residual=False,
-            method=ctx.model.analysis_forward_with_circuit_retention,
+            minimal_train=True,
+            analysis_keep_qk=keep_qk,
+            analysis_keep_v=keep_v,
+            analysis_keep_rst=keep_rst,
+            analysis_position_mask=jnp.ones_like(
+                input_ids, dtype=jnp.bool_),
+            analysis_retention_mode=jnp.asarray(
+                retention_mode, dtype=jnp.int32),
+            analysis_return_residual=False,
             **kwargs)
         return _score_from_result(result, "sum_log_probability")
 
     cache[key] = score
     return score
-
-
-def _all_ones_retention_parity_executable(
-        ctx: Any, mode: str, shape: OperatorSpaceShape):
-    """Compile production and the all-ones retention sidecar together.
-
-    Exact parity is a property of the intervention path, not of two
-    independently lowered TPU executables.  Keeping both forwards in one JIT
-    also makes the all-ones masks compile-time constants, so the comparison
-    cannot be perturbed by a different masked-reduction lowering.
-    """
-    cache = getattr(ctx, "_operator_interpretability_executables", None)
-    if cache is None:
-        cache = {}
-        setattr(ctx, "_operator_interpretability_executables", cache)
-    key = (
-        f"all_ones_retention_parity:{mode}:"
-        f"{shape.n_layers}:{shape.n_qk}:{shape.n_v}:{shape.n_rst}")
-    if key in cache:
-        return cache[key]
-    kwargs = _runtime_kwargs(ctx)
-
-    @jax.jit
-    def compare(params, input_ids, labels):
-        production = ctx.model.apply(
-            {"params": params}, input_ids, labels=labels,
-            attention_mask=jnp.ones_like(input_ids),
-            minimal_train=True, **kwargs)
-        retained = ctx.model.apply(
-            {"params": params}, input_ids,
-            jnp.ones(
-                (shape.n_layers, 2, shape.n_qk), dtype=jnp.bool_),
-            jnp.ones((shape.n_layers, shape.n_v), dtype=jnp.bool_),
-            jnp.ones((shape.n_layers, shape.n_rst), dtype=jnp.bool_),
-            mode=mode,
-            position_mask=jnp.ones_like(input_ids, dtype=jnp.bool_),
-            labels=labels,
-            attention_mask=jnp.ones_like(input_ids),
-            return_residual=False,
-            method=ctx.model.analysis_forward_with_circuit_retention,
-            **kwargs)
-        return (
-            _score_from_result(production, "sum_log_probability"),
-            _score_from_result(retained, "sum_log_probability"),
-        )
-
-    cache[key] = compare
-    return compare
 
 
 def evaluate_behavior(ctx: Any, examples: Sequence[BenchmarkExample], *,
@@ -360,7 +327,8 @@ def evaluate_circuit_retention(
     score = (
         _plain_score_executable(ctx)
         if all_operators_retained
-        else _retention_score_executable(ctx, mode))
+        else _retention_score_executable(ctx))
+    retention_mode = jnp.int32(_retention_mode_code(mode))
 
     def run(answer_side: str) -> np.ndarray:
         arrays = _sequence_arrays(
@@ -376,7 +344,7 @@ def evaluate_circuit_retention(
             value = score(
                 ctx.params, ids, labels,
                 jnp.asarray(masks["qk"]), jnp.asarray(masks["v"]),
-                jnp.asarray(masks["rst"]))
+                jnp.asarray(masks["rst"]), retention_mode)
         return materialize_global_array(value)[:arrays[2]].astype(np.float64)
 
     positive = run("positive")
@@ -408,8 +376,9 @@ def evaluate_circuit_necessity(
     # Invoke the dense masks directly; materializing millions of complement
     # OperatorSite objects would add no scientific information.
     multiple = max(1, int(ctx.mesh.shape["data"]))
-    score = _retention_score_executable(
-        ctx, "conditional_execution_sufficiency")
+    score = _retention_score_executable(ctx)
+    retention_mode = jnp.int32(_retention_mode_code(
+        "conditional_execution_sufficiency"))
 
     def run(answer_side: str) -> np.ndarray:
         arrays = _sequence_arrays(
@@ -419,7 +388,7 @@ def evaluate_circuit_necessity(
         value = score(
             ctx.params, ids, labels,
             jnp.asarray(complement["qk"]), jnp.asarray(complement["v"]),
-            jnp.asarray(complement["rst"]))
+            jnp.asarray(complement["rst"]), retention_mode)
         return materialize_global_array(value)[:arrays[2]].astype(np.float64)
 
     positive = run("positive")
@@ -443,17 +412,38 @@ def all_ones_retention_parity(ctx: Any, examples: Sequence[BenchmarkExample], *,
         examples, prompt_side="base", answer_side="positive",
         pad_token_id=pad_token_id, multiple=multiple)
     ids, labels = _device_batch(ctx, arrays[0], arrays[1])
-    compare = _all_ones_retention_parity_executable(ctx, mode, shape)
-    before_device, after_device = compare(ctx.params, ids, labels)
-    before = materialize_global_array(before_device)
-    after = materialize_global_array(after_device)
+    score = _retention_score_executable(ctx)
+    ones_qk = jnp.ones((shape.n_layers, 2, shape.n_qk), dtype=jnp.bool_)
+    ones_v = jnp.ones((shape.n_layers, shape.n_v), dtype=jnp.bool_)
+    ones_rst = jnp.ones((shape.n_layers, shape.n_rst), dtype=jnp.bool_)
+    # Both references are separate invocations of the same compiled forward.
+    # The mode is a dynamic scalar argument, so TPU lowering and reduction
+    # order cannot differ between the production-mode and retained-mode runs.
+    before = materialize_global_array(score(
+        ctx.params, ids, labels, ones_qk, ones_v, ones_rst, jnp.int32(0)))
+    after = materialize_global_array(score(
+        ctx.params, ids, labels, ones_qk, ones_v, ones_rst,
+        jnp.int32(_retention_mode_code(mode))))
     exact = bool(np.array_equal(before, after))
     if not exact:
-        raise RuntimeError("all-ones circuit retention parity is not machine-exact")
+        unequal = np.not_equal(before, after)
+        first_index = tuple(int(value) for value in np.argwhere(unequal)[0])
+        delta = np.abs(
+            before.astype(np.float64) - after.astype(np.float64))
+        finite_delta = delta[np.isfinite(delta)]
+        max_absolute_delta = (
+            float(np.max(finite_delta)) if finite_delta.size else None)
+        raise RuntimeError(
+            "all-ones circuit retention parity is not machine-exact: "
+            f"mismatch_count={int(np.count_nonzero(unequal))} "
+            f"first_index={first_index} "
+            f"production={before[first_index]!r} "
+            f"retained={after[first_index]!r} "
+            f"max_absolute_delta={max_absolute_delta!r}")
     return {
         "status": "passed",
         "machine_exact": True,
-        "parity_scope": "single_executable_production_sidecar",
+        "parity_scope": "single_dynamic_mode_executable",
         "mode": mode,
         "example_count": arrays[2],
     }
