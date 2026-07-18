@@ -644,15 +644,50 @@ def _validate_evaluated_row_counts(
     limit: Optional[int], tasks: Sequence[str],
 ) -> None:
     results = raw.get("results", {})
+    logged_samples = raw.get("samples")
+    if not isinstance(logged_samples, Mapping):
+        raise RuntimeError(
+            "lm-eval result lacks per-task sample logs required for exact "
+            "row-count validation")
+    sample_tasks = {str(name) for name in logged_samples}
+    if sample_tasks != set(tasks):
+        raise RuntimeError(
+            "lm-eval sample task set differs from requested tasks: "
+            f"requested={sorted(tasks)} actual={sorted(sample_tasks)}")
     for task in tasks:
         metrics = results.get(task)
         if not isinstance(metrics, Mapping):
             raise RuntimeError(f"final task result missing: {task}")
-        candidates = [key for key in metrics if key == "samples"]
-        if len(candidates) != 1:
+        task_samples = logged_samples.get(task)
+        if not isinstance(task_samples, list):
             raise RuntimeError(
-                f"task {task} result lacks exact sample count: {sorted(metrics)}")
-        actual = int(metrics["samples"])
+                f"task {task} sample log is not a list: "
+                f"{type(task_samples).__name__}")
+        malformed = [
+            index for index, sample in enumerate(task_samples)
+            if not isinstance(sample, Mapping) or "doc_id" not in sample
+        ]
+        if malformed:
+            raise RuntimeError(
+                f"task {task} sample log lacks document identity at rows "
+                f"{malformed[:8]}")
+        document_ids = [
+            stable_json_dumps(json_safe(sample["doc_id"]))
+            for sample in task_samples
+        ]
+        if len(set(document_ids)) != len(document_ids):
+            raise RuntimeError(
+                f"task {task} sample log contains duplicate document ids")
+        actual = len(task_samples)
+        # lm-eval 0.4.2 internally tracks ``results[task]['samples']`` but
+        # deliberately removes it while building the public printable result.
+        # If a patched harness preserves that field, require it to agree with
+        # the authoritative log_samples=True document records.
+        if "samples" in metrics and int(metrics["samples"]) != actual:
+            raise RuntimeError(
+                "metric/sample-log row counts disagree: "
+                f"task={task} metric={int(metrics['samples'])} "
+                f"logged={actual}")
         expected_full = int(task_provenance[task]["expected_evaluation_rows"])
         expected = min(int(limit), expected_full) if limit is not None else expected_full
         if actual != expected:
