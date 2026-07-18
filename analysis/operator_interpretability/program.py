@@ -618,7 +618,7 @@ def compactness_metrics(
 def select_validation_program(
         candidates: Sequence[Mapping[str, Any]], *,
         config: ProtocolConfig) -> dict[str, Any]:
-    """Freeze the smallest preregistered passing mass without test access."""
+    """Freeze the smallest compact replay-sufficient mass without test access."""
     allowed = tuple(float(value) for value in config.program_mass_candidates)
     ordered = sorted(candidates, key=lambda row: float(row["program_mass"]))
     if tuple(float(row["program_mass"]) for row in ordered) != allowed:
@@ -632,9 +632,18 @@ def select_validation_program(
             "replay_answer_agreement": float(
                 row["replay"]["answer_agreement_with_full"])
                 >= config.program_replay_agreement_min,
+            "compactness": float(
+                row["compactness"][
+                    "median_decision_position_site_fraction"])
+                <= config.program_compact_fraction_max,
+        }
+        diagnostics = {
             "own_ablation_margin_drop_ci": float(
                 row["ablation"]["own_program"]["margin_drop_ci"]["ci_low"])
                 > 0.0,
+            "own_ablation_permutation": float(
+                row["ablation"]["own_program"]["permutation"][
+                    "p_value_two_sided"]) < config.alpha,
             "own_over_mismatched_ablation_ci": float(
                 row["ablation"]["specificity"]["own_vs_mismatched"][
                     "effect_ci"]["ci_low"]) > 0.0,
@@ -647,15 +656,40 @@ def select_validation_program(
             "own_over_random_ablation_permutation": float(
                 row["ablation"]["specificity"]["own_vs_random"][
                     "permutation"]["p_value_two_sided"]) < config.alpha,
-            "paired_over_mismatch_ci": float(
+            "id_paired_over_mismatch_ci": float(
+                row["source_id_replay"]["paired_vs_mismatch"][
+                    "effect_ci"]["ci_low"]) > 0.0,
+            "id_paired_over_mismatch_permutation": float(
+                row["source_id_replay"]["paired_vs_mismatch"][
+                    "permutation"]["p_value_two_sided"]) < config.alpha,
+            "id_paired_over_random_ci": float(
+                row["source_id_replay"]["paired_vs_random"][
+                    "effect_ci"]["ci_low"]) > 0.0,
+            "id_paired_over_random_permutation": float(
+                row["source_id_replay"]["paired_vs_random"][
+                    "permutation"]["p_value_two_sided"]) < config.alpha,
+            "id_bidirectional_answer_flip": float(
+                row["source_id_replay"][
+                    "bidirectional_answer_flip_fraction"])
+                >= config.program_id_transfer_flip_min,
+            "contribution_paired_over_mismatch_ci": float(
                 row["transplant"]["paired_vs_mismatch"]["effect_ci"]["ci_low"])
                 > 0.0,
-            "compactness": float(
-                row["compactness"][
-                    "median_decision_position_site_fraction"])
-                <= config.program_compact_fraction_max,
+            "contribution_paired_over_mismatch_permutation": float(
+                row["transplant"]["paired_vs_mismatch"][
+                    "permutation"]["p_value_two_sided"]) < config.alpha,
+            "contribution_paired_over_random_ci": float(
+                row["transplant"]["paired_vs_random"][
+                    "effect_ci"]["ci_low"]) > 0.0,
+            "contribution_paired_over_random_permutation": float(
+                row["transplant"]["paired_vs_random"][
+                    "permutation"]["p_value_two_sided"]) < config.alpha,
+            "contribution_bidirectional_answer_flip": float(
+                row["transplant"]["bidirectional_answer_flip_fraction"])
+                >= config.program_transplant_flip_min,
         }
         row["validation_selection_checks"] = checks
+        row["validation_diagnostic_checks"] = diagnostics
         if all(checks.values()):
             passing.append(row)
     if not passing:
@@ -665,6 +699,9 @@ def select_validation_program(
             "selection_phase": "validation",
             "test_consulted": False,
             "candidate_count": len(ordered),
+            "selection_rule": (
+                "smallest_mass_passing_compact_replay_gates"),
+            "causal_diagnostics_used_for_selection": False,
         }
     selected = passing[0]
     return {
@@ -672,16 +709,21 @@ def select_validation_program(
         "selected_program_mass": float(selected["program_mass"]),
         "selection_phase": "validation",
         "test_consulted": False,
-        "selection_rule": "smallest_mass_passing_all_preregistered_gates",
+        "selection_rule": "smallest_mass_passing_compact_replay_gates",
+        "causal_diagnostics_used_for_selection": False,
         "program_algorithm_version": PROGRAM_ALGORITHM_VERSION,
         "selected_validation_metrics_hash": canonical_hash({
             "program_mass": selected["program_mass"],
             "checks": selected["validation_selection_checks"],
             "replay": selected["replay"],
+            "compactness": selected["compactness"],
+        }),
+        "selected_validation_diagnostics_hash": canonical_hash({
+            "program_mass": selected["program_mass"],
+            "checks": selected["validation_diagnostic_checks"],
             "ablation": selected["ablation"],
             "source_id_replay": selected["source_id_replay"],
             "transplant": selected["transplant"],
-            "compactness": selected["compactness"],
         }),
     }
 
@@ -731,10 +773,12 @@ def evaluate_native_program_claims(
             "bidirectional_answer_flip_fraction"])
         >= config.program_id_transfer_flip_min)
     contribution_transfer = (
-        float(test_result["transplant"]["paired_vs_mismatch"][
-            "effect_ci"]["ci_low"]) > 0.0
-        and float(test_result["transplant"]["paired_vs_mismatch"][
-            "permutation"]["p_value_two_sided"]) < config.alpha
+        all(
+            float(test_result["transplant"][name][
+                "effect_ci"]["ci_low"]) > 0.0
+            and float(test_result["transplant"][name][
+                "permutation"]["p_value_two_sided"]) < config.alpha
+            for name in ("paired_vs_mismatch", "paired_vs_random"))
         and float(test_result["transplant"][
             "bidirectional_answer_flip_fraction"])
         >= config.program_transplant_flip_min)

@@ -949,23 +949,29 @@ def evaluate_native_operator_program_candidate(
         raise ValueError(
             "IOI native program requires sum_log_probability scoring")
 
-    mismatch = deterministic_mismatch_mapping(
+    mismatch_source_mapping = deterministic_mismatch_mapping(
         examples, source_schedule, seed=seed + 101)
-    donor_indices = mismatch["donor_indices"]
+    mismatch_base_mapping = deterministic_mismatch_mapping(
+        examples, base_schedule, seed=seed + 113)
+    source_donor_indices = mismatch_source_mapping["donor_indices"]
+    base_donor_indices = mismatch_base_mapping["donor_indices"]
     recipient_ids = [example.example_id for example in examples]
     mismatch_source = reindex_program_schedule(
-        source_schedule, donor_indices,
+        source_schedule, source_donor_indices,
         recipient_example_ids=recipient_ids,
         prompt_side="mismatched_source", shape=shape)
     mismatch_base = reindex_program_schedule(
-        base_schedule, donor_indices,
+        base_schedule, base_donor_indices,
         recipient_example_ids=recipient_ids,
         prompt_side="mismatched_base", shape=shape)
     random_source = random_program_schedule(
         source_schedule, shape=shape, seed=seed + 211)
     random_base = random_program_schedule(
         base_schedule, shape=shape, seed=seed + 223)
-    donor_examples = [examples[int(index)] for index in donor_indices]
+    source_donor_examples = [
+        examples[int(index)] for index in source_donor_indices]
+    base_donor_examples = [
+        examples[int(index)] for index in base_donor_indices]
 
     paired_source_contribution = capture_operator_program_contributions(
         ctx, examples, source_schedule, prompt_side="source",
@@ -974,10 +980,10 @@ def evaluate_native_operator_program_candidate(
         ctx, examples, base_schedule, prompt_side="base",
         pad_token_id=pad_token_id)
     mismatch_source_contribution = capture_operator_program_contributions(
-        ctx, donor_examples, mismatch_source, prompt_side="source",
+        ctx, source_donor_examples, mismatch_source, prompt_side="source",
         pad_token_id=pad_token_id)
     mismatch_base_contribution = capture_operator_program_contributions(
-        ctx, donor_examples, mismatch_base, prompt_side="base",
+        ctx, base_donor_examples, mismatch_base, prompt_side="base",
         pad_token_id=pad_token_id)
     random_source_contribution = capture_operator_program_contributions(
         ctx, examples, random_source, prompt_side="source",
@@ -1025,12 +1031,12 @@ def evaluate_native_operator_program_candidate(
         pad_token_id=pad_token_id,
         program_mode=PROGRAM_MODES["own_id_ablation"])
     mismatch_ablated = _program_margin(
-        ctx, examples, mismatch_source, prompt_side="base",
+        ctx, examples, mismatch_base, prompt_side="base",
         positive_side="positive", negative_side="negative",
         pad_token_id=pad_token_id,
         program_mode=PROGRAM_MODES["own_id_ablation"])
     random_ablated = _program_margin(
-        ctx, examples, random_source, prompt_side="base",
+        ctx, examples, random_base, prompt_side="base",
         positive_side="positive", negative_side="negative",
         pad_token_id=pad_token_id,
         program_mode=PROGRAM_MODES["own_id_ablation"])
@@ -1038,6 +1044,9 @@ def evaluate_native_operator_program_candidate(
     mismatch_drop = full_base_margin - mismatch_ablated
     random_drop = full_base_margin - random_ablated
     ablation = {
+        "control_schedule_side": "base",
+        "mismatched_schedule_hash": mismatch_base.schedule_hash,
+        "random_schedule_hash": random_base.schedule_hash,
         "own_program": _ablation_metrics(
             full_base_margin, own_ablated, config=config, seed=seed + 401),
         "mismatched_program": _ablation_metrics(
@@ -1201,7 +1210,7 @@ def evaluate_native_operator_program_candidate(
     }
     compactness = compactness_metrics(
         base_schedule, shape=shape, paired_schedule=source_schedule,
-        mismatched_schedule=mismatch_source)
+        mismatched_schedule=mismatch_base)
     result = {
         "status": "ready",
         "phase": examples[0].phase,
@@ -1217,11 +1226,13 @@ def evaluate_native_operator_program_candidate(
         "ablation": ablation,
         "source_id_replay": source_id,
         "transplant": transplant,
-        "mismatch_mapping": mismatch,
+        "mismatch_source_mapping": mismatch_source_mapping,
+        "mismatch_base_mapping": mismatch_base_mapping,
         "random_control": {
             "seed_source": seed + 211,
             "seed_base": seed + 223,
             "sampling_policy": config.program_random_sampling,
+            "ablation_reference_side": "base",
             "count_preserved_per_example_layer_route": True,
             "without_replacement": True,
             "source": _random_overlap_metrics(random_source),

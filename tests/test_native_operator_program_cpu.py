@@ -242,9 +242,41 @@ def _capture_rows(examples, shape):
     return {"status": "ready", "rows": rows}
 
 
-def _validation_candidate(mass: float, *, passing: bool):
-    sign = 1.0 if passing else -1.0
-    p_value = 0.01 if passing else 0.5
+def _asymmetric_capture_rows(examples, shape, *, prompt_side: str):
+    if any(shape.pool_size(route) != 8 for route in ROUTES):
+        raise ValueError("asymmetric capture fixture requires pool size 8")
+    weights_by_count = {
+        1: [0.55, 0.10, 0.08, 0.07, 0.06, 0.05, 0.05, 0.04],
+        2: [0.30, 0.25, 0.12, 0.10, 0.08, 0.06, 0.05, 0.04],
+        3: [0.20, 0.18, 0.14, 0.13, 0.11, 0.09, 0.08, 0.07],
+        4: [0.15, 0.14, 0.13, 0.12, 0.12, 0.12, 0.11, 0.11],
+    }
+    rows = []
+    for route in ROUTES:
+        pool = shape.pool_size(route)
+        for layer in range(shape.n_layers):
+            for example_index, example in enumerate(examples):
+                selected_count = 1 + (
+                    example_index % 4 if prompt_side == "base"
+                    else (example_index + 1) % 4)
+                operator_ids = (
+                    list(range(pool)) if prompt_side == "base"
+                    else list(range(pool - 1, -1, -1)))
+                rows.append({
+                    "example_id": example.example_id,
+                    "layer": layer,
+                    "route": route,
+                    "captured_mass": 1.0,
+                    "operator_ids": operator_ids,
+                    "weights": weights_by_count[selected_count],
+                })
+    return {"status": "ready", "rows": rows}
+
+
+def _validation_candidate(
+        mass: float, *, replay_passing: bool, causal_passing: bool):
+    sign = 1.0 if causal_passing else -1.0
+    p_value = 0.01 if causal_passing else 0.5
     advantage = {
         "effect_ci": {"ci_low": sign},
         "permutation": {"p_value_two_sided": p_value},
@@ -254,11 +286,16 @@ def _validation_candidate(mass: float, *, passing: bool):
         "compactness": {
             "median_decision_position_site_fraction": 0.1},
         "replay": {
-            "faithfulness_ci": {"ci_low": 0.9},
-            "answer_agreement_with_full": 1.0,
+            "faithfulness_ci": {
+                "ci_low": 0.9 if replay_passing else 0.7},
+            "answer_agreement_with_full": (
+                1.0 if replay_passing else 0.0),
         },
         "ablation": {
-            "own_program": {"margin_drop_ci": {"ci_low": sign}},
+            "own_program": {
+                "margin_drop_ci": {"ci_low": sign},
+                "permutation": {"p_value_two_sided": p_value},
+            },
             "specificity": {
                 "own_vs_mismatched": dict(advantage),
                 "own_vs_random": dict(advantage),
@@ -268,15 +305,16 @@ def _validation_candidate(mass: float, *, passing: bool):
             "paired_vs_mismatch": dict(advantage),
             "paired_vs_random": dict(advantage),
             "bidirectional_answer_flip_fraction": (
-                1.0 if passing else 0.0),
+                1.0 if causal_passing else 0.0),
         },
         "transplant": {
             "paired_vs_mismatch": {
                 "effect_ci": {"ci_low": sign},
                 "permutation": {"p_value_two_sided": p_value},
             },
+            "paired_vs_random": dict(advantage),
             "bidirectional_answer_flip_fraction": (
-                1.0 if passing else 0.0),
+                1.0 if causal_passing else 0.0),
         },
     }
 
@@ -310,12 +348,20 @@ def test_program_artifact_and_freeze_contracts() -> None:
     config = ProtocolConfig(
         bootstrap_samples=100, permutation_samples=100)
     candidates = [
-        _validation_candidate(mass, passing=(mass >= 0.8))
+        _validation_candidate(
+            mass, replay_passing=(mass >= 0.8), causal_passing=False)
         for mass in config.program_mass_candidates
     ]
     selected = select_validation_program(candidates, config=config)
     assert selected["selected_program_mass"] == 0.8
     assert selected["test_consulted"] is False
+    assert selected["causal_diagnostics_used_for_selection"] is False
+    selected_candidate = next(
+        row for row in candidates if row["program_mass"] == 0.8)
+    assert set(selected_candidate["validation_selection_checks"]) == {
+        "replay_faithfulness_ci", "replay_answer_agreement", "compactness"}
+    assert not all(
+        selected_candidate["validation_diagnostic_checks"].values())
     frozen = selected["selected_program_mass"]
     assert frozen in config.program_mass_candidates
 
@@ -382,16 +428,29 @@ def _ioi_examples(phase: str, count: int):
 
 
 def test_paired_controls_and_claim_gate_integration() -> None:
-    shape = OperatorSpaceShape(n_layers=2, n_qk=4, n_v=4, n_rst=4)
+    shape = OperatorSpaceShape(n_layers=2, n_qk=8, n_v=8, n_rst=8)
     examples = _ioi_examples("test", 16)
-    capture_rows = _capture_rows(examples, shape)
-    widths = {route: 4 for route in ROUTES}
+    base_capture_rows = _asymmetric_capture_rows(
+        examples, shape, prompt_side="base")
+    source_capture_rows = _asymmetric_capture_rows(
+        examples, shape, prompt_side="source")
+    widths = {route: 8 for route in ROUTES}
     base_schedule = build_program_schedule(
-        capture_rows, examples, shape=shape, program_mass=0.5,
+        base_capture_rows, examples, shape=shape, program_mass=0.5,
         prompt_side="base", widths=widths)
     source_schedule = build_program_schedule(
-        capture_rows, examples, shape=shape, program_mass=0.5,
+        source_capture_rows, examples, shape=shape, program_mass=0.5,
         prompt_side="source", widths=widths)
+    assert all(
+        base["site_count"] != source["site_count"]
+        for base, source in zip(
+            base_schedule.records, source_schedule.records))
+    assert any(
+        not np.array_equal(
+            base_schedule.ids[route], source_schedule.ids[route])
+        for route in ROUTES)
+
+    ablation_schedule_hashes: list[str] = []
 
     def fake_capture(
             _ctx, capture_examples, _schedule, *, prompt_side,
@@ -420,9 +479,10 @@ def test_paired_controls_and_claim_gate_integration() -> None:
         elif program_mode == 1:
             value = 2.0
         elif program_mode == 2:
+            ablation_schedule_hashes.append(schedule.schedule_hash)
             value = {
                 "base": 0.0,
-                "mismatched_source": 1.5,
+                "mismatched_base": 1.5,
                 "random_id": 1.8,
             }[schedule.prompt_side]
         elif program_mode == 3:
@@ -476,15 +536,59 @@ def test_paired_controls_and_claim_gate_integration() -> None:
         "bidirectional_answer_flip_fraction"] == 1.0
     assert result["transplant"]["paired_vs_mismatch"][
         "effect_ci"]["ci_low"] > 0.0
+    assert result["transplant"]["paired_vs_random"][
+        "effect_ci"]["ci_low"] > 0.0
     assert result["transplant"][
         "bidirectional_answer_flip_fraction"] == 1.0
     assert result["random_control"]["source"][
         "max_overlap_fraction"] == 0.0
     assert result["random_control"]["base"][
         "max_overlap_fraction"] == 0.0
-    assert all(
-        row["answer_token_disjoint"]
-        for row in result["mismatch_mapping"]["rows"])
+    assert result["ablation"]["control_schedule_side"] == "base"
+    assert ablation_schedule_hashes == [
+        base_schedule.schedule_hash,
+        controls["mismatch_base"].schedule_hash,
+        controls["random_base"].schedule_hash,
+    ]
+    assert result["ablation"]["mismatched_schedule_hash"] == (
+        controls["mismatch_base"].schedule_hash)
+    assert result["ablation"]["random_schedule_hash"] == (
+        controls["random_base"].schedule_hash)
+
+    def assert_mapping_matches_schedule(mapping, schedule, control):
+        assert all(row["answer_token_disjoint"] for row in mapping["rows"])
+        for index, row in enumerate(mapping["rows"]):
+            donor_index = int(mapping["donor_indices"][index])
+            assert row["recipient_site_count"] == int(
+                schedule.records[index]["site_count"])
+            assert row["donor_site_count"] == int(
+                schedule.records[donor_index]["site_count"])
+            assert int(control.records[index]["site_count"]) == int(
+                row["donor_site_count"])
+
+    assert_mapping_matches_schedule(
+        result["mismatch_source_mapping"], source_schedule,
+        controls["mismatch_source"])
+    assert_mapping_matches_schedule(
+        result["mismatch_base_mapping"], base_schedule,
+        controls["mismatch_base"])
+    assert result["mismatch_source_mapping"]["seed"] != (
+        result["mismatch_base_mapping"]["seed"])
+
+    def assert_random_disjoint(reference, random_control):
+        for route in ROUTES:
+            for layer in range(shape.n_layers):
+                for example_index in range(len(examples)):
+                    reference_ids = set(int(value) for value in reference.ids[
+                        route][layer, example_index, reference.valid[
+                            route][layer, example_index]])
+                    random_ids = set(int(value) for value in random_control.ids[
+                        route][layer, example_index, random_control.valid[
+                            route][layer, example_index]])
+                    assert reference_ids.isdisjoint(random_ids)
+
+    assert_random_disjoint(base_schedule, controls["random_base"])
+    assert_random_disjoint(source_schedule, controls["random_source"])
     assert set(controls) == {
         "mismatch_source", "mismatch_base", "random_source", "random_base"}
     claims = evaluate_native_program_claims(result, config=config)
@@ -505,6 +609,13 @@ def test_paired_controls_and_claim_gate_integration() -> None:
         id_transfer_blocked, config=config)
     assert blocked_claims["strongest_supported_claim"] == (
         "specific_causal_decision_program")
+    transplant_random_blocked = copy.deepcopy(result)
+    transplant_random_blocked["transplant"]["paired_vs_random"][
+        "permutation"]["p_value_two_sided"] = 0.5
+    blocked_claims = evaluate_native_program_claims(
+        transplant_random_blocked, config=config)
+    assert blocked_claims["strongest_supported_claim"] == (
+        "counterfactual_operator_selection_transfer")
     print("NATIVE_PROGRAM_PAIRED_CONTROL_INTEGRATION_OK")
 
 
@@ -518,7 +629,8 @@ def test_validation_selection_precedes_single_test_call() -> None:
         return {"selected_mass": selected_mass}
 
     failing = [
-        _validation_candidate(mass, passing=False)
+        _validation_candidate(
+            mass, replay_passing=False, causal_passing=True)
         for mass in config.program_mass_candidates
     ]
     selection, test_result = select_validation_then_evaluate_test(
@@ -528,7 +640,8 @@ def test_validation_selection_precedes_single_test_call() -> None:
     assert calls == []
 
     passing = [
-        _validation_candidate(mass, passing=(mass >= 0.8))
+        _validation_candidate(
+            mass, replay_passing=(mass >= 0.8), causal_passing=False)
         for mass in config.program_mass_candidates
     ]
     selection, test_result = select_validation_then_evaluate_test(

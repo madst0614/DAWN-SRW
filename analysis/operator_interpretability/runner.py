@@ -768,18 +768,18 @@ class OperatorInterpretabilityRunner:
                 discovery_source_capture, discovery_examples,
                 shape=self.shape, program_mass=program_mass,
                 prompt_side="source", widths=discovery_widths)
-            mismatch = deterministic_mismatch_mapping(
-                discovery_examples, source_schedule,
+            mismatch_base_mapping = deterministic_mismatch_mapping(
+                discovery_examples, base_schedule,
                 seed=self.config.seed + 11003 + mass_index)
-            mismatch_schedule = reindex_program_schedule(
-                source_schedule, mismatch["donor_indices"],
+            mismatch_base_schedule = reindex_program_schedule(
+                base_schedule, mismatch_base_mapping["donor_indices"],
                 recipient_example_ids=[
                     example.example_id for example in discovery_examples],
-                prompt_side="mismatched_source", shape=self.shape)
+                prompt_side="mismatched_base", shape=self.shape)
             compactness = compactness_metrics(
                 base_schedule, shape=self.shape,
                 paired_schedule=source_schedule,
-                mismatched_schedule=mismatch_schedule)
+                mismatched_schedule=mismatch_base_schedule)
             artifacts = self._write_program_artifacts(
                 phase="discovery", program_mass=program_mass,
                 schedules={
@@ -953,6 +953,9 @@ class OperatorInterpretabilityRunner:
             test_result, config=self.config)
         human_summary = {
             "selected_program_mass": selected_mass,
+            "validation_selection_rule": selection["selection_rule"],
+            "validation_causal_diagnostics_used_for_selection": selection[
+                "causal_diagnostics_used_for_selection"],
             "decision_scope": "final_ioi_decision_at_answer_position",
             "median_decision_position_site_fraction": test_result[
                 "compactness"]["median_decision_position_site_fraction"],
@@ -997,6 +1000,13 @@ class OperatorInterpretabilityRunner:
                 "paired_vs_mismatch"]["effect_ci"],
             "paired_vs_mismatch_permutation_p": test_result["transplant"][
                 "paired_vs_mismatch"]["permutation"][
+                    "p_value_two_sided"],
+            "paired_vs_random_effect": test_result["transplant"][
+                "paired_vs_random"]["mean_effect"],
+            "paired_vs_random_effect_ci": test_result["transplant"][
+                "paired_vs_random"]["effect_ci"],
+            "paired_vs_random_permutation_p": test_result["transplant"][
+                "paired_vs_random"]["permutation"][
                     "p_value_two_sided"],
             "bidirectional_success": test_result["transplant"][
                 "bidirectional_answer_flip_fraction"],
