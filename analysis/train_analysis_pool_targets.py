@@ -93,7 +93,17 @@ def _positive_int(value: Any, field: str) -> int:
 
 def target_spec(target_id: str, *, registry_path: str | Path | None = None) -> TargetSpec:
     registry = _read_registry(registry_path)
-    key = str(target_id).strip().lower()
+    requested = str(target_id).strip()
+    matches = [
+        str(registered)
+        for registered in registry["targets"]
+        if str(registered).casefold() == requested.casefold()
+    ]
+    if len(matches) > 1:
+        raise ValueError(
+            f"ambiguous case-insensitive analysis target {target_id!r}: "
+            f"{','.join(matches)}")
+    key = matches[0] if matches else requested
     raw = registry["targets"].get(key)
     if not isinstance(raw, Mapping):
         raise ValueError(

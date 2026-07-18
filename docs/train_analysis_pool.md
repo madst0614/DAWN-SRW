@@ -35,7 +35,8 @@ Target과 runtime registry는 [`configs/train_analysis_pool.yaml`](../configs/tr
 | Target | Model version | Scale | Model mesh axis |
 |---|---|---:|---:|
 | `v4171_400m` | `spatial-r1-v4.1.7.1` | 400M | 2 |
-| `v4172_400m_den_qk0p5_v1p0_rst1p2` | `spatial-r1-v4.1.7.2` | 400M | 2 |
+| `v4172_400M` | `spatial-r1-v4.1.7.2` | 400M | 2 |
+| `v4172_1B` | `spatial-r1-v4.1.7.2` | 1.3B | 2 |
 
 Target 경로가 run/root를 가리키더라도 실행 시작 시 committed numeric Orbax step 하나로 고정한다. 결과에는 요청 target, 실제 checkpoint path와 step, checkpoint mesh, effective mesh를 모두 기록한다.
 
