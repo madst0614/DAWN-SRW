@@ -158,15 +158,15 @@ export JAX_LOG_COMPILES="\${JAX_LOG_COMPILES:-0}"
 export TF_CPP_MIN_LOG_LEVEL="\${TF_CPP_MIN_LOG_LEVEL:-2}"
 
 if [ "\$DETACH" = "1" ]; then
-    echo "[run] starting tmux session v394_analysis"
-    tmux kill-session -t v394_analysis 2>/dev/null || true
-    tmux new-session -d -s v394_analysis \
-        "cd '\$WORK_DIR'; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; \$ANALYSIS_CMD_STR > >(tee ~/v394_appendix_data.log) 2> >(tee ~/v394_appendix_progress.log >&2); echo 'Analysis finished. Press enter to close.'; read"
-    echo "[run] detached. data=~/v394_appendix_data.log progress=~/v394_appendix_progress.log"
+    echo "[run] starting tmux session train"
+    tmux kill-session -t train 2>/dev/null || true
+    tmux new-session -d -s train \
+        "cd '\$WORK_DIR'; export JAX_TRACEBACK_FILTERING='\$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='\$JAX_LOG_COMPILES'; export TF_CPP_MIN_LOG_LEVEL='\$TF_CPP_MIN_LOG_LEVEL'; \$ANALYSIS_CMD_STR 2>&1 | tee ~/train.log; echo 'Analysis finished. Press enter to close.'; read"
+    echo "[run] detached. log=~/train.log"
 else
-    echo "[run] foreground analysis; progress and data stream below"
+    echo "[run] foreground analysis; combined stream below"
     cd "\$WORK_DIR"
-    "\${ANALYSIS_CMD[@]}" > >(tee ~/v394_appendix_data.log) 2> >(tee ~/v394_appendix_progress.log >&2)
+    "\${ANALYSIS_CMD[@]}" 2>&1 | tee ~/train.log
 fi
 EOFCMD
 
@@ -180,5 +180,4 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
 
 echo ""
 echo "Done launching/running."
-echo "  Data worker 0:     gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='cat ~/v394_appendix_data.log'"
-echo "  Progress worker 0: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/v394_appendix_progress.log'"
+echo "  Log worker 0: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"

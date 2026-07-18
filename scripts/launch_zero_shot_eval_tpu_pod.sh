@@ -182,12 +182,12 @@ if [ -n "\$LIMIT" ]; then RUN_CMD+=(--limit "\$LIMIT"); fi
 RUN_CMD_STR=\$(printf '%q ' "\${RUN_CMD[@]}")
 
 if [ "\$FOREGROUND" = "1" ]; then
-  "\${RUN_CMD[@]}" 2>&1 | tee "\$HOME/zero_shot_eval.log"
+  "\${RUN_CMD[@]}" 2>&1 | tee "\$HOME/train.log"
 else
-  tmux kill-session -t zero_shot_eval 2>/dev/null || true
-  tmux new-session -d -s zero_shot_eval \
-    "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee '\$HOME/zero_shot_eval.log'"
-  echo "zero_shot_eval tmux session started on \$(hostname)"
+  tmux kill-session -t train 2>/dev/null || true
+  tmux new-session -d -s train \
+    "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee '\$HOME/train.log'"
+  echo "train tmux session started on \$(hostname)"
 fi
 EOFCMD
 
@@ -197,5 +197,5 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
   2>&1 | tee "launch_zero_shot_${TPU_NAME}_$(date -u +%Y%m%dT%H%M%SZ).log"
 
 echo "Launched."
-echo "  Follow: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/zero_shot_eval.log'"
+echo "  Follow: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"
 echo "  Output: $OUTPUT_DIR"

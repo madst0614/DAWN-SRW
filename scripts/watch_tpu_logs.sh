@@ -6,8 +6,8 @@ set -euo pipefail
 TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
-REMOTE_LOG="~/train.log"
-PANE_TARGET="train"
+readonly REMOTE_LOG="~/train.log"
+readonly PANE_TARGET="train"
 SOURCE="auto"
 WORKERS="primary"
 TAIL_LINES=160
@@ -31,8 +31,6 @@ usage() {
         "  --tpu NAME             TPU VM/Pod name" \
         "  --zone ZONE            Default: $ZONE" \
         "  --project PROJECT      Default: $PROJECT" \
-        "  --log PATH             Remote log path. Default: $REMOTE_LOG" \
-        "  --target TMUX_TARGET   tmux target for pane output. Default: $PANE_TARGET" \
         "" \
         "Workers:" \
         "  --primary              Auto-detect and follow the JAX primary host (default)" \
@@ -65,8 +63,6 @@ while [[ $# -gt 0 ]]; do
         --tpu) TPU_NAME="$2"; shift 2 ;;
         --zone) ZONE="$2"; shift 2 ;;
         --project) PROJECT="$2"; shift 2 ;;
-        --log) REMOTE_LOG="$2"; shift 2 ;;
-        --target|--session) PANE_TARGET="$2"; shift 2 ;;
         --file) SOURCE="file"; shift ;;
         --pane|--screen) SOURCE="pane"; shift ;;
         --attach) MODE="attach"; SOURCE="pane"; FOLLOW=0; shift ;;

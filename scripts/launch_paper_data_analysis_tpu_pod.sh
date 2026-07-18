@@ -205,15 +205,15 @@ RUN_CMD=(
 RUN_CMD_STR=\$(printf "%q " "\${RUN_CMD[@]}")
 
 if [ "\$DETACH" = "1" ]; then
-    echo "[run] starting tmux session paper_data_analysis"
-    tmux kill-session -t paper_data_analysis 2>/dev/null || true
-    tmux new-session -d -s paper_data_analysis \
-        "cd '\$WORK_DIR'; \$RUN_CMD_STR > >(tee ~/paper_data_analysis.log) 2> >(tee ~/paper_data_analysis_progress.log >&2); echo 'Analysis finished. Press enter to close.'; read"
-    echo "[run] detached. data=~/paper_data_analysis.log progress=~/paper_data_analysis_progress.log"
+    echo "[run] starting tmux session train"
+    tmux kill-session -t train 2>/dev/null || true
+    tmux new-session -d -s train \
+        "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee ~/train.log; echo 'Analysis finished. Press enter to close.'; read"
+    echo "[run] detached. log=~/train.log"
 else
-    echo "[run] foreground analysis; progress and data stream below"
+    echo "[run] foreground analysis; combined stream below"
     cd "\$WORK_DIR"
-    "\${RUN_CMD[@]}" > >(tee ~/paper_data_analysis.log) 2> >(tee ~/paper_data_analysis_progress.log >&2)
+    "\${RUN_CMD[@]}" 2>&1 | tee ~/train.log
 fi
 EOFCMD
 
@@ -227,5 +227,4 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
 
 echo ""
 echo "Done launching/running."
-echo "  Data worker 0:     gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='cat ~/paper_data_analysis.log'"
-echo "  Progress worker 0: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/paper_data_analysis_progress.log'"
+echo "  Log worker 0: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"

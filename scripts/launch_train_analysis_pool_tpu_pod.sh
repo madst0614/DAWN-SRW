@@ -18,8 +18,8 @@ RUNTIME="v4-64"
 MAX_EXAMPLES="64"
 MESH_DATA=""
 MESH_MODEL=""
-SESSION="train_analysis_pool"
-REMOTE_LOG="~/train_analysis_pool.log"
+readonly SESSION="train"
+readonly REMOTE_LOG="~/train.log"
 INSTALL_DEPS=1
 UPDATE_REPO=1
 DETACH=1
@@ -45,8 +45,6 @@ usage() {
         "  --branch NAME              Git branch (default: $BRANCH)" \
         "  --zone ZONE                Default: $ZONE" \
         "  --project PROJECT          Default: $PROJECT" \
-        "  --log PATH                 Default: $REMOTE_LOG" \
-        "  --session NAME             Default: $SESSION" \
         "  --no-resume                Recompute instead of protocol-bound resume" \
         "  --no-install               Skip remote dependency installation" \
         "  --skip-repo-update         Use the existing remote checkout" \
@@ -80,8 +78,6 @@ while [[ $# -gt 0 ]]; do
         --max-examples-per-phase) MAX_EXAMPLES="$2"; shift 2 ;;
         --mesh-data) MESH_DATA="$2"; shift 2 ;;
         --mesh-model) MESH_MODEL="$2"; shift 2 ;;
-        --log) REMOTE_LOG="$2"; shift 2 ;;
-        --session) SESSION="$2"; shift 2 ;;
         --no-resume) RESUME=0; shift ;;
         --no-install) INSTALL_DEPS=0; shift ;;
         --skip-repo-update) UPDATE_REPO=0; shift ;;
@@ -135,7 +131,6 @@ printf -v Q_BENCHMARK_ROOT '%q' "$BENCHMARK_ROOT"
 printf -v Q_PRESET '%q' "$PRESET"
 printf -v Q_ITEMS '%q' "$ITEMS"
 printf -v Q_RUNTIME '%q' "$RUNTIME"
-printf -v Q_SESSION '%q' "$SESSION"
 printf -v Q_LOG '%q' "$REMOTE_LOG"
 
 read -r -d '' REMOTE_CMD <<EOF || true
@@ -149,7 +144,7 @@ BENCHMARK_ROOT=$Q_BENCHMARK_ROOT
 PRESET=$Q_PRESET
 ITEMS=$Q_ITEMS
 RUNTIME=$Q_RUNTIME
-SESSION=$Q_SESSION
+SESSION=train
 REMOTE_LOG=$Q_LOG
 WORK_DIR="\$HOME/DAWN-SRW"
 REMOTE_LOG="\${REMOTE_LOG/#\~/\$HOME}"
@@ -224,7 +219,7 @@ else
 fi
 EOF
 
-WATCH_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $SESSION --summary"
+WATCH_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --summary"
 echo "TRAIN_ANALYSIS_POOL LAUNCH"
 echo "  tpu=$TPU_NAME zone=$ZONE project=$PROJECT branch=$BRANCH"
 echo "  target=${TARGET:-ad-hoc} checkpoint=${CHECKPOINT:-target-registry} runtime=$RUNTIME"

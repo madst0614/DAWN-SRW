@@ -176,20 +176,45 @@ def _tokenizer_vocab_hash(tokenizer: Any) -> str:
 def _load_source_data_metadata(config: Mapping[str, Any]) -> Tuple[str, Dict[str, Any]]:
     from utils import data_jax
 
-    train_path = config.get("data", {}).get("bin_train")
-    if not train_path:
-        raise RuntimeError("checkpoint full_config.data.bin_train is missing")
-    meta_path = data_jax._meta_path_for(train_path)
-    try:
-        source_meta = data_jax._read_json(meta_path)
-    except Exception as exc:
+    data_config = config.get("data", {})
+    candidates = []
+    for key in ("bin_train", "bin_val"):
+        path = data_config.get(key)
+        if not path:
+            continue
+        for candidate in (path, *data_jax._fallback_paths_for(path)):
+            meta_path = data_jax._meta_path_for(candidate)
+            if meta_path not in candidates:
+                candidates.append(meta_path)
+    if not candidates:
         raise RuntimeError(
-            "cannot establish source tokenizer provenance because the "
-            f"pretokenized data metadata is unreadable: {meta_path}") from exc
-    if not isinstance(source_meta, dict) or not source_meta.get("tokenizer"):
+            "checkpoint full_config.data has no bin_train or bin_val path")
+
+    discovered = []
+    for meta_path in candidates:
+        try:
+            source_meta = data_jax._read_json(meta_path)
+        except Exception:
+            continue
+        if isinstance(source_meta, dict) and source_meta.get("tokenizer"):
+            discovered.append((meta_path, source_meta))
+    if not discovered:
         raise RuntimeError(
-            f"pretokenized data metadata lacks tokenizer id: {meta_path}")
-    return meta_path, source_meta
+            "cannot establish source tokenizer from pretokenized data "
+            "metadata; tried: " + ", ".join(candidates))
+
+    tokenizer_ids = {
+        str(source_meta["tokenizer"])
+        for _, source_meta in discovered
+    }
+    if len(tokenizer_ids) != 1:
+        raise RuntimeError(
+            "pretokenized train/validation tokenizer mismatch: "
+            + repr({
+                meta_path: source_meta["tokenizer"]
+                for meta_path, source_meta in discovered
+            }))
+    return discovered[0]
 
 
 def _load_tokenizer(

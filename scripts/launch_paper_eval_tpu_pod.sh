@@ -190,15 +190,15 @@ fi
 RUN_CMD_STR=\$(printf "%q " "\${RUN_CMD[@]}")
 
 if [ "\$DETACH" = "1" ]; then
-    echo "[run] starting tmux session paper_eval_performance"
-    tmux kill-session -t paper_eval_performance 2>/dev/null || true
-    tmux new-session -d -s paper_eval_performance \
-        "cd '\$WORK_DIR'; \$RUN_CMD_STR > >(tee ~/paper_eval_performance.log) 2> >(tee ~/paper_eval_performance_progress.log >&2); echo 'Paper eval finished. Press enter to close.'; read"
-    echo "[run] detached. data=~/paper_eval_performance.log progress=~/paper_eval_performance_progress.log"
+    echo "[run] starting tmux session train"
+    tmux kill-session -t train 2>/dev/null || true
+    tmux new-session -d -s train \
+        "cd '\$WORK_DIR'; \$RUN_CMD_STR 2>&1 | tee ~/train.log; echo 'Paper eval finished. Press enter to close.'; read"
+    echo "[run] detached. log=~/train.log"
 else
-    echo "[run] foreground eval; progress and data stream below"
+    echo "[run] foreground eval; combined stream below"
     cd "\$WORK_DIR"
-    "\${RUN_CMD[@]}" > >(tee ~/paper_eval_performance.log) 2> >(tee ~/paper_eval_performance_progress.log >&2)
+    "\${RUN_CMD[@]}" 2>&1 | tee ~/train.log
 fi
 EOFCMD
 
@@ -212,10 +212,9 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
 
 echo ""
 echo "Launched."
-echo "  Data log:     gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='cat ~/paper_eval_performance.log'"
-echo "  Progress:     gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/paper_eval_performance_progress.log'"
-echo "  Attach:       gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tmux attach -t paper_eval_performance'"
-echo "  Kill:         gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=all --command='tmux kill-session -t paper_eval_performance'"
+echo "  Log:          gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"
+echo "  Attach:       gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tmux attach -t train'"
+echo "  Kill:         gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=all --command='tmux kill-session -t train'"
 echo "  List GCS:     gcloud storage ls $OUT_DIR"
 echo "  Main table:   gcloud storage cat $OUT_DIR/table_main_performance.csv"
 echo "  FLOPs table:  gcloud storage cat $OUT_DIR/table_theoretical_flops_main.csv"
