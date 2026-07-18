@@ -16,6 +16,8 @@ from analysis.dawn_analysis_common import materialize_global_tree
 from analysis.dawn_analysis_trace import topk_trace_forward
 from analysis.operator_interpretability.benchmark_schema import (
     BenchmarkExample,
+    RAVEL_SOURCE_COLUMNS,
+    RAVEL_VARIABLES,
     canonical_hash,
 )
 from analysis.operator_interpretability.statistics import spearman_rank
@@ -56,6 +58,129 @@ def _capture_tiers(initial: tuple[int, int, int], maxima: tuple[int, int, int]):
             min(limit, max(value + 1, value * 2))
             for value, limit in zip(current, maxima))
         yield current
+
+
+def _discovery_split_assignments(
+        examples: Sequence[BenchmarkExample], *, seed: int) -> tuple[
+            list[int], str, dict[str, dict[str, list[int]]], list[int]]:
+    benchmark_ids = {str(example.benchmark_id) for example in examples}
+    if len(benchmark_ids) != 1:
+        raise ValueError("capture split requires exactly one benchmark")
+    benchmark_id = next(iter(benchmark_ids))
+    if benchmark_id != "ravel":
+        assignments = [
+            int(canonical_hash({
+                "seed": int(seed),
+                "benchmark_id": example.benchmark_id,
+                "example_id": example.example_id,
+            })[:16], 16) % 2
+            for example in examples
+        ]
+        return (
+            assignments,
+            "seeded_hash_of_benchmark_and_example_id",
+            {},
+            [assignments.count(0), assignments.count(1)],
+        )
+
+    group_strata: dict[str, tuple[str, str]] = {}
+    grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for example in examples:
+        group_id = str(example.metadata.get("pair_group_id") or "")
+        source_column = str(example.metadata.get(
+            "official_counterfactual_column") or "")
+        variable = str(example.causal_variable)
+        if not group_id:
+            raise ValueError("RAVEL discovery split requires pair_group_id")
+        if variable not in RAVEL_VARIABLES:
+            raise ValueError(
+                f"RAVEL discovery split has invalid variable={variable!r}")
+        if source_column not in RAVEL_SOURCE_COLUMNS:
+            raise ValueError(
+                "RAVEL discovery split has invalid official source column")
+        stratum = (variable, source_column)
+        previous = group_strata.setdefault(group_id, stratum)
+        if previous != stratum:
+            raise ValueError(
+                "one RAVEL pair_group_id spans multiple localization strata")
+    for group_id, stratum in group_strata.items():
+        grouped[stratum].append(group_id)
+
+    assignment_by_group: dict[str, int] = {}
+    group_totals = [0, 0]
+    stratum_counts: dict[str, dict[str, list[int]]] = {
+        variable: {
+            source_column: [0, 0]
+            for source_column in RAVEL_SOURCE_COLUMNS
+        }
+        for variable in RAVEL_VARIABLES
+    }
+    for stratum in (
+            (variable, source_column)
+            for variable in RAVEL_VARIABLES
+            for source_column in RAVEL_SOURCE_COLUMNS):
+        group_ids = sorted(
+            grouped.get(stratum, ()),
+            key=lambda group_id: (
+                canonical_hash({
+                    "seed": int(seed),
+                    "causal_variable": stratum[0],
+                    "official_counterfactual_column": stratum[1],
+                    "pair_group_id": group_id,
+                }),
+                group_id,
+            ))
+        if group_totals[0] < group_totals[1]:
+            first_split = 0
+        elif group_totals[1] < group_totals[0]:
+            first_split = 1
+        else:
+            first_split = int(canonical_hash({
+                "seed": int(seed),
+                "stratum": list(stratum),
+            })[:16], 16) % 2
+        counts = stratum_counts[stratum[0]][stratum[1]]
+        for index, group_id in enumerate(group_ids):
+            split = (first_split + index) % 2
+            assignment_by_group[group_id] = split
+            counts[split] += 1
+            group_totals[split] += 1
+
+    assignments = [
+        assignment_by_group[str(example.metadata["pair_group_id"])]
+        for example in examples
+    ]
+    return (
+        assignments,
+        "seeded_balanced_pair_group_split_within_causal_variable_and_"
+        "official_counterfactual_column",
+        stratum_counts,
+        group_totals,
+    )
+
+
+def _split_rank_stability(
+        split_aggregate: tuple[Mapping[OperatorSite, Sequence[float]],
+                               Mapping[OperatorSite, Sequence[float]]],
+        split_denominator: tuple[Mapping[tuple[str, int], int],
+                                 Mapping[tuple[str, int], int]],
+) -> tuple[float | None, int]:
+    common_sites = sorted(set(split_aggregate[0]) | set(split_aggregate[1]))
+    stability = spearman_rank(
+        [
+            np.sum(split_aggregate[0].get(site, ()))
+            / max(split_denominator[0].get((site.route, site.layer), 0), 1)
+            for site in common_sites
+        ],
+        [
+            np.sum(split_aggregate[1].get(site, ()))
+            / max(split_denominator[1].get((site.route, site.layer), 0), 1)
+            for site in common_sites
+        ],
+    )
+    if stability is not None and not np.isfinite(stability):
+        stability = None
+    return stability, len(common_sites)
 
 
 def _capture_operator_paths(
@@ -138,11 +263,19 @@ def _capture_operator_paths(
         raise RuntimeError("capture produced no trace")
 
     aggregate: dict[OperatorSite, list[float]] = defaultdict(list)
-    split_aggregate = (
-        defaultdict(list), defaultdict(list))
+    split_aggregate = (defaultdict(list), defaultdict(list))
     qualified_denominator: dict[tuple[str, int], int] = defaultdict(int)
     qualified_mass_total: dict[tuple[str, int], float] = defaultdict(float)
     split_denominator = (defaultdict(int), defaultdict(int))
+    is_ravel = selected[0].benchmark_id == "ravel"
+    variable_split_aggregate = {
+        variable: (defaultdict(list), defaultdict(list))
+        for variable in RAVEL_VARIABLES
+    } if is_ravel else {}
+    variable_split_denominator = {
+        variable: (defaultdict(int), defaultdict(int))
+        for variable in RAVEL_VARIABLES
+    } if is_ravel else {}
     qualified_rows = 0
     total_rows = 0
     raw_operator_value_count = 0
@@ -150,14 +283,9 @@ def _capture_operator_paths(
     attrition: dict[str, dict[int, int]] = {
         route: defaultdict(int) for route in ROUTES}
     row_capture: list[dict[str, Any]] = []
-    split_assignment = [
-        int(canonical_hash({
-            "seed": int(seed),
-            "benchmark_id": example.benchmark_id,
-            "example_id": example.example_id,
-        })[:16], 16) % 2
-        for example in selected
-    ]
+    (split_assignment, split_rule, split_stratum_group_counts,
+     split_group_counts) = _discovery_split_assignments(
+         selected, seed=seed)
     for route in ROUTES:
         ids = np.asarray(trace[f"{route}_top_idx"])[:, :real_count]
         contribution_norms = np.asarray(
@@ -183,6 +311,9 @@ def _capture_operator_paths(
                     "phase": selected[example_index].phase,
                     "causal_variable": selected[example_index].causal_variable,
                     "pair_type": selected[example_index].pair_type,
+                    "official_counterfactual_column": (
+                        selected[example_index].metadata.get(
+                            "official_counterfactual_column")),
                     "discovery_split": split_assignment[example_index],
                     "layer": layer,
                     "route": route,
@@ -203,6 +334,9 @@ def _capture_operator_paths(
                         "phase": selected[example_index].phase,
                         "causal_variable": selected[example_index].causal_variable,
                         "pair_type": selected[example_index].pair_type,
+                        "official_counterfactual_column": (
+                            selected[example_index].metadata.get(
+                                "official_counterfactual_column")),
                         "discovery_split": split_assignment[example_index],
                         "layer": layer,
                         "route": route,
@@ -219,6 +353,10 @@ def _capture_operator_paths(
                 qualified_mass_total[(route, layer)] += mass
                 split_index = split_assignment[example_index]
                 split_denominator[split_index][(route, layer)] += 1
+                variable = str(selected[example_index].causal_variable)
+                if is_ravel:
+                    variable_split_denominator[variable][split_index][
+                        (route, layer)] += 1
                 for operator_id, contribution_norm in zip(
                         ids[layer, example_index],
                         contribution_norms[layer, example_index]):
@@ -228,6 +366,9 @@ def _capture_operator_paths(
                     value = float(contribution_norm)
                     aggregate[site].append(value)
                     split_aggregate[split_index][site].append(value)
+                    if is_ravel:
+                        variable_split_aggregate[variable][split_index][
+                            site].append(value)
 
     ranked = [
         RankedSite(
@@ -243,19 +384,53 @@ def _capture_operator_paths(
         for site, values in aggregate.items()
     ]
     ranked.sort(key=lambda row: (-row.importance, row.site))
-    common_sites = sorted(set(split_aggregate[0]) | set(split_aggregate[1]))
-    rank_stability = spearman_rank(
-        [
-            np.sum(split_aggregate[0][site])
-            / max(split_denominator[0][(site.route, site.layer)], 1)
-            for site in common_sites
-        ],
-        [
-            np.sum(split_aggregate[1][site])
-            / max(split_denominator[1][(site.route, site.layer)], 1)
-            for site in common_sites
-        ],
-    )
+    pooled_rank_stability, pooled_common_site_count = _split_rank_stability(
+        split_aggregate, split_denominator)
+    rank_stability = pooled_rank_stability
+    rank_stability_common_site_count = pooled_common_site_count
+    rank_stability_by_causal_variable: dict[str, dict[str, Any]] = {}
+    rank_stability_min_variable: str | None = None
+    if is_ravel:
+        for variable in RAVEL_VARIABLES:
+            stability, common_site_count = _split_rank_stability(
+                variable_split_aggregate[variable],
+                variable_split_denominator[variable])
+            source_split_counts = split_stratum_group_counts[variable]
+            split_counts = [
+                sum(source_split_counts[source_column][split]
+                    for source_column in RAVEL_SOURCE_COLUMNS)
+                for split in (0, 1)]
+            all_source_strata_represented = all(
+                min(source_split_counts[source_column]) > 0
+                for source_column in RAVEL_SOURCE_COLUMNS)
+            rank_stability_by_causal_variable[variable] = {
+                "status": (
+                    "ready" if stability is not None
+                    and all_source_strata_represented
+                    else "insufficient_stratified_split"),
+                "rank_stability": stability,
+                "common_site_count": common_site_count,
+                "split_independent_group_counts": split_counts,
+                "split_source_group_counts": source_split_counts,
+            }
+        ready_variable_stabilities = {
+            variable: float(row["rank_stability"])
+            for variable, row in rank_stability_by_causal_variable.items()
+            if row["status"] == "ready"
+        }
+        if len(ready_variable_stabilities) == len(RAVEL_VARIABLES):
+            rank_stability_min_variable = min(
+                ready_variable_stabilities,
+                key=lambda variable: (
+                    ready_variable_stabilities[variable], variable))
+            rank_stability = ready_variable_stabilities[
+                rank_stability_min_variable]
+            rank_stability_common_site_count = int(
+                rank_stability_by_causal_variable[
+                    rank_stability_min_variable]["common_site_count"])
+        else:
+            rank_stability = None
+            rank_stability_common_site_count = 0
     if not ranked:
         raise RuntimeError("no captured-mass-qualified discovery candidates")
     result = {
@@ -276,10 +451,11 @@ def _capture_operator_paths(
         "total_row_count": total_rows,
         "qualified_fraction": qualified_rows / max(total_rows, 1),
         "rank_stability": rank_stability,
-        "rank_stability_common_site_count": len(common_sites),
-        "rank_stability_split_rule": "seeded_hash_of_benchmark_and_example_id",
+        "rank_stability_common_site_count": rank_stability_common_site_count,
+        "rank_stability_split_rule": split_rule,
         "rank_stability_split_example_counts": [
             split_assignment.count(0), split_assignment.count(1)],
+        "rank_stability_split_independent_group_counts": split_group_counts,
         "capture_threshold": float(capture_threshold),
         "capture_mass_definition": (
             "sum_pre_cancellation_production_precision_operator_vector_norms"),
@@ -301,6 +477,20 @@ def _capture_operator_paths(
         "phase": required_phase,
         "ranking_eligible": bool(rank_candidates),
     }
+    if is_ravel:
+        result.update({
+            "rank_stability_aggregation": (
+                "minimum_across_preregistered_causal_variables"),
+            "rank_stability_min_variable": rank_stability_min_variable,
+            "rank_stability_by_causal_variable": (
+                rank_stability_by_causal_variable),
+            "rank_stability_split_strata_group_counts": (
+                split_stratum_group_counts),
+            "pooled_rank_stability": pooled_rank_stability,
+            "pooled_rank_stability_common_site_count": (
+                pooled_common_site_count),
+            "pooled_rank_stability_used_for_gate": False,
+        })
     if retain_rows:
         result["rows"] = row_capture
     return result
@@ -355,8 +545,10 @@ def capture_held_out_paths(
     )
     result.pop("ranked_sites", None)
     result.pop("candidate_count", None)
-    result.pop("rank_stability", None)
-    result.pop("rank_stability_common_site_count", None)
+    for key in tuple(result):
+        if (key.startswith("rank_stability")
+                or key.startswith("pooled_rank_stability")):
+            result.pop(key, None)
     return result
 
 

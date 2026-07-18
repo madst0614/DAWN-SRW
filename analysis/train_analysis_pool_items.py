@@ -120,12 +120,12 @@ for _benchmark_id in MIB_CIRCUIT_BENCHMARKS:
 _register("ravel.operator_localization", _mechanistic_item(
     "ravel", "operator_localization", "RAVEL operator-site localization",
     "Which sites carry captured contribution on independent official RAVEL base groups?",
-    "Discovery-only production contribution ranking; cause/isolation derivatives do not duplicate base units.",
+    "Discovery-only production contribution ranking; independent cause groups are balanced by causal variable and official source, and every variable must pass split-rank stability.",
     "ravel.behavioral_eligibility"))
 _register("ravel.operator_space_structure", _mechanistic_item(
     "ravel", "operator_space_structure", "RAVEL operator-space structure",
     "Do read/write maps form reproducible local functional families independent of address?",
-    "Normalized rank-one RW similarity and reciprocal local neighborhoods with address held out.",
+    "Runs only after every causal variable passes localization stability; normalized rank-one RW similarity and reciprocal local neighborhoods hold address out.",
     "ravel.operator_localization"))
 _register("ravel.causal_mediation", _mechanistic_item(
     "ravel", "ravel_causal_mediation", "RAVEL causal mediation",

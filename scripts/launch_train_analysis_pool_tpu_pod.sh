@@ -16,6 +16,7 @@ PRESET="scientific"
 ITEMS=""
 RUNTIME="v4-64"
 MAX_EXAMPLES="128"
+RAVEL_MAX_EXAMPLES="512"
 MESH_DATA=""
 MESH_MODEL=""
 readonly SESSION="train"
@@ -38,7 +39,8 @@ usage() {
         "  --benchmark-root PATH      Immutable prepared benchmark root" \
         "  --preset NAME              Item bundle: zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
         "  --items IDS                Concrete comma-separated item ids; overrides preset" \
-        "  --max-examples-per-phase N Fixed per-phase cap (default: $MAX_EXAMPLES)" \
+        "  --max-examples-per-phase N Non-RAVEL per-phase cap (default: $MAX_EXAMPLES)" \
+        "  --ravel-max-examples-per-phase N RAVEL per-phase cap (default: $RAVEL_MAX_EXAMPLES)" \
         "  --mesh-data N              Ad-hoc assertion; target/runtime value cannot be overridden" \
         "  --mesh-model N             Ad-hoc assertion; registered target owns this value" \
         "  --branch NAME              Git branch (default: $BRANCH)" \
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --preset) PRESET="$2"; shift 2 ;;
         --items) ITEMS="$2"; shift 2 ;;
         --max-examples-per-phase) MAX_EXAMPLES="$2"; shift 2 ;;
+        --ravel-max-examples-per-phase) RAVEL_MAX_EXAMPLES="$2"; shift 2 ;;
         --mesh-data) MESH_DATA="$2"; shift 2 ;;
         --mesh-model) MESH_MODEL="$2"; shift 2 ;;
         --no-install) INSTALL_DEPS=0; shift ;;
@@ -98,6 +101,10 @@ if [[ -n "$TARGET" && -n "$CHECKPOINT" ]] || [[ -z "$TARGET" && -z "$CHECKPOINT"
 fi
 if ! [[ "$MAX_EXAMPLES" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: --max-examples-per-phase must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "$RAVEL_MAX_EXAMPLES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --ravel-max-examples-per-phase must be a positive integer" >&2
     exit 1
 fi
 case "$PRESET" in
@@ -209,6 +216,7 @@ CMD=(
     --runtime "\$RUNTIME"
     --preset "\$PRESET"
     --max-examples-per-phase "$MAX_EXAMPLES"
+    --ravel-max-examples-per-phase "$RAVEL_MAX_EXAMPLES"
     --init-distributed
 )
 if [[ -n "\$TARGET" ]]; then

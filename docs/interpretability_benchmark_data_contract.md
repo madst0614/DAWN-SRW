@@ -296,9 +296,20 @@ loaded as a physically separate shard and cannot be used for selection.
 
 At runtime, RAVEL is sampled by a deterministic round-robin over all 12 strata
 (3 variables x cause/isolation x 2 source kinds). Source variants sharing one
-`pair_group_id` are not counted twice within cause or isolation. The default
-cap is 128 prepared rows per phase, yielding 64 independent cause units before
-behavioral filtering; a manually requested cap of 64 yields 32.
+`pair_group_id` are not counted twice within cause or isolation. The
+pre-registered RAVEL cap is 512 prepared rows per phase, yielding up to 256
+independent cause units before behavioral filtering. Other primary benchmarks
+retain the 128-row cap.
+
+RAVEL localization rank stability is computed separately for `Continent`,
+`Country`, and `Language`. Independent `pair_group_id` units are deterministically
+balanced within each causal-variable x official-counterfactual-column stratum.
+The persisted top-level RAVEL stability is the minimum of the three variable
+scores; the old pooled-variable score is audit-only. Functional-family discovery,
+causal mediation, and held-out trajectory analysis do not execute unless every
+variable reaches the pre-registered 0.80 threshold. This is a runtime protocol
+change and does not require rebuilding an immutable dataset artifact that
+already contains at least the requested rows.
 
 ## Full preparation validation
 

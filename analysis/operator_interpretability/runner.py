@@ -351,7 +351,8 @@ class OperatorInterpretabilityRunner:
             payload: Mapping[str, Any]) -> dict[str, Any]:
         output = dict(payload)
         result = dict(payload.get("result") or {})
-        if kind == "operator_localization" and result.get("status") == "ready":
+        if kind == "operator_localization" and isinstance(
+                result.get("ranked_sites"), Sequence):
             ranked_sites = list(result.pop("ranked_sites", ()))
             profiles = dict(result.pop(
                 "causal_variable_control_profiles", {}) or {})
@@ -473,6 +474,7 @@ class OperatorInterpretabilityRunner:
     def _load_examples(self, benchmark_id: str) -> dict[str, list[Any]]:
         if benchmark_id not in self._examples:
             phases = {}
+            phase_cap = self.config.max_examples_for(benchmark_id)
             for phase in ("discovery", "validation", "test"):
                 values = load_benchmark_examples(
                     self.build, benchmark_id, phase=phase)
@@ -500,9 +502,9 @@ class OperatorInterpretabilityRunner:
                         raise ValueError(
                             "RAVEL phase lacks an official causal stratum: "
                             + ",".join("/".join(key) for key in missing))
-                    if self.config.max_examples_per_phase < len(expected_strata):
+                    if phase_cap < len(expected_strata):
                         raise ValueError(
-                            "max_examples_per_phase cannot represent every "
+                            "RAVEL phase cap cannot represent every "
                             f"RAVEL stratum; minimum={len(expected_strata)}")
                     for group in grouped.values():
                         group.sort(key=lambda example: (
@@ -512,7 +514,7 @@ class OperatorInterpretabilityRunner:
                     cursors = {key: 0 for key in expected_strata}
                     used_group_ids = {
                         "cause": set(), "isolation": set()}
-                    while len(selected) < self.config.max_examples_per_phase:
+                    while len(selected) < phase_cap:
                         added = False
                         for key in expected_strata:
                             group = grouped[key]
@@ -528,17 +530,21 @@ class OperatorInterpretabilityRunner:
                                 selected.append(candidate)
                                 added = True
                                 break
-                            if (len(selected)
-                                    == self.config.max_examples_per_phase):
+                            if len(selected) == phase_cap:
                                 break
                         if not added:
                             break
+                    if len(selected) != phase_cap:
+                        raise ValueError(
+                            "RAVEL prepared phase cannot satisfy the "
+                            f"pre-registered runtime cap: phase={phase} "
+                            f"requested={phase_cap} available={len(selected)}; "
+                            "publish a non-truncated benchmark build")
                     phases[phase] = selected
                 else:
                     values.sort(key=lambda example: (
                         canonical_hash(example.example_id), example.example_id))
-                    phases[phase] = values[
-                        :self.config.max_examples_per_phase]
+                    phases[phase] = values[:phase_cap]
             self._examples[benchmark_id] = phases
         return self._examples[benchmark_id]
 
@@ -607,6 +613,9 @@ class OperatorInterpretabilityRunner:
                     >= self.config.minimum_known_correct)
                 result["minimum_known_correct"] = (
                     self.config.minimum_known_correct)
+                result["runtime_phase_cap"] = self.config.max_examples_for(
+                    benchmark_id)
+                result["runtime_selected_row_count"] = len(examples)
                 phase_results[phase] = result
             output[benchmark_id] = {
                 "status": "ready",
@@ -615,7 +624,7 @@ class OperatorInterpretabilityRunner:
             }
         return {"status": "ready", "benchmarks": output}
 
-    def _capture_kwargs(self) -> dict[str, Any]:
+    def _capture_kwargs(self, benchmark_id: str) -> dict[str, Any]:
         return {
             "pad_token_id": int(self.tokenizer.pad_token_id),
             "topk_qk": self.config.capture_topk_qk,
@@ -625,7 +634,7 @@ class OperatorInterpretabilityRunner:
             "max_topk_v": self.config.capture_max_topk_v,
             "max_topk_rst": self.config.capture_max_topk_rst,
             "capture_threshold": self.config.capture_threshold,
-            "max_examples": self.config.max_examples_per_phase,
+            "max_examples": self.config.max_examples_for(benchmark_id),
         }
 
     def _reduce_ravel_capture(
@@ -712,11 +721,37 @@ class OperatorInterpretabilityRunner:
                 self.ctx, examples,
                 seed=self.config.seed + offset * 1009,
                 retain_rows=(benchmark_id == "ravel"),
-                **self._capture_kwargs())
+                **self._capture_kwargs(benchmark_id))
+            capture["discovery_independent_example_count"] = len(examples)
+            capture["runtime_phase_cap"] = self.config.max_examples_for(
+                benchmark_id)
             if benchmark_id == "ravel":
                 seeds, profiles = self._reduce_ravel_capture(capture)
                 capture["causal_variable_seeds"] = seeds
                 capture["causal_variable_control_profiles"] = profiles
+                variable_stability = dict(
+                    capture.get("rank_stability_by_causal_variable") or {})
+                expected_variables = benchmark_spec("ravel").causal_variables
+                stability_gate_passed = (
+                    set(variable_stability) == set(expected_variables)
+                    and all(
+                        variable_stability[variable].get("status") == "ready"
+                        and float(variable_stability[variable][
+                            "rank_stability"])
+                        >= self.config.rank_stability_min
+                        for variable in expected_variables
+                    )
+                )
+                capture.update({
+                    "rank_stability_gate_threshold": (
+                        self.config.rank_stability_min),
+                    "rank_stability_gate_rule": (
+                        "every_preregistered_causal_variable_at_or_above_"
+                        "threshold"),
+                    "rank_stability_gate_passed": stability_gate_passed,
+                })
+                if not stability_gate_passed:
+                    capture["status"] = "unstable_localization"
             capture.pop("rows", None)
             rows_used_transiently = bool(capture.pop(
                 "raw_rows_materialized_for_runtime", False))
@@ -729,17 +764,33 @@ class OperatorInterpretabilityRunner:
             })
             output[benchmark_id] = capture
         ready = [row for row in output.values() if row.get("status") == "ready"]
+        attempted = [
+            row for row in output.values()
+            if row.get("status") in {"ready", "unstable_localization"}
+        ]
         complete = bool(causal_ids) and len(ready) == len(causal_ids)
         rank_values = [
-            float(row["rank_stability"]) for row in ready
+            float(row["rank_stability"]) for row in attempted
             if row.get("rank_stability") is not None
         ]
+        if complete:
+            status = "ready"
+        elif any(
+                row.get("status") == "insufficient_behavior"
+                for row in output.values()):
+            status = "insufficient_behavior"
+        elif any(
+                row.get("status") == "unstable_localization"
+                for row in output.values()):
+            status = "unstable_localization"
+        else:
+            status = "incomplete"
         return {
-            "status": "ready" if complete else "insufficient_behavior",
+            "status": status,
             "benchmarks": output,
             "qualified_fraction": (
-                min(float(row["qualified_fraction"]) for row in ready)
-                if ready else 0.0),
+                min(float(row["qualified_fraction"]) for row in attempted)
+                if attempted else 0.0),
             "rank_stability": min(rank_values) if rank_values else None,
             "all_primary_benchmarks_ready": complete,
             "ranking_phase": "discovery",
@@ -1057,6 +1108,22 @@ class OperatorInterpretabilityRunner:
         return selected
 
     def _run_operator_space_structure(self) -> dict[str, Any]:
+        if "ravel" in self._scope("operator_space_structure"):
+            localization = self.results["operator_localization"][
+                "benchmarks"].get("ravel", {})
+            if (localization.get("status") != "ready"
+                    or localization.get(
+                        "rank_stability_gate_passed") is not True):
+                return {
+                    "status": "localization_stability_not_met",
+                    "benchmark": "ravel",
+                    "rank_stability": localization.get("rank_stability"),
+                    "rank_stability_gate_threshold": (
+                        self.config.rank_stability_min),
+                    "rank_stability_by_causal_variable": localization.get(
+                        "rank_stability_by_causal_variable"),
+                    "family_discovery_executed": False,
+                }
         pool = self._materialize_pool()
         key_prefix = {"q": "attn_qk", "k": "attn_qk",
                       "v": "attn_v", "rst": "rst"}
@@ -1101,6 +1168,11 @@ class OperatorInterpretabilityRunner:
 
     def _ravel_variable_seeds(self) -> dict[str, dict[str, Any]]:
         capture = self.results["operator_localization"]["benchmarks"]["ravel"]
+        if (capture.get("status") != "ready"
+                or capture.get("rank_stability_gate_passed") is not True):
+            raise ValueError(
+                "RAVEL variable seeds are ineligible under localization "
+                "stability gate")
         seeds = capture.get("causal_variable_seeds")
         if not isinstance(seeds, Mapping):
             raise ValueError(
@@ -1457,8 +1529,20 @@ class OperatorInterpretabilityRunner:
             }
         capture = self.results["operator_localization"]["benchmarks"].get(
             "ravel", {})
-        if capture.get("status") != "ready":
-            return {"status": "localization_not_ready", "benchmark": "ravel"}
+        if (capture.get("status") != "ready"
+                or capture.get("rank_stability_gate_passed") is not True):
+            return {
+                "status": "localization_stability_not_met",
+                "benchmark": "ravel",
+                "causal_intervention_executed": False,
+            }
+        space = self.results.get("operator_space_structure", {})
+        if space.get("status") != "ready":
+            return {
+                "status": "operator_space_not_ready",
+                "benchmark": "ravel",
+                "causal_intervention_executed": False,
+            }
         seeds = self._ravel_variable_seeds()
         expected_variables = benchmark_spec("ravel").causal_variables
         selected_units = {}
@@ -1571,8 +1655,14 @@ class OperatorInterpretabilityRunner:
             }
         localization = self.results["operator_localization"]["benchmarks"].get(
             "ravel", {})
-        if localization.get("status") != "ready":
-            return {"status": "localization_not_ready", "benchmark": "ravel"}
+        if (localization.get("status") != "ready"
+                or localization.get(
+                    "rank_stability_gate_passed") is not True):
+            return {
+                "status": "localization_stability_not_met",
+                "benchmark": "ravel",
+                "trajectory_executed": False,
+            }
         examples = self._known_correct("ravel", "test")
         examples = self._independent_capture_examples("ravel", examples)
         if len(examples) < self.config.minimum_known_correct:
@@ -1583,7 +1673,7 @@ class OperatorInterpretabilityRunner:
         capture = capture_held_out_paths(
             self.ctx, examples, phase="test",
             seed=self.config.seed + 7919,
-            **self._capture_kwargs())
+            **self._capture_kwargs("ravel"))
         confirmation = held_out_trajectory_confirmation(
             capture["rows"], phase="test",
             capture_threshold=self.config.capture_threshold,

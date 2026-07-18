@@ -151,6 +151,15 @@ scientific_claims.primary
 
 기본 preset은 `scientific`이다. Preset에는 checkpoint, TPU, runtime, benchmark selector를 넣지 않는다.
 
+Mechanistic runtime sampling은 MIB/기타 benchmark에 phase당 128개를 쓰고,
+RAVEL에만 phase당 512개를 쓴다. RAVEL discovery localization은
+`causal_variable x official_counterfactual_column` 안에서 독립
+`pair_group_id`를 균형 분할하고, `Continent`, `Country`, `Language` 각각의
+rank stability를 계산한다. 세 값의 최솟값이 0.80보다 낮거나 어느 변수의
+split이 성립하지 않으면 localization artifact는 판정 근거로 저장하되
+operator-space family 선택, causal mediation, multilayer trajectory는 실행하지
+않는다.
+
 현재 catalog 전체는 코드에서 직접 확인할 수 있다.
 
 ```bash

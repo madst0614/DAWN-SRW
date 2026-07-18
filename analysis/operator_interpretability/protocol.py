@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 PROTOCOL_ID = "dawn_operator_interpretability"
-PROTOCOL_SCHEMA_VERSION = 4
+PROTOCOL_SCHEMA_VERSION = 5
 ANALYSIS_ENGINE = "train_analysis_pool"
 SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
@@ -48,6 +48,7 @@ class ProtocolConfig:
 
     seed: int = 4172
     max_examples_per_phase: int = 128
+    ravel_max_examples_per_phase: int = 512
     capture_threshold: float = 0.95
     capture_topk_qk: int = 512
     capture_topk_v: int = 2048
@@ -71,6 +72,9 @@ class ProtocolConfig:
     def validate(self) -> "ProtocolConfig":
         if self.max_examples_per_phase <= 0:
             raise ValueError("max_examples_per_phase must be positive")
+        if self.ravel_max_examples_per_phase <= 0:
+            raise ValueError(
+                "ravel_max_examples_per_phase must be positive")
         if not 0.0 < self.capture_threshold <= 1.0:
             raise ValueError("capture_threshold must be in (0, 1]")
         widths = (
@@ -106,6 +110,12 @@ class ProtocolConfig:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return asdict(self)
+
+    def max_examples_for(self, benchmark_id: str) -> int:
+        self.validate()
+        if str(benchmark_id) == "ravel":
+            return int(self.ravel_max_examples_per_phase)
+        return int(self.max_examples_per_phase)
 
 
 def validate_model_version(model_version: str) -> str:

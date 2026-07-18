@@ -120,6 +120,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-examples-per-phase", type=int,
         default=defaults.max_examples_per_phase)
+    parser.add_argument(
+        "--ravel-max-examples-per-phase", type=int,
+        default=defaults.ravel_max_examples_per_phase)
     parser.add_argument("--capture-threshold", type=float, default=defaults.capture_threshold)
     parser.add_argument("--capture-topk-qk", type=int, default=defaults.capture_topk_qk)
     parser.add_argument("--capture-topk-v", type=int, default=defaults.capture_topk_v)
@@ -228,6 +231,7 @@ def _protocol_config(args: argparse.Namespace) -> ProtocolConfig:
     return ProtocolConfig(
         seed=args.seed,
         max_examples_per_phase=args.max_examples_per_phase,
+        ravel_max_examples_per_phase=args.ravel_max_examples_per_phase,
         capture_threshold=args.capture_threshold,
         capture_topk_qk=args.capture_topk_qk,
         capture_topk_v=args.capture_topk_v,
