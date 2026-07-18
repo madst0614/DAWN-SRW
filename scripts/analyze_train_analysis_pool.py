@@ -210,7 +210,7 @@ def _run_label(args: argparse.Namespace, items: list[str]) -> str:
 def _default_output_parent(checkpoints_dir: str) -> str:
     normalized = str(checkpoints_dir).rstrip("/\\").replace("\\", "/")
     run_root = normalized.rsplit("/", 1)[0]
-    return f"{run_root}/side_analysis/train_analysis_pool"
+    return f"{run_root}/side_analysis"
 
 
 def _independent_run_output(
@@ -220,8 +220,8 @@ def _independent_run_output(
         output_parent or _default_output_parent(checkpoints_dir)
     ).rstrip("/\\")
     return (
-        f"{parent}/{int(step):012d}/"
-        f"{run_label}/{run_id}")
+        f"{parent}/run_analysis_{int(step):012d}_"
+        f"{run_label}_{run_id}")
 
 
 def _protocol_config(args: argparse.Namespace) -> ProtocolConfig:

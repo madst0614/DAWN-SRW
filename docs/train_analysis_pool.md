@@ -212,16 +212,16 @@ Launcher는 실제 TPU `acceleratorType`이 선택 runtime과 같은지 먼저 �
 기본 출력에서 실행 한 번의 root는 다음과 같다.
 
 ```text
-<checkpoint-run>/side_analysis/train_analysis_pool/
-  <12-digit-checkpoint-step>/<preset-or-items-hash>/<unique-run-id>/
+<checkpoint-run>/side_analysis/
+  run_analysis_<12-digit-step>_<preset-or-items-hash>_<unique-run-id>/
 ```
 
 예를 들어 `scientific` preset을 step 39000에서 실행하면 다음과 같은 독립
 폴더가 생긴다.
 
 ```text
-.../train_analysis_pool/000000039000/scientific/
-  20260718T091530Z-a1b2c3d4/
+.../side_analysis/
+  run_analysis_000000039000_scientific_20260718T091530Z-a1b2c3d4/
     summary.log
     summary.json
     run_manifest.json

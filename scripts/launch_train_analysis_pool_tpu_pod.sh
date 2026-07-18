@@ -34,7 +34,7 @@ usage() {
         "  --target ID                Registered target, for example v4171_400m" \
         "  --checkpoint PATH          Ad-hoc Orbax path; mutually exclusive with --target" \
         "  --runtime ID               Physical runtime profile (default: $RUNTIME)" \
-        "  --output PATH              Optional parent for unique run folders; checkpoint side_analysis is default" \
+        "  --output PATH              Optional parent for run_analysis_* folders; checkpoint side_analysis is default" \
         "  --benchmark-root PATH      Immutable prepared benchmark root" \
         "  --preset NAME              Item bundle: zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
         "  --items IDS                Concrete comma-separated item ids; overrides preset" \
