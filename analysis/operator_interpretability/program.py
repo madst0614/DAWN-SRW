@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -22,8 +22,8 @@ from analysis.operator_interpretability.protocol import (
 from analysis.operator_interpretability.units import OperatorSpaceShape
 
 
-PROGRAM_ARTIFACT_SCHEMA_VERSION = 1
-PROGRAM_ALGORITHM_VERSION = "answer_position_mass_prefix_v1"
+PROGRAM_ARTIFACT_SCHEMA_VERSION = 2
+PROGRAM_ALGORITHM_VERSION = "decision_position_mass_prefix_v2"
 PROGRAM_ROUTES = ("q", "k", "v", "rst")
 PROGRAM_MODES = {
     "production": 0,
@@ -38,7 +38,7 @@ def _pool_size(shape: OperatorSpaceShape, route: str) -> int:
     return int(shape.pool_size(route))
 
 
-def _total_operator_sites(shape: OperatorSpaceShape) -> int:
+def _total_decision_position_sites(shape: OperatorSpaceShape) -> int:
     return int(shape.n_layers) * (
         2 * int(shape.n_qk) + int(shape.n_v) + int(shape.n_rst))
 
@@ -210,7 +210,7 @@ def _records_from_arrays(
         captured_mass: np.ndarray | None = None,
         extra: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    total_sites = _total_operator_sites(shape)
+    total_sites = _total_decision_position_sites(shape)
     records = []
     for example_index, example_id in enumerate(example_ids):
         per_layer_route: dict[str, dict[str, int]] = {}
@@ -234,8 +234,10 @@ def _records_from_arrays(
             "prompt_side": str(prompt_side),
             "program_mass": float(program_mass),
             "site_count": site_count,
-            "site_fraction_of_total_operator_sites": (
+            "decision_position_site_fraction": (
                 site_count / max(total_sites, 1)),
+            "decision_position_site_fraction_scope": (
+                "answer_position_layer_route_operator_space"),
             "per_layer_route_site_count": per_layer_route,
             "per_layer_route_captured_mass": per_layer_mass,
             "per_route_site_count": route_counts,
@@ -376,13 +378,38 @@ def deterministic_mismatch_mapping(
         schedule: OperatorProgramSchedule, *, seed: int) -> dict[str, Any]:
     if len(examples) != schedule.batch_size or len(examples) < 2:
         raise ValueError("mismatched programs require at least two aligned rows")
+    if tuple(example.example_id for example in examples) != schedule.example_ids:
+        raise ValueError("mismatched examples and schedule are not aligned")
     counts = [int(record["site_count"]) for record in schedule.records]
     templates = [str(example.metadata.get("template")) for example in examples]
+    answer_sequences = [
+        frozenset(
+            tuple(int(value) for value in ids)
+            for ids in (
+                example.positive_ids,
+                example.negative_ids,
+                example.source_positive_ids,
+                example.source_negative_ids,
+            ))
+        for example in examples
+    ]
+    if any(
+            not signature
+            for sequences in answer_sequences for signature in sequences):
+        raise ValueError("mismatched IOI answer-token signatures are incomplete")
     donor_indices = []
     rows = []
     for index, example in enumerate(examples):
-        eligible = [candidate for candidate in range(len(examples))
-                    if candidate != index]
+        eligible = [
+            candidate for candidate in range(len(examples))
+            if candidate != index
+            and answer_sequences[index].isdisjoint(
+                answer_sequences[candidate])
+        ]
+        if not eligible:
+            raise RuntimeError(
+                "no answer-token-disjoint mismatched donor exists for "
+                f"recipient={example.example_id}")
         same_template = [candidate for candidate in eligible
                          if templates[candidate] == templates[index]]
         candidates = same_template or eligible
@@ -400,12 +427,18 @@ def deterministic_mismatch_mapping(
             "recipient_example_id": str(example.example_id),
             "donor_example_id": str(examples[donor].example_id),
             "same_template": templates[donor] == templates[index],
+            "answer_token_disjoint": True,
+            "recipient_answer_sequences_hash": canonical_hash(
+                sorted(answer_sequences[index])),
+            "donor_answer_sequences_hash": canonical_hash(
+                sorted(answer_sequences[donor])),
             "recipient_site_count": counts[index],
             "donor_site_count": counts[donor],
             "site_count_distance": abs(counts[donor] - counts[index]),
         })
     return {
-        "rule": "same_template_nearest_site_count_seeded",
+        "rule": (
+            "same_template_answer_disjoint_nearest_site_count_seeded"),
         "seed": int(seed),
         "donor_indices": donor_indices,
         "rows": rows,
@@ -420,6 +453,10 @@ def random_program_schedule(
            for route in PROGRAM_ROUTES}
     valid = {route: np.asarray(schedule.valid[route]).copy()
              for route in PROGRAM_ROUTES}
+    overlap_count = np.zeros((schedule.batch_size,), dtype=np.int64)
+    selected_count = np.zeros((schedule.batch_size,), dtype=np.int64)
+    overlap_by_example: list[dict[str, dict[str, Any]]] = [
+        {} for _ in schedule.example_ids]
     for route in PROGRAM_ROUTES:
         pool_size = _pool_size(shape, route)
         for layer in range(int(shape.n_layers)):
@@ -427,6 +464,15 @@ def random_program_schedule(
                 count = int(np.sum(valid[route][layer, example_index]))
                 if count > pool_size:
                     raise ValueError("random program count exceeds route pool")
+                reference_ids = np.asarray(schedule.ids[route][
+                    layer, example_index,
+                    schedule.valid[route][layer, example_index]],
+                    dtype=np.int32)
+                if reference_ids.size != count:
+                    raise ValueError("random program reference count drift")
+                complement_mask = np.ones((pool_size,), dtype=np.bool_)
+                complement_mask[reference_ids] = False
+                complement = np.flatnonzero(complement_mask).astype(np.int32)
                 row_seed = int(canonical_hash({
                     "seed": int(seed),
                     "example_id": example_id,
@@ -434,13 +480,49 @@ def random_program_schedule(
                     "route": route,
                 })[:16], 16)
                 rng = np.random.default_rng(row_seed)
-                ids[route][layer, example_index, :count] = rng.choice(
-                    pool_size, size=count, replace=False).astype(np.int32)
+                if count <= complement.size:
+                    chosen = rng.choice(
+                        complement, size=count, replace=False).astype(
+                            np.int32)
+                else:
+                    unavoidable = count - int(complement.size)
+                    chosen = np.concatenate((
+                        rng.permutation(complement).astype(np.int32),
+                        rng.choice(
+                            reference_ids, size=unavoidable,
+                            replace=False).astype(np.int32),
+                    ))
+                    rng.shuffle(chosen)
+                ids[route][layer, example_index, :count] = chosen
+                overlap = int(np.intersect1d(
+                    chosen, reference_ids, assume_unique=True).size)
+                overlap_count[example_index] += overlap
+                selected_count[example_index] += count
+                overlap_by_example[example_index].setdefault(
+                    str(layer), {})[route] = {
+                        "selected_count": count,
+                        "overlap_count": overlap,
+                        "overlap_fraction": overlap / max(count, 1),
+                        "complement_size": int(complement.size),
+                    }
+    extra = []
+    for example_index in range(schedule.batch_size):
+        total = int(selected_count[example_index])
+        overlap = int(overlap_count[example_index])
+        extra.append({
+            "random_seed": int(seed),
+            "random_sampling_policy": (
+                "selected_complement_first_without_replacement"),
+            "random_reference_overlap_count": overlap,
+            "random_reference_overlap_fraction": overlap / max(total, 1),
+            "random_complement_only": overlap == 0,
+            "per_layer_route_random_overlap": (
+                overlap_by_example[example_index]),
+        })
     records = _records_from_arrays(
         example_ids=schedule.example_ids, prompt_side="random_id",
         program_mass=schedule.program_mass, ids=ids, valid=valid,
-        shape=shape,
-        extra=[{"random_seed": int(seed)} for _ in schedule.example_ids])
+        shape=shape, extra=extra)
     result = OperatorProgramSchedule(
         example_ids=schedule.example_ids,
         prompt_side="random_id",
@@ -461,7 +543,7 @@ def compactness_metrics(
         mismatched_schedule: OperatorProgramSchedule | None = None,
 ) -> dict[str, Any]:
     fractions = np.asarray([
-        float(record["site_fraction_of_total_operator_sites"])
+        float(record["decision_position_site_fraction"])
         for record in schedule.records], dtype=np.float64)
     per_route = {}
     for route in PROGRAM_ROUTES:
@@ -476,7 +558,7 @@ def compactness_metrics(
         range(schedule.batch_size), key=lambda index: schedule.example_ids[index])
     union: set[tuple[int, str, int]] = set()
     union_curve = []
-    total_sites = _total_operator_sites(shape)
+    total_sites = _total_decision_position_sites(shape)
     for example_index in canonical_order:
         for route in PROGRAM_ROUTES:
             route_ids = schedule.ids[route][:, example_index]
@@ -487,7 +569,8 @@ def compactness_metrics(
                     for operator_id in route_ids[layer, route_valid[layer]])
         union_curve.append({
             "example_count": len(union_curve) + 1,
-            "union_fraction": len(union) / max(total_sites, 1),
+            "union_decision_position_fraction": (
+                len(union) / max(total_sites, 1)),
         })
 
     def overlaps(other: OperatorProgramSchedule | None):
@@ -520,11 +603,13 @@ def compactness_metrics(
         return output
 
     return {
-        "site_fraction": fractions.tolist(),
-        "median_site_fraction": float(np.median(fractions)),
-        "mean_site_fraction": float(fractions.mean()),
-        "per_route_site_fraction": per_route,
-        "union_fraction_vs_example_count": union_curve,
+        "scope": "answer_position_layer_route_operator_space",
+        "decision_position_site_fraction": fractions.tolist(),
+        "median_decision_position_site_fraction": float(
+            np.median(fractions)),
+        "mean_decision_position_site_fraction": float(fractions.mean()),
+        "per_route_decision_position_site_fraction": per_route,
+        "union_decision_position_fraction_vs_example_count": union_curve,
         "same_pair_route_overlap": overlaps(paired_schedule),
         "mismatched_route_overlap": overlaps(mismatched_schedule),
     }
@@ -550,11 +635,24 @@ def select_validation_program(
             "own_ablation_margin_drop_ci": float(
                 row["ablation"]["own_program"]["margin_drop_ci"]["ci_low"])
                 > 0.0,
+            "own_over_mismatched_ablation_ci": float(
+                row["ablation"]["specificity"]["own_vs_mismatched"][
+                    "effect_ci"]["ci_low"]) > 0.0,
+            "own_over_mismatched_ablation_permutation": float(
+                row["ablation"]["specificity"]["own_vs_mismatched"][
+                    "permutation"]["p_value_two_sided"]) < config.alpha,
+            "own_over_random_ablation_ci": float(
+                row["ablation"]["specificity"]["own_vs_random"][
+                    "effect_ci"]["ci_low"]) > 0.0,
+            "own_over_random_ablation_permutation": float(
+                row["ablation"]["specificity"]["own_vs_random"][
+                    "permutation"]["p_value_two_sided"]) < config.alpha,
             "paired_over_mismatch_ci": float(
                 row["transplant"]["paired_vs_mismatch"]["effect_ci"]["ci_low"])
                 > 0.0,
             "compactness": float(
-                row["compactness"]["median_site_fraction"])
+                row["compactness"][
+                    "median_decision_position_site_fraction"])
                 <= config.program_compact_fraction_max,
         }
         row["validation_selection_checks"] = checks
@@ -581,28 +679,58 @@ def select_validation_program(
             "checks": selected["validation_selection_checks"],
             "replay": selected["replay"],
             "ablation": selected["ablation"],
+            "source_id_replay": selected["source_id_replay"],
             "transplant": selected["transplant"],
             "compactness": selected["compactness"],
         }),
     }
 
 
+def select_validation_then_evaluate_test(
+        candidates: Sequence[Mapping[str, Any]], *, config: ProtocolConfig,
+        test_evaluator: Callable[[float], Any],
+) -> tuple[dict[str, Any], Any | None]:
+    """Freeze validation first, then call the test path exactly once."""
+    selection = select_validation_program(candidates, config=config)
+    if selection["status"] != "selected":
+        return selection, None
+    selected_mass = float(selection["selected_program_mass"])
+    return selection, test_evaluator(selected_mass)
+
+
 def evaluate_native_program_claims(
         test_result: Mapping[str, Any], *, config: ProtocolConfig) -> dict[str, Any]:
     compact = (
-        float(test_result["compactness"]["median_site_fraction"])
+        float(test_result["compactness"][
+            "median_decision_position_site_fraction"])
         <= config.program_compact_fraction_max)
     sufficiency = (
         float(test_result["replay"]["faithfulness_ci"]["ci_low"])
         >= config.program_replay_faithfulness_min
         and float(test_result["replay"]["answer_agreement_with_full"])
         >= config.program_replay_agreement_min)
-    necessity = (
+    own_necessity = (
         float(test_result["ablation"]["own_program"][
             "margin_drop_ci"]["ci_low"]) > 0.0
         and float(test_result["ablation"]["own_program"][
             "permutation"]["p_value_two_sided"]) < config.alpha)
-    transfer = (
+    specificity = all(
+        float(test_result["ablation"]["specificity"][name][
+            "effect_ci"]["ci_low"]) > 0.0
+        and float(test_result["ablation"]["specificity"][name][
+            "permutation"]["p_value_two_sided"]) < config.alpha
+        for name in ("own_vs_mismatched", "own_vs_random"))
+    selection_transfer = (
+        all(
+            float(test_result["source_id_replay"][name][
+                "effect_ci"]["ci_low"]) > 0.0
+            and float(test_result["source_id_replay"][name][
+                "permutation"]["p_value_two_sided"]) < config.alpha
+            for name in ("paired_vs_mismatch", "paired_vs_random"))
+        and float(test_result["source_id_replay"][
+            "bidirectional_answer_flip_fraction"])
+        >= config.program_id_transfer_flip_min)
+    contribution_transfer = (
         float(test_result["transplant"]["paired_vs_mismatch"][
             "effect_ci"]["ci_low"]) > 0.0
         and float(test_result["transplant"]["paired_vs_mismatch"][
@@ -610,12 +738,18 @@ def evaluate_native_program_claims(
         and float(test_result["transplant"][
             "bidirectional_answer_flip_fraction"])
         >= config.program_transplant_flip_min)
+    specific_causality = own_necessity and specificity
     passed = {
-        "descriptive_program": True,
+        "descriptive_decision_program": True,
         "compact_dynamic_sufficiency": compact and sufficiency,
-        "causal_dynamic_program": compact and sufficiency and necessity,
-        "counterfactual_program_transplant": (
-            compact and sufficiency and necessity and transfer),
+        "specific_causal_decision_program": (
+            compact and sufficiency and specific_causality),
+        "counterfactual_operator_selection_transfer": (
+            compact and sufficiency and specific_causality
+            and selection_transfer),
+        "counterfactual_contribution_transplant": (
+            compact and sufficiency and specific_causality
+            and selection_transfer and contribution_transfer),
     }
     strongest = None
     for claim in NATIVE_PROGRAM_CLAIM_LADDER:
@@ -625,7 +759,7 @@ def evaluate_native_program_claims(
             break
     return {
         "status": "ready",
-        "passed": bool(passed["counterfactual_program_transplant"]),
+        "passed": bool(passed["counterfactual_contribution_transplant"]),
         "claims": {
             claim: {"passed": bool(passed[claim])}
             for claim in NATIVE_PROGRAM_CLAIM_LADDER
@@ -661,7 +795,7 @@ def write_program_schedule_artifact(
         [record["site_count"] for record in schedule.records],
         dtype=np.int32)
     site_fractions = np.asarray([
-        record["site_fraction_of_total_operator_sites"]
+        record["decision_position_site_fraction"]
         for record in schedule.records], dtype=np.float64)
     arrays: dict[str, Any] = {
         "artifact_schema_version": np.asarray(
@@ -675,7 +809,9 @@ def write_program_schedule_artifact(
         "program_hashes": np.asarray([
             record["program_hash"] for record in schedule.records]),
         "site_count": site_counts,
-        "site_fraction": site_fractions,
+        "decision_position_site_fraction": site_fractions,
+        "decision_position_site_fraction_scope": np.asarray(
+            "answer_position_layer_route_operator_space"),
         "per_layer_route_site_count": counts,
         "per_layer_route_captured_mass": captured_mass,
     }

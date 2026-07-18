@@ -63,7 +63,7 @@ from analysis.operator_interpretability.program import (
     deterministic_mismatch_mapping,
     evaluate_native_program_claims,
     reindex_program_schedule,
-    select_validation_program,
+    select_validation_then_evaluate_test,
     write_program_schedule_artifact,
 )
 from analysis.operator_interpretability.protocol import (
@@ -789,12 +789,12 @@ class OperatorInterpretabilityRunner:
             discovery_artifacts[str(program_mass)] = artifacts
             discovery_curve.append({
                 "program_mass": program_mass,
-                "median_site_fraction": compactness[
-                    "median_site_fraction"],
-                "mean_site_fraction": compactness[
-                    "mean_site_fraction"],
-                "per_route_site_fraction": compactness[
-                    "per_route_site_fraction"],
+                "median_decision_position_site_fraction": compactness[
+                    "median_decision_position_site_fraction"],
+                "mean_decision_position_site_fraction": compactness[
+                    "mean_decision_position_site_fraction"],
+                "per_route_decision_position_site_fraction": compactness[
+                    "per_route_decision_position_site_fraction"],
                 "same_pair_route_overlap": compactness[
                     "same_pair_route_overlap"],
                 "mismatched_route_overlap": compactness[
@@ -841,17 +841,23 @@ class OperatorInterpretabilityRunner:
                         **controls,
                     }))
 
-        selection = select_validation_program(
-            validation_candidates, config=self.config)
+        selection, test_examples = select_validation_then_evaluate_test(
+            validation_candidates,
+            config=self.config,
+            test_evaluator=lambda _selected_mass: self._known_correct(
+                "mib_ioi", "test"),
+        )
         common = {
             "program_algorithm_version": PROGRAM_ALGORITHM_VERSION,
             "program_mass_candidates": list(candidate_masses),
+            "decision_scope": "final_ioi_decision_at_answer_position",
             "program_position_scope": self.config.program_position_scope,
             "program_routes": list(self.config.program_routes),
             "program_denominator_policy": (
                 self.config.program_denominator_policy),
             "program_mismatch_matching": (
                 self.config.program_mismatch_matching),
+            "program_random_sampling": self.config.program_random_sampling,
             "discovery": {
                 "status": "ready",
                 "example_count": len(discovery_examples),
@@ -885,15 +891,15 @@ class OperatorInterpretabilityRunner:
                 "selected_program_mass": None,
                 "test_evaluated": False,
                 "test_evaluation_count": 0,
-                "strongest_supported_claim": "descriptive_program",
+                "strongest_supported_claim": "descriptive_decision_program",
                 "checkpoint_specific_claim": True,
                 "scientific_claims_primary_modified": False,
             }
 
         selected_mass = float(selection["selected_program_mass"])
-        # The test program path is deliberately unreachable until the
-        # validation selection record above has been frozen.
-        test_examples = self._known_correct("mib_ioi", "test")
+        # select_validation_then_evaluate_test makes the test data path
+        # unreachable until the validation selection record is frozen.
+        assert test_examples is not None
         if len(test_examples) < minimum:
             return {
                 **common,
@@ -905,7 +911,7 @@ class OperatorInterpretabilityRunner:
                 "minimum_known_correct": minimum,
                 "test_evaluated": False,
                 "test_evaluation_count": 0,
-                "strongest_supported_claim": "descriptive_program",
+                "strongest_supported_claim": "descriptive_decision_program",
                 "checkpoint_specific_claim": True,
                 "scientific_claims_primary_modified": False,
             }
@@ -947,12 +953,14 @@ class OperatorInterpretabilityRunner:
             test_result, config=self.config)
         human_summary = {
             "selected_program_mass": selected_mass,
-            "median_site_fraction": test_result["compactness"][
-                "median_site_fraction"],
-            "mean_site_fraction": test_result["compactness"][
-                "mean_site_fraction"],
-            "per_route_site_fraction": test_result["compactness"][
-                "per_route_site_fraction"],
+            "decision_scope": "final_ioi_decision_at_answer_position",
+            "median_decision_position_site_fraction": test_result[
+                "compactness"]["median_decision_position_site_fraction"],
+            "mean_decision_position_site_fraction": test_result[
+                "compactness"]["mean_decision_position_site_fraction"],
+            "per_route_decision_position_site_fraction": test_result[
+                "compactness"][
+                    "per_route_decision_position_site_fraction"],
             "replay_faithfulness": test_result["replay"][
                 "normalized_faithfulness"],
             "replay_faithfulness_ci": test_result["replay"][
@@ -965,8 +973,17 @@ class OperatorInterpretabilityRunner:
                 "own_program"]["margin_drop_ci"],
             "ablation_permutation_p": test_result["ablation"][
                 "own_program"]["permutation"]["p_value_two_sided"],
-            "source_id_replay_flip": test_result["source_id_replay"][
-                "paired"]["base_to_source"]["answer_flip_fraction"],
+            "own_vs_mismatched_ablation": test_result["ablation"][
+                "specificity"]["own_vs_mismatched"],
+            "own_vs_random_ablation": test_result["ablation"][
+                "specificity"]["own_vs_random"],
+            "source_id_replay_paired_vs_mismatch": test_result[
+                "source_id_replay"]["paired_vs_mismatch"],
+            "source_id_replay_paired_vs_random": test_result[
+                "source_id_replay"]["paired_vs_random"],
+            "source_id_replay_bidirectional_flip": test_result[
+                "source_id_replay"][
+                    "bidirectional_answer_flip_fraction"],
             "source_contribution_transplant_flip": test_result[
                 "transplant"]["paired"]["base_to_source"][
                     "answer_flip_fraction"],

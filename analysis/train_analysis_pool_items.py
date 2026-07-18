@@ -123,9 +123,10 @@ _register("mib_ioi.native_operator_program", _mechanistic_item(
     "Can each paired-correct IOI decision be replayed, ablated, and "
     "counterfactually transferred by its answer-position multilayer RW "
     "operator program?",
-    "Select the smallest compact program mass on validation, then evaluate "
-    "the frozen threshold once on held-out test with paired, mismatched, and "
-    "random controls.",
+    "Select the smallest compact decision-position program mass on "
+    "validation, then evaluate the frozen threshold once on held-out test; "
+    "specificity and ID-only transfer claims require paired effects "
+    "to exceed answer-disjoint mismatched and complement-sampled controls.",
     "mib_ioi.behavioral_eligibility",
     claim_role="checkpoint_specific"))
 

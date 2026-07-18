@@ -877,6 +877,41 @@ def _ablation_metrics(
     }
 
 
+def _paired_advantage_metrics(
+        primary: np.ndarray, control: np.ndarray, *,
+        config: ProtocolConfig, seed: int) -> dict[str, Any]:
+    """Summarize the paired advantage of one intervention over a control."""
+    effect = np.asarray(primary) - np.asarray(control)
+    return {
+        "mean_effect": float(np.mean(effect)),
+        "median_effect": float(np.median(effect)),
+        "positive_effect_fraction": float(np.mean(effect > 0.0)),
+        "effect_ci": bootstrap_mean_ci(
+            effect, samples=config.bootstrap_samples, alpha=config.alpha,
+            seed=seed),
+        "permutation": paired_permutation_test(
+            primary, control, samples=config.permutation_samples,
+            seed=seed + 1),
+    }
+
+
+def _random_overlap_metrics(
+        schedule: OperatorProgramSchedule) -> dict[str, Any]:
+    fractions = np.asarray([
+        float(record["random_reference_overlap_fraction"])
+        for record in schedule.records
+    ], dtype=np.float64)
+    return {
+        "per_example_overlap_fraction": fractions.tolist(),
+        "mean_overlap_fraction": float(np.mean(fractions)),
+        "max_overlap_fraction": float(np.max(fractions)),
+        "complement_only_fraction": float(np.mean([
+            bool(record["random_complement_only"])
+            for record in schedule.records
+        ])),
+    }
+
+
 def _direction_metrics(before: np.ndarray, after: np.ndarray) -> dict[str, Any]:
     improvement = np.asarray(after) - np.asarray(before)
     flips = (np.asarray(before) <= 0.0) & (np.asarray(after) > 0.0)
@@ -999,6 +1034,9 @@ def evaluate_native_operator_program_candidate(
         positive_side="positive", negative_side="negative",
         pad_token_id=pad_token_id,
         program_mode=PROGRAM_MODES["own_id_ablation"])
+    own_drop = full_base_margin - own_ablated
+    mismatch_drop = full_base_margin - mismatch_ablated
+    random_drop = full_base_margin - random_ablated
     ablation = {
         "own_program": _ablation_metrics(
             full_base_margin, own_ablated, config=config, seed=seed + 401),
@@ -1008,6 +1046,12 @@ def evaluate_native_operator_program_candidate(
         "random_program": _ablation_metrics(
             full_base_margin, random_ablated,
             config=config, seed=seed + 431),
+        "specificity": {
+            "own_vs_mismatched": _paired_advantage_metrics(
+                own_drop, mismatch_drop, config=config, seed=seed + 443),
+            "own_vs_random": _paired_advantage_metrics(
+                own_drop, random_drop, config=config, seed=seed + 457),
+        },
     }
 
     before_b2s = _program_margin(
@@ -1047,6 +1091,18 @@ def evaluate_native_operator_program_candidate(
         random_base, "source", "source_negative", "source_positive",
         PROGRAM_MODES["source_id_replay"])
 
+    paired_id_improvement = 0.5 * (
+        (paired_id_b2s - before_b2s) + (paired_id_s2b - before_s2b))
+    mismatch_id_improvement = 0.5 * (
+        (mismatch_id_b2s - before_b2s)
+        + (mismatch_id_s2b - before_s2b))
+    random_id_improvement = 0.5 * (
+        (random_id_b2s - before_b2s) + (random_id_s2b - before_s2b))
+    paired_id_vs_mismatch = paired_id_improvement - mismatch_id_improvement
+    paired_id_vs_random = paired_id_improvement - random_id_improvement
+    paired_id_flip_b2s = (before_b2s <= 0.0) & (paired_id_b2s > 0.0)
+    paired_id_flip_s2b = (before_s2b <= 0.0) & (paired_id_s2b > 0.0)
+
     paired_b2s = direction(
         source_schedule, "base", "intervention_positive",
         "intervention_negative",
@@ -1082,14 +1138,15 @@ def evaluate_native_operator_program_candidate(
     random_improvement = 0.5 * (
         (random_b2s - before_b2s) + (random_s2b - before_s2b))
     paired_vs_mismatch = paired_improvement - mismatch_improvement
+    paired_vs_random = paired_improvement - random_improvement
     paired_flip_b2s = (before_b2s <= 0.0) & (paired_b2s > 0.0)
     paired_flip_s2b = (before_s2b <= 0.0) & (paired_s2b > 0.0)
     source_id = {
         "paired": {
             "base_to_source": _direction_metrics(before_b2s, paired_id_b2s),
             "source_to_base": _direction_metrics(before_s2b, paired_id_s2b),
-            "bidirectional_answer_flip_fraction": float(np.mean(
-                (paired_id_b2s > 0.0) & (paired_id_s2b > 0.0))),
+            "mean_bidirectional_improvement": float(
+                np.mean(paired_id_improvement)),
         },
         "mismatched": {
             "base_to_source": _direction_metrics(
@@ -1101,6 +1158,14 @@ def evaluate_native_operator_program_candidate(
             "base_to_source": _direction_metrics(before_b2s, random_id_b2s),
             "source_to_base": _direction_metrics(before_s2b, random_id_s2b),
         },
+        "paired_vs_mismatch": _paired_advantage_metrics(
+            paired_id_improvement, mismatch_id_improvement,
+            config=config, seed=seed + 509),
+        "paired_vs_random": _paired_advantage_metrics(
+            paired_id_improvement, random_id_improvement,
+            config=config, seed=seed + 523),
+        "bidirectional_answer_flip_fraction": float(np.mean(
+            paired_id_flip_b2s & paired_id_flip_s2b)),
     }
     transplant = {
         "paired": {
@@ -1122,13 +1187,14 @@ def evaluate_native_operator_program_candidate(
                 np.mean(random_improvement)),
         },
         "paired_vs_mismatch": {
-            "mean_effect": float(np.mean(paired_vs_mismatch)),
-            "effect_ci": bootstrap_mean_ci(
-                paired_vs_mismatch, samples=config.bootstrap_samples,
-                alpha=config.alpha, seed=seed + 607),
-            "permutation": paired_permutation_test(
+            **_paired_advantage_metrics(
                 paired_improvement, mismatch_improvement,
-                samples=config.permutation_samples, seed=seed + 613),
+                config=config, seed=seed + 607),
+        },
+        "paired_vs_random": {
+            **_paired_advantage_metrics(
+                paired_improvement, random_improvement,
+                config=config, seed=seed + 631),
         },
         "bidirectional_answer_flip_fraction": float(np.mean(
             paired_flip_b2s & paired_flip_s2b)),
@@ -1141,6 +1207,7 @@ def evaluate_native_operator_program_candidate(
         "phase": examples[0].phase,
         "program_mass": float(base_schedule.program_mass),
         "example_count": len(examples),
+        "decision_scope": "final_ioi_decision_at_answer_position",
         "program_position_scope": config.program_position_scope,
         "program_routes": list(config.program_routes),
         "program_denominator_policy": config.program_denominator_policy,
@@ -1154,8 +1221,11 @@ def evaluate_native_operator_program_candidate(
         "random_control": {
             "seed_source": seed + 211,
             "seed_base": seed + 223,
+            "sampling_policy": config.program_random_sampling,
             "count_preserved_per_example_layer_route": True,
             "without_replacement": True,
+            "source": _random_overlap_metrics(random_source),
+            "base": _random_overlap_metrics(random_base),
         },
         "primary_effect_vectors_persisted_in_item_json": False,
         "_effect_vectors": {
@@ -1167,6 +1237,11 @@ def evaluate_native_operator_program_candidate(
             "own_ablated_margin": own_ablated,
             "mismatched_ablated_margin": mismatch_ablated,
             "random_ablated_margin": random_ablated,
+            "own_program_margin_drop": own_drop,
+            "mismatched_program_margin_drop": mismatch_drop,
+            "random_program_margin_drop": random_drop,
+            "own_vs_mismatched_margin_drop": own_drop - mismatch_drop,
+            "own_vs_random_margin_drop": own_drop - random_drop,
             "counterfactual_before_base_to_source": before_b2s,
             "counterfactual_before_source_to_base": before_s2b,
             "source_id_paired_base_to_source": paired_id_b2s,
@@ -1175,6 +1250,14 @@ def evaluate_native_operator_program_candidate(
             "source_id_mismatched_source_to_base": mismatch_id_s2b,
             "source_id_random_base_to_source": random_id_b2s,
             "source_id_random_source_to_base": random_id_s2b,
+            "source_id_paired_improvement": paired_id_improvement,
+            "source_id_mismatched_improvement": mismatch_id_improvement,
+            "source_id_random_improvement": random_id_improvement,
+            "source_id_paired_vs_mismatch_improvement": (
+                paired_id_vs_mismatch),
+            "source_id_paired_vs_random_improvement": paired_id_vs_random,
+            "source_id_bidirectional_pair_success": (
+                paired_id_flip_b2s & paired_id_flip_s2b),
             "transplant_paired_base_to_source": paired_b2s,
             "transplant_paired_source_to_base": paired_s2b,
             "transplant_mismatched_base_to_source": mismatch_b2s,
@@ -1182,6 +1265,7 @@ def evaluate_native_operator_program_candidate(
             "transplant_random_base_to_source": random_b2s,
             "transplant_random_source_to_base": random_s2b,
             "paired_vs_mismatch_improvement": paired_vs_mismatch,
+            "paired_vs_random_improvement": paired_vs_random,
             "bidirectional_pair_success": (
                 paired_flip_b2s & paired_flip_s2b),
         },

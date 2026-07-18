@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 PROTOCOL_ID = "dawn_operator_interpretability"
-PROTOCOL_SCHEMA_VERSION = 6
+PROTOCOL_SCHEMA_VERSION = 7
 ANALYSIS_ENGINE = "train_analysis_pool"
 SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
@@ -35,10 +35,11 @@ CLAIM_LADDER = (
     "spatial_trajectory_confirmation",
 )
 NATIVE_PROGRAM_CLAIM_LADDER = (
-    "descriptive_program",
+    "descriptive_decision_program",
     "compact_dynamic_sufficiency",
-    "causal_dynamic_program",
-    "counterfactual_program_transplant",
+    "specific_causal_decision_program",
+    "counterfactual_operator_selection_transfer",
+    "counterfactual_contribution_transplant",
 )
 
 # MIB circuit-track fractions, including the mandatory full-model endpoint.
@@ -79,12 +80,15 @@ class ProtocolConfig:
     program_replay_faithfulness_min: float = 0.80
     program_replay_agreement_min: float = 0.90
     program_compact_fraction_max: float = 0.20
+    program_id_transfer_flip_min: float = 0.50
     program_transplant_flip_min: float = 0.50
     program_position_scope: str = "answer_position_only"
     program_routes: tuple[str, ...] = ("q", "k", "v", "rst")
     program_denominator_policy: str = "full_production_denominator"
     program_mismatch_matching: str = (
-        "same_template_nearest_site_count_seeded")
+        "same_template_answer_disjoint_nearest_site_count_seeded")
+    program_random_sampling: str = (
+        "selected_complement_first_without_replacement")
     program_faithfulness_endpoint: str = (
         "paired_counterfactual_source_prompt_base_answer_margin")
 
@@ -137,6 +141,8 @@ class ProtocolConfig:
                  self.program_replay_agreement_min),
                 ("program_compact_fraction_max",
                  self.program_compact_fraction_max),
+                ("program_id_transfer_flip_min",
+                 self.program_id_transfer_flip_min),
                 ("program_transplant_flip_min",
                  self.program_transplant_flip_min)):
             if not 0.0 <= float(value) <= 1.0:
@@ -151,8 +157,11 @@ class ProtocolConfig:
                 "program_denominator_policy must preserve the full "
                 "production denominator")
         if self.program_mismatch_matching != (
-                "same_template_nearest_site_count_seeded"):
+                "same_template_answer_disjoint_nearest_site_count_seeded"):
             raise ValueError("unsupported program_mismatch_matching")
+        if self.program_random_sampling != (
+                "selected_complement_first_without_replacement"):
+            raise ValueError("unsupported program_random_sampling")
         if self.program_faithfulness_endpoint != (
                 "paired_counterfactual_source_prompt_base_answer_margin"):
             raise ValueError("unsupported program_faithfulness_endpoint")
