@@ -39,6 +39,7 @@ from dawn.eval.zero_shot_protocol import (  # noqa: E402
     build_results_summary,
     csv_header_and_row,
     json_safe,
+    normalize_tasks,
     normalize_buckets,
     prepare_causal_request,
     sha256_json,
@@ -54,6 +55,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--init-from", required=True,
                         help="Orbax run/checkpoints directory or concrete step")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--tasks", default=",".join(PRIMARY_TASKS),
+        help="Comma-separated stock task ids; default is the complete primary suite")
     parser.add_argument("--tokenizer", default=None,
                         help="Must match the tokenizer recorded by pretokenization")
     parser.add_argument(
@@ -77,6 +81,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default=None)
     parser.add_argument("--known-validation-loss", type=float, default=None)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--mesh-data", type=int, default=None)
+    parser.add_argument("--mesh-model", type=int, default=None)
     return parser.parse_args()
 
 
@@ -568,17 +574,19 @@ def _dataset_fingerprints(task: Any) -> Dict[str, Any]:
     return output
 
 
-def _load_stock_tasks() -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _load_stock_tasks(
+    tasks: Sequence[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     from lm_eval.tasks import TaskManager, get_task_dict
 
     manager = TaskManager(verbosity="INFO")
-    task_dict = get_task_dict(list(PRIMARY_TASKS), manager)
-    if set(task_dict) != set(PRIMARY_TASKS):
+    task_dict = get_task_dict(list(tasks), manager)
+    if set(task_dict) != set(tasks):
         raise RuntimeError(
             "stock task lookup mismatch: "
-            f"requested={list(PRIMARY_TASKS)} found={sorted(task_dict)}")
+            f"requested={list(tasks)} found={sorted(task_dict)}")
     provenance = {}
-    for name in PRIMARY_TASKS:
+    for name in tasks:
         task = _task_object(task_dict[name])
         if task is None:
             raise RuntimeError(f"stock task {name!r} resolved to None")
@@ -603,10 +611,11 @@ def _load_stock_tasks() -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
 
 def _validate_evaluated_row_counts(
-    raw: Mapping[str, Any], task_provenance: Mapping[str, Any], limit: Optional[int]
+    raw: Mapping[str, Any], task_provenance: Mapping[str, Any],
+    limit: Optional[int], tasks: Sequence[str],
 ) -> None:
     results = raw.get("results", {})
-    for task in PRIMARY_TASKS:
+    for task in tasks:
         metrics = results.get(task)
         if not isinstance(metrics, Mapping):
             raise RuntimeError(f"final task result missing: {task}")
@@ -636,18 +645,19 @@ def _flatten_sample_response(value: Any) -> Optional[Tuple[float, bool]]:
 
 
 def _build_sample_records(
-    raw_results: Mapping[str, Any], traces: Sequence[Mapping[str, Any]]
+    raw_results: Mapping[str, Any], traces: Sequence[Mapping[str, Any]],
+    tasks: Sequence[str],
 ) -> Sequence[Dict[str, Any]]:
     trace_groups: Dict[Tuple[str, str], list] = {}
     for trace in traces:
         task = str(trace["task"])
-        if task not in PRIMARY_TASKS:
+        if task not in tasks:
             continue
         key = (task, stable_json_dumps(trace["document_id"]))
         trace_groups.setdefault(key, []).append(dict(trace))
     raw_samples = raw_results.get("samples", {})
     records = []
-    for task in PRIMARY_TASKS:
+    for task in tasks:
         for sample in raw_samples.get(task, []):
             doc_id = sample.get("doc_id")
             key = (task, stable_json_dumps(json_safe(doc_id)))
@@ -728,7 +738,7 @@ def _build_sample_records(
                 "correct": None if correct is None else bool(correct),
                 "truncated": any(bool(item["truncated"]) for item in candidates),
             })
-    expected = sum(len(raw_samples.get(task, [])) for task in PRIMARY_TASKS)
+    expected = sum(len(raw_samples.get(task, [])) for task in tasks)
     if len(records) != expected:
         raise RuntimeError(
             f"sample output count mismatch: records={len(records)} expected={expected}")
@@ -814,11 +824,12 @@ def _log_required_startup(
     return text
 
 
-def main() -> None:
-    args = _parse_args()
+def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
     start_timestamp = datetime.now(timezone.utc)
     random.seed(args.seed)
     np.random.seed(args.seed)
+    tasks = normalize_tasks(
+        [value.strip() for value in str(args.tasks).split(",") if value.strip()])
 
     # Importing JAX is safe before initialization; device/backend access is not.
     import jax
@@ -874,17 +885,27 @@ def main() -> None:
     if jax.process_index() == 0:
         print("tokenizer_policy=" + stable_json_dumps(tokenizer_meta), flush=True)
 
-    mesh_model = int(training_cfg.get("mesh_model", 0))
-    mesh_data = int(training_cfg.get("mesh_data", 0))
-    if mesh_model <= 0 or mesh_data <= 0:
+    checkpoint_mesh_model = int(training_cfg.get("mesh_model", 0))
+    checkpoint_mesh_data = int(training_cfg.get("mesh_data", 0))
+    if checkpoint_mesh_model <= 0 or checkpoint_mesh_data <= 0:
         raise RuntimeError(
             "checkpoint full_config must contain materialized positive "
             "training.mesh_model and training.mesh_data")
+    mesh_model = int(args.mesh_model or checkpoint_mesh_model)
+    if mesh_model != checkpoint_mesh_model:
+        raise RuntimeError(
+            "zero-shot mesh_model must preserve checkpoint model-axis "
+            f"sharding: checkpoint={checkpoint_mesh_model} requested={mesh_model}")
+    mesh_data = int(args.mesh_data or checkpoint_mesh_data)
+    if mesh_data <= 0:
+        raise RuntimeError("effective zero-shot mesh_data must be positive")
     if mesh_model * mesh_data != jax.device_count():
         raise RuntimeError(
-            "current topology differs from checkpoint mesh: "
-            f"checkpoint={mesh_data}x{mesh_model} "
+            "effective zero-shot mesh differs from current topology: "
+            f"effective={mesh_data}x{mesh_model} "
             f"devices={jax.device_count()}")
+    training_cfg["mesh_model"] = mesh_model
+    training_cfg["mesh_data"] = mesh_data
     canonical._maybe_materialize_vocab_parallel_config(config)
     mesh = canonical.create_mesh(mesh_data, mesh_model)
     model = canonical.build_model_from_config(config)
@@ -946,7 +967,7 @@ def main() -> None:
         eot_token_id=tokenizer_meta["eot_token_id"],
         max_gen_toks=args.max_gen_toks,
     )
-    task_dict, task_provenance = _load_stock_tasks()
+    task_dict, task_provenance = _load_stock_tasks(tasks)
     task_hash = sha256_json(task_provenance)
     _allgather_equal_bytes(
         jax, bytes.fromhex(task_hash), name="task config/dataset hash")
@@ -965,7 +986,8 @@ def main() -> None:
     )
     if raw_results is None:
         raise RuntimeError("lm-eval returned no results")
-    _validate_evaluated_row_counts(raw_results, task_provenance, args.limit)
+    _validate_evaluated_row_counts(
+        raw_results, task_provenance, args.limit, tasks)
     raw_results = dict(raw_results)
     raw_results["config"] = {
         "model": type(adapter).__name__,
@@ -982,7 +1004,7 @@ def main() -> None:
     host_result_hash = sha256_json(raw_results)
     _allgather_equal_bytes(
         jax, bytes.fromhex(host_result_hash), name="final harness result")
-    comparable = args.limit is None
+    comparable = args.limit is None and tasks == PRIMARY_TASKS
     model_name = args.model_name or str(model_cfg.get("model_version", "DAWN"))
     validation_loss = _known_validation_loss(args, metadata)
     task_runtime = adapter.runtime_stats()
@@ -993,18 +1015,20 @@ def main() -> None:
         validation_loss=validation_loss,
         comparable=comparable,
         task_runtime=task_runtime,
+        tasks=tasks,
     )
     summary["validation_ce_cross_check"] = validation_cross_check
-    samples = _build_sample_records(raw_results, adapter.sample_traces())
+    samples = _build_sample_records(
+        raw_results, adapter.sample_traces(), tasks)
     output_dir = _format_output_dir(canonical, args, model_name, step)
 
     end_timestamp = datetime.now(timezone.utc)
     git_info = _git_info()
     first_param = next(iter(jax.tree.leaves(params)))
     task_versions = {
-        task: task_provenance[task]["version"] for task in PRIMARY_TASKS}
+        task: task_provenance[task]["version"] for task in tasks}
     task_config_hashes = {
-        task: task_provenance[task]["config_hash"] for task in PRIMARY_TASKS}
+        task: task_provenance[task]["config_hash"] for task in tasks}
     dataset_info = {
         task: {
             "dataset_path": task_provenance[task]["dataset_path"],
@@ -1013,14 +1037,14 @@ def main() -> None:
             "fingerprints": task_provenance[task]["dataset_fingerprints"],
             "evaluation_split": task_provenance[task]["evaluation_split"],
         }
-        for task in PRIMARY_TASKS
+        for task in tasks
     }
     manifest = {
         "protocol_name": PROTOCOL_NAME,
         "protocol_version": PROTOCOL_VERSION,
         "evaluation_mode": "zero_shot_no_update",
         "num_fewshot": NUM_FEWSHOT,
-        "tasks": list(PRIMARY_TASKS),
+        "tasks": list(tasks),
         "lm_eval_version": lm_eval_version,
         "software_versions": {
             name: _distribution_version(name)
@@ -1055,6 +1079,8 @@ def main() -> None:
         "max_sequence_length": max_length,
         "dtype": str(first_param.dtype),
         "mesh_shape": {"data": mesh_data, "model": mesh_model},
+        "checkpoint_mesh_shape": {
+            "data": checkpoint_mesh_data, "model": checkpoint_mesh_model},
         "global_device_count": int(jax.device_count()),
         "local_device_count": int(jax.local_device_count()),
         "host_count": int(jax.process_count()),
@@ -1095,7 +1121,7 @@ def main() -> None:
             "validation_ce_cross_check="
             + stable_json_dumps(validation_cross_check),
         ]
-        for task in PRIMARY_TASKS:
+        for task in tasks:
             log_lines.append(
                 f"task_runtime[{task}]="
                 + stable_json_dumps(task_runtime.get(task, {})))
@@ -1111,6 +1137,16 @@ def main() -> None:
         print(f"output_dir={output_dir}", flush=True)
     from jax.experimental import multihost_utils
     multihost_utils.sync_global_devices("zero_shot_eval_outputs_written")
+    return {
+        "summary": summary,
+        "manifest": manifest,
+        "raw_results": raw_results,
+        "output_dir": output_dir,
+    }
+
+
+def main() -> None:
+    run_evaluation(_parse_args())
 
 
 if __name__ == "__main__":

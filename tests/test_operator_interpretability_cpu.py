@@ -774,18 +774,17 @@ def _example(phase: str, suffix: str, *, benchmark_id: str = "tiny",
 
 
 def test_protocol_and_schema_contracts() -> None:
-    assert dependency_closure(["conditional_circuit_sufficiency"]) == [
-        "benchmark_contract", "behavioral_eligibility",
-        "operator_localization", "conditional_circuit_sufficiency",
+    assert dependency_closure(["mib_ioi.conditional_circuit_sufficiency"]) == [
+        "mib_ioi.input_contract", "mib_ioi.behavioral_eligibility",
+        "mib_ioi.operator_localization",
+        "mib_ioi.conditional_circuit_sufficiency",
     ]
-    closure = dependency_closure(["scientific_claims"])
-    assert closure == [
-        "benchmark_contract", "behavioral_eligibility",
-        "operator_localization", "conditional_circuit_sufficiency",
-        "circuit_necessity", "autonomous_circuit_sufficiency",
-        "operator_space_structure", "ravel_causal_mediation",
-        "multilayer_trajectory", "scientific_claims",
-    ]
+    closure = dependency_closure(["scientific_claims.primary"])
+    assert closure[-1] == "scientific_claims.primary"
+    assert "mib_ioi.circuit_necessity" in closure
+    assert "mib_arc.autonomous_circuit_sufficiency" in closure
+    assert "ravel.causal_mediation" in closure
+    assert "ravel.multilayer_trajectory" in closure
     assert len(closure) == len(set(closure))
 
     validation_rows = [

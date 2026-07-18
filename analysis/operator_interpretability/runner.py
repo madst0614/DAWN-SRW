@@ -9,7 +9,7 @@ import jax
 import numpy as np
 from transformers import AutoTokenizer
 
-from analysis.dawn_analysis_common import analysis_model_module
+from analysis.dawn_analysis_common import analysis_model_module, git_info
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
     load_protocol_bound_artifact,
@@ -71,7 +71,10 @@ from analysis.operator_interpretability.units import (
     OperatorSpaceShape,
     nested_circuits,
 )
-from analysis.train_analysis_pool_items import dependency_closure
+from analysis.train_analysis_pool_items import (
+    dependency_closure,
+    item_definition,
+)
 
 
 MIB_CIRCUIT_BENCHMARKS = (
@@ -173,6 +176,14 @@ class OperatorInterpretabilityRunner:
             checkpoint_identity=checkpoint_identity,
             model_config_hash=model_config_hash,
         )
+        self.protocol["execution"] = {
+            "target_id": ctx.model_info.get("target_id"),
+            "runtime_id": ctx.model_info.get("runtime_id"),
+            "accelerator_type": ctx.model_info.get("accelerator_type"),
+            "checkpoint_mesh": ctx.model_info.get("checkpoint_mesh"),
+            "effective_mesh": ctx.model_info.get("mesh"),
+        }
+        self.protocol["analysis_code"] = git_info()
         self.contract = {
             "status": "ready",
             "model_version": self.model_version,
@@ -189,10 +200,15 @@ class OperatorInterpretabilityRunner:
             "benchmark_manifest_path": self.build.manifest_path,
             "benchmark_manifest_hash": self.build.manifest_hash,
             "benchmark_ids": list(self.benchmark_ids),
+            "execution": dict(self.protocol["execution"]),
             "tokenizer": tokenizer_record,
             "protocol": self.protocol,
         }
         self.results: dict[str, dict[str, Any]] = {}
+        self.concrete_results: dict[str, dict[str, Any]] = {}
+        self._kind_items: dict[str, list[str]] = {}
+        self._kind_benchmark_ids: dict[str, tuple[str, ...]] = {}
+        self._active_kind: str | None = None
         self._examples: dict[str, dict[str, list[Any]]] = {}
         self._pool_host: dict[str, np.ndarray] | None = None
 
@@ -200,38 +216,138 @@ class OperatorInterpretabilityRunner:
         if self.ctx.is_primary:
             print(message, flush=True)
 
-    def _artifact_path(self, item: str) -> str:
-        return self.store.path("items", f"{item}.json")
+    @staticmethod
+    def _item_relative_path(item_id: str) -> str:
+        parts = str(item_id).split(".")
+        return "/".join(("items", *parts[:-1], f"{parts[-1]}.json"))
 
-    def _persist(self, item: str, result: Mapping[str, Any]) -> None:
-        if self.ctx.is_primary:
-            write_protocol_bound_artifact(
-                self.store, f"items/{item}.json", result,
-                protocol=self.protocol)
+    def _artifact_path(self, item_id: str) -> str:
+        return self.store.path(*self._item_relative_path(item_id).split("/"))
 
-    def _ensure(self, item: str) -> dict[str, Any]:
-        if item in self.results:
-            return self.results[item]
-        if self.resume:
-            existing = load_protocol_bound_artifact(
-                self._artifact_path(item), protocol=self.protocol)
-            if existing is not None:
-                self.results[item] = existing
-                self._print(f"TRAIN_ANALYSIS_POOL item={item} status=resume")
-                return existing
-        method = getattr(self, f"_run_{item}")
-        self._print(f"TRAIN_ANALYSIS_POOL item={item} status=running")
+    def _scope(self, kind: str | None = None) -> tuple[str, ...]:
+        key = str(kind or self._active_kind or "")
+        scopes = getattr(self, "_kind_benchmark_ids", {})
+        return scopes.get(key, tuple(getattr(self, "benchmark_ids", ())))
+
+    def _concrete_payload(
+            self, item_id: str, kind: str,
+            result: Mapping[str, Any]) -> dict[str, Any]:
+        definition = item_definition(item_id)
+        benchmark_id = definition.get("benchmark_id")
+        if benchmark_id is not None and kind != "input_contract" and (
+                isinstance(result.get("benchmarks"), Mapping)):
+            benchmark_result = result["benchmarks"].get(benchmark_id)
+            if not isinstance(benchmark_result, Mapping):
+                raise ValueError(
+                    f"analysis kind {kind} omitted requested benchmark "
+                    f"{benchmark_id}")
+            item_result = dict(benchmark_result)
+        elif kind == "input_contract":
+            item_result = dict(result)
+            item_result["benchmark_ids"] = [str(benchmark_id)]
+            item_result["benchmark_id"] = str(benchmark_id)
+        else:
+            item_result = dict(result)
+        return {
+            "item_id": item_id,
+            "backend": definition["backend"],
+            "analysis_kind": kind,
+            "benchmark_id": benchmark_id,
+            "claim_role": definition["claim_role"],
+            "status": item_result.get("status"),
+            "result": item_result,
+        }
+
+    def _restore_kind(
+            self, kind: str, item_ids: Sequence[str]) -> dict[str, Any] | None:
+        if not self.resume:
+            return None
+        loaded: dict[str, dict[str, Any]] = {}
+        for item_id in item_ids:
+            value = load_protocol_bound_artifact(
+                self._artifact_path(item_id), protocol=self.protocol)
+            if value is None:
+                return None
+            if value.get("item_id") != item_id or value.get("analysis_kind") != kind:
+                raise ValueError(
+                    f"analysis artifact identity mismatch for {item_id}")
+            loaded[item_id] = value
+        if kind == "input_contract":
+            result = dict(self.contract)
+            result["benchmark_ids"] = list(self._scope(kind))
+        elif all(item_definition(item_id).get("benchmark_id") is not None
+                 for item_id in item_ids) and kind in {
+                     "behavioral_eligibility", "operator_localization",
+                     "conditional_circuit_sufficiency",
+                     "autonomous_circuit_sufficiency", "circuit_necessity",
+                 }:
+            result = {
+                "status": "ready",
+                "benchmarks": {
+                    str(item_definition(item_id)["benchmark_id"]):
+                        dict(loaded[item_id]["result"])
+                    for item_id in item_ids
+                },
+            }
+        else:
+            if len(item_ids) != 1:
+                raise ValueError(
+                    f"non-scoped analysis kind {kind} has multiple items")
+            result = dict(loaded[item_ids[0]]["result"])
+        self.concrete_results.update(loaded)
+        for item_id in item_ids:
+            self._print(f"TRAIN_ANALYSIS_POOL item={item_id} status=resume")
+        return result
+
+    def _ensure_kind(
+            self, kind: str, item_ids: Sequence[str]) -> dict[str, Any]:
+        if kind in self.results:
+            return self.results[kind]
+        self._active_kind = kind
+        restored = self._restore_kind(kind, item_ids)
+        if restored is not None:
+            self.results[kind] = restored
+            return restored
+        for item_id in item_ids:
+            self._print(f"TRAIN_ANALYSIS_POOL item={item_id} status=running")
+        method = getattr(self, f"_run_{kind}")
         result = dict(method())
-        self.results[item] = result
-        self._persist(item, result)
-        self._print(
-            f"TRAIN_ANALYSIS_POOL item={item} status={result.get('status')}")
+        self.results[kind] = result
+        for item_id in item_ids:
+            payload = self._concrete_payload(item_id, kind, result)
+            self.concrete_results[item_id] = payload
+            if self.ctx.is_primary:
+                write_protocol_bound_artifact(
+                    self.store, self._item_relative_path(item_id), payload,
+                    protocol=self.protocol)
+            self._print(
+                f"TRAIN_ANALYSIS_POOL item={item_id} "
+                f"status={payload.get('status')}")
         return result
 
     def run(self, items: Sequence[str]) -> dict[str, Any]:
         executed = dependency_closure(items)
-        for item in executed:
-            self._ensure(item)
+        kind_order: list[str] = []
+        for item_id in executed:
+            definition = item_definition(item_id)
+            if definition["backend"] != "operator_interpretability":
+                raise ValueError(
+                    f"OperatorInterpretabilityRunner cannot execute backend="
+                    f"{definition['backend']} item={item_id}")
+            kind = str(definition["analysis_kind"])
+            if kind not in self._kind_items:
+                self._kind_items[kind] = []
+                kind_order.append(kind)
+            self._kind_items[kind].append(item_id)
+        for kind, item_ids in self._kind_items.items():
+            benchmark_ids = [
+                str(item_definition(item_id)["benchmark_id"])
+                for item_id in item_ids
+                if item_definition(item_id).get("benchmark_id") is not None
+            ]
+            self._kind_benchmark_ids[kind] = tuple(dict.fromkeys(benchmark_ids))
+        for kind in kind_order:
+            self._ensure_kind(kind, self._kind_items[kind])
         summary = {
             "status": "complete",
             "requested_items": list(items),
@@ -241,7 +357,8 @@ class OperatorInterpretabilityRunner:
             "benchmark_build_id": self.build.build_id,
             "protocol_hash": canonical_hash(self.protocol),
             "item_status": {
-                item: self.results[item].get("status") for item in executed
+                item: self.concrete_results[item].get("status")
+                for item in executed
             },
             "strongest_supported_claim": (
                 self.results.get("scientific_claims", {}).get(
@@ -249,7 +366,8 @@ class OperatorInterpretabilityRunner:
         }
         if self.ctx.is_primary:
             write_protocol_bound_artifact(
-                self.store, "summary.json", summary, protocol=self.protocol)
+                self.store, "backends/operator_interpretability/summary.json",
+                summary, protocol=self.protocol)
         return summary
 
     def _load_examples(self, benchmark_id: str) -> dict[str, list[Any]]:
@@ -327,12 +445,14 @@ class OperatorInterpretabilityRunner:
             np.asarray(result["corrupted_margin"], dtype=np.float64)[rows],
         )
 
-    def _run_benchmark_contract(self) -> dict[str, Any]:
-        return self.contract
+    def _run_input_contract(self) -> dict[str, Any]:
+        result = dict(self.contract)
+        result["benchmark_ids"] = list(self._scope("input_contract"))
+        return result
 
     def _run_behavioral_eligibility(self) -> dict[str, Any]:
         output: dict[str, Any] = {}
-        for benchmark_id in self.benchmark_ids:
+        for benchmark_id in self._scope("behavioral_eligibility"):
             phase_results = {}
             for phase, examples in self._load_examples(benchmark_id).items():
                 result = evaluate_behavior(
@@ -376,7 +496,7 @@ class OperatorInterpretabilityRunner:
     def _run_operator_localization(self) -> dict[str, Any]:
         output: dict[str, Any] = {}
         causal_ids = [
-            benchmark_id for benchmark_id in self.benchmark_ids
+            benchmark_id for benchmark_id in self._scope("operator_localization")
             if benchmark_id in PRIMARY_BENCHMARK_IDS
         ]
         for offset, benchmark_id in enumerate(causal_ids):
@@ -545,7 +665,7 @@ class OperatorInterpretabilityRunner:
 
     def _run_sufficiency(self, mode: str) -> dict[str, Any]:
         output = {}
-        for benchmark_id in self.benchmark_ids:
+        for benchmark_id in self._scope():
             if benchmark_id not in MIB_CIRCUIT_BENCHMARKS:
                 continue
             capture = self.results["operator_localization"]["benchmarks"].get(
@@ -1128,7 +1248,7 @@ class OperatorInterpretabilityRunner:
         return aggregate
 
     def _run_ravel_causal_mediation(self) -> dict[str, Any]:
-        if "ravel" not in self.benchmark_ids:
+        if "ravel" not in self._scope("ravel_causal_mediation"):
             return {"status": "not_requested", "benchmark": "ravel"}
         behavior = self.results["behavioral_eligibility"]["benchmarks"][
             "ravel"]["phases"]
@@ -1246,7 +1366,7 @@ class OperatorInterpretabilityRunner:
         }
 
     def _run_multilayer_trajectory(self) -> dict[str, Any]:
-        if "ravel" not in self.benchmark_ids:
+        if "ravel" not in self._scope("multilayer_trajectory"):
             return {"status": "not_requested", "benchmark": "ravel"}
         behavior = self.results["behavioral_eligibility"]["benchmarks"][
             "ravel"]["phases"]["test"]

@@ -38,6 +38,18 @@ PRIMARY_METRICS: Mapping[str, Tuple[str, ...]] = {
 }
 
 
+def normalize_tasks(tasks: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+    values = tuple(PRIMARY_TASKS if tasks is None else tasks)
+    normalized = tuple(dict.fromkeys(str(task).strip() for task in values))
+    if not normalized or any(not task for task in normalized):
+        raise ValueError("at least one non-empty zero-shot task is required")
+    unknown = [task for task in normalized if task not in PRIMARY_TASKS]
+    if unknown:
+        raise ValueError(
+            "unknown stock zero-shot tasks: " + ",".join(unknown))
+    return normalized
+
+
 @dataclass(frozen=True)
 class PreparedRequest:
     """One causal request after boundary tokenization and left truncation."""
@@ -361,53 +373,57 @@ def build_results_summary(
     validation_loss: Optional[float],
     comparable: bool,
     task_runtime: Optional[Mapping[str, Any]] = None,
+    tasks: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
+    selected_tasks = normalize_tasks(tasks)
     results = raw_results.get("results")
     if not isinstance(results, Mapping):
         raise KeyError("lm-eval result is missing the top-level 'results' map")
-    missing = [task for task in PRIMARY_TASKS if task not in results]
+    missing = [task for task in selected_tasks if task not in results]
     if missing:
         raise KeyError("final task result missing: " + ", ".join(missing))
-    for task, metrics in PRIMARY_METRICS.items():
+    for task in selected_tasks:
+        metrics = PRIMARY_METRICS[task]
         for metric in metrics:
             require_metric(results[task], task, metric)
 
-    lambada_ppl = require_metric(
-        results["lambada_openai"], "lambada_openai", "perplexity")
+    task_accuracy_metric = {
+        "lambada_openai": "acc",
+        "hellaswag": "acc_norm",
+        "piqa": "acc_norm",
+        "arc_easy": "acc_norm",
+        "arc_challenge": "acc_norm",
+        "winogrande": "acc",
+    }
     accuracies = {
-        "lambada_acc": require_metric(
-            results["lambada_openai"], "lambada_openai", "acc"),
-        "hellaswag": require_metric(
-            results["hellaswag"], "hellaswag", "acc_norm"),
-        "piqa": require_metric(results["piqa"], "piqa", "acc_norm"),
-        "arc_easy": require_metric(
-            results["arc_easy"], "arc_easy", "acc_norm"),
-        "arc_challenge": require_metric(
-            results["arc_challenge"], "arc_challenge", "acc_norm"),
-        "winogrande": require_metric(
-            results["winogrande"], "winogrande", "acc"),
+        task: require_metric(results[task], task, task_accuracy_metric[task])
+        for task in selected_tasks
     }
     mean_acc = sum(accuracies.values()) / len(accuracies)
     row = {
         "Model": str(model),
         "Step": int(step),
         "Val loss": None if validation_loss is None else float(validation_loss),
-        "LAMBADA PPL": lambada_ppl,
-        "LAMBADA ACC": accuracies["lambada_acc"],
-        "HellaSwag": accuracies["hellaswag"],
-        "PIQA": accuracies["piqa"],
-        "ARC-E": accuracies["arc_easy"],
-        "ARC-C": accuracies["arc_challenge"],
-        "WinoGrande": accuracies["winogrande"],
+        "LAMBADA PPL": (
+            require_metric(results["lambada_openai"], "lambada_openai", "perplexity")
+            if "lambada_openai" in selected_tasks else None),
+        "LAMBADA ACC": accuracies.get("lambada_openai"),
+        "HellaSwag": accuracies.get("hellaswag"),
+        "PIQA": accuracies.get("piqa"),
+        "ARC-E": accuracies.get("arc_easy"),
+        "ARC-C": accuracies.get("arc_challenge"),
+        "WinoGrande": accuracies.get("winogrande"),
         "Mean ACC": mean_acc,
     }
+    full_suite = selected_tasks == PRIMARY_TASKS
     return {
         "protocol_name": PROTOCOL_NAME,
         "protocol_version": PROTOCOL_VERSION,
         "num_fewshot": NUM_FEWSHOT,
-        "tasks": list(PRIMARY_TASKS),
-        "comparable": bool(comparable),
-        "smoke_test_only": not bool(comparable),
+        "tasks": list(selected_tasks),
+        "complete_primary_suite": full_suite,
+        "comparable": bool(comparable and full_suite),
+        "smoke_test_only": not bool(comparable and full_suite),
         "table": row,
         "metrics": json_safe(results),
         "task_runtime": json_safe(task_runtime or {}),
@@ -420,7 +436,7 @@ def csv_header_and_row(summary: Mapping[str, Any]) -> Tuple[List[str], List[Any]
         "Model", "Step", "Val loss", "LAMBADA PPL", "LAMBADA ACC",
         "HellaSwag", "PIQA", "ARC-E", "ARC-C", "WinoGrande", "Mean ACC",
     ]
-    return header, [table[key] for key in header]
+    return header, [table.get(key) for key in header]
 
 
 def request_sequence_hash(requests: Sequence[PreparedRequest]) -> str:

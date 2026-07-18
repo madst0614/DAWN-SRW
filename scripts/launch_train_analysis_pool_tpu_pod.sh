@@ -9,11 +9,12 @@ PROJECT="dawn-486218"
 BRANCH="main"
 REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
 CHECKPOINT=""
+TARGET=""
 OUTPUT=""
 BENCHMARK_ROOT="gs://dawn-tpu-data-c4/dataset/operator_interpretability"
-BENCHMARKS="primary"
 PRESET="scientific"
 ITEMS=""
+RUNTIME="v4-64"
 MAX_EXAMPLES="64"
 MESH_DATA=""
 MESH_MODEL=""
@@ -28,18 +29,19 @@ DRY_RUN=0
 
 usage() {
     printf '%s\n' \
-        "Usage: $0 --tpu NAME --checkpoint PATH [options]" \
+        "Usage: $0 --tpu NAME (--target ID | --checkpoint PATH) [options]" \
         "" \
         "  --tpu NAME                 Existing TPU VM/Pod" \
-        "  --checkpoint PATH          Orbax step, checkpoints directory, run, or latest" \
+        "  --target ID                Registered target, for example v4171_400m" \
+        "  --checkpoint PATH          Ad-hoc Orbax path; mutually exclusive with --target" \
+        "  --runtime ID               Physical runtime profile (default: $RUNTIME)" \
         "  --output PATH              Optional artifact root; checkpoint side_analysis is default" \
         "  --benchmark-root PATH      Immutable prepared benchmark root" \
-        "  --benchmarks IDS           primary, all, or canonical comma-separated ids" \
-        "  --preset NAME              contract, circuit, causal, scientific" \
-        "  --items IDS                Canonical comma-separated items; overrides preset" \
+        "  --preset NAME              Item bundle: zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
+        "  --items IDS                Concrete comma-separated item ids; overrides preset" \
         "  --max-examples-per-phase N Fixed per-phase cap (default: $MAX_EXAMPLES)" \
-        "  --mesh-data N              Override checkpoint mesh data axis" \
-        "  --mesh-model N             Override checkpoint mesh model axis" \
+        "  --mesh-data N              Ad-hoc assertion; target/runtime value cannot be overridden" \
+        "  --mesh-model N             Ad-hoc assertion; registered target owns this value" \
         "  --branch NAME              Git branch (default: $BRANCH)" \
         "  --zone ZONE                Default: $ZONE" \
         "  --project PROJECT          Default: $PROJECT" \
@@ -68,10 +70,11 @@ while [[ $# -gt 0 ]]; do
         --project) PROJECT="$2"; shift 2 ;;
         --branch) BRANCH="$2"; shift 2 ;;
         --repo-url) REPO_URL="$2"; shift 2 ;;
+        --target) TARGET="$2"; shift 2 ;;
         --checkpoint) CHECKPOINT="$(normalize_gcs "$2")"; shift 2 ;;
+        --runtime) RUNTIME="$2"; shift 2 ;;
         --output) OUTPUT="$(normalize_gcs "$2")"; shift 2 ;;
         --benchmark-root) BENCHMARK_ROOT="$(normalize_gcs "$2")"; shift 2 ;;
-        --benchmarks) BENCHMARKS="$2"; shift 2 ;;
         --preset) PRESET="$2"; shift 2 ;;
         --items) ITEMS="$2"; shift 2 ;;
         --max-examples-per-phase) MAX_EXAMPLES="$2"; shift 2 ;;
@@ -90,8 +93,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$TPU_NAME" || -z "$CHECKPOINT" ]]; then
-    echo "ERROR: --tpu and --checkpoint are required" >&2
+if [[ -z "$TPU_NAME" ]]; then
+    echo "ERROR: --tpu is required" >&2
+    usage >&2
+    exit 1
+fi
+if [[ -n "$TARGET" && -n "$CHECKPOINT" ]] || [[ -z "$TARGET" && -z "$CHECKPOINT" ]]; then
+    echo "ERROR: exactly one of --target or --checkpoint is required" >&2
     usage >&2
     exit 1
 fi
@@ -100,18 +108,33 @@ if ! [[ "$MAX_EXAMPLES" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 case "$PRESET" in
-    contract|circuit|causal|scientific) ;;
+    contract|zero_shot|mechanistic_screen|mib_ioi_circuit|mib_mcqa_circuit|mib_arithmetic_circuit|mib_arc_circuit|circuit|ravel_causal|causal|scientific|all) ;;
     *) echo "ERROR: unsupported canonical preset $PRESET" >&2; exit 1 ;;
 esac
+case "$RUNTIME" in
+    v4-32|v4-64|v4-128) ;;
+    *) echo "ERROR: unsupported runtime profile $RUNTIME" >&2; exit 1 ;;
+esac
+
+if [[ "$DRY_RUN" != "1" ]]; then
+    ACTUAL_ACCELERATOR="$(gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+        --zone="$ZONE" --project="$PROJECT" \
+        --format='value(acceleratorType)')"
+    if [[ "$ACTUAL_ACCELERATOR" != "$RUNTIME" ]]; then
+        echo "ERROR: runtime=$RUNTIME but TPU $TPU_NAME acceleratorType=$ACTUAL_ACCELERATOR" >&2
+        exit 1
+    fi
+fi
 
 printf -v Q_REPO '%q' "$REPO_URL"
 printf -v Q_BRANCH '%q' "$BRANCH"
+printf -v Q_TARGET '%q' "$TARGET"
 printf -v Q_CHECKPOINT '%q' "$CHECKPOINT"
 printf -v Q_OUTPUT '%q' "$OUTPUT"
 printf -v Q_BENCHMARK_ROOT '%q' "$BENCHMARK_ROOT"
-printf -v Q_BENCHMARKS '%q' "$BENCHMARKS"
 printf -v Q_PRESET '%q' "$PRESET"
 printf -v Q_ITEMS '%q' "$ITEMS"
+printf -v Q_RUNTIME '%q' "$RUNTIME"
 printf -v Q_SESSION '%q' "$SESSION"
 printf -v Q_LOG '%q' "$REMOTE_LOG"
 
@@ -119,12 +142,13 @@ read -r -d '' REMOTE_CMD <<EOF || true
 set -euo pipefail
 REPO_URL=$Q_REPO
 BRANCH=$Q_BRANCH
+TARGET=$Q_TARGET
 CHECKPOINT=$Q_CHECKPOINT
 OUTPUT=$Q_OUTPUT
 BENCHMARK_ROOT=$Q_BENCHMARK_ROOT
-BENCHMARKS=$Q_BENCHMARKS
 PRESET=$Q_PRESET
 ITEMS=$Q_ITEMS
+RUNTIME=$Q_RUNTIME
 SESSION=$Q_SESSION
 REMOTE_LOG=$Q_LOG
 WORK_DIR="\$HOME/DAWN-SRW"
@@ -156,19 +180,23 @@ if [[ "$INSTALL_DEPS" == "1" ]]; then
     python3 -m pip install "jax[tpu]==0.6.2" \
         -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
     python3 -m pip install \
-        flax optax orbax-checkpoint==0.11.24 numpy pyyaml gcsfs \
-        transformers==4.57.6 datasets==4.8.5 huggingface-hub requests -q
+        flax optax numpy pyyaml google-cloud-storage requests sentencepiece -q
+    python3 -m pip install -r requirements_zero_shot_eval.txt -q
 fi
 
 CMD=(
     python3 -u scripts/analyze_train_analysis_pool.py
-    --checkpoint "\$CHECKPOINT"
     --benchmark-root "\$BENCHMARK_ROOT"
-    --benchmarks "\$BENCHMARKS"
+    --runtime "\$RUNTIME"
     --preset "\$PRESET"
     --max-examples-per-phase "$MAX_EXAMPLES"
     --init-distributed
 )
+if [[ -n "\$TARGET" ]]; then
+    CMD+=(--target "\$TARGET")
+else
+    CMD+=(--checkpoint "\$CHECKPOINT")
+fi
 [[ -z "\$OUTPUT" ]] || CMD+=(--output "\$OUTPUT")
 [[ -z "\$ITEMS" ]] || CMD+=(--items "\$ITEMS")
 [[ -z "$MESH_DATA" ]] || CMD+=(--mesh-data "$MESH_DATA")
@@ -199,11 +227,16 @@ EOF
 WATCH_CMD="bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --log $REMOTE_LOG --target $SESSION --summary"
 echo "TRAIN_ANALYSIS_POOL LAUNCH"
 echo "  tpu=$TPU_NAME zone=$ZONE project=$PROJECT branch=$BRANCH"
-echo "  checkpoint=$CHECKPOINT"
+echo "  target=${TARGET:-ad-hoc} checkpoint=${CHECKPOINT:-target-registry} runtime=$RUNTIME"
 echo "  output=${OUTPUT:-checkpoint-side-analysis-default}"
-echo "  benchmarks=$BENCHMARKS preset=$PRESET items=${ITEMS:-preset}"
+echo "  preset=$PRESET items=${ITEMS:-preset}"
 echo "  session=$SESSION log=$REMOTE_LOG"
-echo "Copy-paste: $0 --tpu $TPU_NAME --zone $ZONE --project $PROJECT --branch $BRANCH --checkpoint $CHECKPOINT --benchmark-root $BENCHMARK_ROOT --preset $PRESET"
+if [[ -n "$TARGET" ]]; then
+    SOURCE_COPY="--target $TARGET"
+else
+    SOURCE_COPY="--checkpoint $CHECKPOINT"
+fi
+echo "Copy-paste: $0 --tpu $TPU_NAME --zone $ZONE --project $PROJECT --branch $BRANCH $SOURCE_COPY --runtime $RUNTIME --benchmark-root $BENCHMARK_ROOT --preset $PRESET"
 echo "Watch logs: $WATCH_CMD"
 
 if [[ "$DRY_RUN" == "1" ]]; then

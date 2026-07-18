@@ -1,96 +1,182 @@
 # train_analysis_pool
 
-`train_analysis_pool`은 DAWN의 공유 RW 연산 공간이 의미 있는 인과적 계산 단위인지 판별하는 단일 분석 시스템이다. 사용자 작성 프롬프트, 생성 IOI, 임의 synthetic binding, 버전별 분석 엔진, 과거 probe 산출물은 입력으로 받지 않는다.
+`train_analysis_pool`은 고정된 DAWN 체크포인트의 행동 평가와 RW 연산 공간 해석을 한 item registry에서 관리한다. 분석 대상 데이터는 item ID에 포함되며 별도의 `benchmark` 실행 축은 없다. 파라미터를 갱신하는 downstream fine-tuning은 이 시스템에 포함하지 않는다.
 
-지원 체크포인트 버전은 다음 둘뿐이다.
+지원 체크포인트 버전:
 
 - `spatial-r1-v4.1.7.1`
 - `spatial-r1-v4.1.7.2`
 
-v4172는 v4171과 같은 production retention·contribution·interchange 훅을 사용하고, 체크포인트가 선언한 generalized bilinear operator key를 그대로 materialize한다. 다른 모델 버전, schema, tokenizer, benchmark manifest, checkpoint identity, model config, protocol이 섞이면 실행 또는 resume이 실패한다. 예전 이름이나 artifact를 새 형식으로 묵시적으로 해석하는 호환 경로는 없다.
+## 실행 모델
 
-## 공식 입력
+한 번의 실행은 다음 네 요소로 정의된다.
 
-기본 `primary` build는 다음 공개 데이터만 사용한다.
-
-| ID | 공식 소스 | 공식 counterfactual | 분석 트랙 |
-|---|---|---|---|
-| `mib_ioi` | `mib-bench/ioi` | `s2_io_flip_counterfactual` | MIB-adapted operator-site circuit |
-| `mib_mcqa` | `mib-bench/copycolors_mcqa`, `4_answer_choices` | `symbol_counterfactual` | MIB-adapted operator-site circuit |
-| `mib_arithmetic` | `mib-bench/arithmetic_addition` | `random_counterfactual` | MIB-adapted operator-site circuit |
-| `mib_arc` | `mib-bench/arc_easy` | `symbol_counterfactual` | MIB-adapted operator-site circuit |
-| `ravel` | `mib-bench/ravel` | `prompt_template_counterfactual`, `attribute_counterfactual` | RAVEL-style operator-contribution mediation |
-
-선택적 `all` build는 공식 BLiMP와 CounterFact를 행동 확인 자료로 추가하지만 primary circuit 또는 RAVEL claim에는 사용하지 않는다.
-
-준비 단계는 원본 dataset revision, tokenizer revision·vocabulary hash, 실제 phase별 row 수, 제외 사유, 각 JSONL SHA-256을 immutable `manifest.json`에 기록한다. 원본 split을 재사용해야 할 때는 공식 row identity를 hash-bucket해 discovery·validation·test에 정확히 한 번만 배정한다.
-
-RAVEL schema v2는 같은 공식 base row에서 만든 cause와 isolation을 동일한 `pair_group_id`로 묶고 두 행을 항상 같은 phase에 원자적으로 배정한다. trace 위치는 demonstration 속 동명이 아니라 prompt에서 대상 entity가 마지막으로 나타나는 token이다. 구 schema build는 거부된다.
-
-```bash
-python3 scripts/prepare_interpretability_benchmarks.py \
-  --output-root gs://dawn-tpu-data-c4/dataset/operator_interpretability \
-  --benchmarks primary \
-  --publish-latest
+```text
+run = target × items/preset × runtime × protocol
 ```
 
-## 분석 아이템
+- **item**: 무엇을 측정하는지와 입력 task를 함께 고정한다.
+- **preset**: 자주 함께 실행하는 item ID만 묶는다.
+- **target**: 모델 버전, 체크포인트, scale, model-axis mesh를 고정한다.
+- **runtime**: 물리 accelerator와 전역 JAX device 수를 고정한다.
 
-모든 아이템은 v4171과 v4172를 지원하며 버전별 별칭은 없다.
+Target과 runtime은 독립적이지만 실행 직전에 결합된다. Target의 `mesh_model`은 체크포인트 model-axis와 정확히 같아야 하고, runtime의 device 수로 data-axis를 계산한다.
 
-| 아이템 | 판별 대상 | 선행 아이템 | 지원 버전 |
-|---|---|---|---|
-| `benchmark_contract` | 소스·tokenizer·phase·checkpoint·protocol 고정 | 없음 | v4171, v4172 |
-| `behavioral_eligibility` | 해석할 만큼 base와 source 모두 정답 행동을 보이는가 | `benchmark_contract` | v4171, v4172 |
-| `operator_localization` | 어느 `(layer, route, operator)`가 production contribution을 운반하는가 | `behavioral_eligibility` | v4171, v4172 |
-| `conditional_circuit_sufficiency` | 선택 회로가 전체 production admission denominator 아래 충분한가 | `operator_localization` | v4171, v4172 |
-| `autonomous_circuit_sufficiency` | 선택 회로가 자체 admission denominator만으로 충분한가 | `operator_localization` | v4171, v4172 |
-| `circuit_necessity` | validation에서 선택한 회로를 억제하면 held-out margin이 감소하는가 | `conditional_circuit_sufficiency` | v4171, v4172 |
-| `operator_space_structure` | 주소와 무관하게 RW 함수의 국소 family가 재현되는가 | `operator_localization` | v4171, v4172 |
-| `ravel_causal_mediation` | operator family가 목표 변수를 전달하고 비목표 효과를 격리하는가 | `operator_space_structure` | v4171, v4172 |
-| `multilayer_trajectory` | held-out same-variable 경로가 disjoint cross-variable 대조보다 유사한가 | `operator_localization` | v4171, v4172 |
-| `scientific_claims` | 모든 선행 조건을 통과한 가장 강한 claim은 무엇인가 | 전체 결과 아이템 | v4171, v4172 |
-
-현재 preset은 `contract`, `circuit`, `causal`, `scientific`이며 기본값은 `scientific`이다. 코드와 같은 catalog는 다음 명령으로 확인한다.
-
-```bash
-python3 scripts/analyze_train_analysis_pool.py --list-items
+```text
+mesh_data = runtime.global_device_count / target.mesh_model
 ```
 
-## 사전 고정된 분석 규칙
+기본 runtime은 `v4-64`이다. `v4-64`는 JAX device 32개이므로 `mesh_model=2`인 400M target은 `mesh_data=16`, 즉 `16×2` mesh로 실행된다. 나눗셈이 정확하지 않거나 실제 보이는 JAX device/process 수가 runtime과 다르면 자동 보정하지 않고 실패한다. Target의 canonical config에 선언된 model fields도 checkpoint `full_config.model`과 대조하므로 이름만 400M이고 실제 구조가 다른 checkpoint는 통과하지 못한다.
 
-- 분석 단위의 전체 모집단은 모든 `(layer, route, operator)` site다.
-- 회로 fraction은 MIB circuit track의 `0.1%, 0.2%, 0.5%, 1%, 2%, 5%, 10%, 20%, 50%, 100%`다.
-- 행동 적격성은 base와 source의 clean-label positive-minus-negative margin이 모두 양수인 행만 인정한다. RAVEL localization·trajectory의 독립 표본 단위는 cause/isolation 행이 아니라 공식 base row다.
-- sparse 순위는 production precision에서 각 operator의 post-denominator contribution vector norm을 cross-operator cancellation 전에 계산한다. gate mass나 scalar coefficient를 contribution의 대용치로 쓰지 않는다.
-- 후보 순위는 discovery에서만 만든다. captured mass 95%를 못 채우면 route별 폭을 사전 고정된 최대치까지 늘리고, 그래도 부족한 행은 attrition으로 제외한다. validation/test에서는 후보를 다시 순위화하지 않는다.
-- 가장 작은 회로는 validation faithfulness의 bootstrap 95% CI 하한이 기준을 통과할 때만 선택한다. 선택을 고정한 뒤 test를 한 번 평가한다.
-- faithfulness는 `(circuit - corrupted) / (baseline - corrupted)`다. corrupted margin은 공식 MIB처럼 clean label 방향을 유지한다.
-- conditional sufficiency는 선택 numerator와 전체 production admission denominator를 쓴다. autonomous sufficiency는 numerator와 denominator를 모두 선택 회로에서 계산한다.
-- necessity는 선택 회로 전체의 numerator를 억제한 paired margin drop이며 bootstrap CI, paired permutation, benchmark 간 BH 보정을 모두 통과해야 한다.
-- functional family는 정규화한 rank-one RW map의 함수 유사도만으로 찾는다. reciprocal seed-local neighborhood만 family로 인정하고 transitive closure는 하지 않는다. address는 discovery에서 제외하고 사후 compactness 확인에만 쓴다.
-- operation-space 계산은 설정된 후보 부분공간에 한정된다. 후보가 전체 pool이 아니면 결과에 funnel limitation을 명시하고 전체 공간 또는 충분성 claim을 통과시키지 않는다.
-- interchange는 production route의 post-denominator·learned-pool-scale contribution에 `base - selected(base) + selected(source)`를 적용한다.
-- RAVEL은 `Continent`, `Country`, `Language`마다 discovery seed와 그 seed를 포함하는 가장 작은 RW family를 별도로 고른다. family는 seed-only 및 같은 크기의 disjoint nonfamily control보다 cause-margin improvement가 커야 한다. nonfamily control은 변수별 discovery mean absolute contribution으로 중복 없이 matching한다. 세 변수와 두 대조의 6개 검정을 한 번에 BH 보정한다.
-- RAVEL cause/isolation은 변수별로 각각 최소 8쌍을 요구한다. cause는 positive causal transfer CI와 paired permutation을, isolation은 absolute non-target effect CI 상한을 판정한다.
-- multilayer trajectory는 공식 base group을 anchor·same-variable·cross-variable control로 겹치지 않게 나누며, triplet 하나를 통계 표본 하나로 bootstrap/permutation한다.
-- seed, 표본 수, alpha와 모든 임계값은 protocol hash에 포함된다. 중간 단계가 실패하거나 captured mass·rank stability가 부족하면 더 강한 claim으로 승격하지 않는다.
+Target과 runtime registry는 [`configs/train_analysis_pool.yaml`](../configs/train_analysis_pool.yaml)에 있다. TPU 이름, zone, project는 target에 포함하지 않는다.
 
-checkpoint identity는 resolved path, step, run metadata와 parameter path·shape·dtype schema hash를 묶는다. 400M parameter value 전체의 content hash는 수집하지 않으며 이 제한을 결과에 명시한다. 따라서 결과는 해당 checkpoint identity에만 유효하고, 복제 checkpoint나 다른 checkpoint로의 일반화는 별도 반복 실험 없이는 주장하지 않는다.
+## 등록 target
 
-이 구현은 MIB의 TransformerLens edge graph 또는 RAVEL의 공식 featurizer와 동치라고 주장하지 않는다. 정확한 명칭은 `MIB-adapted operator-site circuit`과 `RAVEL-style operator-contribution mediation`이다.
+| Target | Model version | Scale | Model mesh axis |
+|---|---|---:|---:|
+| `v4171_400m` | `spatial-r1-v4.1.7.1` | 400M | 2 |
+| `v4172_400m_den_qk0p5_v1p0_rst1p2` | `spatial-r1-v4.1.7.2` | 400M | 2 |
+
+Target 경로가 run/root를 가리키더라도 실행 시작 시 committed numeric Orbax step 하나로 고정한다. 결과에는 요청 target, 실제 checkpoint path와 step, checkpoint mesh, effective mesh를 모두 기록한다.
+
+## 등록 runtime
+
+| Runtime | Accelerator | JAX devices | Workers |
+|---|---|---:|---:|
+| `v4-32` | `v4-32` | 16 | 4 |
+| `v4-64` | `v4-64` | 32 | 8 |
+| `v4-128` | `v4-128` | 64 | 16 |
+
+## Concrete items
+
+### MIB circuit items
+
+다음 여섯 item이 각 `mib_ioi`, `mib_mcqa`, `mib_arithmetic`, `mib_arc` prefix 아래에 있다.
+
+```text
+<mib>.input_contract
+<mib>.behavioral_eligibility
+<mib>.operator_localization
+<mib>.conditional_circuit_sufficiency
+<mib>.autonomous_circuit_sufficiency
+<mib>.circuit_necessity
+```
+
+예시:
+
+```text
+mib_ioi.behavioral_eligibility
+mib_ioi.operator_localization
+mib_ioi.conditional_circuit_sufficiency
+mib_ioi.autonomous_circuit_sufficiency
+mib_ioi.circuit_necessity
+```
+
+`behavioral_eligibility`는 frozen inference만 수행한다. Base와 source의 positive-minus-negative log-probability margin을 계산하고 둘 다 맞은 예제만 후속 기전 분석에 전달한다. Optimizer, weight update, checkpoint write는 없다.
+
+### RAVEL items
+
+```text
+ravel.input_contract
+ravel.behavioral_eligibility
+ravel.operator_localization
+ravel.operator_space_structure
+ravel.causal_mediation
+ravel.multilayer_trajectory
+```
+
+`ravel.causal_mediation`은 route-native contribution interchange로 family, seed-only control, contribution-matched disjoint control을 비교한다. Cause와 isolation을 함께 통과해야 하며 다중 검정은 BH 보정한다.
+
+### Auxiliary mechanistic behavior items
+
+```text
+blimp.input_contract
+blimp.behavioral_eligibility
+counterfact.input_contract
+counterfact.behavioral_eligibility
+```
+
+이 결과는 외부 행동 확인용이며 primary scientific claim 선택에는 사용하지 않는다.
+
+### Stock zero-shot items
+
+```text
+zero_shot.lambada_openai
+zero_shot.hellaswag
+zero_shot.piqa
+zero_shot.arc_easy
+zero_shot.arc_challenge
+zero_shot.winogrande
+```
+
+Zero-shot backend는 `lm-eval==0.4.2`, `num_fewshot=0`의 stock task를 사용한다. 선택된 task들은 체크포인트 restore와 evaluator 실행을 공유하지만 결과와 protocol은 item별로 저장한다. 이 item들은 auxiliary이며 functional-family 발견, circuit 선택, RAVEL family 선택, scientific claim gate의 입력으로 사용하지 않는다.
+
+### Scientific aggregation
+
+```text
+scientific_claims.primary
+```
+
+이 item은 primary MIB/RAVEL 기전 item의 fail-closed claim ladder만 집계한다. Zero-shot과 BLiMP/CounterFact 결과는 읽지 않는다.
+
+## Presets
+
+| Preset | 목적 |
+|---|---|
+| `contract` | primary input contract만 확인 |
+| `zero_shot` | stock zero-shot 6개 |
+| `mechanistic_screen` | primary 행동 적격성만 확인 |
+| `mib_ioi_circuit` | IOI circuit 분석 |
+| `mib_mcqa_circuit` | MCQA circuit 분석 |
+| `mib_arithmetic_circuit` | arithmetic circuit 분석 |
+| `mib_arc_circuit` | ARC circuit 분석 |
+| `circuit` | 네 MIB circuit 전체 |
+| `ravel_causal` / `causal` | RAVEL causal + trajectory |
+| `scientific` | primary scientific claim dependency closure 전체 |
+| `all` | scientific + auxiliary behavior + zero-shot |
+
+기본 preset은 `scientific`이다. Preset에는 checkpoint, TPU, runtime, benchmark selector를 넣지 않는다.
+
+현재 catalog 전체는 코드에서 직접 확인할 수 있다.
+
+```bash
+python3 scripts/analyze_train_analysis_pool.py --list-items --list-targets
+```
 
 ## 실행
 
+Target 사용:
+
 ```bash
-python3 scripts/analyze_train_analysis_pool.py \
-  --checkpoint gs://.../checkpoints/latest \
-  --benchmark-root gs://dawn-tpu-data-c4/dataset/operator_interpretability \
-  --preset scientific \
+python3 -u scripts/analyze_train_analysis_pool.py \
+  --target v4171_400m \
+  --runtime v4-64 \
+  --preset mechanistic_screen \
   --init-distributed
 ```
 
-TPU pod 전체 worker에서는 다음 launcher를 쓴다.
+개별 item 사용:
+
+```bash
+python3 -u scripts/analyze_train_analysis_pool.py \
+  --target v4171_400m \
+  --items mib_ioi.behavioral_eligibility,mib_ioi.operator_localization \
+  --init-distributed
+```
+
+Ad-hoc checkpoint 사용:
+
+```bash
+python3 -u scripts/analyze_train_analysis_pool.py \
+  --checkpoint gs://.../checkpoints/000000003200 \
+  --runtime v4-64 \
+  --preset zero_shot \
+  --init-distributed
+```
+
+`--target`과 `--checkpoint`는 상호 배타적이다. 등록 target에서는 `--config`나 다른 `mesh_model`로 target 계약을 덮어쓸 수 없다.
+
+TPU pod launcher:
 
 ```bash
 bash scripts/launch_train_analysis_pool_tpu_pod.sh \
@@ -98,23 +184,45 @@ bash scripts/launch_train_analysis_pool_tpu_pod.sh \
   --zone us-central2-b \
   --project dawn-486218 \
   --branch main \
-  --checkpoint gs://.../checkpoints/latest \
+  --target v4171_400m \
+  --runtime v4-64 \
   --preset scientific
 ```
 
-기본 출력은 해당 run의 `side_analysis/train_analysis_pool/<checkpoint-step>/`이다. `items/<item>.json`과 `summary.json`은 protocol, checkpoint, model-config, benchmark manifest hash를 포함한다. protocol record가 정확히 일치하지 않는 산출물은 resume하지 않는다.
+Launcher는 실제 TPU `acceleratorType`이 선택 runtime과 같은지 먼저 검사한다.
 
-## Claim ladder
+## 산출물
 
-최종 claim은 다음 순서로 fail-closed 평가한다.
+기본 출력:
 
-1. localization
-2. necessity
-3. conditional sufficiency
-4. autonomous sufficiency
-5. interchange causality
-6. non-target isolation
-7. held-out generalization
-8. spatial trajectory confirmation
+```text
+<run>/side_analysis/train_analysis_pool/<checkpoint-step>/
+```
 
-마지막 단계는 RAVEL family가 두 대조군을 모두 이긴 6-test BH 결과와 held-out trajectory CI·paired null까지 요구한다. 중간 단계가 실패하면 그 아래 단계까지만 보고하며, 결과가 좋지 않다는 이유로 임계값을 완화하거나 test에서 회로를 다시 선택하지 않는다.
+주요 파일:
+
+```text
+items/mib_ioi/behavioral_eligibility.json
+items/mib_ioi/operator_localization.json
+items/ravel/causal_mediation.json
+items/zero_shot/hellaswag.json
+items/scientific_claims/primary.json
+backends/operator_interpretability/summary.json
+backends/stock_zero_shot/results_summary.json
+backends/stock_zero_shot/run_manifest.json
+summary.json
+```
+
+Mechanistic item protocol에는 checkpoint identity, model config, benchmark manifest, target, runtime, checkpoint/effective mesh가 포함된다. Zero-shot item protocol에는 concrete checkpoint, parameter identity, stock task config hash, dataset fingerprint, tokenizer 정책, target/runtime mesh가 포함된다.
+
+`--resume`은 item protocol이 정확히 일치할 때만 허용한다. 기존 artifact가 있지만 target, concrete checkpoint, runtime, code revision 또는 protocol이 다르면 덮어쓰지 않고 실패하며, 의도적으로 다시 계산할 때만 `--no-resume`을 사용한다.
+
+## 과학적 경계
+
+- Test phase는 circuit/family 선택에 사용하지 않는다.
+- Conditional sufficiency와 autonomous sufficiency를 구분한다.
+- Necessity는 full production denominator 아래 selected numerator suppression으로 계산한다.
+- Interchange는 `base - selected(base) + selected(source)`이며 V contribution은 V 위치에만 삽입한다.
+- Empty/padded group은 production 계약에 맞는 contribution no-op으로 처리한다.
+- Zero-shot과 secondary behavior item은 scientific claim gate에 사용하지 않는다.
+- Downstream fine-tuning은 파라미터를 변경하므로 pool 밖에 둔다.

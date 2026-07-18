@@ -1,0 +1,40 @@
+schema_version: 1
+default_runtime: v4-64
+
+# Targets identify model/checkpoint truth. They do not contain TPU VM names,
+# zones, projects, or a data-axis size. The checkpoint resolver pins every run
+# to one committed numeric Orbax step before analysis begins.
+targets:
+  v4171_400m:
+    model_version: spatial-r1-v4.1.7.1
+    scale: 400m
+    checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4171_400M_c4_40B_v4_64_emb_tau/run_vspatial-r1-v4.1.7.1_20260712_172338_3201
+    config: configs/train_config_v4171_400M_c4_40B_v4_64.yaml
+    mesh_model: 2
+    compatible_runtimes: [v4-32, v4-64, v4-128]
+
+  v4172_400m_den_qk0p5_v1p0_rst1p2:
+    model_version: spatial-r1-v4.1.7.2
+    scale: 400m
+    checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201
+    config: configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+    mesh_model: 2
+    compatible_runtimes: [v4-32, v4-64, v4-128]
+
+# Runtime profiles identify physical global topology. TPU v4 accelerator names
+# count TensorCores, while JAX exposes half as many devices/chips.
+runtimes:
+  v4-32:
+    accelerator_type: v4-32
+    global_device_count: 16
+    worker_count: 4
+
+  v4-64:
+    accelerator_type: v4-64
+    global_device_count: 32
+    worker_count: 8
+
+  v4-128:
+    accelerator_type: v4-128
+    global_device_count: 64
+    worker_count: 16
