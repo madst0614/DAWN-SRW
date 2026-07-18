@@ -595,11 +595,25 @@ def _load_stock_tasks(
     from lm_eval.tasks import TaskManager, get_task_dict
 
     manager = TaskManager(verbosity="INFO")
-    task_dict = get_task_dict(list(tasks), manager)
-    if set(task_dict) != set(tasks):
-        raise RuntimeError(
-            "stock task lookup mismatch: "
-            f"requested={list(tasks)} found={sorted(task_dict)}")
+    task_dict = {}
+    for name in tasks:
+        print(f"ZERO_SHOT_TASK_LOAD task={name}", flush=True)
+        try:
+            loaded = get_task_dict([name], manager)
+        except Exception as exc:
+            raise RuntimeError(
+                "stock zero-shot task load failed: "
+                f"task={name} "
+                f"lm-eval={importlib_metadata.version('lm-eval')} "
+                f"datasets={importlib_metadata.version('datasets')} "
+                f"huggingface-hub={importlib_metadata.version('huggingface-hub')}"
+            ) from exc
+        if set(loaded) != {name}:
+            raise RuntimeError(
+                "stock task lookup mismatch: "
+                f"requested={[name]} found={sorted(loaded)}")
+        task_dict[name] = loaded[name]
+        print(f"ZERO_SHOT_TASK_READY task={name}", flush=True)
     provenance = {}
     for name in tasks:
         task = _task_object(task_dict[name])
