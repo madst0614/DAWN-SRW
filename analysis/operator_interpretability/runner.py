@@ -16,7 +16,6 @@ from analysis.dawn_analysis_common import (
 )
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
-    load_protocol_bound_artifact,
     resolve_benchmark_build,
     write_protocol_bound_artifact,
 )
@@ -80,6 +79,7 @@ from analysis.train_analysis_pool_items import (
     dependency_closure,
     item_definition,
 )
+from analysis.train_analysis_pool_reporting import TrainAnalysisPoolTextReporter
 
 
 MIB_CIRCUIT_BENCHMARKS = (
@@ -110,11 +110,11 @@ class OperatorInterpretabilityRunner:
     def __init__(
             self, ctx: Any, *, benchmark_root: str,
             benchmark_ids: Sequence[str], protocol_config: ProtocolConfig,
-            resume: bool = True) -> None:
+            text_reporter: TrainAnalysisPoolTextReporter | None = None) -> None:
         self.ctx = ctx
         self.store = ctx.store
         self.config = protocol_config.validate()
-        self.resume = bool(resume)
+        self.text_reporter = text_reporter
         self.model_version = validate_model_version(
             str(ctx.model_cfg["model_version"]))
         self.shape = OperatorSpaceShape.from_model_cfg(ctx.model_cfg)
@@ -265,63 +265,152 @@ class OperatorInterpretabilityRunner:
             "result": item_result,
         }
 
-    def _restore_kind(
-            self, kind: str, item_ids: Sequence[str]) -> dict[str, Any] | None:
-        if not self.resume:
-            return None
-        loaded: dict[str, dict[str, Any]] = {}
-        for item_id in item_ids:
-            value = load_protocol_bound_artifact(
-                self._artifact_path(item_id), protocol=self.protocol)
-            if value is None:
-                return None
-            if value.get("item_id") != item_id or value.get("analysis_kind") != kind:
-                raise ValueError(
-                    f"analysis artifact identity mismatch for {item_id}")
-            loaded[item_id] = value
-        if kind == "input_contract":
-            result = dict(self.contract)
-            result["benchmark_ids"] = list(self._scope(kind))
-        elif all(item_definition(item_id).get("benchmark_id") is not None
-                 for item_id in item_ids) and kind in {
-                     "behavioral_eligibility", "operator_localization",
-                     "conditional_circuit_sufficiency",
-                     "autonomous_circuit_sufficiency", "circuit_necessity",
-                 }:
-            result = {
-                "status": "ready",
-                "benchmarks": {
-                    str(item_definition(item_id)["benchmark_id"]):
-                        dict(loaded[item_id]["result"])
-                    for item_id in item_ids
-                },
+    @staticmethod
+    def _strip_nested_rows(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            output = {}
+            for key, child in value.items():
+                if key == "rows" and isinstance(child, Sequence) and not (
+                        isinstance(child, (str, bytes))):
+                    output["raw_row_count"] = len(child)
+                    output["raw_rows_persisted"] = False
+                else:
+                    output[str(key)] = (
+                        OperatorInterpretabilityRunner._strip_nested_rows(
+                            child))
+            return output
+        if isinstance(value, list):
+            return [
+                OperatorInterpretabilityRunner._strip_nested_rows(child)
+                for child in value
+            ]
+        if isinstance(value, tuple):
+            return [
+                OperatorInterpretabilityRunner._strip_nested_rows(child)
+                for child in value
+            ]
+        return value
+
+    @staticmethod
+    def _compact_selected_circuit(result: Mapping[str, Any]) -> dict[str, Any]:
+        output = dict(result)
+        selected = output.get("selected_circuit")
+        if not isinstance(selected, Mapping):
+            return output
+        selected_output = dict(selected)
+        sites = selected_output.pop("sites", ())
+        selected_output.update({
+            "circuit_hash": str(
+                selected_output.get("circuit_hash")
+                or canonical_hash(dict(selected))),
+            "explicit_site_count": len(sites),
+            "sites_persisted": False,
+            "site_definition": (
+                "validation_selected_fraction_of_localization_ranking"),
+        })
+        output["selected_circuit"] = selected_output
+        return output
+
+    def _compact_scientific_claims(
+            self, item_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
+        claims = {}
+        for name, row in dict(result.get("claims") or {}).items():
+            claims[str(name)] = {
+                "passed": bool(row.get("passed", False)),
+                "unmet_prerequisites": list(
+                    row.get("unmet_prerequisites") or ()),
             }
-        else:
-            if len(item_ids) != 1:
-                raise ValueError(
-                    f"non-scoped analysis kind {kind} has multiple items")
-            result = dict(loaded[item_ids[0]]["result"])
-        self.concrete_results.update(loaded)
-        for item_id in item_ids:
-            self._print(f"TRAIN_ANALYSIS_POOL item={item_id} status=resume")
-        return result
+        upstream = dependency_closure([item_id])[:-1]
+        return {
+            "status": result.get("status"),
+            "claims": claims,
+            "strongest_supported_claim": result.get(
+                "strongest_supported_claim"),
+            "checkpoint_scope": result.get("checkpoint_scope"),
+            "cross_checkpoint_claim": result.get("cross_checkpoint_claim"),
+            "suppression_interpreted_as": result.get(
+                "suppression_interpreted_as"),
+            "benchmark_scope": list(result.get("benchmark_scope") or ()),
+            "checkpoint_identity": result.get("checkpoint_identity"),
+            "single_checkpoint_only": result.get("single_checkpoint_only"),
+            "official_transformerlens_edge_equivalence_claimed": result.get(
+                "official_transformerlens_edge_equivalence_claimed"),
+            "official_ravel_featurizer_equivalence_claimed": result.get(
+                "official_ravel_featurizer_equivalence_claimed"),
+            "evidence_embedded": False,
+            "evidence_contract": (
+                "protocol_bound_upstream_item_artifact_references"),
+            "upstream_item_artifacts": {
+                upstream_item: self._artifact_path(upstream_item)
+                for upstream_item in upstream
+            },
+        }
+
+    def _payload_for_storage(
+            self, item_id: str, kind: str,
+            payload: Mapping[str, Any]) -> dict[str, Any]:
+        output = dict(payload)
+        result = dict(payload.get("result") or {})
+        if kind == "operator_localization" and result.get("status") == "ready":
+            ranked_sites = list(result.pop("ranked_sites", ()))
+            profiles = dict(result.pop(
+                "causal_variable_control_profiles", {}) or {})
+            result.update({
+                "ranked_site_count": len(ranked_sites),
+                "ranked_site_preview": [
+                    dict(row) for row in ranked_sites[:5]],
+                "ranked_sites_persisted_in_item_json": False,
+                "causal_variable_profile_summary": {
+                    str(variable): {
+                        "layer": int(profile["layer"]),
+                        "route": str(profile["route"]),
+                        "qualified_row_denominator": int(
+                            profile["qualified_row_denominator"]),
+                        "operator_count": len(
+                            profile.get("operator_ids") or ()),
+                    }
+                    for variable, profile in profiles.items()
+                },
+                "causal_variable_profiles_persisted_in_item_json": False,
+                "raw_parameters_persisted": False,
+                "dense_capture_persisted": False,
+            })
+        elif kind in {
+                "conditional_circuit_sufficiency",
+                "autonomous_circuit_sufficiency"}:
+            result = self._compact_selected_circuit(result)
+        elif kind == "circuit_necessity":
+            result = self._strip_nested_rows(result)
+            intervention = result.get("intervention")
+            if isinstance(intervention, Mapping) and isinstance(
+                    intervention.get("margin"), Sequence):
+                intervention_output = dict(intervention)
+                margin = intervention_output.pop("margin")
+                intervention_output["margin_count"] = len(margin)
+                intervention_output["margin_persisted"] = False
+                result["intervention"] = intervention_output
+        elif kind in {"ravel_causal_mediation", "multilayer_trajectory"}:
+            result = self._strip_nested_rows(result)
+        elif kind == "scientific_claims":
+            result = self._compact_scientific_claims(item_id, result)
+        output["result"] = result
+        return output
 
     def _ensure_kind(
             self, kind: str, item_ids: Sequence[str]) -> dict[str, Any]:
         if kind in self.results:
             return self.results[kind]
         self._active_kind = kind
-        restored = self._restore_kind(kind, item_ids)
-        if restored is not None:
-            self.results[kind] = restored
-            return restored
         for item_id in item_ids:
             self._print(f"TRAIN_ANALYSIS_POOL item={item_id} status=running")
         method = getattr(self, f"_run_{kind}")
         result = dict(method())
         self.results[kind] = result
         for item_id in item_ids:
-            payload = self._concrete_payload(item_id, kind, result)
+            runtime_payload = self._concrete_payload(item_id, kind, result)
+            payload = (
+                self._payload_for_storage(item_id, kind, runtime_payload)
+                if self.ctx.is_primary else runtime_payload)
             self.concrete_results[item_id] = payload
             if self.ctx.is_primary:
                 write_protocol_bound_artifact(
@@ -330,6 +419,10 @@ class OperatorInterpretabilityRunner:
             self._print(
                 f"TRAIN_ANALYSIS_POOL item={item_id} "
                 f"status={payload.get('status')}")
+            if self.text_reporter is not None:
+                self.text_reporter.emit(
+                    payload, artifact_path=self._artifact_path(item_id),
+                    event="completed")
         return result
 
     def run(self, items: Sequence[str]) -> dict[str, Any]:
@@ -535,6 +628,69 @@ class OperatorInterpretabilityRunner:
             "max_examples": self.config.max_examples_per_phase,
         }
 
+    def _reduce_ravel_capture(
+            self, capture: Mapping[str, Any]) -> tuple[
+                dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        rows = list(capture.get("rows") or ())
+        seeds: dict[str, dict[str, Any]] = {}
+        control_profiles: dict[str, dict[str, Any]] = {}
+        for variable in benchmark_spec("ravel").causal_variables:
+            denominators: dict[tuple[int, str], int] = defaultdict(int)
+            absolute_totals: dict[tuple[int, str, int], float] = defaultdict(
+                float)
+            signed_totals: dict[tuple[int, str, int], float] = defaultdict(
+                float)
+            counts: dict[tuple[int, str, int], int] = defaultdict(int)
+            for row in rows:
+                if (not row["qualified"]
+                        or row["causal_variable"] != variable):
+                    continue
+                layer, route = int(row["layer"]), str(row["route"])
+                denominators[(layer, route)] += 1
+                for operator_id, weight in zip(
+                        row["operator_ids"], row["weights"]):
+                    key = (layer, route, int(operator_id))
+                    value = float(weight)
+                    absolute_totals[key] += abs(value)
+                    signed_totals[key] += value
+                    counts[key] += 1
+            if not absolute_totals:
+                seeds[variable] = {
+                    "status": "no_qualified_discovery_site"}
+                continue
+            ranked = sorted([
+                (
+                    total / denominators[(key[0], key[1])], key,
+                    counts[key],
+                )
+                for key, total in absolute_totals.items()
+            ], key=lambda value: (-value[0], value[1]))
+            importance, (layer, route, operator_id), discovery_count = ranked[0]
+            seeds[variable] = {
+                "status": "ready",
+                "layer": layer,
+                "route": route,
+                "operator_id": operator_id,
+                "importance": importance,
+                "discovery_count": discovery_count,
+                "selection_phase": "discovery",
+            }
+            denominator = denominators[(layer, route)]
+            profile_ids = sorted(
+                key[2] for key in signed_totals
+                if key[0] == layer and key[1] == route)
+            control_profiles[variable] = {
+                "layer": layer,
+                "route": route,
+                "qualified_row_denominator": denominator,
+                "operator_ids": profile_ids,
+                "importance": [
+                    signed_totals[(layer, route, value)] / denominator
+                    for value in profile_ids
+                ],
+            }
+        return seeds, control_profiles
+
     def _run_operator_localization(self) -> dict[str, Any]:
         output: dict[str, Any] = {}
         causal_ids = [
@@ -552,10 +708,26 @@ class OperatorInterpretabilityRunner:
                     "minimum_known_correct": self.config.minimum_known_correct,
                 }
                 continue
-            output[benchmark_id] = capture_discovery_candidates(
+            capture = capture_discovery_candidates(
                 self.ctx, examples,
                 seed=self.config.seed + offset * 1009,
+                retain_rows=(benchmark_id == "ravel"),
                 **self._capture_kwargs())
+            if benchmark_id == "ravel":
+                seeds, profiles = self._reduce_ravel_capture(capture)
+                capture["causal_variable_seeds"] = seeds
+                capture["causal_variable_control_profiles"] = profiles
+            capture.pop("rows", None)
+            rows_used_transiently = bool(capture.pop(
+                "raw_rows_materialized_for_runtime", False))
+            capture.update({
+                "raw_capture_row_count": int(capture["total_row_count"]),
+                "raw_capture_rows_persisted": False,
+                "raw_capture_rows_used_transiently": rows_used_transiently,
+                "raw_capture_retention": (
+                    "aggregate_ranked_sites_and_preregistered_ravel_profiles"),
+            })
+            output[benchmark_id] = capture
         ready = [row for row in output.values() if row.get("status") == "ready"]
         complete = bool(causal_ids) and len(ready) == len(causal_ids)
         rank_values = [
@@ -664,7 +836,13 @@ class OperatorInterpretabilityRunner:
             if fraction == selection.get("selected_fraction")), None)
         if selected_circuit is None:
             raise RuntimeError("validation selected an unknown circuit fraction")
-        result["selected_circuit"] = selected_circuit.to_dict()
+        selected_validation = next(
+            row for row in validation_rows
+            if row["fraction"] == selection.get("selected_fraction"))
+        selected_circuit_record = selected_circuit.to_dict()
+        selected_circuit_record["circuit_hash"] = selected_validation[
+            "circuit_hash"]
+        result["selected_circuit"] = selected_circuit_record
 
         # The test phase is unopened until the validation choice is frozen,
         # and only that one frozen circuit is evaluated on test.
@@ -923,44 +1101,14 @@ class OperatorInterpretabilityRunner:
 
     def _ravel_variable_seeds(self) -> dict[str, dict[str, Any]]:
         capture = self.results["operator_localization"]["benchmarks"]["ravel"]
-        variables = benchmark_spec("ravel").causal_variables
-        output = {}
-        for variable in variables:
-            denominators: dict[tuple[int, str], int] = defaultdict(int)
-            totals: dict[tuple[int, str, int], float] = defaultdict(float)
-            counts: dict[tuple[int, str, int], int] = defaultdict(int)
-            for row in capture["rows"]:
-                if (not row["qualified"]
-                        or row["causal_variable"] != variable):
-                    continue
-                layer, route = int(row["layer"]), str(row["route"])
-                denominators[(layer, route)] += 1
-                for operator_id, weight in zip(
-                        row["operator_ids"], row["weights"]):
-                    key = (layer, route, int(operator_id))
-                    totals[key] += abs(float(weight))
-                    counts[key] += 1
-            if not totals:
-                output[variable] = {"status": "no_qualified_discovery_site"}
-                continue
-            ranked = sorted([
-                (
-                    total / denominators[(key[0], key[1])], key,
-                    counts[key]
-                )
-                for key, total in totals.items()
-            ], key=lambda value: (-value[0], value[1]))
-            importance, (layer, route, operator_id), discovery_count = ranked[0]
-            output[variable] = {
-                "status": "ready",
-                "layer": layer,
-                "route": route,
-                "operator_id": operator_id,
-                "importance": importance,
-                "discovery_count": discovery_count,
-                "selection_phase": "discovery",
-            }
-        return output
+        seeds = capture.get("causal_variable_seeds")
+        if not isinstance(seeds, Mapping):
+            raise ValueError(
+                "RAVEL localization lacks preregistered variable seeds")
+        expected = set(benchmark_spec("ravel").causal_variables)
+        if set(seeds) != expected:
+            raise ValueError("RAVEL localization variable seed set mismatch")
+        return {str(key): dict(value) for key, value in seeds.items()}
 
     def _family_for_seed(
             self, seed: Mapping[str, Any]) -> tuple[int, str, list[int]]:
@@ -978,22 +1126,25 @@ class OperatorInterpretabilityRunner:
             self, variable: str, *, layer: int, route: str,
             family: Sequence[int]) -> dict[str, Any]:
         capture = self.results["operator_localization"]["benchmarks"]["ravel"]
-        qualified_rows = [
-            row for row in capture["rows"]
-            if row["qualified"] and row["causal_variable"] == variable
-            and int(row["layer"]) == int(layer) and row["route"] == route
-        ]
-        if not qualified_rows:
+        profiles = capture.get("causal_variable_control_profiles")
+        if not isinstance(profiles, Mapping):
             raise ValueError(
-                f"no qualified RAVEL discovery rows for {variable}/{layer}/{route}")
-        totals: dict[int, float] = defaultdict(float)
-        for row in qualified_rows:
-            for operator_id, weight in zip(row["operator_ids"], row["weights"]):
-                totals[int(operator_id)] += float(weight)
-        denominator = len(qualified_rows)
+                "RAVEL localization lacks contribution-matching profiles")
+        profile = profiles.get(variable)
+        if not isinstance(profile, Mapping):
+            raise ValueError(
+                f"no RAVEL control profile for variable={variable}")
+        if (int(profile["layer"]) != int(layer)
+                or str(profile["route"]) != str(route)):
+            raise ValueError(
+                "RAVEL control profile does not match the selected seed site")
+        operator_ids = list(profile.get("operator_ids") or ())
+        importance_values = list(profile.get("importance") or ())
+        if len(operator_ids) != len(importance_values):
+            raise ValueError("RAVEL control profile arrays are misaligned")
         importance = {
-            operator_id: total / denominator
-            for operator_id, total in totals.items()
+            int(operator_id): float(value)
+            for operator_id, value in zip(operator_ids, importance_values)
         }
         family_ids = [int(value) for value in family]
         available = set(range(self.shape.pool_size(route))) - set(family_ids)
@@ -1439,6 +1590,15 @@ class OperatorInterpretabilityRunner:
             bootstrap_samples=self.config.bootstrap_samples,
             permutation_samples=self.config.permutation_samples,
             alpha=self.config.alpha, seed=self.config.seed + 7927)
+        raw_rows = capture.pop("rows")
+        rows_used_transiently = bool(capture.pop(
+            "raw_rows_materialized_for_runtime", False))
+        capture.update({
+            "raw_capture_row_count": len(raw_rows),
+            "raw_capture_rows_persisted": False,
+            "raw_capture_rows_used_transiently": rows_used_transiently,
+            "raw_capture_retention": "trajectory_statistics_and_digest_only",
+        })
         return {
             "status": confirmation["status"],
             "benchmark": "ravel",

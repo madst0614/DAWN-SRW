@@ -23,7 +23,6 @@ readonly REMOTE_LOG="~/train.log"
 INSTALL_DEPS=1
 UPDATE_REPO=1
 DETACH=1
-FROM_SCRATCH=0
 REPLACE=0
 DRY_RUN=0
 
@@ -35,7 +34,7 @@ usage() {
         "  --target ID                Registered target, for example v4171_400m" \
         "  --checkpoint PATH          Ad-hoc Orbax path; mutually exclusive with --target" \
         "  --runtime ID               Physical runtime profile (default: $RUNTIME)" \
-        "  --output PATH              Optional artifact root; checkpoint side_analysis is default" \
+        "  --output PATH              Optional parent for unique run folders; checkpoint side_analysis is default" \
         "  --benchmark-root PATH      Immutable prepared benchmark root" \
         "  --preset NAME              Item bundle: zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
         "  --items IDS                Concrete comma-separated item ids; overrides preset" \
@@ -45,7 +44,6 @@ usage() {
         "  --branch NAME              Git branch (default: $BRANCH)" \
         "  --zone ZONE                Default: $ZONE" \
         "  --project PROJECT          Default: $PROJECT" \
-        "  --from-scratch             Recompute instead of protocol-bound resume" \
         "  --no-install               Skip remote dependency installation" \
         "  --skip-repo-update         Use the existing remote checkout" \
         "  --foreground               Do not use tmux" \
@@ -78,7 +76,6 @@ while [[ $# -gt 0 ]]; do
         --max-examples-per-phase) MAX_EXAMPLES="$2"; shift 2 ;;
         --mesh-data) MESH_DATA="$2"; shift 2 ;;
         --mesh-model) MESH_MODEL="$2"; shift 2 ;;
-        --from-scratch) FROM_SCRATCH=1; shift ;;
         --no-install) INSTALL_DEPS=0; shift ;;
         --skip-repo-update) UPDATE_REPO=0; shift ;;
         --foreground) DETACH=0; shift ;;
@@ -223,7 +220,6 @@ fi
 [[ -z "\$ITEMS" ]] || CMD+=(--items "\$ITEMS")
 [[ -z "$MESH_DATA" ]] || CMD+=(--mesh-data "$MESH_DATA")
 [[ -z "$MESH_MODEL" ]] || CMD+=(--mesh-model "$MESH_MODEL")
-[[ "$FROM_SCRATCH" == "1" ]] && CMD+=(--from-scratch)
 
 CMD_TEXT=\$(printf '%q ' "\${CMD[@]}")
 echo "TRAIN_ANALYSIS_POOL worker=\$(hostname) branch=\$BRANCH"

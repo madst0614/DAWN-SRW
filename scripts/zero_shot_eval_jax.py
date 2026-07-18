@@ -1082,8 +1082,10 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
         tasks=tasks,
     )
     summary["validation_ce_cross_check"] = validation_cross_check
-    samples = _build_sample_records(
-        raw_results, adapter.sample_traces(), tasks)
+    compact_artifacts = bool(getattr(args, "compact_artifacts", False))
+    samples = (
+        () if compact_artifacts else _build_sample_records(
+            raw_results, adapter.sample_traces(), tasks))
     output_dir = _format_output_dir(canonical, args, model_name, step)
 
     end_timestamp = datetime.now(timezone.utc)
@@ -1157,11 +1159,18 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
         "comparable": comparable,
         "smoke_test_only": not comparable,
         "host_result_hash": host_result_hash,
+        "artifact_policy": (
+            "compact_aggregate_only" if compact_artifacts
+            else "standalone_per_example_audit"),
+        "harness_raw_persisted": not compact_artifacts,
+        "sample_records_persisted": not compact_artifacts,
     }
 
     if jax.process_index() == 0:
-        _write_json(canonical, _output_path(
-            canonical, output_dir, "results_harness_raw.json"), raw_results)
+        if not compact_artifacts:
+            _write_json(canonical, _output_path(
+                canonical, output_dir, "results_harness_raw.json"),
+                raw_results)
         _write_json(canonical, _output_path(
             canonical, output_dir, "results_summary.json"), summary)
         header, row = csv_header_and_row(summary)
@@ -1171,11 +1180,13 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
         writer.writerow(row)
         _write_text(canonical, _output_path(
             canonical, output_dir, "results_summary.csv"), csv_buffer.getvalue())
-        sample_text = "".join(
-            json.dumps(json_safe(sample), ensure_ascii=False, sort_keys=True)
-            + "\n" for sample in samples)
-        _write_text(canonical, _output_path(
-            canonical, output_dir, "samples.jsonl"), sample_text)
+        if not compact_artifacts:
+            sample_text = "".join(
+                json.dumps(
+                    json_safe(sample), ensure_ascii=False, sort_keys=True)
+                + "\n" for sample in samples)
+            _write_text(canonical, _output_path(
+                canonical, output_dir, "samples.jsonl"), sample_text)
         _write_json(canonical, _output_path(
             canonical, output_dir, "run_manifest.json"), manifest)
         log_lines = [
@@ -1201,10 +1212,14 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
         print(f"output_dir={output_dir}", flush=True)
     from jax.experimental import multihost_utils
     multihost_utils.sync_global_devices("zero_shot_eval_outputs_written")
+    returned_results = raw_results
+    if compact_artifacts and "samples" in raw_results:
+        returned_results = dict(raw_results)
+        returned_results.pop("samples", None)
     return {
         "summary": summary,
         "manifest": manifest,
-        "raw_results": raw_results,
+        "raw_results": returned_results,
         "output_dir": output_dir,
     }
 

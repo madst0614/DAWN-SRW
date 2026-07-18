@@ -9,6 +9,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from analysis.dawn_analysis_storage import (
     exists,
+    json_safe,
     join_path,
     open_path,
     read_json,
@@ -26,6 +27,11 @@ from analysis.operator_interpretability.protocol import PHASES, require_protocol
 DEFAULT_BENCHMARK_ROOT = (
     "gs://dawn-tpu-data-c4/dataset/operator_interpretability"
 )
+
+# Item artifacts are aggregate audit records, never raw capture containers.
+# Keeping this fail-loud ceiling small prevents a regression back to multi-GB
+# JSON even when a new analysis kind accidentally embeds dense evidence.
+MAX_PROTOCOL_BOUND_JSON_BYTES = 2 * 1024 * 1024
 
 
 def sha256_path(path: str) -> str:
@@ -172,7 +178,17 @@ def write_protocol_bound_artifact(store: Any, relative_path: str,
         "protocol_hash": canonical_hash(protocol),
         "payload": dict(payload),
     }
-    write_json_atomic(path, record)
+    safe_record = json_safe(record)
+    encoded_size = len((json.dumps(
+        safe_record, indent=2, sort_keys=True,
+        ensure_ascii=False) + "\n").encode("utf-8"))
+    if encoded_size > MAX_PROTOCOL_BOUND_JSON_BYTES:
+        raise RuntimeError(
+            "protocol-bound item JSON exceeds the compact-artifact contract: "
+            f"path={path} bytes={encoded_size} "
+            f"limit={MAX_PROTOCOL_BOUND_JSON_BYTES}; retain only aggregate "
+            "metrics, uncertainty, decisions, counts, and digests")
+    write_json_atomic(path, safe_record)
     return path
 
 

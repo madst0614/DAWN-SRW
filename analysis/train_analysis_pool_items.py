@@ -84,7 +84,7 @@ for _benchmark_id in (*PRIMARY_MECHANISTIC_BENCHMARKS,
         _benchmark_id, "behavioral_eligibility",
         f"{_benchmark_id} behavioral eligibility",
         "Does the frozen checkpoint solve enough paired examples for mechanistic analysis?",
-        "Base and source must both have positive clean-label margins; no optimizer or parameter update.",
+        "Base must be correct, and labeled source behavior must also be correct when defined; no optimizer or parameter update.",
         _contract, claim_role=_claim_role))
 
 for _benchmark_id in MIB_CIRCUIT_BENCHMARKS:

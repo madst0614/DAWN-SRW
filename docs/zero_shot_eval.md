@@ -40,10 +40,16 @@ bash scripts/launch_zero_shot_eval_tpu_pod.sh \
   --init-from gs://.../checkpoints/<CONCRETE_STEP>
 ```
 
-Every output directory contains `results_harness_raw.json`,
+Every standalone evaluator output directory contains `results_harness_raw.json`,
 `results_summary.json`, `results_summary.csv`, `samples.jsonl`,
 `run_manifest.json`, and `eval.log`. Runs with `--limit` are marked
 `comparable=false` and `smoke_test_only=true`.
+
+When the same evaluator is invoked as a `train_analysis_pool` item, the pool's
+compact artifact policy omits `results_harness_raw.json` and `samples.jsonl`;
+aggregate metrics, exact row counts, task/dataset/tokenizer provenance, and the
+full in-memory result digest remain in `results_summary.json` and
+`run_manifest.json`.
 
 Local/VM verification after installing the pinned requirements:
 

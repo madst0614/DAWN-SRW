@@ -8,6 +8,8 @@ import gc
 import json
 import os
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import jax
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
@@ -24,7 +27,6 @@ from analysis.dawn_analysis_common import (
     create_mesh_from_cfg,
     create_or_reuse_sharded_fns,
     get_train,
-    git_info,
     is_primary_host,
     model_cfg_from_config,
     resolve_checkpoint,
@@ -33,18 +35,18 @@ from analysis.dawn_analysis_common import (
 )
 from analysis.dawn_analysis_storage import (
     AnalysisStore,
+    exists,
     join_path,
-    read_json,
     write_json_atomic,
 )
 from analysis.operator_interpretability.artifacts import (
     DEFAULT_BENCHMARK_ROOT,
+    MAX_PROTOCOL_BOUND_JSON_BYTES,
     resolve_benchmark_build,
     write_protocol_bound_artifact,
 )
 from analysis.operator_interpretability.benchmark_schema import canonical_hash
 from analysis.operator_interpretability.protocol import (
-    PROTOCOL_ID,
     PROTOCOL_SCHEMA_VERSION,
     ProtocolConfig,
     validate_model_version,
@@ -60,6 +62,7 @@ from analysis.train_analysis_pool_items import (
     parse_train_analysis_pool_items,
     train_analysis_pool_catalog,
 )
+from analysis.train_analysis_pool_reporting import TrainAnalysisPoolTextReporter
 from analysis.train_analysis_pool_targets import (
     DEFAULT_REGISTRY_PATH,
     ExecutionSelection,
@@ -68,12 +71,6 @@ from analysis.train_analysis_pool_targets import (
     target_runtime_catalog,
     target_spec,
     validate_target_checkpoint_config,
-)
-from dawn.eval.zero_shot_protocol import (
-    LM_EVAL_VERSION,
-    NUM_FEWSHOT,
-    PROTOCOL_NAME as ZERO_SHOT_PROTOCOL_NAME,
-    PROTOCOL_VERSION as ZERO_SHOT_PROTOCOL_VERSION,
 )
 
 
@@ -88,7 +85,10 @@ def parse_args() -> argparse.Namespace:
     source.add_argument(
         "--checkpoint", help="Ad-hoc Orbax step, checkpoints directory, run, or latest path")
     parser.add_argument("--config", default=None, help="Fallback only when checkpoint metadata lacks full_config")
-    parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--output", default=None,
+        help=("Optional parent directory for independent run folders; "
+              "the step, preset/items label, and unique run id are appended"))
     parser.add_argument("--benchmark-root", default=DEFAULT_BENCHMARK_ROOT)
     parser.add_argument(
         "--registry", default=str(DEFAULT_REGISTRY_PATH),
@@ -105,9 +105,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-targets", action="store_true")
     parser.add_argument("--zero-shot-batch-size", type=int, default=32)
     parser.add_argument("--zero-shot-limit", type=int, default=None)
-    parser.add_argument(
-        "--from-scratch", dest="resume", action="store_false", default=True,
-        help="Recompute instead of resuming protocol-matched artifacts")
     parser.add_argument(
         "--mesh-data", type=int, default=None,
         help="Ad-hoc checkpoint assertion; registered target mesh cannot be overridden")
@@ -175,10 +172,56 @@ def _initialize_distributed(args: argparse.Namespace) -> None:
             raise
 
 
-def _default_output(checkpoints_dir: str, step: int) -> str:
+def _new_analysis_run_id() -> str:
+    width = 25
+    local = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-" + uuid.uuid4().hex[:8]
+        if is_primary_host() else "0" * width)
+    encoded = np.frombuffer(local.encode("ascii"), dtype=np.uint8)
+    if int(jax.process_count()) > 1:
+        from jax.experimental import multihost_utils
+
+        encoded = np.asarray(multihost_utils.broadcast_one_to_all(
+            encoded, is_source=is_primary_host()), dtype=np.uint8)
+    run_id = bytes(encoded.tolist()).decode("ascii")
+    if len(run_id) != width or run_id == "0" * width:
+        raise RuntimeError("failed to establish a shared analysis run id")
+    return run_id
+
+
+def _broadcast_primary_bool(value: bool) -> bool:
+    encoded = np.asarray(
+        bool(value) if is_primary_host() else False, dtype=np.bool_)
+    if int(jax.process_count()) > 1:
+        from jax.experimental import multihost_utils
+
+        encoded = np.asarray(multihost_utils.broadcast_one_to_all(
+            encoded, is_source=is_primary_host()), dtype=np.bool_)
+    return bool(encoded.item())
+
+
+def _run_label(args: argparse.Namespace, items: list[str]) -> str:
+    if not args.items:
+        return str(args.preset)
+    return "items-" + canonical_hash(list(items))[:12]
+
+
+def _default_output_parent(checkpoints_dir: str) -> str:
     normalized = str(checkpoints_dir).rstrip("/\\").replace("\\", "/")
     run_root = normalized.rsplit("/", 1)[0]
-    return f"{run_root}/side_analysis/train_analysis_pool/{int(step):012d}"
+    return f"{run_root}/side_analysis/train_analysis_pool"
+
+
+def _independent_run_output(
+        checkpoints_dir: str, step: int, *, output_parent: str | None,
+        run_label: str, run_id: str) -> str:
+    parent = str(
+        output_parent or _default_output_parent(checkpoints_dir)
+    ).rstrip("/\\")
+    return (
+        f"{parent}/{int(step):012d}/"
+        f"{run_label}/{run_id}")
 
 
 def _protocol_config(args: argparse.Namespace) -> ProtocolConfig:
@@ -230,6 +273,7 @@ def _zero_shot_args(
         seed=args.seed,
         mesh_data=selection.mesh.mesh_data,
         mesh_model=selection.mesh.mesh_model,
+        compact_artifacts=True,
     )
 
 
@@ -237,7 +281,8 @@ def _run_zero_shot_backend(
         args: argparse.Namespace, *, selection: ExecutionSelection,
         checkpoint_dir: str, checkpoint_step: int,
         checkpoint_config_hash: str, item_ids: list[str],
-        store: AnalysisStore) -> dict:
+        store: AnalysisStore,
+        text_reporter: TrainAnalysisPoolTextReporter | None = None) -> dict:
     if args.zero_shot_batch_size <= 0:
         raise ValueError("--zero-shot-batch-size must be positive")
     if args.zero_shot_limit is not None and args.zero_shot_limit <= 0:
@@ -246,81 +291,6 @@ def _run_zero_shot_backend(
     concrete_checkpoint = join_path(
         checkpoint_dir, f"{int(checkpoint_step):012d}")
     backend_output = store.path("backends", "stock_zero_shot")
-    code = git_info()
-    loaded = {}
-    for item_id, task in zip(item_ids, tasks):
-        path = store.path("items", "zero_shot", f"{task}.json")
-        record = read_json(path, None) if args.resume else None
-        if record is None:
-            loaded = {}
-            break
-        if not isinstance(record, dict):
-            raise ValueError(f"invalid zero-shot item artifact: {path}")
-        protocol = record.get("protocol")
-        payload = record.get("payload")
-        if not isinstance(protocol, dict) or not isinstance(payload, dict):
-            raise ValueError(f"invalid zero-shot protocol artifact: {path}")
-        if record.get("protocol_hash") != canonical_hash(protocol):
-            raise ValueError(f"zero-shot protocol hash mismatch: {path}")
-        required_protocol_fields = (
-            "task_version", "task_config_hash", "dataset", "tokenizer",
-            "checkpoint_params_hash",
-        )
-        missing_protocol = [
-            key for key in required_protocol_fields
-            if key not in protocol
-        ]
-        if missing_protocol:
-            raise ValueError(
-                f"zero-shot artifact lacks protocol fields for {item_id}: "
-                + ",".join(missing_protocol))
-        expected = {
-            "protocol_name": ZERO_SHOT_PROTOCOL_NAME,
-            "protocol_version": ZERO_SHOT_PROTOCOL_VERSION,
-            "lm_eval_version": LM_EVAL_VERSION,
-            "num_fewshot": NUM_FEWSHOT,
-            "task_id": task,
-            "checkpoint_path": concrete_checkpoint,
-            "checkpoint_step": int(checkpoint_step),
-            "checkpoint_config_hash": checkpoint_config_hash,
-            "target_id": selection.target_id,
-            "runtime_id": selection.mesh.runtime_id,
-            "effective_mesh": {
-                "data": selection.mesh.mesh_data,
-                "model": selection.mesh.mesh_model,
-            },
-            "analysis_git_commit": code.get("git_commit"),
-            "analysis_git_branch": code.get("git_branch"),
-            "analysis_working_tree_clean": not bool(code.get("git_dirty")),
-        }
-        differences = [
-            key for key, value in expected.items()
-            if protocol.get(key) != value
-        ]
-        if differences:
-            raise ValueError(
-                f"zero-shot artifact protocol mismatch for {item_id}: "
-                + ",".join(differences))
-        if payload.get("item_id") != item_id:
-            raise ValueError(f"zero-shot item identity mismatch: {path}")
-        loaded[item_id] = payload
-    if len(loaded) == len(item_ids):
-        for item_id in item_ids:
-            if store.is_primary:
-                print(
-                    f"TRAIN_ANALYSIS_POOL item={item_id} status=resume",
-                    flush=True)
-        return {
-            "status": "complete",
-            "requested_items": list(item_ids),
-            "executed_items": list(item_ids),
-            "item_status": {
-                item_id: loaded[item_id].get("status")
-                for item_id in item_ids
-            },
-            "resumed_items": list(item_ids),
-            "output": backend_output,
-        }
     from scripts.zero_shot_eval_jax import run_evaluation
 
     result = run_evaluation(_zero_shot_args(
@@ -384,6 +354,12 @@ def _run_zero_shot_backend(
             print(
                 f"TRAIN_ANALYSIS_POOL item={item_id} status=ready",
                 flush=True)
+        if text_reporter is not None:
+            text_reporter.emit(
+                payload,
+                artifact_path=store.path(
+                    "items", "zero_shot", f"{task}.json"),
+                event="completed")
     return {
         "status": "complete",
         "requested_items": list(item_ids),
@@ -452,12 +428,8 @@ def _build_context(
         args: argparse.Namespace, selection: ExecutionSelection,
         checkpoint_dir: str, checkpoint_step: int,
         checkpoint_metadata: dict, config: dict,
-        checkpoint_mesh: dict) -> AnalysisContext:
+        checkpoint_mesh: dict, store: AnalysisStore) -> AnalysisContext:
     mesh = create_mesh_from_cfg(config)
-    output = args.output or _default_output(checkpoint_dir, checkpoint_step)
-    store = AnalysisStore(
-        output, is_primary=is_primary_host(),
-        analysis_version=f"{PROTOCOL_ID}-{PROTOCOL_SCHEMA_VERSION}")
     params, restored_metadata, model = restore_params_and_cfg(
         config, checkpoint_dir, int(checkpoint_step), mesh)
     checkpoint_metadata.update(restored_metadata or {})
@@ -493,7 +465,7 @@ def _build_context(
             f"runtime={selection.mesh.runtime_id} "
             f"mesh={int(mesh.shape['data'])}x{int(mesh.shape['model'])} "
             f"version={model_cfg['model_version']} step={checkpoint_step} "
-            f"params={model_info['param_count']} output={output}",
+            f"params={model_info['param_count']} output={store.output_dir}",
             flush=True)
     return AnalysisContext(
         args=args,
@@ -560,52 +532,134 @@ def main() -> int:
             )
     (selection, checkpoint_dir, checkpoint_step, checkpoint_metadata,
      config, checkpoint_mesh, checkpoint_config_hash) = _resolve_source(args)
-    output = args.output or _default_output(checkpoint_dir, checkpoint_step)
+    run_id = _new_analysis_run_id()
+    run_label = _run_label(args, items)
+    output = _independent_run_output(
+        checkpoint_dir, checkpoint_step, output_parent=args.output,
+        run_label=run_label, run_id=run_id)
     store = AnalysisStore(
         output, is_primary=is_primary_host(),
         analysis_version=f"train_analysis_pool-{PROTOCOL_SCHEMA_VERSION}")
+    output_collision = _broadcast_primary_bool(
+        (exists(store.path("run_manifest.json")) or exists(
+            store.path("summary.json"))) if store.is_primary else False)
+    if output_collision:
+        raise FileExistsError(
+            "analysis output must identify a new independent run: "
+            f"{store.output_dir}")
+    run_manifest = {
+        "schema_version": 1,
+        "status": "running",
+        "run_id": run_id,
+        "run_label": run_label,
+        "preset": args.preset,
+        "requested_items": list(items),
+        "executed_items": list(executed),
+        "target_id": selection.target_id,
+        "runtime_id": selection.mesh.runtime_id,
+        "checkpoint_path": checkpoint_dir,
+        "checkpoint_step": int(checkpoint_step),
+        "checkpoint_config_hash": checkpoint_config_hash,
+        "benchmark_build_id": (
+            benchmark_build.build_id if mechanistic_items else None),
+        "benchmark_manifest_path": (
+            benchmark_build.manifest_path if mechanistic_items else None),
+        "output": store.output_dir,
+        "run_semantics": "independent_checkpoint_step_preset_invocation",
+        "raw_parameters_persisted": False,
+        "dense_capture_rows_persisted": False,
+        "max_protocol_bound_item_json_bytes": (
+            MAX_PROTOCOL_BOUND_JSON_BYTES),
+    }
+    if store.is_primary:
+        write_json_atomic(store.path("run_manifest.json"), run_manifest)
+    sync_hosts("train_analysis_pool_run_reserved")
+    mechanistic_protocol = (
+        _protocol_config(args) if mechanistic_items else None)
+    text_reporter = TrainAnalysisPoolTextReporter(
+        store,
+        preset=args.preset,
+        requested_items=items,
+        executed_items=executed,
+        target_id=selection.target_id,
+        runtime_id=selection.mesh.runtime_id,
+        checkpoint_path=checkpoint_dir,
+        checkpoint_step=checkpoint_step,
+        run_id=run_id,
+        run_label=run_label,
+        benchmark_build_id=(
+            benchmark_build.build_id if mechanistic_items else None),
+        benchmark_manifest_path=(
+            benchmark_build.manifest_path if mechanistic_items else None),
+        checkpoint_config_hash=checkpoint_config_hash,
+        max_item_json_bytes=MAX_PROTOCOL_BOUND_JSON_BYTES,
+        mechanistic_protocol_config=(
+            mechanistic_protocol.to_dict()
+            if mechanistic_protocol is not None else None),
+    )
+    text_reporter.start()
     backend_summaries = {}
     item_status = {}
     strongest_claim = None
 
-    if zero_shot_items:
-        backend_summaries["stock_zero_shot"] = _run_zero_shot_backend(
-            args,
-            selection=selection,
-            checkpoint_dir=checkpoint_dir,
-            checkpoint_step=checkpoint_step,
-            checkpoint_config_hash=checkpoint_config_hash,
-            item_ids=zero_shot_items,
-            store=store,
-        )
-        item_status.update(
-            backend_summaries["stock_zero_shot"]["item_status"])
-        gc.collect()
-        jax.clear_caches()
-        sync_hosts("train_analysis_pool_zero_shot_complete")
+    try:
+        if zero_shot_items:
+            backend_summaries["stock_zero_shot"] = _run_zero_shot_backend(
+                args,
+                selection=selection,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_step=checkpoint_step,
+                checkpoint_config_hash=checkpoint_config_hash,
+                item_ids=zero_shot_items,
+                store=store,
+                text_reporter=text_reporter,
+            )
+            item_status.update(
+                backend_summaries["stock_zero_shot"]["item_status"])
+            gc.collect()
+            jax.clear_caches()
+            sync_hosts("train_analysis_pool_zero_shot_complete")
 
-    if mechanistic_items:
-        context = _build_context(
-            args, selection, checkpoint_dir, checkpoint_step,
-            checkpoint_metadata, config, checkpoint_mesh)
-        sync_hosts("train_analysis_pool_loaded")
-        runner = OperatorInterpretabilityRunner(
-            context,
-            benchmark_root=args.benchmark_root,
-            benchmark_ids=mechanistic_benchmark_ids,
-            protocol_config=_protocol_config(args),
-            resume=args.resume,
-        )
-        backend_summaries["operator_interpretability"] = runner.run(
-            mechanistic_items)
-        item_status.update(
-            backend_summaries["operator_interpretability"]["item_status"])
-        strongest_claim = backend_summaries[
-            "operator_interpretability"].get("strongest_supported_claim")
+        if mechanistic_items:
+            if mechanistic_protocol is None:
+                raise RuntimeError("mechanistic protocol was not initialized")
+            context = _build_context(
+                args, selection, checkpoint_dir, checkpoint_step,
+                checkpoint_metadata, config, checkpoint_mesh, store)
+            sync_hosts("train_analysis_pool_loaded")
+            runner = OperatorInterpretabilityRunner(
+                context,
+                benchmark_root=args.benchmark_root,
+                benchmark_ids=mechanistic_benchmark_ids,
+                protocol_config=mechanistic_protocol,
+                text_reporter=text_reporter,
+            )
+            backend_summaries["operator_interpretability"] = runner.run(
+                mechanistic_items)
+            item_status.update(
+                backend_summaries[
+                    "operator_interpretability"]["item_status"])
+            strongest_claim = backend_summaries[
+                "operator_interpretability"].get(
+                    "strongest_supported_claim")
+    except Exception as exc:
+        if store.is_primary:
+            text_reporter.fail(exc)
+            run_manifest.update({
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "summary_log": text_reporter.report_path,
+            })
+            write_json_atomic(store.path("run_manifest.json"), run_manifest)
+        raise
 
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
+        "run_id": run_id,
+        "run_label": run_label,
+        "preset": args.preset,
         "requested_items": list(items),
         "executed_items": list(executed),
         "item_status": item_status,
@@ -620,10 +674,26 @@ def main() -> int:
         "model_version": config.get("model", {}).get("model_version"),
         "backends": backend_summaries,
         "strongest_supported_claim": strongest_claim,
+        "text_outputs": {
+            "summary_log": text_reporter.report_path,
+        },
+        "run_semantics": "independent_checkpoint_step_preset_invocation",
+        "raw_parameters_persisted": False,
+        "dense_capture_rows_persisted": False,
+        "max_protocol_bound_item_json_bytes": (
+            MAX_PROTOCOL_BOUND_JSON_BYTES),
     }
     sync_hosts("train_analysis_pool_complete")
     if store.is_primary:
         write_json_atomic(store.path("summary.json"), summary)
+        text_reporter.finish(summary)
+        run_manifest.update({
+            "status": "complete",
+            "summary_json": store.path("summary.json"),
+            "summary_log": text_reporter.report_path,
+            "strongest_supported_claim": strongest_claim,
+        })
+        write_json_atomic(store.path("run_manifest.json"), run_manifest)
         print(
             "TRAIN_ANALYSIS_POOL COMPLETE "
             f"status={summary['status']} "

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
 
@@ -21,6 +23,11 @@ from analysis.operator_interpretability.units import OperatorSite, RankedSite
 
 
 ROUTES = ("q", "k", "v", "rst")
+
+
+def _digest_block(digest: Any, payload: bytes) -> None:
+    digest.update(len(payload).to_bytes(8, byteorder="little", signed=False))
+    digest.update(payload)
 
 
 def _pad_examples(examples: Sequence[BenchmarkExample], *, pad_token_id: int,
@@ -57,6 +64,7 @@ def _capture_operator_paths(
         max_topk_qk: int, max_topk_v: int, max_topk_rst: int,
         capture_threshold: float, seed: int,
         required_phase: str, rank_candidates: bool,
+        retain_rows: bool,
         max_examples: int | None = None) -> dict[str, Any]:
     selected = list(examples[:max_examples] if max_examples else examples)
     if not selected or any(
@@ -133,9 +141,12 @@ def _capture_operator_paths(
     split_aggregate = (
         defaultdict(list), defaultdict(list))
     qualified_denominator: dict[tuple[str, int], int] = defaultdict(int)
+    qualified_mass_total: dict[tuple[str, int], float] = defaultdict(float)
     split_denominator = (defaultdict(int), defaultdict(int))
     qualified_rows = 0
     total_rows = 0
+    raw_operator_value_count = 0
+    raw_capture_digest = hashlib.sha256()
     attrition: dict[str, dict[int, int]] = {
         route: defaultdict(int) for route in ROUTES}
     row_capture: list[dict[str, Any]] = []
@@ -160,7 +171,11 @@ def _capture_operator_paths(
                 total_rows += 1
                 mass = float(captured[layer, example_index])
                 is_qualified = mass >= float(capture_threshold)
-                row_capture.append({
+                operator_ids = np.asarray(
+                    ids[layer, example_index], dtype="<i4")
+                weights = np.asarray(
+                    contribution_norms[layer, example_index], dtype="<f8")
+                header = json.dumps({
                     "benchmark_id": selected[example_index].benchmark_id,
                     "example_id": selected[example_index].example_id,
                     "pair_group_id": selected[example_index].metadata.get(
@@ -173,17 +188,35 @@ def _capture_operator_paths(
                     "route": route,
                     "captured_mass": mass,
                     "qualified": is_qualified,
-                    "operator_ids": [
-                        int(value) for value in ids[layer, example_index]],
-                    "weights": [
-                        float(value) for value in
-                        contribution_norms[layer, example_index]],
-                })
+                }, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False).encode("utf-8")
+                _digest_block(raw_capture_digest, header)
+                _digest_block(raw_capture_digest, operator_ids.tobytes())
+                _digest_block(raw_capture_digest, weights.tobytes())
+                raw_operator_value_count += int(operator_ids.size)
+                if retain_rows:
+                    row_capture.append({
+                        "benchmark_id": selected[example_index].benchmark_id,
+                        "example_id": selected[example_index].example_id,
+                        "pair_group_id": selected[example_index].metadata.get(
+                            "pair_group_id", selected[example_index].example_id),
+                        "phase": selected[example_index].phase,
+                        "causal_variable": selected[example_index].causal_variable,
+                        "pair_type": selected[example_index].pair_type,
+                        "discovery_split": split_assignment[example_index],
+                        "layer": layer,
+                        "route": route,
+                        "captured_mass": mass,
+                        "qualified": is_qualified,
+                        "operator_ids": operator_ids.tolist(),
+                        "weights": weights.tolist(),
+                    })
                 if not is_qualified:
                     attrition[route][layer] += 1
                     continue
                 qualified_rows += 1
                 qualified_denominator[(route, layer)] += 1
+                qualified_mass_total[(route, layer)] += mass
                 split_index = split_assignment[example_index]
                 split_denominator[split_index][(route, layer)] += 1
                 for operator_id, contribution_norm in zip(
@@ -203,11 +236,9 @@ def _capture_operator_paths(
                 np.sum(values)
                 / qualified_denominator[(site.route, site.layer)]),
             discovery_count=len(values),
-            captured_mass_mean=float(np.mean([
-                row["captured_mass"] for row in row_capture
-                if row["layer"] == site.layer and row["route"] == site.route
-                and row["qualified"]
-            ])),
+            captured_mass_mean=float(
+                qualified_mass_total[(site.route, site.layer)]
+                / qualified_denominator[(site.route, site.layer)]),
         )
         for site, values in aggregate.items()
     ]
@@ -227,7 +258,7 @@ def _capture_operator_paths(
     )
     if not ranked:
         raise RuntimeError("no captured-mass-qualified discovery candidates")
-    return {
+    result = {
         "status": "ready",
         "ranked_sites": [
             {
@@ -262,10 +293,17 @@ def _capture_operator_paths(
             route: {str(layer): count for layer, count in layers.items()}
             for route, layers in attrition.items()
         },
-        "rows": row_capture,
+        "raw_capture_digest": raw_capture_digest.hexdigest(),
+        "raw_capture_digest_algorithm": (
+            "sha256_len_prefixed_canonical_row_header_le_i32_ids_le_f64_weights"),
+        "raw_capture_operator_value_count": raw_operator_value_count,
+        "raw_rows_materialized_for_runtime": bool(retain_rows),
         "phase": required_phase,
         "ranking_eligible": bool(rank_candidates),
     }
+    if retain_rows:
+        result["rows"] = row_capture
+    return result
 
 
 def capture_discovery_candidates(
@@ -273,6 +311,7 @@ def capture_discovery_candidates(
         pad_token_id: int, topk_qk: int, topk_v: int, topk_rst: int,
         max_topk_qk: int, max_topk_v: int, max_topk_rst: int,
         capture_threshold: float, seed: int,
+        retain_rows: bool = True,
         max_examples: int | None = None) -> dict[str, Any]:
     """Rank operator sites from discovery traces only."""
     return _capture_operator_paths(
@@ -286,6 +325,7 @@ def capture_discovery_candidates(
         seed=seed,
         required_phase="discovery",
         rank_candidates=True,
+        retain_rows=retain_rows,
         max_examples=max_examples,
     )
 
@@ -310,6 +350,7 @@ def capture_held_out_paths(
         seed=seed,
         required_phase=phase,
         rank_candidates=False,
+        retain_rows=True,
         max_examples=max_examples,
     )
     result.pop("ranked_sites", None)

@@ -13,16 +13,21 @@ semantics are defined in
 
 ## 실행 모델
 
-한 번의 실행은 다음 네 요소로 정의된다.
+한 번의 실행은 다음 다섯 요소로 정의된다.
 
 ```text
-run = target × items/preset × runtime × protocol
+run = committed checkpoint step × items/preset × runtime × protocol × invocation
 ```
 
 - **item**: 무엇을 측정하는지와 입력 task를 함께 고정한다.
 - **preset**: 자주 함께 실행하는 item ID만 묶는다.
 - **target**: 모델 버전, 체크포인트, scale, model-axis mesh를 고정한다.
 - **runtime**: 물리 accelerator와 전역 JAX device 수를 고정한다.
+- **invocation**: 같은 조건의 재실행도 덮어쓰지 않는 고유 실행 ID이다.
+
+같은 step과 preset을 다시 실행해도 새 invocation ID를 받으며 서로 다른
+독립 run 폴더에 기록된다. 분석 중간 산출물을 다음 실행에 이어 붙이는 resume
+개념은 없다. 실패한 실행도 그 실행의 폴더에 남고, 재실행은 항상 새 run이다.
 
 Target과 runtime은 독립적이지만 실행 직전에 결합된다. Target의 `mesh_model`은 체크포인트 model-axis와 정확히 같아야 하고, runtime의 device 수로 data-axis를 계산한다.
 
@@ -77,7 +82,11 @@ mib_ioi.autonomous_circuit_sufficiency
 mib_ioi.circuit_necessity
 ```
 
-`behavioral_eligibility`는 frozen inference만 수행한다. Base와 source의 positive-minus-negative log-probability margin을 계산하고 둘 다 맞은 예제만 후속 기전 분석에 전달한다. Optimizer, weight update, checkpoint write는 없다.
+`behavioral_eligibility`는 frozen inference만 수행한다. Base의
+positive-minus-negative log-probability margin이 양수여야 하며, 정답 label이
+정의된 source는 source margin도 양수여야 후속 기전 분석에 전달된다. RAVEL의
+unlabeled Wikipedia source처럼 source 정답이 정의되지 않은 경우에는 source
+정답을 임의로 만들지 않는다. Optimizer, weight update, checkpoint write는 없다.
 
 ### RAVEL items
 
@@ -179,7 +188,9 @@ python3 -u scripts/analyze_train_analysis_pool.py \
   --init-distributed
 ```
 
-`--target`과 `--checkpoint`는 상호 배타적이다. 등록 target에서는 `--config`나 다른 `mesh_model`로 target 계약을 덮어쓸 수 없다.
+`--target`과 `--checkpoint`는 상호 배타적이다. 등록 target에서는 `--config`나
+다른 `mesh_model`로 target 계약을 덮어쓸 수 없다. `--output`을 지정하면 그
+경로는 run 자체가 아니라 독립 run들이 생성될 부모 경로로 사용된다.
 
 TPU pod launcher:
 
@@ -198,29 +209,56 @@ Launcher는 실제 TPU `acceleratorType`이 선택 runtime과 같은지 먼저 �
 
 ## 산출물
 
-기본 출력:
+기본 출력에서 실행 한 번의 root는 다음과 같다.
 
 ```text
-<run>/side_analysis/train_analysis_pool/<checkpoint-step>/
+<checkpoint-run>/side_analysis/train_analysis_pool/
+  <12-digit-checkpoint-step>/<preset-or-items-hash>/<unique-run-id>/
 ```
 
-주요 파일:
+예를 들어 `scientific` preset을 step 39000에서 실행하면 다음과 같은 독립
+폴더가 생긴다.
 
 ```text
-items/mib_ioi/behavioral_eligibility.json
-items/mib_ioi/operator_localization.json
-items/ravel/causal_mediation.json
-items/zero_shot/hellaswag.json
-items/scientific_claims/primary.json
-backends/operator_interpretability/summary.json
-backends/stock_zero_shot/results_summary.json
-backends/stock_zero_shot/run_manifest.json
-summary.json
+.../train_analysis_pool/000000039000/scientific/
+  20260718T091530Z-a1b2c3d4/
+    summary.log
+    summary.json
+    run_manifest.json
+    items/
+    backends/
 ```
+
+`summary.log`는 run root에 있으며 GCS metadata도
+`text/plain; charset=utf-8`로 설정한다. 실행 정체성, checkpoint와 benchmark
+계약, 사전 고정된 threshold, 각 item의 과학적 질문과 판정 기준, 주요 집계값,
+신뢰구간, p-value/BH 판정, attrition과 blocker, 최종 claim을 item 완료 때마다
+기록한다. 같은 item block은 stdout에도 출력되므로 launcher가 관리하는 모든
+콘솔 출력은 `~/train.log`에서도 그대로 볼 수 있다. 성공한 run은
+`summary.log` 하나만 복사해도 결과 해석에 필요한 human-facing 정보가 남는다.
+실행이 실패해도 그 시점까지 완료된 item, 예외 종류와 메시지, 새 독립 run으로
+재실행해야 한다는 계약을 같은 `summary.log` 끝에 기록한다.
+
+`summary.json`, `items/`, `backends/`는 자동 처리와 audit를 위한 compact JSON
+이다. 다음 데이터는 영구 저장하지 않는다.
+
+- model parameter 값 또는 parameter 사본
+- example × layer × route의 원시 capture row
+- 수천 개 operator ID/weight의 dense row 배열
+- scientific claim 안에 upstream item 결과를 다시 중첩한 사본
+- pool 안에서 실행한 zero-shot의 lm-eval raw sample 및 중복 sample log
+
+대신 row/operator 수, aggregate metric, uncertainty, 판정, canonical digest와
+소수의 localization preview만 저장한다. Protocol-bound item JSON 하나가 2 MiB를
+넘으면 조용히 저장하지 않고 실패한다. 따라서 새 분석 item이 다시 dense
+evidence를 JSON에 삽입하면 즉시 발견된다.
 
 Mechanistic item protocol에는 checkpoint identity, model config, benchmark manifest, target, runtime, checkpoint/effective mesh가 포함된다. Zero-shot item protocol에는 concrete checkpoint, parameter identity, stock task config hash, dataset fingerprint, tokenizer 정책, target/runtime mesh가 포함된다.
 
-기본 실행은 item protocol이 정확히 일치할 때만 resume한다. 기존 artifact가 있지만 target, concrete checkpoint, runtime, code revision 또는 protocol이 다르면 덮어쓰지 않고 실패하며, 의도적으로 다시 계산할 때만 `--from-scratch`를 사용한다.
+각 invocation은 새 폴더에서 처음부터 계산한다. 기존 item artifact를 검색하거나
+이어 쓰지 않으며 `--from-scratch`, `--no-resume` 같은 분석 실행 옵션도 없다.
+Protocol identity는 같은 run 내부의 모든 compact artifact에 기록되어 결과의
+출처와 설정을 검증하는 용도로만 사용한다.
 
 ## 과학적 경계
 

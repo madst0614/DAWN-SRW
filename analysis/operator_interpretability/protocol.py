@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 PROTOCOL_ID = "dawn_operator_interpretability"
-PROTOCOL_SCHEMA_VERSION = 3
+PROTOCOL_SCHEMA_VERSION = 4
 ANALYSIS_ENGINE = "train_analysis_pool"
 SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
@@ -143,7 +143,7 @@ def protocol_record(config: ProtocolConfig, *, model_version: str,
 
 
 def require_protocol_match(record: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
-    """Fail instead of silently resuming an artifact under a changed protocol."""
+    """Fail when a protocol-bound artifact is read under another protocol."""
     keys = sorted(set(record) | set(expected))
     differences = [key for key in keys if record.get(key) != expected.get(key)]
     if differences:

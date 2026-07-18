@@ -180,10 +180,10 @@ def _gcs_bucket_blob(path: str) -> tuple[str, str]:
 
 def _set_gcs_object_metadata(path: str | os.PathLike[str],
                              content_type: Optional[str] = None,
-                             content_disposition: Optional[str] = None) -> None:
+                             content_disposition: Optional[str] = None) -> bool:
     path_s = str(path)
     if not is_gcs_path(path_s) or (not content_type and not content_disposition):
-        return
+        return True
     attrs = {}
     if content_type:
         attrs["content_type"] = content_type
@@ -193,7 +193,7 @@ def _set_gcs_object_metadata(path: str | os.PathLike[str],
         fs = _get_gcs_fs()
         if fs is not None and hasattr(fs, "setxattrs"):
             fs.setxattrs(path_s, **attrs)
-            return
+            return True
     except Exception:
         pass
     try:
@@ -206,8 +206,9 @@ def _set_gcs_object_metadata(path: str | os.PathLike[str],
         if content_disposition:
             blob.content_disposition = content_disposition
         blob.patch()
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _text_content_type_for_path(path: str | os.PathLike[str]) -> str:
@@ -278,7 +279,8 @@ def read_json(path: str | os.PathLike[str], default: Any = None) -> Any:
 
 def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes,
                        content_type: Optional[str] = None,
-                       content_disposition: Optional[str] = None) -> str:
+                       content_disposition: Optional[str] = None,
+                       require_metadata: bool = False) -> str:
     path_s = str(path)
     tmp = f"{path_s}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
     parent = dirname(path_s)
@@ -288,7 +290,13 @@ def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes,
             with open_path(tmp, "wb") as f:
                 f.write(payload)
             _gcs_copy(tmp, path_s)
-            _set_gcs_object_metadata(path_s, content_type, content_disposition)
+            metadata_set = _set_gcs_object_metadata(
+                path_s, content_type, content_disposition)
+            if require_metadata and not metadata_set:
+                raise RuntimeError(
+                    "failed to establish required GCS object metadata: "
+                    f"path={path_s} content_type={content_type!r} "
+                    f"content_disposition={content_disposition!r}")
         finally:
             try:
                 remove_path(tmp)
@@ -307,12 +315,14 @@ def write_bytes_atomic(path: str | os.PathLike[str], payload: bytes,
 
 def write_text_atomic(path: str | os.PathLike[str], text: str,
                       content_type: Optional[str] = None,
-                      content_disposition: str = "inline") -> str:
+                      content_disposition: str = "inline",
+                      require_metadata: bool = False) -> str:
     return write_bytes_atomic(
         path,
         text.encode("utf-8"),
         content_type=content_type or _text_content_type_for_path(path),
         content_disposition=content_disposition,
+        require_metadata=require_metadata,
     )
 
 
