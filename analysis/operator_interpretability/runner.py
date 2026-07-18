@@ -21,7 +21,11 @@ from analysis.operator_interpretability.benchmark_registry import (
     assert_benchmark_support,
     benchmark_spec,
 )
-from analysis.operator_interpretability.benchmark_schema import canonical_hash
+from analysis.operator_interpretability.benchmark_schema import (
+    BENCHMARK_SCHEMA,
+    BENCHMARK_SCHEMA_VERSION,
+    canonical_hash,
+)
 from analysis.operator_interpretability.capture import (
     capture_discovery_candidates,
     capture_held_out_paths,
@@ -36,10 +40,7 @@ from analysis.operator_interpretability.circuit import (
 )
 from analysis.operator_interpretability.claim_gate import evaluate_claims
 from analysis.operator_interpretability.eligibility import tokenizer_vocab_hash
-from analysis.operator_interpretability.interchange import (
-    normalized_mediation_effect,
-    score_interchange_rows,
-)
+from analysis.operator_interpretability.interchange import score_interchange_rows
 from analysis.operator_interpretability.intervention import (
     all_ones_retention_parity,
     evaluate_behavior,
@@ -197,6 +198,8 @@ class OperatorInterpretabilityRunner:
             "checkpoint_parameter_content_hash_included": False,
             "model_config_hash": model_config_hash,
             "benchmark_build_id": self.build.build_id,
+            "benchmark_schema": BENCHMARK_SCHEMA,
+            "benchmark_schema_version": BENCHMARK_SCHEMA_VERSION,
             "benchmark_manifest_path": self.build.manifest_path,
             "benchmark_manifest_hash": self.build.manifest_hash,
             "benchmark_ids": list(self.benchmark_ids),
@@ -377,29 +380,62 @@ class OperatorInterpretabilityRunner:
                 values = load_benchmark_examples(
                     self.build, benchmark_id, phase=phase)
                 if benchmark_id == "ravel":
-                    grouped: dict[str, list[Any]] = defaultdict(list)
+                    spec = benchmark_spec("ravel")
+                    grouped: dict[tuple[str, str, str], list[Any]] = (
+                        defaultdict(list))
                     for example in values:
-                        group_id = str(example.metadata["pair_group_id"])
-                        grouped[group_id].append(example)
-                    selected = []
-                    ordered_groups = sorted(grouped.items(), key=lambda row: (
-                        canonical_hash(row[0]), row[0]))
-                    for group_id, group in ordered_groups:
-                        if (len(group) != 2
-                                or {example.pair_type for example in group} != {
-                                    "cause", "isolation"}):
-                            raise ValueError(
-                                "RAVEL phase group must contain exactly one "
-                                f"cause and one isolation row: {group_id}")
-                        group.sort(key=lambda example: example.pair_type)
-                        if (len(selected) + len(group)
-                                > self.config.max_examples_per_phase):
-                            continue
-                        selected.extend(group)
-                    if not selected:
+                        source_column = str(example.metadata.get(
+                            "official_counterfactual_column") or "")
+                        key = (
+                            str(example.causal_variable),
+                            str(example.pair_type),
+                            source_column,
+                        )
+                        grouped[key].append(example)
+                    expected_strata = [
+                        (variable, pair_type, source_column)
+                        for variable in spec.causal_variables
+                        for pair_type in ("cause", "isolation")
+                        for source_column in spec.counterfactual_columns
+                    ]
+                    missing = [key for key in expected_strata if not grouped[key]]
+                    if missing:
                         raise ValueError(
-                            "max_examples_per_phase is too small for one "
-                            "atomic RAVEL cause/isolation group")
+                            "RAVEL phase lacks an official causal stratum: "
+                            + ",".join("/".join(key) for key in missing))
+                    if self.config.max_examples_per_phase < len(expected_strata):
+                        raise ValueError(
+                            "max_examples_per_phase cannot represent every "
+                            f"RAVEL stratum; minimum={len(expected_strata)}")
+                    for group in grouped.values():
+                        group.sort(key=lambda example: (
+                            canonical_hash(example.example_id),
+                            example.example_id))
+                    selected = []
+                    cursors = {key: 0 for key in expected_strata}
+                    used_group_ids = {
+                        "cause": set(), "isolation": set()}
+                    while len(selected) < self.config.max_examples_per_phase:
+                        added = False
+                        for key in expected_strata:
+                            group = grouped[key]
+                            pair_type = key[1]
+                            while cursors[key] < len(group):
+                                candidate = group[cursors[key]]
+                                cursors[key] += 1
+                                group_id = str(
+                                    candidate.metadata["pair_group_id"])
+                                if group_id in used_group_ids[pair_type]:
+                                    continue
+                                used_group_ids[pair_type].add(group_id)
+                                selected.append(candidate)
+                                added = True
+                                break
+                            if (len(selected)
+                                    == self.config.max_examples_per_phase):
+                                break
+                        if not added:
+                            break
                     phases[phase] = selected
                 else:
                     values.sort(key=lambda example: (
@@ -416,6 +452,8 @@ class OperatorInterpretabilityRunner:
             return list(examples)
         selected: dict[str, Any] = {}
         for example in examples:
+            if example.pair_type != "cause":
+                continue
             group_id = str(example.metadata["pair_group_id"])
             current = selected.get(group_id)
             if current is None or example.example_id < current.example_id:
@@ -995,13 +1033,13 @@ class OperatorInterpretabilityRunner:
             raise ValueError("interchange control rows are not paired")
         example_ids = sorted(candidate_rows)
         candidate_effect = np.asarray([
-            float(candidate_rows[example_id]["patched_source_margin"])
-            - float(candidate_rows[example_id]["base_source_margin"])
+            float(candidate_rows[example_id]["patched_intervention_margin"])
+            - float(candidate_rows[example_id]["base_intervention_margin"])
             for example_id in example_ids
         ], dtype=np.float64)
         comparator_effect = np.asarray([
-            float(comparator_rows[example_id]["patched_source_margin"])
-            - float(comparator_rows[example_id]["base_source_margin"])
+            float(comparator_rows[example_id]["patched_intervention_margin"])
+            - float(comparator_rows[example_id]["base_intervention_margin"])
             for example_id in example_ids
         ], dtype=np.float64)
         difference = candidate_effect - comparator_effect
@@ -1028,12 +1066,6 @@ class OperatorInterpretabilityRunner:
             operator_ids=family,
             pad_token_id=int(self.tokenizer.pad_token_id))
         score = score_interchange_rows(rows)
-        mediation = [
-            normalized_mediation_effect(
-                row["base_source_margin"], row["source_source_margin"],
-                row["patched_source_margin"])
-            for row in rows if row["pair_type"] == "cause"
-        ]
         variable_results = {}
         p_value_variables = []
         for offset, variable in enumerate(sorted({
@@ -1053,8 +1085,10 @@ class OperatorInterpretabilityRunner:
                     "isolation_pair_count": len(isolation_rows),
                 }
                 continue
-            cause_base = [row["base_source_margin"] for row in cause_rows]
-            cause_patched = [row["patched_source_margin"] for row in cause_rows]
+            cause_base = [
+                row["base_intervention_margin"] for row in cause_rows]
+            cause_patched = [
+                row["patched_intervention_margin"] for row in cause_rows]
             cause_delta = np.asarray(cause_patched) - np.asarray(cause_base)
             isolation_delta = [
                 abs(float(row["patched_base_margin"])
@@ -1100,8 +1134,12 @@ class OperatorInterpretabilityRunner:
         score.update({
             "phase": phase,
             "rows": rows,
-            "normalized_mediation_ci": bootstrap_mean_ci(
-                [value for value in mediation if value is not None],
+            "cause_effect_ci": bootstrap_mean_ci(
+                [
+                    float(row["patched_intervention_margin"])
+                    - float(row["base_intervention_margin"])
+                    for row in rows if row["pair_type"] == "cause"
+                ],
                 samples=self.config.bootstrap_samples,
                 alpha=self.config.alpha,
                 seed=self.config.seed + seed_offset + 101),
@@ -1148,12 +1186,6 @@ class OperatorInterpretabilityRunner:
             row for result in ready.values() for row in result["rows"]
         ]
         aggregate = score_interchange_rows(rows)
-        mediation = [
-            normalized_mediation_effect(
-                row["base_source_margin"], row["source_source_margin"],
-                row["patched_source_margin"])
-            for row in rows if row["pair_type"] == "cause"
-        ]
         p_values = [
             ready[variable]["causal_variables"][variable][
                 "cause_paired_null"]["p_value_two_sided"]
@@ -1218,8 +1250,12 @@ class OperatorInterpretabilityRunner:
             "phase": phase,
             "per_variable": dict(per_variable),
             "causal_variables": variable_evidence,
-            "normalized_mediation_ci": bootstrap_mean_ci(
-                [value for value in mediation if value is not None],
+            "cause_effect_ci": bootstrap_mean_ci(
+                [
+                    float(row["patched_intervention_margin"])
+                    - float(row["base_intervention_margin"])
+                    for row in rows if row["pair_type"] == "cause"
+                ],
                 samples=self.config.bootstrap_samples,
                 alpha=self.config.alpha, seed=self.config.seed + 6001),
             "isolation_effect_ci": bootstrap_mean_ci([

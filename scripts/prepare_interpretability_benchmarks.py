@@ -47,16 +47,17 @@ from analysis.operator_interpretability.benchmark_schema import (
     validate_examples,
     validate_manifest,
 )
+from analysis.operator_interpretability.benchmarks.common import AdapterOutput
 from analysis.operator_interpretability.eligibility import (
+    BenchmarkEligibilityError,
     shared_split_phase,
     tokenize_adapted_pair,
     tokenizer_vocab_hash,
 )
-from analysis.operator_interpretability.protocol import PROTOCOL_ID
+from analysis.operator_interpretability.protocol import PHASES, PROTOCOL_ID
 
 
 DEFAULT_OUTPUT_ROOT = "gs://dawn-tpu-data-c4/dataset/operator_interpretability"
-BLIMP_COMMIT_API = "https://api.github.com/repos/alexwarstadt/blimp/commits/master"
 BLIMP_ARCHIVE = "https://github.com/alexwarstadt/blimp/archive/{revision}.zip"
 
 
@@ -101,11 +102,64 @@ def _sha256_path(path: str) -> str:
     return digest.hexdigest()
 
 
+def _source_identity_audit(
+        benchmark_id: str,
+        split_rows: Mapping[str, Iterable[Mapping[str, Any]]]) -> dict[str, Any]:
+    seen: dict[str, str] = {}
+    split_counts: dict[str, int] = {}
+    for split, rows in split_rows.items():
+        local: set[str] = set()
+        count = 0
+        for row in rows:
+            digest = canonical_hash(dict(row))
+            if digest in local:
+                raise ValueError(
+                    f"duplicate official source row within "
+                    f"{benchmark_id}/{split}: {digest}")
+            previous_split = seen.get(digest)
+            if previous_split is not None:
+                raise ValueError(
+                    "official source split leakage: "
+                    f"benchmark={benchmark_id} first={previous_split} "
+                    f"second={split} row_hash={digest}")
+            local.add(digest)
+            seen[digest] = split
+            count += 1
+        split_counts[split] = count
+    return {
+        "algorithm": "sha256_canonical_full_source_row",
+        "split_row_counts": split_counts,
+        "unique_row_count": len(seen),
+        "within_split_duplicates": 0,
+        "cross_split_overlaps": 0,
+        "audited_before_selection_and_tokenization": True,
+    }
+
+
+def _python_feature_schema(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    field_types: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        for key, value in row.items():
+            field_types[str(key)].add(type(value).__name__)
+    return {
+        key: sorted(values) for key, values in sorted(field_types.items())
+    }
+
+
 def _hf_source_rows(spec: Any) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
-    info = HfApi().dataset_info(spec.source_dataset, revision="main")
+    if not spec.source_revision:
+        raise ValueError(f"{spec.benchmark_id} lacks a pinned source revision")
+    info = HfApi().dataset_info(
+        spec.source_dataset, revision=spec.source_revision)
     revision = str(info.sha)
+    if revision != spec.source_revision:
+        raise ValueError(
+            f"resolved source revision drift for {spec.benchmark_id}: "
+            f"expected={spec.source_revision} actual={revision}")
     rows: dict[str, list[Mapping[str, Any]]] = {}
-    for split in sorted(set(spec.split_map.values())):
+    official_datasets: dict[str, Any] = {}
+    split_audit: dict[str, Any] = {}
+    for split in sorted(set(spec.phase_splits.values())):
         kwargs = {
             "path": spec.source_dataset,
             "split": split,
@@ -114,19 +168,63 @@ def _hf_source_rows(spec: Any) -> tuple[dict[str, list[Mapping[str, Any]]], dict
         if spec.source_config:
             kwargs["name"] = spec.source_config
         dataset = load_dataset(**kwargs)
-        rows[split] = [dict(row) for row in dataset]
+        official_datasets[split] = dataset
+        expected_rows = int(spec.expected_split_rows[split])
+        if len(dataset) != expected_rows:
+            raise ValueError(
+                f"official split row-count drift for {spec.benchmark_id}/{split}: "
+                f"expected={expected_rows} actual={len(dataset)}")
+        missing_columns = sorted(
+            set(spec.required_columns) - set(dataset.column_names))
+        if missing_columns:
+            raise ValueError(
+                f"official source schema drift for {spec.benchmark_id}/{split}: "
+                f"missing={','.join(missing_columns)}")
+        selected = dataset
+        if spec.source_row_limit is not None and len(selected) > int(
+                spec.source_row_limit):
+            if spec.source_shuffle_seed is None:
+                raise ValueError(
+                    f"{spec.benchmark_id} source limit lacks a shuffle seed")
+            selected = selected.shuffle(
+                seed=int(spec.source_shuffle_seed)).select(
+                    range(int(spec.source_row_limit)))
+        rows[split] = [dict(row) for row in selected]
+        split_audit[split] = {
+            "official_rows": len(dataset),
+            "selected_rows": len(selected),
+            "columns": list(dataset.column_names),
+            "feature_schema_hash": canonical_hash(dataset.features.to_dict()),
+        }
     return rows, {
         "kind": "huggingface_dataset",
         "repository": spec.source_dataset,
+        "config": spec.source_config,
         "revision": revision,
         "resolved_commit": revision,
+        "phase_splits": dict(spec.phase_splits),
+        "counterfactual_columns": list(spec.counterfactual_columns),
+        "split_audit": split_audit,
+        "identity_audit": _source_identity_audit(
+            spec.benchmark_id, official_datasets),
+        "selection": {
+            "row_limit": spec.source_row_limit,
+            "shuffle_seed": spec.source_shuffle_seed,
+            "official_splits_preserved": True,
+        },
+        "reference": {
+            "repository": spec.reference_repository,
+            "revision": spec.reference_revision,
+            "path": spec.reference_path,
+        },
     }
 
 
-def _blimp_source_rows() -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
-    response = requests.get(BLIMP_COMMIT_API, timeout=60)
-    response.raise_for_status()
-    revision = str(response.json()["sha"])
+def _blimp_source_rows(
+        spec: Any) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, Any]]:
+    revision = str(spec.source_revision or "")
+    if not revision:
+        raise ValueError("BLiMP source revision is not pinned")
     archive_response = requests.get(
         BLIMP_ARCHIVE.format(revision=revision), timeout=180)
     archive_response.raise_for_status()
@@ -152,11 +250,34 @@ def _blimp_source_rows() -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, 
                 rows.append(row)
     if len(rows) != 67_000:
         raise ValueError(f"official BLiMP expected 67000 rows, got {len(rows)}")
+    spec = benchmark_spec("blimp")
+    missing_columns = sorted(
+        set(spec.required_columns) - set(rows[0]))
+    if missing_columns:
+        raise ValueError(
+            "official BLiMP schema drift: "
+            f"missing={','.join(missing_columns)}")
+    feature_schema = _python_feature_schema(rows)
     return {"train": rows}, {
         "kind": "github_archive",
         "repository": "alexwarstadt/blimp",
         "revision": revision,
         "archive_sha256": _sha256_bytes(payload),
+        "phase_splits": dict(benchmark_spec("blimp").phase_splits),
+        "split_audit": {
+            "train": {
+                "official_rows": len(rows), "selected_rows": len(rows),
+                "columns": sorted({key for row in rows for key in row}),
+                "feature_schema_hash": canonical_hash(feature_schema),
+            },
+        },
+        "identity_audit": _source_identity_audit(
+            "blimp", {"train": rows}),
+        "reference": {
+            "repository": spec.reference_repository,
+            "revision": spec.reference_revision,
+            "path": spec.reference_path,
+        },
     }
 
 
@@ -164,21 +285,54 @@ def _counterfact_source_rows(spec: Any) -> tuple[dict[str, list[Mapping[str, Any
     response = requests.get(spec.source_dataset, timeout=180)
     response.raise_for_status()
     payload = response.content
+    content_sha256 = _sha256_bytes(payload)
+    if content_sha256 != spec.source_revision:
+        raise ValueError(
+            "official CounterFact content drift: "
+            f"expected={spec.source_revision} actual={content_sha256}")
     value = response.json()
     if not isinstance(value, list) or not value:
         raise ValueError("official CounterFact payload is not a non-empty list")
-    return {"train": [dict(row) for row in value]}, {
+    expected_rows = int(spec.expected_split_rows["train"])
+    if len(value) != expected_rows:
+        raise ValueError(
+            "official CounterFact row-count drift: "
+            f"expected={expected_rows} actual={len(value)}")
+    missing_columns = sorted(
+        set(spec.required_columns) - set(value[0]))
+    if missing_columns:
+        raise ValueError(
+            "official CounterFact schema drift: "
+            f"missing={','.join(missing_columns)}")
+    rows = [dict(row) for row in value]
+    feature_schema = _python_feature_schema(rows)
+    return {"train": rows}, {
         "kind": "published_json",
         "url": spec.source_dataset,
-        "content_sha256": _sha256_bytes(payload),
-        "revision": _sha256_bytes(payload),
+        "content_sha256": content_sha256,
+        "revision": content_sha256,
+        "phase_splits": dict(spec.phase_splits),
+        "split_audit": {
+            "train": {
+                "official_rows": len(value), "selected_rows": len(value),
+                "columns": sorted(value[0]),
+                "feature_schema_hash": canonical_hash(feature_schema),
+            },
+        },
+        "identity_audit": _source_identity_audit(
+            "counterfact", {"train": rows}),
+        "reference": {
+            "repository": spec.reference_repository,
+            "revision": spec.reference_revision,
+            "path": spec.reference_path,
+        },
     }
 
 
 def _source_rows(benchmark_id: str):
     spec = benchmark_spec(benchmark_id)
     if benchmark_id == "blimp":
-        return _blimp_source_rows()
+        return _blimp_source_rows(spec)
     if benchmark_id == "counterfact":
         return _counterfact_source_rows(spec)
     return _hf_source_rows(spec)
@@ -195,8 +349,13 @@ def _logical_phase(example_id: str, logical_phases: Sequence[str]) -> str:
     raise ValueError(f"unsupported shared split mapping: {phases}")
 
 
-def _adapted_rows(adapter: Any, row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _adapted_rows(
+        adapter: Any, row: Mapping[str, Any],
+        excluded: Counter) -> list[Mapping[str, Any]]:
     value = adapter(row)
+    if isinstance(value, AdapterOutput):
+        excluded.update(value.excluded)
+        return [dict(item) for item in value.rows]
     if isinstance(value, Mapping):
         return [value]
     if isinstance(value, Sequence) and all(isinstance(item, Mapping) for item in value):
@@ -209,8 +368,12 @@ def _exclusion_key(stage: str, exc: Exception) -> str:
     message = str(exc).lower()
     categories = (
         ("max_seq_len", "sequence_too_long"),
+        ("no shared token prefix", "minimal_pair_no_shared_prefix"),
+        ("lacks divergent continuations", (
+            "minimal_pair_no_divergent_continuation")),
         ("one model token", "label_not_single_token"),
         ("token lengths differ", "answer_length_mismatch"),
+        ("tokenize identically", "identical_candidate_tokens"),
         ("trace anchor", "trace_anchor_invalid"),
         ("counterfactual", "counterfactual_contract_invalid"),
         ("answerkey", "answer_key_invalid"),
@@ -229,9 +392,9 @@ def prepare_benchmark(benchmark_id: str, tokenizer: Any, *,
     spec = benchmark_spec(benchmark_id)
     source_rows, source_record = _source_rows(benchmark_id)
     module = importlib.import_module(spec.adapter_module)
-    adapter = getattr(module, spec.adapter_name)
+    adapter = getattr(module, "adapt_rows")
     source_to_phases: dict[str, list[str]] = defaultdict(list)
-    for phase, source_split in spec.split_map.items():
+    for phase, source_split in spec.phase_splits.items():
         source_to_phases[source_split].append(phase)
     examples: list[BenchmarkExample] = []
     excluded = Counter()
@@ -239,10 +402,8 @@ def prepare_benchmark(benchmark_id: str, tokenizer: Any, *,
     for source_split, rows in source_rows.items():
         logical_phases = source_to_phases[source_split]
         for row in rows:
-            try:
-                adapted_values = _adapted_rows(adapter, row)
-            except Exception as exc:
-                excluded[_exclusion_key("adapter", exc)] += 1
+            adapted_values = _adapted_rows(adapter, row, excluded)
+            if not adapted_values:
                 continue
             grouped: list[tuple[Mapping[str, Any], str]] = []
             for adapted in adapted_values:
@@ -258,18 +419,15 @@ def prepare_benchmark(benchmark_id: str, tokenizer: Any, *,
                     excluded[f"cap:{phase}"] += count
                 continue
             prepared: list[BenchmarkExample] = []
-            try:
-                for adapted, phase in grouped:
-                    adapted = dict(adapted)
-                    adapted.pop("phase_group_id", None)
-                    adapted["example_id"] = (
-                        f"{phase}:{adapted['example_id']}")
+            for adapted, phase in grouped:
+                adapted = dict(adapted)
+                adapted.pop("phase_group_id", None)
+                try:
                     prepared.append(tokenize_adapted_pair(
                         tokenizer, benchmark_id, phase, adapted,
                         max_seq_len=max_seq_len))
-            except Exception as exc:
-                excluded[_exclusion_key("eligibility", exc)] += len(grouped)
-                continue
+                except BenchmarkEligibilityError as exc:
+                    excluded[_exclusion_key("eligibility", exc)] += 1
             examples.extend(prepared)
             phase_counts.update(example.phase for example in prepared)
     examples.sort(key=lambda item: (item.phase, item.example_id))
@@ -339,7 +497,7 @@ def main() -> int:
     work_root = Path(args.work_dir) if args.work_dir else Path(
         tempfile.mkdtemp(prefix="dawn-interpretability-"))
     work_root.mkdir(parents=True, exist_ok=True)
-    files: dict[str, Path] = {}
+    files: dict[str, dict[str, Path]] = {}
     entries: dict[str, Any] = {}
     sources: dict[str, Any] = {}
     for benchmark_id in benchmark_ids:
@@ -347,26 +505,56 @@ def main() -> int:
         examples, source, eligibility = prepare_benchmark(
             benchmark_id, tokenizer, max_seq_len=int(args.max_seq_len),
             max_rows_per_phase=args.max_rows_per_phase)
-        path = work_root / f"{benchmark_id}.jsonl"
-        sha256 = _write_jsonl(path, examples)
-        files[benchmark_id] = path
+        phase_files: dict[str, Path] = {}
+        phase_entries: dict[str, Any] = {}
+        for phase in PHASES:
+            phase_examples = [
+                example for example in examples if example.phase == phase]
+            if not phase_examples:
+                raise ValueError(
+                    f"prepared benchmark has no {phase} rows: {benchmark_id}")
+            relative_path = f"{benchmark_id}/{phase}.jsonl"
+            path = work_root / benchmark_id / f"{phase}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            sha256 = _write_jsonl(path, phase_examples)
+            phase_files[phase] = path
+            phase_entries[phase] = {
+                "path": relative_path,
+                "sha256": sha256,
+                "row_count": len(phase_examples),
+            }
+        files[benchmark_id] = phase_files
         sources[benchmark_id] = source
         entries[benchmark_id] = {
-            "path": path.name,
-            "sha256": sha256,
             "row_count": len(examples),
             "phase_counts": dict(Counter(
                 example.phase for example in examples)),
+            "phases": phase_entries,
             "eligibility": eligibility,
             "track": benchmark_spec(benchmark_id).track,
             "metric": benchmark_spec(benchmark_id).metric,
             "supported_model_versions": list(
                 benchmark_spec(benchmark_id).supported_model_versions),
         }
+    tokenizer_record = {
+        "name": args.tokenizer,
+        "requested_revision": args.tokenizer_revision,
+        "resolved_revision": tokenizer_revision,
+        "vocab_hash": tokenizer_vocab_hash(tokenizer),
+        "vocab_size": len(tokenizer.get_vocab()),
+        "pad_token_id": int(tokenizer.pad_token_id),
+        "add_special_tokens": False,
+        "is_fast": bool(tokenizer.is_fast),
+    }
+    registry = registry_record()
     build_material = {
+        "schema": BENCHMARK_SCHEMA,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
+        "protocol_id": PROTOCOL_ID,
         "benchmarks": entries,
         "sources": sources,
-        "tokenizer_revision": tokenizer_revision,
+        "registry": registry,
+        "tokenizer": tokenizer_record,
         "max_seq_len": int(args.max_seq_len),
     }
     build_id = canonical_hash(build_material)[:24]
@@ -378,21 +566,13 @@ def main() -> int:
         "created_at": datetime.now(timezone.utc).replace(
             microsecond=0).isoformat(),
         "protocol_id": PROTOCOL_ID,
-        "tokenizer": {
-            "name": args.tokenizer,
-            "requested_revision": args.tokenizer_revision,
-            "resolved_revision": tokenizer_revision,
-            "vocab_hash": tokenizer_vocab_hash(tokenizer),
-            "vocab_size": len(tokenizer.get_vocab()),
-            "pad_token_id": int(tokenizer.pad_token_id),
-            "add_special_tokens": False,
-            "is_fast": bool(tokenizer.is_fast),
-        },
+        "tokenizer": tokenizer_record,
         "sources": sources,
         "benchmarks": entries,
-        "registry": registry_record(),
+        "registry": registry,
         "max_seq_len": int(args.max_seq_len),
     }
+    manifest = validate_manifest(manifest)
     build_root = join_path(
         str(args.output_root).rstrip("/\\"), "builds", build_id)
     manifest_destination = join_path(build_root, "manifest.json")
@@ -414,24 +594,34 @@ def main() -> int:
             f"PREPARE REUSE build_id={build_id} manifest={manifest_destination}",
             flush=True)
     else:
-        for benchmark_id, path in files.items():
-            _publish_immutable_file(
-                path,
-                join_path(build_root, path.name),
-                str(entries[benchmark_id]["sha256"]),
-            )
+        for benchmark_id, phase_files in files.items():
+            for phase, path in phase_files.items():
+                phase_entry = entries[benchmark_id]["phases"][phase]
+                _publish_immutable_file(
+                    path,
+                    join_path(
+                        build_root,
+                        *str(phase_entry["path"]).replace(
+                            "\\", "/").split("/"),
+                    ),
+                    str(phase_entry["sha256"]),
+                )
         write_json_atomic(manifest_destination, manifest)
 
     for benchmark_id, entry in manifest["benchmarks"].items():
-        shard_path = join_path(
-            build_root,
-            *str(entry["path"]).replace("\\", "/").split("/"),
-        )
-        if not exists(shard_path):
-            raise FileNotFoundError(
-                f"benchmark manifest references a missing shard: {shard_path}")
-        if _sha256_path(shard_path) != str(entry["sha256"]):
-            raise ValueError(f"benchmark shard hash mismatch: {benchmark_id}")
+        for phase in PHASES:
+            phase_entry = entry["phases"][phase]
+            shard_path = join_path(
+                build_root,
+                *str(phase_entry["path"]).replace("\\", "/").split("/"),
+            )
+            if not exists(shard_path):
+                raise FileNotFoundError(
+                    "benchmark manifest references a missing phase shard: "
+                    f"{shard_path}")
+            if _sha256_path(shard_path) != str(phase_entry["sha256"]):
+                raise ValueError(
+                    f"benchmark phase shard hash mismatch: {benchmark_id}/{phase}")
 
     manifest_hash = canonical_hash(manifest)
     if args.publish_latest:

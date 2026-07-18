@@ -90,6 +90,8 @@ def _sequence_arrays(examples: Sequence[BenchmarkExample], *,
         "negative": "negative_ids",
         "source_positive": "source_positive_ids",
         "source_negative": "source_negative_ids",
+        "intervention_positive": "intervention_positive_ids",
+        "intervention_negative": "intervention_negative_ids",
     }
     if answer_side not in answer_fields:
         raise ValueError(f"unknown answer side: {answer_side}")
@@ -125,18 +127,27 @@ def _device_batch(ctx: Any, input_ids: np.ndarray, labels: np.ndarray):
     )
 
 
-def _score_from_result(result: Mapping[str, Any]) -> jax.Array:
+def _score_from_result(
+        result: Mapping[str, Any], normalization: str) -> jax.Array:
     valid = result["valid_mask"].astype(jnp.float32)
-    return (-result["per_token_ce"].astype(jnp.float32) * valid).sum(axis=-1)
+    token_logp = -result["per_token_ce"].astype(jnp.float32) * valid
+    total = token_logp.sum(axis=-1)
+    if normalization == "sum_log_probability":
+        return total
+    if normalization == "mean_log_probability_per_token":
+        return total / jnp.maximum(valid.sum(axis=-1), jnp.float32(1.0))
+    raise ValueError(f"unknown candidate score normalization: {normalization}")
 
 
-def _plain_score_executable(ctx: Any):
+def _plain_score_executable(
+        ctx: Any, normalization: str = "sum_log_probability"):
     cache = getattr(ctx, "_operator_interpretability_executables", None)
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    if "plain_score" in cache:
-        return cache["plain_score"]
+    key = f"plain_score:{normalization}"
+    if key in cache:
+        return cache[key]
     kwargs = _runtime_kwargs(ctx)
 
     @jax.jit
@@ -149,10 +160,28 @@ def _plain_score_executable(ctx: Any):
             {"params": params}, input_ids, labels=labels,
             attention_mask=jnp.ones_like(input_ids),
             minimal_train=True, **kwargs)
-        return _score_from_result(result)
+        return _score_from_result(result, normalization)
 
-    cache["plain_score"] = score
+    cache[key] = score
     return score
+
+
+def _candidate_score_normalization(
+        examples: Sequence[BenchmarkExample]) -> str:
+    values = {
+        str(example.metadata.get("candidate_score_normalization")
+            or "sum_log_probability")
+        for example in examples
+    }
+    if len(values) != 1:
+        raise ValueError(
+            "candidate score normalization differs within one evaluation batch")
+    normalization = next(iter(values))
+    if normalization not in {
+            "sum_log_probability", "mean_log_probability_per_token"}:
+        raise ValueError(
+            f"unknown candidate score normalization: {normalization}")
+    return normalization
 
 
 def _retention_score_executable(ctx: Any, mode: str):
@@ -176,7 +205,7 @@ def _retention_score_executable(ctx: Any, mode: str):
             return_residual=False,
             method=ctx.model.analysis_forward_with_circuit_retention,
             **kwargs)
-        return _score_from_result(result)
+        return _score_from_result(result, "sum_log_probability")
 
     cache[key] = score
     return score
@@ -187,7 +216,8 @@ def evaluate_behavior(ctx: Any, examples: Sequence[BenchmarkExample], *,
     if not examples:
         raise ValueError("behavior evaluation has no examples")
     multiple = max(1, int(ctx.mesh.shape["data"]))
-    score = _plain_score_executable(ctx)
+    score_normalization = _candidate_score_normalization(examples)
+    score = _plain_score_executable(ctx, score_normalization)
 
     def run(prompt_side: str, answer_side: str) -> np.ndarray:
         arrays = _sequence_arrays(
@@ -201,40 +231,72 @@ def evaluate_behavior(ctx: Any, examples: Sequence[BenchmarkExample], *,
     base_negative = run("base", "negative")
     source_base_positive = run("source", "positive")
     source_base_negative = run("source", "negative")
-    source_own_positive = run("source", "source_positive")
-    source_own_negative = run("source", "source_negative")
+    source_scored = np.asarray([
+        example.source_behavior_required for example in examples],
+        dtype=np.bool_)
+    source_own_margin = np.full((len(examples),), np.nan, dtype=np.float64)
+    if np.any(source_scored):
+        scored_examples = [
+            example for example in examples if example.source_behavior_required]
+
+        def run_source(answer_side: str) -> np.ndarray:
+            arrays = _sequence_arrays(
+                scored_examples, prompt_side="source", answer_side=answer_side,
+                pad_token_id=pad_token_id, multiple=multiple)
+            ids, labels = _device_batch(ctx, arrays[0], arrays[1])
+            return np.asarray(jax.device_get(score(ctx.params, ids, labels)))[
+                :arrays[2]].astype(np.float64)
+
+        source_own_margin[source_scored] = (
+            run_source("source_positive") - run_source("source_negative"))
     base_margin = base_positive - base_negative
     # Official MIB faithfulness keeps the clean-label orientation on the
     # corrupted/source prompt.  source_own_margin separately audits whether
     # the checkpoint solves the source member of the counterfactual pair.
     corrupted_margin = source_base_positive - source_base_negative
-    source_own_margin = source_own_positive - source_own_negative
     base_known_correct = base_margin > 0.0
-    source_known_correct = source_own_margin > 0.0
+    # The official RAVEL Wikipedia source is a context prompt, not a labeled
+    # behavioral query.  It is therefore not a second behavioral prerequisite;
+    # preserve that fact explicitly instead of inventing a source label.
+    source_known_correct = (~source_scored) | (source_own_margin > 0.0)
     pair_known_correct = base_known_correct & source_known_correct
+    source_margin_output = [
+        float(value) if scored else None
+        for value, scored in zip(source_own_margin, source_scored)
+    ]
+    scored_source_correct = source_known_correct[source_scored]
     return {
         "status": "ready",
         "phase": examples[0].phase,
+        "candidate_score_normalization": score_normalization,
         "example_ids": [example.example_id for example in examples],
         "base_positive_logp": base_positive.tolist(),
         "base_negative_logp": base_negative.tolist(),
         "base_margin": base_margin.tolist(),
         "corrupted_margin": corrupted_margin.tolist(),
-        "source_own_margin": source_own_margin.tolist(),
+        "source_own_margin": source_margin_output,
+        "source_behavior_scored": source_scored.tolist(),
         "base_known_correct": base_known_correct.tolist(),
         "source_known_correct": source_known_correct.tolist(),
         "known_correct": pair_known_correct.tolist(),
         "known_correct_count": int(np.sum(pair_known_correct)),
         "base_known_correct_count": int(np.sum(base_known_correct)),
-        "source_known_correct_count": int(np.sum(source_known_correct)),
+        "source_known_correct_count": int(np.sum(scored_source_correct)),
+        "source_behavior_scored_count": int(np.sum(source_scored)),
         "accuracy": float(np.mean(base_known_correct)),
+        "source_accuracy": (
+            float(np.mean(scored_source_correct))
+            if scored_source_correct.size else None),
         "pair_accuracy": float(np.mean(pair_known_correct)),
         "mean_margin": float(np.mean(base_margin)),
         "mean_corrupted_margin": float(np.mean(corrupted_margin)),
-        "mean_source_own_margin": float(np.mean(source_own_margin)),
+        "mean_source_own_margin": (
+            float(np.mean(source_own_margin[source_scored]))
+            if np.any(source_scored) else None),
         "corrupted_margin_orientation": (
             "base_positive_minus_base_negative_on_source_prompt"),
-        "mechanistic_eligibility": "base_and_source_both_known_correct",
+        "mechanistic_eligibility": (
+            "base_known_correct_and_labeled_source_known_correct_when_defined"),
     }
 
 
@@ -366,6 +428,7 @@ def evaluate_operator_interchange(
         ctx.model_cfg, examples, layer=layer, route=route,
         operator_ids=operator_ids)
     multiple = max(1, int(ctx.mesh.shape["data"]))
+    score_normalization = _candidate_score_normalization(examples)
     source_arrays = _prompt_arrays(
         examples, side="source", pad_token_id=pad_token_id,
         multiple=multiple)
@@ -415,9 +478,9 @@ def evaluate_operator_interchange(
             return_residual=False,
             method=ctx.model.analysis_forward_with_operator_interchange,
             **kwargs)
-        return _score_from_result(result)
+        return _score_from_result(result, score_normalization)
 
-    plain = _plain_score_executable(ctx)
+    plain = _plain_score_executable(ctx, score_normalization)
 
     def scores(prompt_side: str, answer_side: str, *, patch: bool) -> np.ndarray:
         arrays = _sequence_arrays(
@@ -443,12 +506,12 @@ def evaluate_operator_interchange(
 
     base_base = scores("base", "positive", patch=False) - scores(
         "base", "negative", patch=False)
-    base_source = scores("base", "source_positive", patch=False) - scores(
-        "base", "source_negative", patch=False)
-    source_source = scores("source", "source_positive", patch=False) - scores(
-        "source", "source_negative", patch=False)
-    patched_source = scores("base", "source_positive", patch=True) - scores(
-        "base", "source_negative", patch=True)
+    base_intervention = scores(
+        "base", "intervention_positive", patch=False) - scores(
+            "base", "intervention_negative", patch=False)
+    patched_intervention = scores(
+        "base", "intervention_positive", patch=True) - scores(
+            "base", "intervention_negative", patch=True)
     patched_base = scores("base", "positive", patch=True) - scores(
         "base", "negative", patch=True)
     return [
@@ -460,10 +523,10 @@ def evaluate_operator_interchange(
             "route": route,
             "operator_ids": list(normalized_operator_ids),
             "position_kind": example.metadata.get("position_kind"),
+            "candidate_score_normalization": score_normalization,
             "base_base_margin": float(base_base[index]),
-            "base_source_margin": float(base_source[index]),
-            "source_source_margin": float(source_source[index]),
-            "patched_source_margin": float(patched_source[index]),
+            "base_intervention_margin": float(base_intervention[index]),
+            "patched_intervention_margin": float(patched_intervention[index]),
             "patched_base_margin": float(patched_base[index]),
         }
         for index, example in enumerate(examples)

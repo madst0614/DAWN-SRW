@@ -747,28 +747,71 @@ def test_model_interchange(harness) -> None:
 
 
 def _example(phase: str, suffix: str, *, benchmark_id: str = "tiny",
-             pair_type: str = "pair", group_id: str | None = None):
+             pair_type: str = "pair", group_id: str | None = None,
+             causal_variable: str = "variable",
+             source_column: str | None = None):
     metadata = {}
     if group_id is not None:
         metadata["pair_group_id"] = group_id
+    source_behavior_required = True
+    positive_answer = "yes"
+    negative_answer = "no"
+    intervention_positive_answer = "source-yes"
+    intervention_negative_answer = "source-no"
+    intervention_positive_ids = (7,)
+    intervention_negative_ids = (8,)
+    source_positive_ids = (7,)
+    source_negative_ids = (8,)
+    if benchmark_id == "ravel":
+        source_column = str(source_column)
+        other_variable = next(
+            value for value in ("Continent", "Country", "Language")
+            if value != causal_variable)
+        metadata.update({
+            "official_counterfactual_column": source_column,
+            "base_query_attribute": (
+                causal_variable if pair_type == "cause" else other_variable),
+            "candidate_score_normalization": (
+                "mean_log_probability_per_token"),
+        })
+        source_behavior_required = (
+            source_column == "attribute_counterfactual")
+        if not source_behavior_required:
+            source_positive_ids = ()
+            source_negative_ids = ()
+        if pair_type == "cause":
+            intervention_positive_answer = negative_answer
+            intervention_negative_answer = positive_answer
+            intervention_positive_ids = (6,)
+            intervention_negative_ids = (5,)
+        else:
+            intervention_positive_answer = positive_answer
+            intervention_negative_answer = negative_answer
+            intervention_positive_ids = (5,)
+            intervention_negative_ids = (6,)
     return BenchmarkExample(
         benchmark_id=benchmark_id,
         example_id=f"{phase}-{suffix}",
         phase=phase,
         base_prompt="base",
         source_prompt="source",
-        positive_answer="yes",
-        negative_answer="no",
-        causal_variable="variable",
+        positive_answer=positive_answer,
+        negative_answer=negative_answer,
+        intervention_positive_answer=intervention_positive_answer,
+        intervention_negative_answer=intervention_negative_answer,
+        causal_variable=causal_variable,
         pair_type=pair_type,
+        source_behavior_required=source_behavior_required,
         trace_position_base=1,
         trace_position_source=1,
         input_ids_base=(1, 2),
         input_ids_source=(3, 4),
         positive_ids=(5,),
         negative_ids=(6,),
-        source_positive_ids=(7,),
-        source_negative_ids=(8,),
+        source_positive_ids=source_positive_ids,
+        source_negative_ids=source_negative_ids,
+        intervention_positive_ids=intervention_positive_ids,
+        intervention_negative_ids=intervention_negative_ids,
         metadata=metadata,
     )
 
@@ -947,14 +990,20 @@ def test_protocol_and_schema_contracts() -> None:
 
     ravel_rows = []
     for phase in ("discovery", "validation", "test"):
-        ravel_rows.extend((
-            _example(
-                phase, "cause", benchmark_id="ravel",
-                pair_type="cause", group_id=f"{phase}-group"),
-            _example(
-                phase, "isolation", benchmark_id="ravel",
-                pair_type="isolation", group_id=f"{phase}-group"),
-        ))
+        for variable in ("Continent", "Country", "Language"):
+            for pair_type in ("cause", "isolation"):
+                for source_column in (
+                        "attribute_counterfactual",
+                        "wikipedia_counterfactual"):
+                    ravel_rows.append(_example(
+                        phase,
+                        f"{variable}-{pair_type}-{source_column}",
+                        benchmark_id="ravel",
+                        pair_type=pair_type,
+                        group_id=f"{phase}-{variable}-{pair_type}",
+                        causal_variable=variable,
+                        source_column=source_column,
+                    ))
     validate_examples(ravel_rows)
     _expect_raises(
         (ValueError,),
@@ -996,7 +1045,7 @@ def test_protocol_and_schema_contracts() -> None:
         "autonomous_sufficiency": {"status": "incomplete"},
         "interchange": {
             "status": "ready", "cause_success_fraction": 1.0,
-            "normalized_mediation_ci": {"ci_low": 0.5},
+            "cause_effect_ci": {"ci_low": 0.5},
             "all_variables_causal_after_bh": True,
             "isolation_absolute_effect_mean": 0.0,
             "isolation_effect_ci": {"ci_high": 0.0},

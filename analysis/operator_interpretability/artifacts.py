@@ -20,7 +20,7 @@ from analysis.operator_interpretability.benchmark_schema import (
     validate_examples,
     validate_manifest,
 )
-from analysis.operator_interpretability.protocol import require_protocol_match
+from analysis.operator_interpretability.protocol import PHASES, require_protocol_match
 
 
 DEFAULT_BENCHMARK_ROOT = (
@@ -106,24 +106,56 @@ def load_benchmark_examples(build: BenchmarkBuild, benchmark_id: str, *,
     if not isinstance(entry, Mapping):
         raise FileNotFoundError(
             f"benchmark {benchmark_id!r} is absent from build {build.build_id}")
-    relative = str(entry.get("path") or f"{benchmark_id}.jsonl")
-    path = join_path(build.build_root, *relative.replace("\\", "/").split("/"))
-    if not exists(path):
-        raise FileNotFoundError(path)
-    if sha256_path(path) != str(entry.get("sha256") or ""):
-        raise ValueError(f"benchmark shard hash mismatch: {benchmark_id}")
+    if phase is not None and phase not in PHASES:
+        raise ValueError(f"unknown benchmark phase: {phase!r}")
+    phase_entries = entry.get("phases")
+    if not isinstance(phase_entries, Mapping):
+        raise ValueError(
+            f"benchmark manifest lacks physical phase shards: {benchmark_id}")
+    selected_phases = (phase,) if phase is not None else PHASES
     examples: list[BenchmarkExample] = []
-    with open_path(path, "r") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                example = BenchmarkExample.from_dict(json.loads(line))
-            except Exception as exc:
-                raise ValueError(
-                    f"invalid {benchmark_id} row at {path}:{line_number}") from exc
-            if phase is None or example.phase == phase:
+    for selected_phase in selected_phases:
+        phase_entry = phase_entries.get(selected_phase)
+        if not isinstance(phase_entry, Mapping):
+            raise ValueError(
+                f"benchmark manifest lacks phase={selected_phase}: {benchmark_id}")
+        relative = str(phase_entry.get("path") or "")
+        path = join_path(
+            build.build_root, *relative.replace("\\", "/").split("/"))
+        if not exists(path):
+            raise FileNotFoundError(path)
+        if sha256_path(path) != str(phase_entry.get("sha256") or ""):
+            raise ValueError(
+                f"benchmark phase shard hash mismatch: "
+                f"{benchmark_id}/{selected_phase}")
+        phase_count = 0
+        with open_path(path, "rb") as handle:
+            for line_number, raw_line in enumerate(handle, 1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    line = raw_line.decode("utf-8")
+                    example = BenchmarkExample.from_dict(json.loads(line))
+                except Exception as exc:
+                    raise ValueError(
+                        f"invalid {benchmark_id} row at "
+                        f"{path}:{line_number}") from exc
+                if example.benchmark_id != benchmark_id:
+                    raise ValueError(
+                        f"benchmark id mismatch at {path}:{line_number}")
+                if example.phase != selected_phase:
+                    raise ValueError(
+                        "physical phase shard contains a foreign phase: "
+                        f"{path}:{line_number} expected={selected_phase} "
+                        f"actual={example.phase}")
                 examples.append(example)
+                phase_count += 1
+        expected_count = int(phase_entry.get("row_count", -1))
+        if phase_count != expected_count:
+            raise ValueError(
+                f"benchmark phase row count mismatch: "
+                f"{benchmark_id}/{selected_phase} expected={expected_count} "
+                f"actual={phase_count}")
     if phase is None:
         validate_examples(examples)
     elif not examples:

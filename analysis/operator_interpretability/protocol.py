@@ -47,7 +47,7 @@ class ProtocolConfig:
     """Settings that must be fixed before validation or test is inspected."""
 
     seed: int = 4172
-    max_examples_per_phase: int = 64
+    max_examples_per_phase: int = 128
     capture_threshold: float = 0.95
     capture_topk_qk: int = 512
     capture_topk_v: int = 2048

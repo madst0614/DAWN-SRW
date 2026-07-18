@@ -76,7 +76,7 @@ def evaluate_claims(results: Mapping[str, Any],
         and _number(interchange.get("cause_success_fraction"), 0.0)
         >= config.interchange_success_min
         and _number(
-            (interchange.get("normalized_mediation_ci") or {}).get("ci_low"),
+            (interchange.get("cause_effect_ci") or {}).get("ci_low"),
             float("-inf")) > 0.0
         and interchange.get("all_variables_causal_after_bh") is True,
         ["autonomous_sufficiency"], interchange)

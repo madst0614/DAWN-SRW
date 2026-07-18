@@ -1,5 +1,9 @@
 # train_analysis_pool
 
+Primary dataset forms, pinned revisions, split rules, and prepared artifact
+semantics are defined in
+[`interpretability_benchmark_data_contract.md`](interpretability_benchmark_data_contract.md).
+
 `train_analysis_pool`은 고정된 DAWN 체크포인트의 행동 평가와 RW 연산 공간 해석을 한 item registry에서 관리한다. 분석 대상 데이터는 item ID에 포함되며 별도의 `benchmark` 실행 축은 없다. 파라미터를 갱신하는 downstream fine-tuning은 이 시스템에 포함하지 않는다.
 
 지원 체크포인트 버전:
