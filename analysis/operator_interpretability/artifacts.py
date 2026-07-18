@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -28,10 +29,12 @@ DEFAULT_BENCHMARK_ROOT = (
     "gs://dawn-tpu-data-c4/dataset/operator_interpretability"
 )
 
-# Item artifacts are aggregate audit records, never raw capture containers.
-# Keeping this fail-loud ceiling small prevents a regression back to multi-GB
-# JSON even when a new analysis kind accidentally embeds dense evidence.
-MAX_PROTOCOL_BOUND_JSON_BYTES = 2 * 1024 * 1024
+# Item artifacts should remain aggregate audit records rather than raw capture
+# containers. This threshold is advisory: exceeding it must not discard an
+# otherwise completed analysis run during the final serialization step.
+PROTOCOL_BOUND_JSON_WARNING_BYTES = 2 * 1024 * 1024
+# Compatibility for callers that imported the former hard-limit name.
+MAX_PROTOCOL_BOUND_JSON_BYTES = PROTOCOL_BOUND_JSON_WARNING_BYTES
 
 
 def sha256_path(path: str) -> str:
@@ -182,12 +185,17 @@ def write_protocol_bound_artifact(store: Any, relative_path: str,
     encoded_size = len((json.dumps(
         safe_record, indent=2, sort_keys=True,
         ensure_ascii=False) + "\n").encode("utf-8"))
-    if encoded_size > MAX_PROTOCOL_BOUND_JSON_BYTES:
-        raise RuntimeError(
-            "protocol-bound item JSON exceeds the compact-artifact contract: "
+    if encoded_size > PROTOCOL_BOUND_JSON_WARNING_BYTES:
+        warnings.warn(
+            "protocol-bound item JSON exceeds the advisory compact-artifact "
+            "threshold: "
             f"path={path} bytes={encoded_size} "
-            f"limit={MAX_PROTOCOL_BOUND_JSON_BYTES}; retain only aggregate "
-            "metrics, uncertainty, decisions, counts, and digests")
+            "warning_threshold="
+            f"{PROTOCOL_BOUND_JSON_WARNING_BYTES}; writing the "
+            "artifact so a completed analysis is not discarded",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     write_json_atomic(path, safe_record)
     return path
 

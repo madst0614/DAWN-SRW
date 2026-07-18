@@ -233,7 +233,7 @@ class TrainAnalysisPoolTextReporter:
             "mechanistic_protocol_config: " + json.dumps(
                 dict(mechanistic_protocol_config or {}),
                 sort_keys=True, ensure_ascii=False),
-            f"max_protocol_bound_item_json_bytes: "
+            f"protocol_bound_item_json_warning_bytes: "
             f"{max_item_json_bytes or 'not_applicable'}",
             f"json_summary: {store.path('summary.json')}",
             f"summary_log: {self.report_path}",

@@ -52,7 +52,9 @@ from analysis.operator_interpretability.intervention import (
     evaluate_behavior,
     evaluate_circuit_necessity,
     evaluate_circuit_retention,
-    evaluate_native_operator_program_candidate,
+    evaluate_native_operator_program_causal_diagnostics,
+    evaluate_native_operator_program_phase_baselines,
+    evaluate_native_operator_program_selection_candidate,
     evaluate_operator_interchange,
 )
 from analysis.operator_interpretability.program import (
@@ -62,8 +64,9 @@ from analysis.operator_interpretability.program import (
     compactness_metrics,
     deterministic_mismatch_mapping,
     evaluate_native_program_claims,
+    native_program_diagnostic_checks,
     reindex_program_schedule,
-    select_validation_then_evaluate_test,
+    select_validation_program,
     write_program_schedule_artifact,
 )
 from analysis.operator_interpretability.protocol import (
@@ -666,8 +669,13 @@ class OperatorInterpretabilityRunner:
     def _compact_program_capture(capture: Mapping[str, Any]) -> dict[str, Any]:
         output = dict(capture)
         rows = list(output.pop("rows", ()))
+        ranked_sites = list(output.pop("ranked_sites", ()))
+        output.pop("candidate_count", None)
         output["raw_capture_row_count"] = len(rows)
         output["raw_capture_rows_persisted_in_item_json"] = False
+        output["derived_ranked_site_count"] = int(
+            output.get("derived_ranked_site_count", len(ranked_sites)))
+        output["derived_ranked_sites_persisted_in_item_json"] = False
         output["raw_capture_retention"] = (
             "program_schedule_binary_artifact_and_capture_digest")
         return output
@@ -730,6 +738,11 @@ class OperatorInterpretabilityRunner:
             self.ctx, examples, phase=phase, prompt_side="source",
             seed=seed + 1, **self._program_capture_kwargs())
         widths = capture_schedule_widths((base, source))
+        for capture in (base, source):
+            ranked_sites = capture.pop("ranked_sites", ())
+            capture["derived_ranked_site_count"] = int(
+                capture.pop("candidate_count", len(ranked_sites)))
+            capture["derived_ranked_sites_persisted_in_item_json"] = False
         return base, source, widths
 
     def _run_native_operator_program(self) -> dict[str, Any]:
@@ -805,8 +818,9 @@ class OperatorInterpretabilityRunner:
             self._capture_program_phase(
                 validation_examples, phase="validation",
                 seed=self.config.seed + 20011))
-        validation_candidates = []
+        validation_schedules = {}
         validation_artifacts = {}
+        validation_seeds = {}
         for mass_index, program_mass in enumerate(candidate_masses):
             base_schedule = build_program_schedule(
                 validation_base_capture, validation_examples,
@@ -816,37 +830,129 @@ class OperatorInterpretabilityRunner:
                 validation_source_capture, validation_examples,
                 shape=self.shape, program_mass=program_mass,
                 prompt_side="source", widths=validation_widths)
-            candidate, controls = evaluate_native_operator_program_candidate(
-                self.ctx, validation_examples,
-                base_schedule=base_schedule,
-                source_schedule=source_schedule,
-                shape=self.shape,
-                pad_token_id=int(self.tokenizer.pad_token_id),
-                config=self.config,
-                seed=self.config.seed + 21013 + mass_index * 101,
-            )
-            effect_vectors = candidate.pop("_effect_vectors")
-            effect_artifact = self._write_program_effect_artifact(
-                phase="validation", program_mass=program_mass,
-                vectors=effect_vectors)
-            if effect_artifact is not None:
-                candidate["effect_artifact"] = effect_artifact
-            validation_candidates.append(candidate)
+            validation_schedules[program_mass] = (
+                base_schedule, source_schedule)
+            validation_seeds[program_mass] = (
+                self.config.seed + 21013 + mass_index * 101)
             validation_artifacts[str(program_mass)] = (
                 self._write_program_artifacts(
                     phase="validation", program_mass=program_mass,
                     schedules={
                         "base": base_schedule,
                         "source": source_schedule,
-                        **controls,
                     }))
 
-        selection, test_examples = select_validation_then_evaluate_test(
-            validation_candidates,
-            config=self.config,
-            test_evaluator=lambda _selected_mass: self._known_correct(
-                "mib_ioi", "test"),
+        baseline_base, baseline_source = validation_schedules[
+            candidate_masses[0]]
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=validation "
+            "stage=phase_baselines status=running")
+        validation_baselines = evaluate_native_operator_program_phase_baselines(
+            self.ctx, validation_examples,
+            base_schedule=baseline_base,
+            source_schedule=baseline_source,
+            shape=self.shape,
+            pad_token_id=int(self.tokenizer.pad_token_id),
         )
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=validation "
+            "stage=phase_baselines status=ready")
+
+        validation_selection_candidates = []
+        validation_replay_margins = {}
+        for program_mass in candidate_masses:
+            base_schedule, source_schedule = validation_schedules[program_mass]
+            self._print(
+                "TRAIN_ANALYSIS_POOL native_program phase=validation "
+                f"mass={program_mass:.2f} stage=replay status=running")
+            candidate, replay_margin = (
+                evaluate_native_operator_program_selection_candidate(
+                    self.ctx, validation_examples,
+                    base_schedule=base_schedule,
+                    source_schedule=source_schedule,
+                    baselines=validation_baselines,
+                    shape=self.shape,
+                    pad_token_id=int(self.tokenizer.pad_token_id),
+                    config=self.config,
+                    seed=validation_seeds[program_mass],
+                ))
+            candidate["schedule_artifacts"] = validation_artifacts[
+                str(program_mass)]
+            validation_selection_candidates.append(candidate)
+            validation_replay_margins[program_mass] = replay_margin
+            self._print(
+                "TRAIN_ANALYSIS_POOL native_program phase=validation "
+                f"mass={program_mass:.2f} stage=replay status=ready")
+
+        selection = select_validation_program(
+            validation_selection_candidates, config=self.config)
+        selected_validation_diagnostics = None
+        if selection["status"] == "selected":
+            selected_mass = float(selection["selected_program_mass"])
+            frozen_selection_hash = canonical_hash(selection)
+            self._print(
+                "TRAIN_ANALYSIS_POOL native_program phase=validation "
+                f"mass={selected_mass:.2f} stage=selection status=frozen")
+            selected_base, selected_source = validation_schedules[selected_mass]
+            selected_candidate = next(
+                candidate for candidate in validation_selection_candidates
+                if float(candidate["program_mass"]) == selected_mass)
+            self._print(
+                "TRAIN_ANALYSIS_POOL native_program phase=validation "
+                f"mass={selected_mass:.2f} stage=causal_diagnostics "
+                "status=running")
+            selected_validation_diagnostics, selected_controls = (
+                evaluate_native_operator_program_causal_diagnostics(
+                    self.ctx, validation_examples,
+                    base_schedule=selected_base,
+                    source_schedule=selected_source,
+                    baselines=validation_baselines,
+                    selection_candidate=selected_candidate,
+                    replay_margin=validation_replay_margins[selected_mass],
+                    shape=self.shape,
+                    pad_token_id=int(self.tokenizer.pad_token_id),
+                    config=self.config,
+                    seed=validation_seeds[selected_mass],
+                ))
+            if canonical_hash(selection) != frozen_selection_hash:
+                raise RuntimeError(
+                    "validation causal diagnostics changed frozen selection")
+            effect_vectors = selected_validation_diagnostics.pop(
+                "_effect_vectors")
+            effect_artifact = self._write_program_effect_artifact(
+                phase="validation", program_mass=selected_mass,
+                vectors=effect_vectors)
+            if effect_artifact is not None:
+                selected_validation_diagnostics[
+                    "effect_artifact"] = effect_artifact
+            selected_validation_diagnostics["control_schedule_artifacts"] = (
+                self._write_program_artifacts(
+                    phase="validation", program_mass=selected_mass,
+                    schedules=selected_controls))
+            diagnostic_checks = native_program_diagnostic_checks(
+                selected_validation_diagnostics, config=self.config)
+            selected_validation_diagnostics[
+                "validation_diagnostic_checks"] = diagnostic_checks
+            selected_validation_diagnostics[
+                "selected_validation_diagnostics_hash"] = canonical_hash({
+                    "program_mass": selected_mass,
+                    "checks": diagnostic_checks,
+                    "ablation": selected_validation_diagnostics["ablation"],
+                    "source_id_replay": selected_validation_diagnostics[
+                        "source_id_replay"],
+                    "transplant": selected_validation_diagnostics[
+                        "transplant"],
+                })
+            selected_validation_diagnostics["selection_record_hash"] = (
+                selection["selection_record_hash"])
+            self._print(
+                "TRAIN_ANALYSIS_POOL native_program phase=validation "
+                f"mass={selected_mass:.2f} stage=causal_diagnostics "
+                "status=ready")
+        else:
+            self._print(
+                "TRAIN_ANALYSIS_POOL native_program phase=validation "
+                "stage=selection status=no_compact_program")
         common = {
             "program_algorithm_version": PROGRAM_ALGORITHM_VERSION,
             "program_mass_candidates": list(candidate_masses),
@@ -858,6 +964,16 @@ class OperatorInterpretabilityRunner:
             "program_mismatch_matching": (
                 self.config.program_mismatch_matching),
             "program_random_sampling": self.config.program_random_sampling,
+            "execution_plan": {
+                "phase_baselines_computed_once_per_phase": True,
+                "validation_selection_evaluator": "replay_only",
+                "validation_full_diagnostic_evaluations": (
+                    1 if selection["status"] == "selected" else 0),
+                "test_full_diagnostic_evaluation_limit": 1,
+                "positive_negative_margin_fusion": False,
+                "mass_replay_batching": False,
+                "contribution_capture_batching": False,
+            },
             "discovery": {
                 "status": "ready",
                 "example_count": len(discovery_examples),
@@ -871,13 +987,13 @@ class OperatorInterpretabilityRunner:
             "validation": {
                 "status": "ready",
                 "example_count": len(validation_examples),
-                "candidates": validation_candidates,
+                "selection_candidates": validation_selection_candidates,
                 "selection": selection,
+                "selected_diagnostics": selected_validation_diagnostics,
                 "base_capture": self._compact_program_capture(
                     validation_base_capture),
                 "source_capture": self._compact_program_capture(
                     validation_source_capture),
-                "schedule_artifacts": validation_artifacts,
             },
             "test_used_for_selection": False,
             "test_program_executable_called_before_selection": False,
@@ -897,9 +1013,12 @@ class OperatorInterpretabilityRunner:
             }
 
         selected_mass = float(selection["selected_program_mass"])
-        # select_validation_then_evaluate_test makes the test data path
-        # unreachable until the validation selection record is frozen.
-        assert test_examples is not None
+        if selected_validation_diagnostics is None:
+            raise RuntimeError(
+                "selected validation mass has no causal diagnostics")
+        # Test access stays unreachable until selection is frozen and the
+        # selected validation diagnostics have completed.
+        test_examples = self._known_correct("mib_ioi", "test")
         if len(test_examples) < minimum:
             return {
                 **common,
@@ -927,15 +1046,56 @@ class OperatorInterpretabilityRunner:
             test_source_capture, test_examples,
             shape=self.shape, program_mass=selected_mass,
             prompt_side="source", widths=test_widths)
-        test_result, test_controls = evaluate_native_operator_program_candidate(
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=test "
+            f"mass={selected_mass:.2f} stage=phase_baselines status=running")
+        test_baselines = evaluate_native_operator_program_phase_baselines(
             self.ctx, test_examples,
             base_schedule=test_base_schedule,
             source_schedule=test_source_schedule,
             shape=self.shape,
             pad_token_id=int(self.tokenizer.pad_token_id),
-            config=self.config,
-            seed=self.config.seed + 31033,
         )
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=test "
+            f"mass={selected_mass:.2f} stage=phase_baselines status=ready")
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=test "
+            f"mass={selected_mass:.2f} stage=replay status=running")
+        test_selection_candidate, test_replay_margin = (
+            evaluate_native_operator_program_selection_candidate(
+                self.ctx, test_examples,
+                base_schedule=test_base_schedule,
+                source_schedule=test_source_schedule,
+                baselines=test_baselines,
+                shape=self.shape,
+                pad_token_id=int(self.tokenizer.pad_token_id),
+                config=self.config,
+                seed=self.config.seed + 31033,
+            ))
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=test "
+            f"mass={selected_mass:.2f} stage=replay status=ready")
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=test "
+            f"mass={selected_mass:.2f} stage=causal_diagnostics "
+            "status=running")
+        test_result, test_controls = (
+            evaluate_native_operator_program_causal_diagnostics(
+                self.ctx, test_examples,
+                base_schedule=test_base_schedule,
+                source_schedule=test_source_schedule,
+                baselines=test_baselines,
+                selection_candidate=test_selection_candidate,
+                replay_margin=test_replay_margin,
+                shape=self.shape,
+                pad_token_id=int(self.tokenizer.pad_token_id),
+                config=self.config,
+                seed=self.config.seed + 31033,
+            ))
+        self._print(
+            "TRAIN_ANALYSIS_POOL native_program phase=test "
+            f"mass={selected_mass:.2f} stage=causal_diagnostics status=ready")
         test_effect_vectors = test_result.pop("_effect_vectors")
         test_effect_artifact = self._write_program_effect_artifact(
             phase="test", program_mass=selected_mass,

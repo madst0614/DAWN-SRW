@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import numbers
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 import jax
@@ -14,7 +16,10 @@ from analysis.dawn_analysis_common import (
     materialize_global_array,
     materialize_global_tree,
 )
-from analysis.operator_interpretability.benchmark_schema import BenchmarkExample
+from analysis.operator_interpretability.benchmark_schema import (
+    BenchmarkExample,
+    canonical_hash,
+)
 from analysis.operator_interpretability.circuit import (
     bootstrap_faithfulness_ci,
     normalized_faithfulness,
@@ -923,24 +928,77 @@ def _direction_metrics(before: np.ndarray, after: np.ndarray) -> dict[str, Any]:
     }
 
 
-def evaluate_native_operator_program_candidate(
-        ctx: Any, examples: Sequence[BenchmarkExample], *,
+@dataclass(frozen=True)
+class NativeProgramPhaseBaselines:
+    """Mass-independent native-program margins frozen for one data phase."""
+
+    full_base_margin: np.ndarray
+    corrupted_margin: np.ndarray
+    before_base_to_source: np.ndarray
+    before_source_to_base: np.ndarray
+    example_ids: tuple[str, ...] = ()
+    phase: str = ""
+
+    def __post_init__(self) -> None:
+        expected_shape: tuple[int, ...] | None = None
+        for name in (
+                "full_base_margin", "corrupted_margin",
+                "before_base_to_source", "before_source_to_base"):
+            value = np.array(getattr(self, name), dtype=np.float64, copy=True)
+            if value.ndim != 1 or value.size == 0:
+                raise ValueError(
+                    f"native program phase baseline {name} must be nonempty 1D")
+            if not np.all(np.isfinite(value)):
+                raise ValueError(
+                    f"native program phase baseline {name} is non-finite")
+            if expected_shape is None:
+                expected_shape = value.shape
+            elif value.shape != expected_shape:
+                raise ValueError("native program phase baseline shapes differ")
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+        example_ids = tuple(str(value) for value in self.example_ids)
+        if example_ids and len(example_ids) != int(expected_shape[0]):
+            raise ValueError(
+                "native program phase baseline example ids are not aligned")
+        object.__setattr__(self, "example_ids", example_ids)
+        object.__setattr__(self, "phase", str(self.phase))
+
+
+def _validate_native_operator_program_phase(
+        examples: Sequence[BenchmarkExample], *,
         base_schedule: OperatorProgramSchedule,
         source_schedule: OperatorProgramSchedule,
-        shape: OperatorSpaceShape, pad_token_id: int,
-        config: ProtocolConfig, seed: int,
-) -> tuple[dict[str, Any], dict[str, OperatorProgramSchedule]]:
-    """Evaluate one mass with paired, mismatched, and random programs."""
+        shape: OperatorSpaceShape) -> tuple[str, ...]:
     if not examples or any(
             example.benchmark_id != "mib_ioi"
             or example.pair_type != "s2_io_flip_counterfactual"
             for example in examples):
         raise ValueError(
             "native operator programs require official paired IOI examples")
-    if tuple(example.example_id for example in examples) != (
-            base_schedule.example_ids) or base_schedule.example_ids != (
-                source_schedule.example_ids):
+    example_ids = tuple(example.example_id for example in examples)
+    if example_ids != base_schedule.example_ids or base_schedule.example_ids != (
+            source_schedule.example_ids):
         raise ValueError("base/source programs are not example-aligned")
+    phases = {str(example.phase) for example in examples}
+    if len(phases) != 1:
+        raise ValueError("native operator program examples span multiple phases")
+    for example in examples:
+        orientation = (
+            tuple(example.intervention_positive_ids)
+                == tuple(example.negative_ids),
+            tuple(example.intervention_negative_ids)
+                == tuple(example.positive_ids),
+            tuple(example.source_negative_ids) == tuple(example.positive_ids),
+            tuple(example.source_positive_ids) == tuple(example.negative_ids),
+        )
+        if not all(orientation):
+            raise ValueError(
+                f"{example.example_id}: IOI answer orientation contract failed")
+    if base_schedule.prompt_side != "base":
+        raise ValueError("native operator base schedule has the wrong side")
+    if source_schedule.prompt_side != "source":
+        raise ValueError("native operator source schedule has the wrong side")
     base_schedule.validate(shape)
     source_schedule.validate(shape)
     if base_schedule.program_mass != source_schedule.program_mass:
@@ -948,6 +1006,165 @@ def evaluate_native_operator_program_candidate(
     if _candidate_score_normalization(examples) != "sum_log_probability":
         raise ValueError(
             "IOI native program requires sum_log_probability scoring")
+    return example_ids
+
+
+def _validate_native_program_phase_baselines(
+        baselines: NativeProgramPhaseBaselines,
+        examples: Sequence[BenchmarkExample]) -> None:
+    if not isinstance(baselines, NativeProgramPhaseBaselines):
+        raise TypeError("native program phase baselines have the wrong type")
+    example_ids = tuple(example.example_id for example in examples)
+    if baselines.example_ids and baselines.example_ids != example_ids:
+        raise ValueError("native program phase baselines use different examples")
+    if baselines.phase and baselines.phase != str(examples[0].phase):
+        raise ValueError("native program phase baselines use a different phase")
+    if baselines.full_base_margin.shape != (len(examples),):
+        raise ValueError("native program phase baselines have the wrong length")
+
+
+def _native_program_replay_summary(
+        replay_margin: np.ndarray, baselines: NativeProgramPhaseBaselines, *,
+        config: ProtocolConfig, seed: int) -> dict[str, Any]:
+    full_base_margin = baselines.full_base_margin
+    corrupted_margin = baselines.corrupted_margin
+    faithfulness = normalized_faithfulness(
+        float(np.mean(replay_margin)), float(np.mean(full_base_margin)),
+        float(np.mean(corrupted_margin)))
+    if faithfulness is None:
+        raise RuntimeError("native program faithfulness endpoint is undefined")
+    return {
+        "full_base_margin_mean": float(np.mean(full_base_margin)),
+        "replay_base_margin_mean": float(np.mean(replay_margin)),
+        "answer_agreement_with_full": float(np.mean(
+            (replay_margin > 0.0) == (full_base_margin > 0.0))),
+        "accuracy": float(np.mean(replay_margin > 0.0)),
+        "normalized_faithfulness": float(faithfulness),
+        "faithfulness_ci": bootstrap_faithfulness_ci(
+            replay_margin, full_base_margin, corrupted_margin,
+            samples=config.bootstrap_samples, alpha=config.alpha,
+            seed=seed + 307),
+        "faithfulness_endpoint": config.program_faithfulness_endpoint,
+    }
+
+
+def evaluate_native_operator_program_phase_baselines(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        base_schedule: OperatorProgramSchedule,
+        source_schedule: OperatorProgramSchedule,
+        shape: OperatorSpaceShape, pad_token_id: int,
+) -> NativeProgramPhaseBaselines:
+    """Evaluate the four production margins exactly once for a phase."""
+    example_ids = _validate_native_operator_program_phase(
+        examples, base_schedule=base_schedule, source_schedule=source_schedule,
+        shape=shape)
+    mode0 = PROGRAM_MODES["production"]
+    full_base_margin = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    corrupted_margin = _program_margin(
+        ctx, examples, source_schedule, prompt_side="source",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    before_base_to_source = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="intervention_positive",
+        negative_side="intervention_negative",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    before_source_to_base = _program_margin(
+        ctx, examples, source_schedule, prompt_side="source",
+        positive_side="source_negative", negative_side="source_positive",
+        pad_token_id=pad_token_id, program_mode=mode0)
+    return NativeProgramPhaseBaselines(
+        full_base_margin=full_base_margin,
+        corrupted_margin=corrupted_margin,
+        before_base_to_source=before_base_to_source,
+        before_source_to_base=before_source_to_base,
+        example_ids=example_ids,
+        phase=str(examples[0].phase),
+    )
+
+
+def evaluate_native_operator_program_selection_candidate(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        base_schedule: OperatorProgramSchedule,
+        source_schedule: OperatorProgramSchedule,
+        baselines: NativeProgramPhaseBaselines,
+        shape: OperatorSpaceShape, pad_token_id: int,
+        config: ProtocolConfig, seed: int,
+) -> tuple[dict[str, Any], np.ndarray]:
+    """Evaluate only the replay and compactness gates used to select mass."""
+    _validate_native_operator_program_phase(
+        examples, base_schedule=base_schedule, source_schedule=source_schedule,
+        shape=shape)
+    _validate_native_program_phase_baselines(baselines, examples)
+    replay_margin = _program_margin(
+        ctx, examples, base_schedule, prompt_side="base",
+        positive_side="positive", negative_side="negative",
+        pad_token_id=pad_token_id,
+        program_mode=PROGRAM_MODES["own_id_replay"])
+    replay_margin = np.asarray(replay_margin, dtype=np.float64)
+    replay = _native_program_replay_summary(
+        replay_margin, baselines, config=config, seed=seed)
+    compactness = compactness_metrics(
+        base_schedule, shape=shape, paired_schedule=source_schedule)
+    return {
+        "status": "ready",
+        "phase": str(examples[0].phase),
+        "program_mass": float(base_schedule.program_mass),
+        "example_count": len(examples),
+        "decision_scope": "final_ioi_decision_at_answer_position",
+        "program_position_scope": config.program_position_scope,
+        "program_routes": list(config.program_routes),
+        "program_denominator_policy": config.program_denominator_policy,
+        "candidate_score_normalization": "sum_log_probability",
+        "selection_only": True,
+        "causal_diagnostics_evaluated": False,
+        "compactness": compactness,
+        "replay": replay,
+    }, replay_margin
+
+
+def evaluate_native_operator_program_causal_diagnostics(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        base_schedule: OperatorProgramSchedule,
+        source_schedule: OperatorProgramSchedule,
+        baselines: NativeProgramPhaseBaselines,
+        selection_candidate: Mapping[str, Any],
+        replay_margin: np.ndarray,
+        shape: OperatorSpaceShape, pad_token_id: int,
+        config: ProtocolConfig, seed: int,
+) -> tuple[dict[str, Any], dict[str, OperatorProgramSchedule]]:
+    """Run controls and causal diagnostics for one already-frozen mass."""
+    _validate_native_operator_program_phase(
+        examples, base_schedule=base_schedule, source_schedule=source_schedule,
+        shape=shape)
+    _validate_native_program_phase_baselines(baselines, examples)
+    if float(selection_candidate.get("program_mass", -1.0)) != float(
+            base_schedule.program_mass):
+        raise ValueError("selection replay and diagnostic program masses differ")
+    if str(selection_candidate.get("phase")) != str(examples[0].phase):
+        raise ValueError("selection replay and diagnostic phases differ")
+    if int(selection_candidate.get("example_count", -1)) != len(examples):
+        raise ValueError("selection replay and diagnostic examples differ")
+    if selection_candidate.get("selection_only") is not True:
+        raise ValueError("causal diagnostics require a selection-only replay")
+    if selection_candidate.get("causal_diagnostics_evaluated") is not False:
+        raise ValueError("selection replay already contains causal diagnostics")
+    replay_margin = np.asarray(replay_margin, dtype=np.float64)
+    if replay_margin.shape != (len(examples),):
+        raise ValueError("selection replay margin has the wrong shape")
+    expected_replay = _native_program_replay_summary(
+        replay_margin, baselines, config=config, seed=seed)
+    if canonical_hash(expected_replay) != canonical_hash(
+            selection_candidate.get("replay")):
+        raise ValueError("selection replay metrics do not match replay margins")
+    replay = copy.deepcopy(dict(selection_candidate["replay"]))
+    full_base_margin = baselines.full_base_margin
+    corrupted_margin = baselines.corrupted_margin
+    before_b2s = baselines.before_base_to_source
+    before_s2b = baselines.before_source_to_base
 
     mismatch_source_mapping = deterministic_mismatch_mapping(
         examples, source_schedule, seed=seed + 101)
@@ -992,39 +1209,6 @@ def evaluate_native_operator_program_candidate(
         ctx, examples, random_base, prompt_side="base",
         pad_token_id=pad_token_id)
 
-    mode0 = PROGRAM_MODES["production"]
-    full_base_margin = _program_margin(
-        ctx, examples, base_schedule, prompt_side="base",
-        positive_side="positive", negative_side="negative",
-        pad_token_id=pad_token_id, program_mode=mode0)
-    corrupted_margin = _program_margin(
-        ctx, examples, source_schedule, prompt_side="source",
-        positive_side="positive", negative_side="negative",
-        pad_token_id=pad_token_id, program_mode=mode0)
-    replay_margin = _program_margin(
-        ctx, examples, base_schedule, prompt_side="base",
-        positive_side="positive", negative_side="negative",
-        pad_token_id=pad_token_id,
-        program_mode=PROGRAM_MODES["own_id_replay"])
-    faithfulness = normalized_faithfulness(
-        float(np.mean(replay_margin)), float(np.mean(full_base_margin)),
-        float(np.mean(corrupted_margin)))
-    if faithfulness is None:
-        raise RuntimeError("native program faithfulness endpoint is undefined")
-    replay = {
-        "full_base_margin_mean": float(np.mean(full_base_margin)),
-        "replay_base_margin_mean": float(np.mean(replay_margin)),
-        "answer_agreement_with_full": float(np.mean(
-            (replay_margin > 0.0) == (full_base_margin > 0.0))),
-        "accuracy": float(np.mean(replay_margin > 0.0)),
-        "normalized_faithfulness": float(faithfulness),
-        "faithfulness_ci": bootstrap_faithfulness_ci(
-            replay_margin, full_base_margin, corrupted_margin,
-            samples=config.bootstrap_samples, alpha=config.alpha,
-            seed=seed + 307),
-        "faithfulness_endpoint": config.program_faithfulness_endpoint,
-    }
-
     own_ablated = _program_margin(
         ctx, examples, base_schedule, prompt_side="base",
         positive_side="positive", negative_side="negative",
@@ -1062,16 +1246,6 @@ def evaluate_native_operator_program_candidate(
                 own_drop, random_drop, config=config, seed=seed + 457),
         },
     }
-
-    before_b2s = _program_margin(
-        ctx, examples, base_schedule, prompt_side="base",
-        positive_side="intervention_positive",
-        negative_side="intervention_negative",
-        pad_token_id=pad_token_id, program_mode=mode0)
-    before_s2b = _program_margin(
-        ctx, examples, source_schedule, prompt_side="source",
-        positive_side="source_negative", negative_side="source_positive",
-        pad_token_id=pad_token_id, program_mode=mode0)
 
     def direction(
             schedule, prompt_side, positive_side, negative_side, mode,
@@ -1211,6 +1385,22 @@ def evaluate_native_operator_program_candidate(
     compactness = compactness_metrics(
         base_schedule, shape=shape, paired_schedule=source_schedule,
         mismatched_schedule=mismatch_base)
+    selection_compactness = selection_candidate.get("compactness")
+    if not isinstance(selection_compactness, Mapping):
+        raise ValueError("selection replay is missing compactness metrics")
+    selection_keys = (
+        "scope", "decision_position_site_fraction",
+        "median_decision_position_site_fraction",
+        "mean_decision_position_site_fraction",
+        "per_route_decision_position_site_fraction",
+        "union_decision_position_fraction_vs_example_count",
+        "same_pair_route_overlap",
+    )
+    if canonical_hash({
+            key: selection_compactness.get(key) for key in selection_keys
+    }) != canonical_hash({key: compactness.get(key) for key in selection_keys}):
+        raise ValueError(
+            "selection replay and causal diagnostic compactness differ")
     result = {
         "status": "ready",
         "phase": examples[0].phase,
@@ -1221,6 +1411,8 @@ def evaluate_native_operator_program_candidate(
         "program_routes": list(config.program_routes),
         "program_denominator_policy": config.program_denominator_policy,
         "candidate_score_normalization": "sum_log_probability",
+        "selection_replay_reused": True,
+        "causal_diagnostics_evaluated": True,
         "compactness": compactness,
         "replay": replay,
         "ablation": ablation,
@@ -1288,3 +1480,29 @@ def evaluate_native_operator_program_candidate(
         "random_base": random_base,
     }
     return result, controls
+
+
+def evaluate_native_operator_program_candidate(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        base_schedule: OperatorProgramSchedule,
+        source_schedule: OperatorProgramSchedule,
+        shape: OperatorSpaceShape, pad_token_id: int,
+        config: ProtocolConfig, seed: int,
+) -> tuple[dict[str, Any], dict[str, OperatorProgramSchedule]]:
+    """Compatibility entrypoint for a single full native-program evaluation."""
+    baselines = evaluate_native_operator_program_phase_baselines(
+        ctx, examples, base_schedule=base_schedule,
+        source_schedule=source_schedule, shape=shape,
+        pad_token_id=pad_token_id)
+    selection_candidate, replay_margin = (
+        evaluate_native_operator_program_selection_candidate(
+            ctx, examples, base_schedule=base_schedule,
+            source_schedule=source_schedule, baselines=baselines,
+            shape=shape, pad_token_id=pad_token_id,
+            config=config, seed=seed))
+    return evaluate_native_operator_program_causal_diagnostics(
+        ctx, examples, base_schedule=base_schedule,
+        source_schedule=source_schedule, baselines=baselines,
+        selection_candidate=selection_candidate,
+        replay_margin=replay_margin, shape=shape,
+        pad_token_id=pad_token_id, config=config, seed=seed)

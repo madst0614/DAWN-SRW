@@ -14,7 +14,9 @@ import numpy as np
 
 from analysis.dawn_analysis_storage import AnalysisStore
 from analysis.operator_interpretability.intervention import (
-    evaluate_native_operator_program_candidate,
+    evaluate_native_operator_program_causal_diagnostics,
+    evaluate_native_operator_program_phase_baselines,
+    evaluate_native_operator_program_selection_candidate,
 )
 from analysis.operator_interpretability.program import (
     OperatorProgramSchedule,
@@ -22,6 +24,7 @@ from analysis.operator_interpretability.program import (
     deterministic_mismatch_mapping,
     evaluate_native_program_claims,
     load_program_schedule_artifact,
+    native_program_diagnostic_checks,
     select_validation_program,
     select_validation_then_evaluate_test,
     write_program_schedule_artifact,
@@ -273,16 +276,11 @@ def _asymmetric_capture_rows(examples, shape, *, prompt_side: str):
     return {"status": "ready", "rows": rows}
 
 
-def _validation_candidate(
-        mass: float, *, replay_passing: bool, causal_passing: bool):
-    sign = 1.0 if causal_passing else -1.0
-    p_value = 0.01 if causal_passing else 0.5
-    advantage = {
-        "effect_ci": {"ci_low": sign},
-        "permutation": {"p_value_two_sided": p_value},
-    }
+def _validation_candidate(mass: float, *, replay_passing: bool):
     return {
         "program_mass": mass,
+        "selection_only": True,
+        "causal_diagnostics_evaluated": False,
         "compactness": {
             "median_decision_position_site_fraction": 0.1},
         "replay": {
@@ -290,31 +288,6 @@ def _validation_candidate(
                 "ci_low": 0.9 if replay_passing else 0.7},
             "answer_agreement_with_full": (
                 1.0 if replay_passing else 0.0),
-        },
-        "ablation": {
-            "own_program": {
-                "margin_drop_ci": {"ci_low": sign},
-                "permutation": {"p_value_two_sided": p_value},
-            },
-            "specificity": {
-                "own_vs_mismatched": dict(advantage),
-                "own_vs_random": dict(advantage),
-            },
-        },
-        "source_id_replay": {
-            "paired_vs_mismatch": dict(advantage),
-            "paired_vs_random": dict(advantage),
-            "bidirectional_answer_flip_fraction": (
-                1.0 if causal_passing else 0.0),
-        },
-        "transplant": {
-            "paired_vs_mismatch": {
-                "effect_ci": {"ci_low": sign},
-                "permutation": {"p_value_two_sided": p_value},
-            },
-            "paired_vs_random": dict(advantage),
-            "bidirectional_answer_flip_fraction": (
-                1.0 if causal_passing else 0.0),
         },
     }
 
@@ -348,8 +321,7 @@ def test_program_artifact_and_freeze_contracts() -> None:
     config = ProtocolConfig(
         bootstrap_samples=100, permutation_samples=100)
     candidates = [
-        _validation_candidate(
-            mass, replay_passing=(mass >= 0.8), causal_passing=False)
+        _validation_candidate(mass, replay_passing=(mass >= 0.8))
         for mass in config.program_mass_candidates
     ]
     selected = select_validation_program(candidates, config=config)
@@ -360,8 +332,9 @@ def test_program_artifact_and_freeze_contracts() -> None:
         row for row in candidates if row["program_mass"] == 0.8)
     assert set(selected_candidate["validation_selection_checks"]) == {
         "replay_faithfulness_ci", "replay_answer_agreement", "compactness"}
-    assert not all(
-        selected_candidate["validation_diagnostic_checks"].values())
+    assert "validation_diagnostic_checks" not in selected_candidate
+    assert "selected_validation_diagnostics_hash" not in selected
+    assert selected["selection_record_hash"]
     frozen = selected["selected_program_mass"]
     assert frozen in config.program_mass_candidates
 
@@ -451,6 +424,7 @@ def test_paired_controls_and_claim_gate_integration() -> None:
         for route in ROUTES)
 
     ablation_schedule_hashes: list[str] = []
+    program_mode_calls: list[int] = []
 
     def fake_capture(
             _ctx, capture_examples, _schedule, *, prompt_side,
@@ -468,6 +442,7 @@ def test_paired_controls_and_claim_gate_integration() -> None:
             positive_side, negative_side, pad_token_id, program_mode,
             source=None):
         del prompt_side, negative_side, pad_token_id, source
+        program_mode_calls.append(int(program_mode))
         count = len(margin_examples)
         if program_mode == 0:
             if positive_side in {"intervention_positive", "source_negative"}:
@@ -514,15 +489,54 @@ def test_paired_controls_and_claim_gate_integration() -> None:
             side_effect=fake_capture), patch(
                 "analysis.operator_interpretability.intervention."
                 "_program_margin", side_effect=fake_margin):
-        result, controls = evaluate_native_operator_program_candidate(
+        baselines = evaluate_native_operator_program_phase_baselines(
             object(), examples,
             base_schedule=base_schedule,
             source_schedule=source_schedule,
             shape=shape,
             pad_token_id=0,
+        )
+        selection_candidate, replay_margin = (
+            evaluate_native_operator_program_selection_candidate(
+                object(), examples,
+                base_schedule=base_schedule,
+                source_schedule=source_schedule,
+                baselines=baselines,
+                shape=shape,
+                pad_token_id=0,
+                config=config,
+                seed=4172,
+            ))
+        assert set(selection_candidate).isdisjoint({
+            "ablation", "source_id_replay", "transplant", "random_control"})
+        result, controls = evaluate_native_operator_program_causal_diagnostics(
+            object(), examples,
+            base_schedule=base_schedule,
+            source_schedule=source_schedule,
+            baselines=baselines,
+            selection_candidate=selection_candidate,
+            replay_margin=replay_margin,
+            shape=shape,
+            pad_token_id=0,
             config=config,
             seed=4172,
         )
+
+    assert all(not value.flags.writeable for value in (
+        baselines.full_base_margin,
+        baselines.corrupted_margin,
+        baselines.before_base_to_source,
+        baselines.before_source_to_base,
+    ))
+    assert {mode: program_mode_calls.count(mode) for mode in range(5)} == {
+        0: 4,
+        1: 1,
+        2: 3,
+        3: 6,
+        4: 6,
+    }
+    assert all(native_program_diagnostic_checks(
+        result, config=config).values())
 
     for name in ("own_vs_mismatched", "own_vs_random"):
         stats = result["ablation"]["specificity"][name]
@@ -629,8 +643,7 @@ def test_validation_selection_precedes_single_test_call() -> None:
         return {"selected_mass": selected_mass}
 
     failing = [
-        _validation_candidate(
-            mass, replay_passing=False, causal_passing=True)
+        _validation_candidate(mass, replay_passing=False)
         for mass in config.program_mass_candidates
     ]
     selection, test_result = select_validation_then_evaluate_test(
@@ -640,8 +653,7 @@ def test_validation_selection_precedes_single_test_call() -> None:
     assert calls == []
 
     passing = [
-        _validation_candidate(
-            mass, replay_passing=(mass >= 0.8), causal_passing=False)
+        _validation_candidate(mass, replay_passing=(mass >= 0.8))
         for mass in config.program_mass_candidates
     ]
     selection, test_result = select_validation_then_evaluate_test(

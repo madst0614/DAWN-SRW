@@ -41,7 +41,7 @@ from analysis.dawn_analysis_storage import (
 )
 from analysis.operator_interpretability.artifacts import (
     DEFAULT_BENCHMARK_ROOT,
-    MAX_PROTOCOL_BOUND_JSON_BYTES,
+    PROTOCOL_BOUND_JSON_WARNING_BYTES,
     resolve_benchmark_build,
     write_protocol_bound_artifact,
 )
@@ -572,8 +572,8 @@ def main() -> int:
         "run_semantics": "independent_checkpoint_step_preset_invocation",
         "raw_parameters_persisted": False,
         "dense_capture_rows_persisted": False,
-        "max_protocol_bound_item_json_bytes": (
-            MAX_PROTOCOL_BOUND_JSON_BYTES),
+        "protocol_bound_item_json_warning_bytes": (
+            PROTOCOL_BOUND_JSON_WARNING_BYTES),
     }
     if store.is_primary:
         write_json_atomic(store.path("run_manifest.json"), run_manifest)
@@ -596,7 +596,7 @@ def main() -> int:
         benchmark_manifest_path=(
             benchmark_build.manifest_path if mechanistic_items else None),
         checkpoint_config_hash=checkpoint_config_hash,
-        max_item_json_bytes=MAX_PROTOCOL_BOUND_JSON_BYTES,
+        max_item_json_bytes=PROTOCOL_BOUND_JSON_WARNING_BYTES,
         mechanistic_protocol_config=(
             mechanistic_protocol.to_dict()
             if mechanistic_protocol is not None else None),
@@ -684,8 +684,8 @@ def main() -> int:
         "run_semantics": "independent_checkpoint_step_preset_invocation",
         "raw_parameters_persisted": False,
         "dense_capture_rows_persisted": False,
-        "max_protocol_bound_item_json_bytes": (
-            MAX_PROTOCOL_BOUND_JSON_BYTES),
+        "protocol_bound_item_json_warning_bytes": (
+            PROTOCOL_BOUND_JSON_WARNING_BYTES),
     }
     sync_hosts("train_analysis_pool_complete")
     if store.is_primary:
