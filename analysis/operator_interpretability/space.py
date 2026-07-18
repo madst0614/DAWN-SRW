@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
-from analysis.dawn_analysis_common import analysis_model_module
+from analysis.dawn_analysis_common import (
+    analysis_model_module,
+    materialize_global_array,
+)
 
 
 def candidate_pool_vectors(
@@ -29,9 +31,9 @@ def candidate_pool_vectors(
     index = jnp.asarray(ids, dtype=jnp.int32)
     return {
         "operator_ids": ids,
-        "read": np.asarray(jax.device_get(pool[f"{prefix}_read"][index])),
-        "write": np.asarray(jax.device_get(pool[f"{prefix}_write"][index])),
-        "address": np.asarray(jax.device_get(pool[f"{prefix}_op_key"][index])),
+        "read": materialize_global_array(pool[f"{prefix}_read"][index]),
+        "write": materialize_global_array(pool[f"{prefix}_write"][index]),
+        "address": materialize_global_array(pool[f"{prefix}_op_key"][index]),
     }
 
 

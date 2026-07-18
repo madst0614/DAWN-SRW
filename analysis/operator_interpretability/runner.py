@@ -9,7 +9,11 @@ import jax
 import numpy as np
 from transformers import AutoTokenizer
 
-from analysis.dawn_analysis_common import analysis_model_module, git_info
+from analysis.dawn_analysis_common import (
+    analysis_model_module,
+    git_info,
+    materialize_global_array,
+)
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
     load_protocol_bound_artifact,
@@ -824,7 +828,8 @@ class OperatorInterpretabilityRunner:
                 "rst_read", "rst_write", "rst_op_key",
             )
             self._pool_host = {
-                name: np.asarray(jax.device_get(pool[name]), dtype=np.float64)
+                name: np.asarray(
+                    materialize_global_array(pool[name]), dtype=np.float64)
                 for name in names
             }
         return self._pool_host

@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from analysis.dawn_analysis_common import materialize_global_array
 from analysis.operator_interpretability.benchmark_schema import BenchmarkExample
 from analysis.operator_interpretability.units import (
     OperatorCircuit,
@@ -224,8 +225,8 @@ def evaluate_behavior(ctx: Any, examples: Sequence[BenchmarkExample], *,
             examples, prompt_side=prompt_side, answer_side=answer_side,
             pad_token_id=pad_token_id, multiple=multiple)
         ids, labels = _device_batch(ctx, arrays[0], arrays[1])
-        return np.asarray(jax.device_get(score(ctx.params, ids, labels)))[
-            :arrays[2]].astype(np.float64)
+        return materialize_global_array(
+            score(ctx.params, ids, labels))[:arrays[2]].astype(np.float64)
 
     base_positive = run("base", "positive")
     base_negative = run("base", "negative")
@@ -244,8 +245,8 @@ def evaluate_behavior(ctx: Any, examples: Sequence[BenchmarkExample], *,
                 scored_examples, prompt_side="source", answer_side=answer_side,
                 pad_token_id=pad_token_id, multiple=multiple)
             ids, labels = _device_batch(ctx, arrays[0], arrays[1])
-            return np.asarray(jax.device_get(score(ctx.params, ids, labels)))[
-                :arrays[2]].astype(np.float64)
+            return materialize_global_array(
+                score(ctx.params, ids, labels))[:arrays[2]].astype(np.float64)
 
         source_own_margin[source_scored] = (
             run_source("source_positive") - run_source("source_negative"))
@@ -317,7 +318,7 @@ def evaluate_circuit_retention(
             ctx.params, ids, labels,
             jnp.asarray(masks["qk"]), jnp.asarray(masks["v"]),
             jnp.asarray(masks["rst"]))
-        return np.asarray(jax.device_get(value))[:arrays[2]].astype(np.float64)
+        return materialize_global_array(value)[:arrays[2]].astype(np.float64)
 
     positive = run("positive")
     negative = run("negative")
@@ -357,7 +358,7 @@ def evaluate_circuit_necessity(
             ctx.params, ids, labels,
             jnp.asarray(complement["qk"]), jnp.asarray(complement["v"]),
             jnp.asarray(complement["rst"]))
-        return np.asarray(jax.device_get(value))[:arrays[2]].astype(np.float64)
+        return materialize_global_array(value)[:arrays[2]].astype(np.float64)
 
     positive = run("positive")
     negative = run("negative")
@@ -385,10 +386,10 @@ def all_ones_retention_parity(ctx: Any, examples: Sequence[BenchmarkExample], *,
     ones_qk = jnp.ones((shape.n_layers, 2, shape.n_qk), dtype=jnp.bool_)
     ones_v = jnp.ones((shape.n_layers, shape.n_v), dtype=jnp.bool_)
     ones_rst = jnp.ones((shape.n_layers, shape.n_rst), dtype=jnp.bool_)
-    before = jax.device_get(plain(ctx.params, ids, labels))
-    after = jax.device_get(retained(
+    before = materialize_global_array(plain(ctx.params, ids, labels))
+    after = materialize_global_array(retained(
         ctx.params, ids, labels, ones_qk, ones_v, ones_rst))
-    exact = bool(np.array_equal(np.asarray(before), np.asarray(after)))
+    exact = bool(np.array_equal(before, after))
     if not exact:
         raise RuntimeError("all-ones circuit retention parity is not machine-exact")
     return {
@@ -502,7 +503,7 @@ def evaluate_operator_interchange(
                 source_contribution)
         else:
             value = plain(ctx.params, ids, labels)
-        return np.asarray(jax.device_get(value))[:arrays[2]].astype(np.float64)
+        return materialize_global_array(value)[:arrays[2]].astype(np.float64)
 
     base_base = scores("base", "positive", patch=False) - scores(
         "base", "negative", patch=False)

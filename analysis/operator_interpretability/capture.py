@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from analysis.dawn_analysis_common import materialize_global_tree
 from analysis.dawn_analysis_trace import topk_trace_forward
 from analysis.operator_interpretability.benchmark_schema import (
     BenchmarkExample,
@@ -105,7 +106,7 @@ def _capture_operator_paths(
     retries = 0
     capture_history: list[dict[str, Any]] = []
     for widths in _capture_tiers(initial, maxima):
-        candidate = jax.device_get(executable(widths)(
+        candidate = materialize_global_tree(executable(widths)(
             ctx.params, input_ids, positions))
         qualified = {}
         capture_row = {"widths": list(widths), "routes": {}}

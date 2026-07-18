@@ -93,6 +93,31 @@ def host_info() -> Dict[str, Any]:
     }
 
 
+def materialize_global_array(value: Any) -> np.ndarray:
+    """Return one exact host copy of a global JAX array on every process.
+
+    This function is collective when ``value`` spans non-addressable devices,
+    so every JAX process must call it in the same order. Fully addressable
+    values retain the ordinary ``device_get`` path.
+    """
+    if isinstance(value, jax.Array) and not value.is_fully_addressable:
+        from jax.experimental import multihost_utils
+
+        host_value = np.asarray(multihost_utils.process_allgather(value))
+        expected_shape = tuple(int(size) for size in value.shape)
+        if host_value.shape != expected_shape:
+            raise RuntimeError(
+                "global array materialization changed shape: "
+                f"expected={expected_shape} actual={host_value.shape}")
+        return host_value
+    return np.asarray(jax.device_get(value))
+
+
+def materialize_global_tree(value: Any) -> Any:
+    """Materialize every array leaf while preserving the pytree structure."""
+    return jax.tree.map(materialize_global_array, value)
+
+
 def load_analysis_config(config_path: str) -> Dict[str, Any]:
     with open_path(config_path, "r") as f:
         return yaml.safe_load(f)
