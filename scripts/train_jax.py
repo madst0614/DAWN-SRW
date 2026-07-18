@@ -4707,6 +4707,29 @@ def count_parameters(params):
     return sum(x.size for x in jax.tree.leaves(params))
 
 
+def _abstract_model_params_for_restore(model, init_rng, dropout_rng,
+                                       max_seq_len):
+    """Trace model initialization without materializing parameter buffers."""
+    dummy_input = jax.ShapeDtypeStruct(
+        (1, int(max_seq_len)),
+        jnp.int32,
+    )
+
+    def _initialize(params_key, dropout_key, input_ids):
+        return model.init(
+            {'params': params_key, 'dropout': dropout_key},
+            input_ids,
+            deterministic=True,
+        )['params']
+
+    return jax.eval_shape(
+        _initialize,
+        init_rng,
+        dropout_rng,
+        dummy_input,
+    )
+
+
 # ============================================================
 # Orthogonality + diversity loss (inline for jit)
 # ============================================================
@@ -9369,6 +9392,101 @@ def shard_params_to_mesh(params, param_shardings):
         params, param_shardings)
 
 
+def _abstract_tree_with_shardings(shape_tree, sharding_tree, *, name):
+    """Attach final mesh shardings to an abstract array PyTree."""
+    try:
+        return jax.tree.map(
+            lambda shape, sharding: shape.update(sharding=sharding),
+            shape_tree,
+            sharding_tree,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to attach target shardings to abstract {name}."
+        ) from exc
+
+
+def _optimizer_state_shardings(abstract_opt_state, abstract_params,
+                               param_shardings, mesh):
+    """Derive exact optimizer-state shardings from parameter path suffixes.
+
+    Adam moments and MultiSteps gradient accumulators retain the corresponding
+    parameter path as a suffix of their optimizer-state path. Those tensors
+    must use the same sharding as the parameter; optimizer counters are
+    replicated. Any future non-scalar optimizer leaf that does not follow this
+    invariant fails loudly instead of being restored with an accidental
+    replicated/default sharding.
+    """
+    param_shapes_with_paths = jax.tree_util.tree_flatten_with_path(
+        abstract_params)[0]
+    param_shardings_with_paths = jax.tree_util.tree_flatten_with_path(
+        param_shardings)[0]
+    if len(param_shapes_with_paths) != len(param_shardings_with_paths):
+        raise RuntimeError(
+            "Parameter shape/sharding leaf counts differ while building "
+            "the abstract optimizer restore target.")
+
+    param_entries = []
+    for (shape_path, shape), (sharding_path, sharding) in zip(
+            param_shapes_with_paths, param_shardings_with_paths):
+        if tuple(shape_path) != tuple(sharding_path):
+            raise RuntimeError(
+                "Parameter shape/sharding paths differ while building the "
+                "abstract optimizer restore target: "
+                f"shape={jax.tree_util.keystr(shape_path)} "
+                f"sharding={jax.tree_util.keystr(sharding_path)}")
+        param_entries.append((tuple(shape_path), shape, sharding))
+
+    replicated = NamedSharding(mesh, P())
+
+    def _path_endswith(path, suffix):
+        return len(path) >= len(suffix) and tuple(path[-len(suffix):]) == suffix
+
+    def _leaf_sharding(opt_path, opt_leaf):
+        shape = tuple(getattr(opt_leaf, 'shape', ()))
+        if shape == ():
+            return replicated
+
+        opt_path = tuple(opt_path)
+        matches = [
+            entry for entry in param_entries
+            if _path_endswith(opt_path, entry[0])
+        ]
+        if not matches:
+            raise RuntimeError(
+                "Cannot derive sharding for non-scalar optimizer-state leaf "
+                f"opt_state{jax.tree_util.keystr(opt_path)} shape={shape}; "
+                "no parameter path suffix matches.")
+        max_path_len = max(len(entry[0]) for entry in matches)
+        matches = [
+            entry for entry in matches if len(entry[0]) == max_path_len
+        ]
+        if len(matches) != 1:
+            matched_paths = ', '.join(
+                'params' + jax.tree_util.keystr(entry[0])
+                for entry in matches)
+            raise RuntimeError(
+                "Ambiguous parameter sharding for optimizer-state leaf "
+                f"opt_state{jax.tree_util.keystr(opt_path)}: "
+                f"{matched_paths}")
+
+        param_path, param_shape, param_sharding = matches[0]
+        expected_shape = tuple(getattr(param_shape, 'shape', ()))
+        if shape != expected_shape:
+            raise RuntimeError(
+                "Optimizer-state/parameter shape mismatch while deriving "
+                "abstract restore sharding: "
+                f"opt_state{jax.tree_util.keystr(opt_path)} shape={shape}, "
+                f"params{jax.tree_util.keystr(param_path)} "
+                f"shape={expected_shape}.")
+        return param_sharding
+
+    return jax.tree.map_with_path(
+        _leaf_sharding,
+        abstract_opt_state,
+    )
+
+
 def shard_to_mesh(data, sharding, global_shape):
     """Multi-host: create global array from host-local data.
 
@@ -10326,6 +10444,89 @@ def _restore_orbax_state(manager, step, target_state):
     metadata = _composite_item(restored, 'metadata')
     return (state if isinstance(state, dict) else {},
             metadata if isinstance(metadata, dict) else {})
+
+
+def _assert_abstract_restore_target(target_state):
+    """Fail if a resume target accidentally retains live device arrays."""
+    live_paths = [
+        jax.tree_util.keystr(path)
+        for path, leaf in jax.tree_util.tree_flatten_with_path(target_state)[0]
+        if isinstance(leaf, jax.Array)
+    ]
+    if live_paths:
+        raise RuntimeError(
+            "Resume abstract target unexpectedly contains live JAX arrays: "
+            + ', '.join(live_paths))
+
+
+def _shardings_equivalent(actual, expected, ndim):
+    if actual is None or expected is None:
+        return actual is expected
+    try:
+        return bool(actual.is_equivalent_to(expected, ndim))
+    except Exception:
+        pass
+    return (
+        getattr(actual, 'spec', None) == getattr(expected, 'spec', None)
+        and _sharding_device_set(actual) == _sharding_device_set(expected)
+    )
+
+
+def _validate_restored_array_tree(restored_tree, abstract_tree, *, name):
+    """Validate structure, shape, dtype, and final sharding after restore."""
+    restored_structure = jax.tree_util.tree_structure(restored_tree)
+    abstract_structure = jax.tree_util.tree_structure(abstract_tree)
+    if restored_structure != abstract_structure:
+        raise RuntimeError(
+            f"Restored {name} PyTree structure does not match its abstract "
+            "restore target.")
+
+    restored_leaves = jax.tree_util.tree_flatten_with_path(restored_tree)[0]
+    abstract_leaves = jax.tree_util.tree_flatten_with_path(abstract_tree)[0]
+    for (restored_path, restored), (abstract_path, abstract) in zip(
+            restored_leaves, abstract_leaves):
+        if tuple(restored_path) != tuple(abstract_path):
+            raise RuntimeError(
+                f"Restored {name} leaf path mismatch: "
+                f"restored={jax.tree_util.keystr(restored_path)} "
+                f"target={jax.tree_util.keystr(abstract_path)}")
+        path = jax.tree_util.keystr(abstract_path)
+        if not isinstance(abstract, jax.ShapeDtypeStruct):
+            raise RuntimeError(
+                f"Abstract {name}{path} is not ShapeDtypeStruct: "
+                f"{type(abstract).__name__}")
+        if not isinstance(restored, jax.Array):
+            raise RuntimeError(
+                f"Restored {name}{path} is not a jax.Array: "
+                f"{type(restored).__name__}")
+
+        restored_shape = tuple(restored.shape)
+        target_shape = tuple(abstract.shape)
+        if restored_shape != target_shape:
+            raise RuntimeError(
+                f"Restored {name}{path} shape mismatch: "
+                f"checkpoint={restored_shape} target={target_shape}")
+        if restored.dtype != abstract.dtype:
+            raise RuntimeError(
+                f"Restored {name}{path} dtype mismatch: "
+                f"checkpoint={restored.dtype} target={abstract.dtype}")
+        if not _shardings_equivalent(
+                restored.sharding, abstract.sharding, restored.ndim):
+            raise RuntimeError(
+                f"Restored {name}{path} sharding mismatch: "
+                f"checkpoint={restored.sharding} "
+                f"target={abstract.sharding}")
+
+
+def _validate_restored_state_keys(restored_state, target_state):
+    expected = set(target_state)
+    actual = set(restored_state)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Orbax resume state fields do not match the full training-state "
+            f"target: missing={missing} unexpected={unexpected}")
 
 
 def _sharding_device_set(sharding):
@@ -16574,19 +16775,34 @@ def main():
     _maybe_materialize_vocab_parallel_config(cfg)
     model = build_model_from_config(cfg)
 
-    # Initialize
+    # Resume must construct only an abstract target. Concrete params are
+    # created exclusively for a scratch run.
+    _has_resume_checkpoint = resume_step is not None
     rng = jax.random.PRNGKey(seed)
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
-    dummy_input = jnp.ones((1, max_seq_len), dtype=jnp.int32)
+    if _has_resume_checkpoint:
+        if is_host0:
+            print(
+                "=== Starting abstract model shape evaluation for resume ===",
+                flush=True,
+            )
+        params = _abstract_model_params_for_restore(
+            model,
+            init_rng,
+            dropout_rng,
+            max_seq_len,
+        )
+    else:
+        dummy_input = jnp.ones((1, max_seq_len), dtype=jnp.int32)
+        if is_host0:
+            print("=== Starting model.init ===", flush=True)
+        variables = model.init(
+            {'params': init_rng, 'dropout': dropout_rng},
+            dummy_input,
+            deterministic=True,
+        )
+        params = variables['params']
 
-    if is_host0:
-        print("=== Starting model.init ===", flush=True)
-    variables = model.init(
-        {'params': init_rng, 'dropout': dropout_rng},
-        dummy_input,
-        deterministic=True,
-    )
-    params = variables['params']
     n_params = count_parameters(params)
     symbolic_counts = (
         _v417x_symbolic_parameter_count(cfg['model'])
@@ -16594,12 +16810,24 @@ def main():
     if (symbolic_counts is not None
             and int(symbolic_counts['total']) != int(n_params)):
         raise RuntimeError(
-            "v417x symbolic/initialized parameter mismatch: "
+            "v417x symbolic/parameter-tree mismatch: "
             f"expected={symbolic_counts['total']} actual={n_params}")
 
     if is_host0:
-        print("=== model.init done ===", flush=True)
+        if _has_resume_checkpoint:
+            print(
+                "=== abstract model shape evaluation done ===",
+                flush=True,
+            )
+        else:
+            print("=== model.init done ===", flush=True)
         print(f"\nModel parameters: {n_params:,}")
+        print(
+            "Parameter tree source: "
+            + ("abstract checkpoint target (no parameter buffers created)"
+               if _has_resume_checkpoint else "concrete scratch initialization"),
+            flush=True,
+        )
         if _is_v417x_version(model_version_cfg):
             breakdown_labels = (
                 ('token embedding', 'token_embedding'),
@@ -16652,7 +16880,10 @@ def main():
             print("Bilinear probe params: "
                   f"{symbolic_counts['bilinear_probe_matrices']}")
             print(f"Expected config params: {symbolic_counts['total']}")
-            print(f"Actual initialized params: {n_params}")
+            print(
+                ("Abstract target params: " if _has_resume_checkpoint
+                 else "Actual initialized params: ")
+                + str(n_params))
             print("Parameter-match delta vs v4171: "
                   f"{int(symbolic_counts['total']) - int(v4171_reference_total)}")
             if (str(model_version_cfg) == V4172_MODEL_VERSION
@@ -16725,8 +16956,6 @@ def main():
                 f"v={m['n_v'] / d_model_cfg:.3f} "
                 f"rst={m['n_rst'] / d_model_cfg:.3f}")
             print(f"  fixed_tau={m['fixed_tau']}")
-
-    _has_resume_checkpoint = resume_step is not None
 
     rank = cfg['model'].get('rank', 64)
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
@@ -17164,7 +17393,6 @@ def main():
     global_step = 0
     start_step_in_epoch = 0
     best_val_loss = float('inf')
-    _has_resume_checkpoint = resume_step is not None
     orbax_root = _join_path(checkpoint_dir, "checkpoints")
 
     if _has_resume_checkpoint:
@@ -17567,12 +17795,35 @@ def main():
         vocab_size_padded=cfg['model'].get('vocab_size_padded', None))
     if is_host0:
         _print_param_sharding_summary(param_shardings, model_version_cfg)
-    params = shard_params_to_mesh(params, param_shardings)
+    if _has_resume_checkpoint:
+        target_params = _abstract_tree_with_shardings(
+            params,
+            param_shardings,
+            name='params',
+        )
+        abstract_opt_state = jax.eval_shape(
+            optimizer.init,
+            target_params,
+        )
+        opt_state_shardings = _optimizer_state_shardings(
+            abstract_opt_state,
+            target_params,
+            param_shardings,
+            mesh,
+        )
+        target_opt_state = _abstract_tree_with_shardings(
+            abstract_opt_state,
+            opt_state_shardings,
+            name='opt_state',
+        )
+        del abstract_opt_state
+        del opt_state_shardings
+    else:
+        params = shard_params_to_mesh(params, param_shardings)
+        opt_state = optimizer.init(params)
+        opt_state = _replicate_optimizer_state_scalars_to_mesh(
+            opt_state, mesh)
 
-    opt_state = optimizer.init(params)
-    opt_state = _replicate_optimizer_state_scalars_to_mesh(opt_state, mesh)
-    target_params = params
-    target_opt_state = opt_state
     latest_checkpoint_manager = _create_orbax_checkpoint_manager(
         _join(checkpoint_dir, 'checkpoints'),
         checkpoint_interval=ckpt_interval,
@@ -17589,6 +17840,7 @@ def main():
     )
 
     if _has_resume_checkpoint:
+        replicated = NamedSharding(mesh, P())
         target_state = _build_orbax_state(
             target_params, target_opt_state, rng,
             epoch=0,
@@ -17600,23 +17852,46 @@ def main():
             full_config=full_config_snapshot,
             model_config=cfg['model'],
         )
+        target_state['rng'] = jax.ShapeDtypeStruct(
+            (2,),
+            jnp.uint32,
+            sharding=replicated,
+        )
+        _assert_abstract_restore_target(target_state)
+        if is_host0:
+            print("  resume_restore_target=abstract", flush=True)
+            print("  resume_concrete_init_skipped=true", flush=True)
+            print("  resume_post_restore_device_put=false", flush=True)
         restored_state, restored_metadata = _restore_orbax_state(
             latest_checkpoint_manager, resume_step, target_state)
+        _validate_restored_state_keys(restored_state, target_state)
         if _is_v417x_version(model_version_cfg):
             _validate_v4171_checkpoint_param_schema(
                 restored_state['params'], target_params)
-        params = _match_tree_to_template_on_mesh(
-            restored_state['params'], target_params, mesh, name='params')
-        opt_state = _match_tree_to_template_on_mesh(
-            restored_state['opt_state'], target_opt_state, mesh,
-            name='opt_state')
+        _validate_restored_array_tree(
+            restored_state['params'],
+            target_params,
+            name='params',
+        )
+        _validate_restored_array_tree(
+            restored_state['opt_state'],
+            target_opt_state,
+            name='opt_state',
+        )
+        _validate_restored_array_tree(
+            restored_state['rng'],
+            target_state['rng'],
+            name='rng',
+        )
+        params = restored_state['params']
+        opt_state = restored_state['opt_state']
+        rng = restored_state['rng']
         if is_host0:
-            print("  Restored params/optimizer state matched to full mesh sharding.")
-        if 'rng' not in restored_state:
-            raise KeyError("Orbax checkpoint state is missing required rng.")
-        restored_rng = np.asarray(
-            restored_state['rng'], dtype=np.uint32).reshape((2,))
-        rng = jnp.asarray(restored_rng, dtype=jnp.uint32)
+            print(
+                "  Restored params, full optimizer state, and RNG directly "
+                "into final mesh shardings.",
+                flush=True,
+            )
         start_epoch = _state_scalar(restored_state, 'epoch', 0, int)
         global_step = _state_scalar(
             restored_state, 'global_step',
@@ -17628,6 +17903,10 @@ def main():
             restored_state, 'step_in_epoch', 0, int)
         saved_steps_per_epoch = _state_scalar(
             restored_state, 'steps_per_epoch', 0, int)
+        restored_consumed_examples = _state_scalar(
+            restored_state, 'consumed_examples', -1, int)
+        restored_consumed_tokens = _state_scalar(
+            restored_state, 'consumed_tokens', -1, int)
         if saved_step_in_epoch > 0 and saved_steps_per_epoch == steps_per_epoch:
             start_step_in_epoch = saved_step_in_epoch
         elif saved_step_in_epoch > 0:
@@ -17646,6 +17925,12 @@ def main():
             print(
                 f"  [resume check] step_in_epoch={start_step_in_epoch}",
                 flush=True)
+            print(
+                "  [resume check] consumed_examples="
+                f"{restored_consumed_examples} consumed_tokens="
+                f"{restored_consumed_tokens}",
+                flush=True,
+            )
             if opt_count is not None and int(opt_count) != int(global_step):
                 print(
                     "  WARNING: optimizer count does not match global_step: "
@@ -17692,11 +17977,10 @@ def main():
         del target_params
         del target_opt_state
         gc.collect()
-        jax.clear_caches()
         if is_host0:
             print(
-                "  Resume restore cleanup: released Orbax target/restored "
-                "state trees before train_step JIT.",
+                "  Resume restore cleanup: released abstract Orbax target "
+                "trees before train_step JIT.",
                 flush=True)
     elif is_host0:
         print(f"  Orbax checkpoints: {_join(checkpoint_dir, 'checkpoints')}")
