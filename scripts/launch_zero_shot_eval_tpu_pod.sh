@@ -7,7 +7,6 @@ PROJECT="dawn-486218"
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
 INIT_FROM=""
 OUTPUT_DIR=""
-TOKENIZER_REVISION=""
 GH_TOKEN=""
 BATCH_SIZE="32"
 LIMIT=""
@@ -21,7 +20,6 @@ while [[ $# -gt 0 ]]; do
     --branch) BRANCH="$2"; shift 2 ;;
     --init-from) INIT_FROM="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
-    --tokenizer-revision) TOKENIZER_REVISION="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --limit) LIMIT="$2"; shift 2 ;;
     --token) GH_TOKEN="$2"; shift 2 ;;
@@ -35,7 +33,6 @@ Required:
   --init-from PATH             Orbax run/checkpoints directory or step
 
 Reproducibility:
-  --tokenizer-revision REV     Required if source C4 metadata lacks revision
   --output-dir PATH            Local or gs:// result directory
   --limit N                    Smoke only; omitted means full comparable run
   --batch-size N               Fixed global batch (default: 32)
@@ -107,7 +104,7 @@ echo "  Zone/project:       $ZONE / $PROJECT"
 echo "  Branch:             $BRANCH"
 echo "  Init from:          $INIT_FROM"
 echo "  Output:             $OUTPUT_DIR"
-echo "  Tokenizer revision: ${TOKENIZER_REVISION:-<source metadata>}"
+echo "  Tokenizer:          source pretokenization metadata"
 echo "  Global batch:       $BATCH_SIZE"
 echo "  Limit:              ${LIMIT:-<full>}"
 echo "============================================"
@@ -121,7 +118,6 @@ REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 INIT_FROM='${INIT_FROM}'
 OUTPUT_DIR='${OUTPUT_DIR}'
-TOKENIZER_REVISION='${TOKENIZER_REVISION}'
 BATCH_SIZE='${BATCH_SIZE}'
 LIMIT='${LIMIT}'
 FOREGROUND='${FOREGROUND}'
@@ -173,9 +169,6 @@ RUN_CMD=(python3 scripts/zero_shot_eval_jax.py
   --init-from "\$INIT_FROM"
   --output-dir "\$OUTPUT_DIR"
   --batch-size "\$BATCH_SIZE")
-if [ -n "\$TOKENIZER_REVISION" ]; then
-  RUN_CMD+=(--tokenizer-revision "\$TOKENIZER_REVISION")
-fi
 if [ -n "\$LIMIT" ]; then RUN_CMD+=(--limit "\$LIMIT"); fi
 RUN_CMD_STR=\$(printf '%q ' "\${RUN_CMD[@]}")
 

@@ -104,7 +104,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-targets", action="store_true")
     parser.add_argument("--zero-shot-batch-size", type=int, default=32)
     parser.add_argument("--zero-shot-limit", type=int, default=None)
-    parser.add_argument("--tokenizer-revision", default=None)
     parser.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
         help="Resume only artifacts with an exactly matching protocol/checkpoint hash")
@@ -216,7 +215,6 @@ def _zero_shot_args(
         output_dir=output_dir,
         tasks=",".join(tasks),
         tokenizer=None,
-        tokenizer_revision=args.tokenizer_revision,
         pad_token_id=None,
         eot_token_id=None,
         batch_size=args.zero_shot_batch_size,

@@ -60,10 +60,6 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated stock task ids; default is the complete primary suite")
     parser.add_argument("--tokenizer", default=None,
                         help="Must match the tokenizer recorded by pretokenization")
-    parser.add_argument(
-        "--tokenizer-revision", default=None,
-        help=("Immutable Hugging Face revision used for this evaluation. "
-              "Required when source metadata did not record a revision."))
     parser.add_argument("--pad-token-id", type=int, default=None)
     parser.add_argument(
         "--eot-token-id", type=int, default=None,
@@ -211,28 +207,22 @@ def _load_tokenizer(
             "tokenizer id differs from source preprocessing: "
             f"source={source_id!r} requested={requested_id!r}")
     source_revision = source_meta.get("tokenizer_revision")
-    revision = args.tokenizer_revision or source_revision
-    if not revision and not Path(requested_id).exists():
-        raise RuntimeError(
-            "source preprocessing metadata did not record tokenizer_revision. "
-            "Pass --tokenizer-revision with an immutable revision; using a "
-            "floating latest/main tokenizer is forbidden. "
-            f"source_metadata={source_meta_path}")
     tokenizer = AutoTokenizer.from_pretrained(
         requested_id,
-        revision=revision,
+        revision=source_revision,
         use_fast=True,
     )
     local_tokenizer = Path(requested_id).exists()
     resolved_revision = getattr(tokenizer, "init_kwargs", {}).get(
         "_commit_hash")
     if not local_tokenizer:
-        resolved_revision = str(resolved_revision or revision or "")
-        if re.fullmatch(r"[0-9a-fA-F]{40}", resolved_revision) is None:
+        resolved_revision = str(resolved_revision or source_revision or "")
+        if resolved_revision and re.fullmatch(
+                r"[0-9a-fA-F]{40}", resolved_revision) is None:
             raise RuntimeError(
-                "tokenizer revision did not resolve to an immutable 40-hex "
-                "Hugging Face commit. Pass a commit SHA, not a branch/tag: "
-                f"requested_revision={revision!r} "
+                "source tokenizer did not resolve to a 40-hex Hugging Face "
+                "commit: "
+                f"source_revision={source_revision!r} "
                 f"resolved_revision={resolved_revision!r}")
     logical_vocab = int(config["model"].get(
         "logical_vocab_size", config["model"]["vocab_size"]))
@@ -282,7 +272,7 @@ def _load_tokenizer(
 
     metadata = {
         "id": requested_id,
-        "revision": revision,
+        "revision": source_revision,
         "resolved_revision": resolved_revision,
         "local_path": local_tokenizer,
         "transformers_version": transformers_version,

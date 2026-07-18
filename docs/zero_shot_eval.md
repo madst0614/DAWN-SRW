@@ -13,13 +13,13 @@ mesh, disables dropout, and never constructs an optimizer. A run/checkpoints
 directory is resolved by host 0 exactly once and broadcast as a committed
 numeric step before metadata, params, tasks, or output paths are initialized.
 
-The pretokenized C4 metadata records the tokenizer id but older datasets do not
-record its immutable revision. For such checkpoints, pass
-`--tokenizer-revision`; the evaluator refuses a floating revision. It never
-adds CLS, SEP, BOS, EOS, or padding tokens. If the source tokenizer has no
-causal EOT/BOS, the six primary tasks remain valid because their contexts are
-non-empty, while rolling/empty-context calls fail until an explicitly verified
-`--eot-token-id` is supplied.
+The evaluator loads the tokenizer id already recorded by the pretokenized C4
+metadata. If that metadata also records a revision it is used automatically;
+otherwise the resolved Hugging Face revision and vocabulary hash are captured
+in the run manifest. It never adds CLS, SEP, BOS, EOS, or padding tokens. If
+the source tokenizer has no causal EOT/BOS, the six primary tasks remain valid
+because their contexts are non-empty, while rolling/empty-context calls fail
+until an explicitly verified `--eot-token-id` is supplied.
 
 Smoke run:
 
@@ -28,7 +28,6 @@ bash scripts/launch_zero_shot_eval_tpu_pod.sh \
   --tpu <TPU_NAME> \
   --branch <BRANCH> \
   --init-from gs://.../checkpoints/<CONCRETE_STEP> \
-  --tokenizer-revision <IMMUTABLE_REVISION> \
   --limit 32
 ```
 
@@ -38,8 +37,7 @@ Full comparable run:
 bash scripts/launch_zero_shot_eval_tpu_pod.sh \
   --tpu <TPU_NAME> \
   --branch <BRANCH> \
-  --init-from gs://.../checkpoints/<CONCRETE_STEP> \
-  --tokenizer-revision <IMMUTABLE_REVISION>
+  --init-from gs://.../checkpoints/<CONCRETE_STEP>
 ```
 
 Every output directory contains `results_harness_raw.json`,
