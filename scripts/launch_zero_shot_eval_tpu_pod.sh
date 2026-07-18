@@ -136,14 +136,21 @@ else
 fi
 
 python3 -m pip install --upgrade pip -q
-python3 -m pip install "jax[tpu]" \
+python3 -m pip install \
+  "jax[tpu]==0.6.2" \
+  "flax==0.10.7" \
+  "optax==0.2.8" \
+  "numpy==2.5.1" \
+  pyyaml sentencepiece google-cloud-storage \
   -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-python3 -m pip install -U flax optax numpy pyyaml transformers \
-  sentencepiece huggingface_hub google-cloud-storage -q
 python3 -m pip install -r requirements_zero_shot_eval.txt -q
 python3 - <<'PYCHK'
 from importlib import metadata
-import datasets, fsspec, jax, orbax.checkpoint, pyarrow, transformers
+import datasets, flax, fsspec, jax, optax, orbax.checkpoint, pyarrow, transformers
+assert jax.__version__ == '0.6.2'
+assert metadata.version('flax') == '0.10.7'
+assert metadata.version('optax') == '0.2.8'
+assert metadata.version('numpy') == '2.5.1'
 assert metadata.version('lm_eval') == '0.4.2'
 assert metadata.version('orbax-checkpoint') == '0.11.24'
 assert metadata.version('transformers') == '4.40.2'
@@ -155,6 +162,8 @@ assert metadata.version('fsspec') == '2024.3.1'
 print('lm-eval=' + metadata.version('lm_eval'), flush=True)
 print('orbax-checkpoint=' + metadata.version('orbax-checkpoint'), flush=True)
 print('jax=' + jax.__version__, flush=True)
+print('flax=' + flax.__version__, flush=True)
+print('optax=' + optax.__version__, flush=True)
 print('datasets=' + datasets.__version__, flush=True)
 print('pyarrow=' + pyarrow.__version__, flush=True)
 print('transformers=' + transformers.__version__, flush=True)
