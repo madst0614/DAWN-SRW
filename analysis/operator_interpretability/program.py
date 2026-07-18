@@ -615,6 +615,68 @@ def compactness_metrics(
     }
 
 
+def native_program_diagnostic_checks(
+        result: Mapping[str, Any], *, config: ProtocolConfig) -> dict[str, bool]:
+    """Evaluate causal gates after validation mass has already been frozen."""
+    return {
+        "own_ablation_margin_drop_ci": float(
+            result["ablation"]["own_program"]["margin_drop_ci"]["ci_low"])
+            > 0.0,
+        "own_ablation_permutation": float(
+            result["ablation"]["own_program"]["permutation"][
+                "p_value_two_sided"]) < config.alpha,
+        "own_over_mismatched_ablation_ci": float(
+            result["ablation"]["specificity"]["own_vs_mismatched"][
+                "effect_ci"]["ci_low"]) > 0.0,
+        "own_over_mismatched_ablation_permutation": float(
+            result["ablation"]["specificity"]["own_vs_mismatched"][
+                "permutation"]["p_value_two_sided"]) < config.alpha,
+        "own_over_random_ablation_ci": float(
+            result["ablation"]["specificity"]["own_vs_random"][
+                "effect_ci"]["ci_low"]) > 0.0,
+        "own_over_random_ablation_permutation": float(
+            result["ablation"]["specificity"]["own_vs_random"][
+                "permutation"]["p_value_two_sided"]) < config.alpha,
+        "id_paired_over_mismatch_ci": float(
+            result["source_id_replay"]["paired_vs_mismatch"][
+                "effect_ci"]["ci_low"]) > 0.0,
+        "id_paired_over_mismatch_permutation": float(
+            result["source_id_replay"]["paired_vs_mismatch"][
+                "permutation"]["p_value_two_sided"]) < config.alpha,
+        "id_paired_over_random_ci": float(
+            result["source_id_replay"]["paired_vs_random"][
+                "effect_ci"]["ci_low"]) > 0.0,
+        "id_paired_over_random_permutation": float(
+            result["source_id_replay"]["paired_vs_random"][
+                "permutation"]["p_value_two_sided"]) < config.alpha,
+        "id_bidirectional_answer_flip": float(
+            result["source_id_replay"][
+                "bidirectional_answer_flip_fraction"])
+            >= config.program_id_transfer_flip_min,
+        "contribution_paired_over_mismatch_ci": float(
+            result["transplant"]["paired_vs_mismatch"][
+                "effect_ci"]["ci_low"]) > 0.0,
+        "contribution_paired_over_mismatch_permutation": float(
+            result["transplant"]["paired_vs_mismatch"][
+                "permutation"]["p_value_two_sided"]) < config.alpha,
+        "contribution_paired_over_random_ci": float(
+            result["transplant"]["paired_vs_random"][
+                "effect_ci"]["ci_low"]) > 0.0,
+        "contribution_paired_over_random_permutation": float(
+            result["transplant"]["paired_vs_random"][
+                "permutation"]["p_value_two_sided"]) < config.alpha,
+        "contribution_bidirectional_answer_flip": float(
+            result["transplant"]["bidirectional_answer_flip_fraction"])
+            >= config.program_transplant_flip_min,
+    }
+
+
+def _freeze_selection_record(record: dict[str, Any]) -> dict[str, Any]:
+    frozen = dict(record)
+    frozen["selection_record_hash"] = canonical_hash(frozen)
+    return frozen
+
+
 def select_validation_program(
         candidates: Sequence[Mapping[str, Any]], *,
         config: ProtocolConfig) -> dict[str, Any]:
@@ -625,6 +687,9 @@ def select_validation_program(
         raise ValueError("validation program candidates do not match protocol")
     passing = []
     for row in ordered:
+        if row.get("causal_diagnostics_evaluated") is not False:
+            raise ValueError(
+                "validation selection requires replay-only candidates")
         checks = {
             "replay_faithfulness_ci": float(
                 row["replay"]["faithfulness_ci"]["ci_low"])
@@ -637,95 +702,35 @@ def select_validation_program(
                     "median_decision_position_site_fraction"])
                 <= config.program_compact_fraction_max,
         }
-        diagnostics = {
-            "own_ablation_margin_drop_ci": float(
-                row["ablation"]["own_program"]["margin_drop_ci"]["ci_low"])
-                > 0.0,
-            "own_ablation_permutation": float(
-                row["ablation"]["own_program"]["permutation"][
-                    "p_value_two_sided"]) < config.alpha,
-            "own_over_mismatched_ablation_ci": float(
-                row["ablation"]["specificity"]["own_vs_mismatched"][
-                    "effect_ci"]["ci_low"]) > 0.0,
-            "own_over_mismatched_ablation_permutation": float(
-                row["ablation"]["specificity"]["own_vs_mismatched"][
-                    "permutation"]["p_value_two_sided"]) < config.alpha,
-            "own_over_random_ablation_ci": float(
-                row["ablation"]["specificity"]["own_vs_random"][
-                    "effect_ci"]["ci_low"]) > 0.0,
-            "own_over_random_ablation_permutation": float(
-                row["ablation"]["specificity"]["own_vs_random"][
-                    "permutation"]["p_value_two_sided"]) < config.alpha,
-            "id_paired_over_mismatch_ci": float(
-                row["source_id_replay"]["paired_vs_mismatch"][
-                    "effect_ci"]["ci_low"]) > 0.0,
-            "id_paired_over_mismatch_permutation": float(
-                row["source_id_replay"]["paired_vs_mismatch"][
-                    "permutation"]["p_value_two_sided"]) < config.alpha,
-            "id_paired_over_random_ci": float(
-                row["source_id_replay"]["paired_vs_random"][
-                    "effect_ci"]["ci_low"]) > 0.0,
-            "id_paired_over_random_permutation": float(
-                row["source_id_replay"]["paired_vs_random"][
-                    "permutation"]["p_value_two_sided"]) < config.alpha,
-            "id_bidirectional_answer_flip": float(
-                row["source_id_replay"][
-                    "bidirectional_answer_flip_fraction"])
-                >= config.program_id_transfer_flip_min,
-            "contribution_paired_over_mismatch_ci": float(
-                row["transplant"]["paired_vs_mismatch"]["effect_ci"]["ci_low"])
-                > 0.0,
-            "contribution_paired_over_mismatch_permutation": float(
-                row["transplant"]["paired_vs_mismatch"][
-                    "permutation"]["p_value_two_sided"]) < config.alpha,
-            "contribution_paired_over_random_ci": float(
-                row["transplant"]["paired_vs_random"][
-                    "effect_ci"]["ci_low"]) > 0.0,
-            "contribution_paired_over_random_permutation": float(
-                row["transplant"]["paired_vs_random"][
-                    "permutation"]["p_value_two_sided"]) < config.alpha,
-            "contribution_bidirectional_answer_flip": float(
-                row["transplant"]["bidirectional_answer_flip_fraction"])
-                >= config.program_transplant_flip_min,
-        }
         row["validation_selection_checks"] = checks
-        row["validation_diagnostic_checks"] = diagnostics
         if all(checks.values()):
             passing.append(row)
-    if not passing:
-        return {
-            "status": "no_compact_validation_program",
-            "selected_program_mass": None,
-            "selection_phase": "validation",
-            "test_consulted": False,
-            "candidate_count": len(ordered),
-            "selection_rule": (
-                "smallest_mass_passing_compact_replay_gates"),
-            "causal_diagnostics_used_for_selection": False,
-        }
-    selected = passing[0]
-    return {
-        "status": "selected",
-        "selected_program_mass": float(selected["program_mass"]),
+    common = {
         "selection_phase": "validation",
         "test_consulted": False,
+        "candidate_count": len(ordered),
         "selection_rule": "smallest_mass_passing_compact_replay_gates",
         "causal_diagnostics_used_for_selection": False,
         "program_algorithm_version": PROGRAM_ALGORITHM_VERSION,
+    }
+    if not passing:
+        return _freeze_selection_record({
+            **common,
+            "status": "no_compact_validation_program",
+            "selected_program_mass": None,
+        })
+    selected = passing[0]
+    return _freeze_selection_record({
+        **common,
+        "status": "selected",
+        "selected_program_mass": float(selected["program_mass"]),
         "selected_validation_metrics_hash": canonical_hash({
             "program_mass": selected["program_mass"],
             "checks": selected["validation_selection_checks"],
             "replay": selected["replay"],
             "compactness": selected["compactness"],
         }),
-        "selected_validation_diagnostics_hash": canonical_hash({
-            "program_mass": selected["program_mass"],
-            "checks": selected["validation_diagnostic_checks"],
-            "ablation": selected["ablation"],
-            "source_id_replay": selected["source_id_replay"],
-            "transplant": selected["transplant"],
-        }),
-    }
+    })
 
 
 def select_validation_then_evaluate_test(

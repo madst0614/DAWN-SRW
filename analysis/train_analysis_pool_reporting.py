@@ -175,6 +175,13 @@ def format_item_text(payload: Mapping[str, Any], *, artifact_path: str,
         lines.append(f"  benchmark: {payload.get('benchmark_id')}")
     if payload.get("task_id") is not None:
         lines.append(f"  task: {payload.get('task_id')}")
+    artifact_warnings = payload.get("artifact_warnings")
+    if isinstance(artifact_warnings, Sequence) and not isinstance(
+            artifact_warnings, (str, bytes)) and artifact_warnings:
+        lines.extend([
+            "Warnings:",
+            *_result_lines({"artifact_warnings": list(artifact_warnings)}),
+        ])
     if payload.get("analysis_kind") == "native_operator_program":
         human_summary = result.get("human_summary")
         if isinstance(human_summary, Mapping):
@@ -233,7 +240,7 @@ class TrainAnalysisPoolTextReporter:
             "mechanistic_protocol_config: " + json.dumps(
                 dict(mechanistic_protocol_config or {}),
                 sort_keys=True, ensure_ascii=False),
-            f"max_protocol_bound_item_json_bytes: "
+            f"protocol_bound_item_json_warning_bytes: "
             f"{max_item_json_bytes or 'not_applicable'}",
             f"json_summary: {store.path('summary.json')}",
             f"summary_log: {self.report_path}",
@@ -284,6 +291,18 @@ class TrainAnalysisPoolTextReporter:
             (item_id, status) for item_id, status in item_status.items()
             if status not in {"ready", "complete", "passed", "selected"}
         ]
+        artifact_warnings = [
+            dict(row) for row in summary.get("artifact_warnings", ())
+            if isinstance(row, Mapping)
+        ]
+        artifact_warning_lines = [
+            "  "
+            f"{row.get('code')}: path={row.get('path')} "
+            f"bytes={row.get('encoded_bytes')} "
+            f"threshold={row.get('warning_threshold_bytes')} "
+            f"write_continued={str(bool(row.get('write_continued'))).lower()}"
+            for row in artifact_warnings
+        ]
         self._footer = [
             _LINE,
             "TRAIN_ANALYSIS_POOL COMPLETE",
@@ -310,6 +329,9 @@ class TrainAnalysisPoolTextReporter:
                 [f"  {item_id}: {status}" for item_id, status in blockers]
                 if blockers else ["  none"]
             ),
+            f"artifact_warning_count: {len(artifact_warnings)}",
+            "artifact_warnings:",
+            *(artifact_warning_lines or ["  none"]),
             f"json_summary: {self.store.path('summary.json')}",
             f"summary_log: {self.report_path}",
             "raw_parameters_persisted: false",

@@ -41,7 +41,7 @@ from analysis.dawn_analysis_storage import (
 )
 from analysis.operator_interpretability.artifacts import (
     DEFAULT_BENCHMARK_ROOT,
-    MAX_PROTOCOL_BOUND_JSON_BYTES,
+    PROTOCOL_BOUND_JSON_WARNING_BYTES,
     resolve_benchmark_build,
     write_protocol_bound_artifact,
 )
@@ -308,6 +308,7 @@ def _run_zero_shot_backend(
     manifest = dict(result["manifest"])
     raw_results = dict(result["raw_results"])
     item_status = {}
+    artifact_warnings = []
     for item_id, task in zip(item_ids, tasks):
         metrics = (raw_results.get("results") or {}).get(task)
         if not isinstance(metrics, dict):
@@ -353,6 +354,12 @@ def _run_zero_shot_backend(
             write_protocol_bound_artifact(
                 store, f"items/zero_shot/{task}.json", payload,
                 protocol=protocol)
+        for warning in payload.get("artifact_warnings", ()):
+            if isinstance(warning, dict):
+                artifact_warnings.append({
+                    "item_id": item_id,
+                    **warning,
+                })
         item_status[item_id] = "ready"
         if store.is_primary:
             print(
@@ -369,6 +376,7 @@ def _run_zero_shot_backend(
         "requested_items": list(item_ids),
         "executed_items": list(item_ids),
         "item_status": item_status,
+        "artifact_warnings": artifact_warnings,
         "output": result["output_dir"],
         "comparable": summary.get("comparable", False),
         "protocol_hashes": {
@@ -572,8 +580,8 @@ def main() -> int:
         "run_semantics": "independent_checkpoint_step_preset_invocation",
         "raw_parameters_persisted": False,
         "dense_capture_rows_persisted": False,
-        "max_protocol_bound_item_json_bytes": (
-            MAX_PROTOCOL_BOUND_JSON_BYTES),
+        "protocol_bound_item_json_warning_bytes": (
+            PROTOCOL_BOUND_JSON_WARNING_BYTES),
     }
     if store.is_primary:
         write_json_atomic(store.path("run_manifest.json"), run_manifest)
@@ -596,7 +604,7 @@ def main() -> int:
         benchmark_manifest_path=(
             benchmark_build.manifest_path if mechanistic_items else None),
         checkpoint_config_hash=checkpoint_config_hash,
-        max_item_json_bytes=MAX_PROTOCOL_BOUND_JSON_BYTES,
+        max_item_json_bytes=PROTOCOL_BOUND_JSON_WARNING_BYTES,
         mechanistic_protocol_config=(
             mechanistic_protocol.to_dict()
             if mechanistic_protocol is not None else None),
@@ -658,6 +666,14 @@ def main() -> int:
             write_json_atomic(store.path("run_manifest.json"), run_manifest)
         raise
 
+    artifact_warnings = []
+    for backend, backend_summary in backend_summaries.items():
+        for warning in backend_summary.get("artifact_warnings", ()):
+            if isinstance(warning, dict):
+                artifact_warnings.append({
+                    "backend": backend,
+                    **warning,
+                })
     summary = {
         "schema_version": 2,
         "status": "complete",
@@ -667,6 +683,7 @@ def main() -> int:
         "requested_items": list(items),
         "executed_items": list(executed),
         "item_status": item_status,
+        "artifact_warnings": artifact_warnings,
         "target": selection.to_dict(),
         "checkpoint_path_resolved": checkpoint_dir,
         "checkpoint_step": int(checkpoint_step),
@@ -684,8 +701,8 @@ def main() -> int:
         "run_semantics": "independent_checkpoint_step_preset_invocation",
         "raw_parameters_persisted": False,
         "dense_capture_rows_persisted": False,
-        "max_protocol_bound_item_json_bytes": (
-            MAX_PROTOCOL_BOUND_JSON_BYTES),
+        "protocol_bound_item_json_warning_bytes": (
+            PROTOCOL_BOUND_JSON_WARNING_BYTES),
     }
     sync_hosts("train_analysis_pool_complete")
     if store.is_primary:

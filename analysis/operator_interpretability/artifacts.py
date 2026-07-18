@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -28,10 +29,12 @@ DEFAULT_BENCHMARK_ROOT = (
     "gs://dawn-tpu-data-c4/dataset/operator_interpretability"
 )
 
-# Item artifacts are aggregate audit records, never raw capture containers.
-# Keeping this fail-loud ceiling small prevents a regression back to multi-GB
-# JSON even when a new analysis kind accidentally embeds dense evidence.
-MAX_PROTOCOL_BOUND_JSON_BYTES = 2 * 1024 * 1024
+# Item artifacts should remain aggregate audit records rather than raw capture
+# containers. This threshold is advisory: exceeding it must not discard an
+# otherwise completed analysis run during the final serialization step.
+PROTOCOL_BOUND_JSON_WARNING_BYTES = 2 * 1024 * 1024
+# Compatibility for callers that imported the former hard-limit name.
+MAX_PROTOCOL_BOUND_JSON_BYTES = PROTOCOL_BOUND_JSON_WARNING_BYTES
 
 
 def sha256_path(path: str) -> str:
@@ -173,21 +176,77 @@ def write_protocol_bound_artifact(store: Any, relative_path: str,
                                   payload: Mapping[str, Any], *,
                                   protocol: Mapping[str, Any]) -> str:
     path = store.path(*relative_path.replace("\\", "/").split("/"))
-    record = {
-        "protocol": dict(protocol),
-        "protocol_hash": canonical_hash(protocol),
-        "payload": dict(payload),
-    }
-    safe_record = json_safe(record)
-    encoded_size = len((json.dumps(
-        safe_record, indent=2, sort_keys=True,
-        ensure_ascii=False) + "\n").encode("utf-8"))
-    if encoded_size > MAX_PROTOCOL_BOUND_JSON_BYTES:
-        raise RuntimeError(
-            "protocol-bound item JSON exceeds the compact-artifact contract: "
+    warning_code = "protocol_bound_json_advisory_threshold_exceeded"
+    output_payload = dict(payload)
+    existing_warnings = [
+        dict(row) for row in (
+            output_payload.get("artifact_warnings") or ())
+        if isinstance(row, Mapping) and row.get("code") != warning_code
+    ]
+    output_payload.pop("artifact_warnings", None)
+    if existing_warnings:
+        output_payload["artifact_warnings"] = existing_warnings
+
+    def encoded(value: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+        safe = json_safe({
+            "protocol": dict(protocol),
+            "protocol_hash": canonical_hash(protocol),
+            "payload": dict(value),
+        })
+        size = len((json.dumps(
+            safe, indent=2, sort_keys=True,
+            ensure_ascii=False) + "\n").encode("utf-8"))
+        return safe, size
+
+    safe_record, encoded_size = encoded(output_payload)
+    if encoded_size > PROTOCOL_BOUND_JSON_WARNING_BYTES:
+        size_warning = {
+            "code": warning_code,
+            "severity": "warning",
+            "path": path,
+            "encoded_bytes": int(encoded_size),
+            "warning_threshold_bytes": int(
+                PROTOCOL_BOUND_JSON_WARNING_BYTES),
+            "write_continued": True,
+            "artifact_discarded": False,
+            "message": (
+                "Protocol-bound item JSON exceeded the advisory size "
+                "threshold; artifact writing continued."),
+        }
+        for _ in range(4):
+            output_payload["artifact_warnings"] = [
+                *existing_warnings, size_warning]
+            safe_record, final_size = encoded(output_payload)
+            if final_size == size_warning["encoded_bytes"]:
+                break
+            size_warning = {
+                **size_warning,
+                "encoded_bytes": int(final_size),
+            }
+        output_payload["artifact_warnings"] = [
+            *existing_warnings, size_warning]
+        safe_record, encoded_size = encoded(output_payload)
+        if encoded_size != size_warning["encoded_bytes"]:
+            size_warning = {
+                **size_warning,
+                "encoded_bytes": int(encoded_size),
+            }
+            output_payload["artifact_warnings"] = [
+                *existing_warnings, size_warning]
+            safe_record, encoded_size = encoded(output_payload)
+        warnings.warn(
+            "protocol-bound item JSON exceeds the advisory compact-artifact "
+            "threshold: "
             f"path={path} bytes={encoded_size} "
-            f"limit={MAX_PROTOCOL_BOUND_JSON_BYTES}; retain only aggregate "
-            "metrics, uncertainty, decisions, counts, and digests")
+            "warning_threshold="
+            f"{PROTOCOL_BOUND_JSON_WARNING_BYTES}; writing the "
+            "artifact so a completed analysis is not discarded",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if isinstance(payload, dict):
+        payload.clear()
+        payload.update(output_payload)
     write_json_atomic(path, safe_record)
     return path
 

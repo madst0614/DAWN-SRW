@@ -124,8 +124,9 @@ _register("mib_ioi.native_operator_program", _mechanistic_item(
     "counterfactually transferred by its answer-position multilayer RW "
     "operator program?",
     "Select the smallest compact replay-sufficient decision-position mass "
-    "on validation, then evaluate the frozen threshold once on held-out "
-    "test; causal diagnostics never select mass, and specificity plus "
+    "from replay-only validation candidates, freeze it, run causal "
+    "diagnostics only for that validation mass, then evaluate the frozen "
+    "threshold once on held-out test; specificity plus "
     "ID-only transfer claims require paired effects "
     "to exceed answer-disjoint mismatched and complement-sampled controls.",
     "mib_ioi.behavioral_eligibility",

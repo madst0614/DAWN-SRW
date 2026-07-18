@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 PROTOCOL_ID = "dawn_operator_interpretability"
-PROTOCOL_SCHEMA_VERSION = 8
+PROTOCOL_SCHEMA_VERSION = 9
 ANALYSIS_ENGINE = "train_analysis_pool"
 SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
