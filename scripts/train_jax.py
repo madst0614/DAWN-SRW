@@ -20003,6 +20003,13 @@ def main():
     _latest_production_diagnostic_step = None
     _production_diagnostic_seen = False
     _production_diagnostic_parity_checked = False
+    # training_fast and production_diagnostics are deliberately distinct TPU
+    # executables.  Their model math is the same, but XLA may choose a
+    # different float32 reduction order when the diagnostics graph retains
+    # observational outputs.  Keep the startup gate fail-loud for a material
+    # mismatch without requiring bitwise identity across those executables.
+    _production_diagnostic_parity_atol = 1.0e-5
+    _production_diagnostic_parity_rtol = 1.0e-6
     # The optional startup OOM probe executes and blocks on train_step once.
     # Otherwise the first real call is compile-inclusive and is excluded from
     # steady-state timing below.
@@ -20144,22 +20151,35 @@ def main():
                     diagnostic_metrics['loss']))
                 _fast_loss_value = np.asarray(jax.device_get(
                     metrics['ce_loss']))
-                if not np.array_equal(
-                        _diagnostic_loss_value, _fast_loss_value):
-                    _parity_abs_diff = float(np.max(np.abs(
-                        _diagnostic_loss_value.astype(np.float64)
-                        - _fast_loss_value.astype(np.float64))))
+                _diagnostic_loss_f64 = (
+                    _diagnostic_loss_value.astype(np.float64))
+                _fast_loss_f64 = _fast_loss_value.astype(np.float64)
+                _parity_abs_diff = float(np.max(np.abs(
+                    _diagnostic_loss_f64 - _fast_loss_f64)))
+                _parity_limit = float(
+                    _production_diagnostic_parity_atol
+                    + _production_diagnostic_parity_rtol
+                    * np.max(np.abs(_fast_loss_f64)))
+                _parity_finite = bool(
+                    np.all(np.isfinite(_diagnostic_loss_f64))
+                    and np.all(np.isfinite(_fast_loss_f64)))
+                if not _parity_finite or _parity_abs_diff > _parity_limit:
                     raise RuntimeError(
                         "training_fast/production_diagnostics loss parity "
                         "failed before accepting the first optimizer update: "
                         f"fast={float(_fast_loss_value):.9g}, "
                         f"diagnostic={float(_diagnostic_loss_value):.9g}, "
-                        f"abs_diff={_parity_abs_diff:.9g}, tolerance=0")
+                        f"abs_diff={_parity_abs_diff:.9g}, "
+                        f"limit={_parity_limit:.9g}, "
+                        f"atol={_production_diagnostic_parity_atol:.9g}, "
+                        f"rtol={_production_diagnostic_parity_rtol:.9g}")
                 _production_diagnostic_parity_checked = True
                 if is_host0:
                     print(
                         "  production diagnostics parity: "
-                        "fast_loss == diagnostic_loss (exact, pre_update)",
+                        "loss close (pre_update; "
+                        f"abs_diff={_parity_abs_diff:.9g}, "
+                        f"limit={_parity_limit:.9g})",
                         flush=True)
 
             params, opt_state = new_params, new_opt_state
