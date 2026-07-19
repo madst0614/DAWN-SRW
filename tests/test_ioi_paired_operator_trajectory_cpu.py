@@ -756,7 +756,38 @@ def test_margin_orientation_donor_group_and_path_gate() -> None:
         "p_value_two_sided"] < ProtocolConfig().alpha
     assert uncertainty["paired_minus_mismatched_paired_permutation"][
         "p_value_two_sided"] < ProtocolConfig().alpha
+    assert all(
+        uncertainty["per_direction"][direction][
+            "paired_and_specific_validation_passed"]
+        for direction in ("source_to_base", "base_to_source"))
+    assert uncertainty[
+        "direction_averaged_causal_pair_specific_validation_passed"] is True
+    assert uncertainty["validation_bidirectional_path_supported"] is True
     assert uncertainty["causal_pair_specific_validation_passed"] is True
+
+    asymmetric_vectors = {
+        "source_to_base": {
+            "paired_effect": np.full((16,), 2.0, dtype=np.float64),
+            "mismatched_effect": np.full((16,), 0.2, dtype=np.float64),
+        },
+        "base_to_source": {
+            "paired_effect": np.full((16,), -0.2, dtype=np.float64),
+            "mismatched_effect": np.full((16,), -0.05, dtype=np.float64),
+        },
+    }
+    asymmetric = summarize_frozen_path_uncertainty(
+        {"path_length": 1, "directions": asymmetric_vectors},
+        config=ProtocolConfig(), seed=4173)
+    assert asymmetric[
+        "direction_averaged_causal_pair_specific_validation_passed"] is True
+    assert asymmetric["direction_averaged"][
+        "paired_and_specific_validation_passed"] is True
+    assert asymmetric["per_direction"]["source_to_base"][
+        "paired_and_specific_validation_passed"] is True
+    assert asymmetric["per_direction"]["base_to_source"][
+        "paired_and_specific_validation_passed"] is False
+    assert asymmetric["validation_bidirectional_path_supported"] is False
+    assert asymmetric["causal_pair_specific_validation_passed"] is False
     print("TRAJECTORY_ORIENTATION_DONOR_GROUP_AND_PATH_GATE_OK")
 
 

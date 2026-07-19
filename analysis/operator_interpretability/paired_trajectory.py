@@ -3727,7 +3727,8 @@ def summarize_frozen_path_uncertainty(
             "frozen path uncertainty requires both intervention directions")
     paired_by_direction = []
     mismatch_by_direction = []
-    for direction in required:
+    per_direction = {}
+    for direction_index, direction in enumerate(required):
         values = directions[direction]
         paired = np.asarray(values["paired_effect"], dtype=np.float64)
         mismatched = np.asarray(
@@ -3738,6 +3739,47 @@ def summarize_frozen_path_uncertainty(
                 "arrays")
         paired_by_direction.append(paired)
         mismatch_by_direction.append(mismatched)
+        specific = paired - mismatched
+        direction_seed = seed + 11 + 4 * direction_index
+        direction_paired_ci = bootstrap_mean_ci(
+            paired, samples=config.bootstrap_samples,
+            alpha=config.alpha, seed=direction_seed)
+        direction_specific_ci = bootstrap_mean_ci(
+            specific, samples=config.bootstrap_samples,
+            alpha=config.alpha, seed=direction_seed + 1)
+        direction_paired_permutation = paired_permutation_test(
+            paired, np.zeros_like(paired),
+            samples=config.permutation_samples, seed=direction_seed + 2)
+        direction_specific_permutation = paired_permutation_test(
+            paired, mismatched,
+            samples=config.permutation_samples, seed=direction_seed + 3)
+        direction_paired_supported = bool(
+            direction_paired_ci["ci_low"] is not None
+            and float(direction_paired_ci["ci_low"]) > 0.0
+            and float(direction_paired_permutation["p_value_two_sided"])
+            < config.alpha)
+        direction_specific_supported = bool(
+            direction_specific_ci["ci_low"] is not None
+            and float(direction_specific_ci["ci_low"]) > 0.0
+            and float(direction_specific_permutation["p_value_two_sided"])
+            < config.alpha)
+        per_direction[direction] = {
+            "paired_effect_mean": float(paired.mean()),
+            "mismatched_effect_mean": float(mismatched.mean()),
+            "paired_minus_mismatched_effect_mean": float(specific.mean()),
+            "paired_effect_ci": direction_paired_ci,
+            "paired_minus_mismatched_effect_ci": direction_specific_ci,
+            "paired_effect_paired_permutation": (
+                direction_paired_permutation),
+            "paired_minus_mismatched_paired_permutation": (
+                direction_specific_permutation),
+            "paired_effect_supported": direction_paired_supported,
+            "pair_specific_effect_supported": (
+                direction_specific_supported),
+            "paired_and_specific_validation_passed": bool(
+                direction_paired_supported
+                and direction_specific_supported),
+        }
     if paired_by_direction[0].shape != paired_by_direction[1].shape:
         raise ValueError(
             "frozen path intervention directions have different cohorts")
@@ -3765,12 +3807,32 @@ def summarize_frozen_path_uncertainty(
         specific_ci["ci_low"] is not None
         and float(specific_ci["ci_low"]) > 0.0
         and float(specific_permutation["p_value_two_sided"]) < config.alpha)
+    averaged_supported = bool(paired_supported and specific_supported)
+    bidirectional_supported = all(bool(
+        per_direction[direction][
+            "paired_and_specific_validation_passed"])
+        for direction in required)
     return {
         "evaluation_scope": (
             "discovery_frozen_final_path_on_preregistered_validation_split"),
         "path_length": int(vector_record["path_length"]),
         "bidirectional_effect_aggregation": (
             "per_example_mean_of_source_to_base_and_base_to_source"),
+        "direction_averaged_statistic_role": "aggregate_effect_only",
+        "direction_averaged": {
+            "paired_effect_mean": float(paired_effect.mean()),
+            "mismatched_effect_mean": float(mismatched_effect.mean()),
+            "paired_minus_mismatched_effect_mean": float(
+                specific_effect.mean()),
+            "paired_effect_ci": paired_ci,
+            "paired_minus_mismatched_effect_ci": specific_ci,
+            "paired_effect_paired_permutation": paired_permutation,
+            "paired_minus_mismatched_paired_permutation": (
+                specific_permutation),
+            "paired_effect_supported": paired_supported,
+            "pair_specific_effect_supported": specific_supported,
+            "paired_and_specific_validation_passed": averaged_supported,
+        },
         "paired_effect_ci": paired_ci,
         "paired_minus_mismatched_effect_ci": specific_ci,
         "paired_effect_paired_permutation": paired_permutation,
@@ -3778,8 +3840,14 @@ def summarize_frozen_path_uncertainty(
         "alpha": float(config.alpha),
         "paired_effect_supported": paired_supported,
         "pair_specific_effect_supported": specific_supported,
-        "causal_pair_specific_validation_passed": bool(
-            paired_supported and specific_supported),
+        "direction_averaged_causal_pair_specific_validation_passed": (
+            averaged_supported),
+        "per_direction": per_direction,
+        "per_direction_validation_gate_required": True,
+        "bidirectional_gate_combination": (
+            "intersection_union_all_directions_must_pass_paired_and_specific"),
+        "validation_bidirectional_path_supported": bidirectional_supported,
+        "causal_pair_specific_validation_passed": bidirectional_supported,
         "validation_used_for_path_selection": False,
         "test_used": False,
     }

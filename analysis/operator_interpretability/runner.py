@@ -1895,17 +1895,30 @@ class OperatorInterpretabilityRunner:
             compact_validation_path.get("prefixes") or [{}])[-1]
         validation_uncertainty = compact_validation_path.get(
             "final_frozen_path_uncertainty") or {}
+        validation_bidirectional_path_supported = bool(
+            validation_uncertainty.get(
+                "validation_bidirectional_path_supported", False))
         if validation_uncertainty:
             human_lines.append(
                 "The final discovery-frozen path was evaluated on validation "
-                "with bootstrap intervals and paired sign-flip permutation "
-                "tests for both the paired and paired-minus-mismatched "
-                "effects.")
+                "with separate bootstrap intervals and paired sign-flip "
+                "permutation tests in each intervention direction, plus a "
+                "direction-averaged aggregate statistic.")
+            if validation_bidirectional_path_supported:
+                human_lines.append(
+                    "Both validation directions independently supported the "
+                    "paired and paired-minus-mismatched path effects.")
+            else:
+                human_lines.append(
+                    "At least one validation direction failed its paired or "
+                    "paired-minus-mismatched gate, so bidirectional path "
+                    "support was not claimed.")
         human_summary = {
             "narrative": human_lines,
             "first_divergence": first or None,
             "frozen_path_hash": path_record["path_record_hash"],
             "frozen_path_length": int(path_record["path_length"]),
+            "discovery_causal_path_selected": causal_path_supported,
             "validation_paired_effect": final_validation.get(
                 "bidirectional_paired_effect_mean"),
             "validation_mismatched_effect": final_validation.get(
@@ -1916,6 +1929,14 @@ class OperatorInterpretabilityRunner:
                 "paired_effect_ci"),
             "validation_specific_effect_ci": validation_uncertainty.get(
                 "paired_minus_mismatched_effect_ci"),
+            "validation_per_direction": validation_uncertainty.get(
+                "per_direction"),
+            "validation_direction_averaged_supported": (
+                validation_uncertainty.get(
+                    "direction_averaged_causal_pair_specific_validation_"
+                    "passed")),
+            "validation_bidirectional_path_supported": (
+                validation_bidirectional_path_supported),
             "validation_causal_pair_specific_passed": (
                 validation_uncertainty.get(
                     "causal_pair_specific_validation_passed")),
@@ -1944,9 +1965,13 @@ class OperatorInterpretabilityRunner:
             "passed": None,
             "descriptive_trace_ready": True,
             "single_site_results_ready": True,
+            "discovery_causal_path_selected": causal_path_supported,
             "causal_path_supported": causal_path_supported,
+            "causal_path_supported_scope": "discovery_selection_only",
             "validation_path_evaluated": bool(
                 validation_path.get("validation_path_evaluated", False)),
+            "validation_bidirectional_path_supported": (
+                validation_bidirectional_path_supported),
             "analysis_kind": "paired_operator_trajectory",
             "interpretation_scope": (
                 "causal_site_trajectory_not_complete_token_to_token_"
