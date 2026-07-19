@@ -190,6 +190,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trajectory-max-path-sites", type=int,
         default=defaults.trajectory_max_path_sites)
+    parser.add_argument(
+        "--trajectory-path-prefix-batch-size", type=int,
+        default=defaults.trajectory_path_prefix_batch_size)
     return parser.parse_args()
 
 
@@ -307,6 +310,8 @@ def _protocol_config(args: argparse.Namespace) -> ProtocolConfig:
         trajectory_max_operator_followup_sites=(
             args.trajectory_max_operator_followup_sites),
         trajectory_max_path_sites=args.trajectory_max_path_sites,
+        trajectory_path_prefix_batch_size=(
+            args.trajectory_path_prefix_batch_size),
     ).validate()
 
 

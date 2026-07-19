@@ -75,6 +75,7 @@ from analysis.operator_interpretability.paired_trajectory import (
     capture_candidate_site_values,
     capture_full_active_trajectory,
     capture_production_atlas,
+    deduplicate_residual_candidates,
     deterministic_deep_selection,
     deterministic_mismatch_mapping as trajectory_mismatch_mapping,
     divergence_extrema,
@@ -85,6 +86,7 @@ from analysis.operator_interpretability.paired_trajectory import (
     freeze_operator_followup_sites,
     ioi_semantic_record,
     merge_divergence_atlases,
+    merge_staged_coarse_patch_results,
     merge_trajectory_batch_summaries,
     operator_parameter_provenance,
     select_discovery_candidates,
@@ -494,9 +496,14 @@ class OperatorInterpretabilityRunner:
             "mib_ioi.behavioral_eligibility",
             "mib_ioi.paired_operator_trajectory",
         }
-        self._paired_trajectory_test_isolated = (
-            "mib_ioi.paired_operator_trajectory" in requested_set
-            and requested_set <= trajectory_only_items)
+        trajectory_requested = (
+            "mib_ioi.paired_operator_trajectory" in requested_set)
+        if trajectory_requested and not requested_set <= trajectory_only_items:
+            raise ValueError(
+                "mib_ioi.paired_operator_trajectory must be requested only "
+                "with its dedicated input-contract and behavioral-eligibility "
+                "items so held-out test access remains isolated")
+        self._paired_trajectory_test_isolated = trajectory_requested
         executed = dependency_closure(items)
         kind_order: list[str] = []
         for item_id in executed:
@@ -1470,12 +1477,14 @@ class OperatorInterpretabilityRunner:
             trajectory_batches = []
             divergence = None
             deep_shards = []
+            running_widths = dict(initial_widths)
             for deep_index, example in enumerate(deep):
                 example_semantic = {
                     example.example_id: deep_semantic[example.example_id]}
                 trajectory_batch = capture_full_active_trajectory(
                     self.ctx, [example], example_semantic,
                     pad_token_id=pad_token_id, config=self.config,
+                    initial_widths=running_widths,
                     fixed_sequence_length=maximum_trace_sequence_length,
                     fixed_trace_width=maximum_trace_positions,
                     progress=self._trajectory_progress)
@@ -1500,6 +1509,12 @@ class OperatorInterpretabilityRunner:
                         "test_data_accessor_called": False,
                         "test_used": False,
                     }
+                running_widths = {
+                    pool: max(
+                        int(running_widths[pool]),
+                        int(trajectory_batch["widths"][pool]))
+                    for pool in ("qk", "v", "rst")
+                }
                 persisted = write_deep_trace_shards(
                     self.store, trajectory_batch, [example],
                     example_semantic, protocol_hash=protocol_hash,
@@ -1516,6 +1531,7 @@ class OperatorInterpretabilityRunner:
                         (divergence, example_divergence)))
                 trajectory_batches.append({
                     "example_id": example.example_id,
+                    "initial_widths": trajectory_batch["initial_widths"],
                     "widths": trajectory_batch["widths"],
                     "retries": trajectory_batch["retries"],
                     "completeness": trajectory_batch["completeness"],
@@ -1567,25 +1583,46 @@ class OperatorInterpretabilityRunner:
                 discovery, seed=self.config.trajectory_seed + 101)
             last_successful_stage = stage
 
-            stage = "discovery_coarse_patch"
-            discovery_coarse = evaluate_coarse_site_patches(
+            stage = "discovery_route_patch"
+            discovery_route = evaluate_coarse_site_patches(
                 self.ctx, discovery, discovery_semantic, candidates,
                 discovery_site_values, discovery_mismatch,
                 production_atlas=discovery_atlas,
                 pad_token_id=pad_token_id, config=self.config,
-                phase="discovery", progress=self._trajectory_progress)
+                phase="discovery", patch_kinds=("route",),
+                progress=self._trajectory_progress)
             if selection["selection_record_hash"] != (
                     selection_hash_before_causal):
                 raise RuntimeError(
                     "causal patching changed the frozen candidate record")
+            last_successful_stage = stage
+
+            stage = "route_followup_and_path_freeze"
+            operator_followup = freeze_operator_followup_sites(
+                discovery_route, candidates, config=self.config)
+            path_record = freeze_chronological_path(
+                discovery_route, candidates, config=self.config)
+            path_hash_before_validation = str(
+                path_record["path_record_hash"])
+            last_successful_stage = stage
+
+            stage = "discovery_residual_patch"
+            residual_candidates = deduplicate_residual_candidates(candidates)
+            discovery_residual = evaluate_coarse_site_patches(
+                self.ctx, discovery, discovery_semantic, residual_candidates,
+                discovery_site_values, discovery_mismatch,
+                production_atlas=discovery_atlas,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="discovery", patch_kinds=("residual",),
+                progress=self._trajectory_progress)
+            discovery_coarse = merge_staged_coarse_patch_results(
+                discovery_route, discovery_residual)
             discovery_site_artifact = write_causal_vector_artifact(
                 self.store, "discovery_site_patches.npz",
                 discovery_coarse, protocol_hash=protocol_hash)
             last_successful_stage = stage
 
-            stage = "operator_followup_freeze"
-            operator_followup = freeze_operator_followup_sites(
-                discovery_coarse, candidates, config=self.config)
+            stage = "operator_group_preparation"
             discovery_index = {
                 example.example_id: index
                 for index, example in enumerate(discovery)
@@ -1617,13 +1654,6 @@ class OperatorInterpretabilityRunner:
                 operator_groups, protocol_hash=protocol_hash)
             last_successful_stage = stage
 
-            stage = "chronological_path_freeze"
-            path_record = freeze_chronological_path(
-                discovery_coarse, candidates, config=self.config)
-            path_hash_before_validation = str(
-                path_record["path_record_hash"])
-            last_successful_stage = stage
-
             stage = "discovery_cumulative_path"
             discovery_path = evaluate_cumulative_path(
                 self.ctx, discovery, path_record,
@@ -1637,13 +1667,6 @@ class OperatorInterpretabilityRunner:
                 discovery_path, protocol_hash=protocol_hash)
             last_successful_stage = stage
 
-            stage = "validation_frozen_value_capture"
-            validation_site_values = capture_candidate_site_values(
-                self.ctx, validation, validation_semantic, candidates,
-                pad_token_id=pad_token_id, phase="validation",
-                progress=self._trajectory_progress)
-            validation_mismatch = trajectory_mismatch_mapping(
-                validation, seed=self.config.trajectory_seed + 107)
             path_indices = {
                 int(row["candidate_index"])
                 for row in path_record["sites"]
@@ -1652,23 +1675,73 @@ class OperatorInterpretabilityRunner:
                 candidate for candidate in candidates
                 if int(candidate["candidate_index"]) in path_indices
             ]
-            validation_single = evaluate_coarse_site_patches(
-                self.ctx, validation, validation_semantic,
-                path_candidates, validation_site_values,
-                validation_mismatch,
-                production_atlas=validation_atlas,
-                pad_token_id=pad_token_id, config=self.config,
-                phase="validation", progress=self._trajectory_progress)
-            last_successful_stage = stage
+            if path_candidates:
+                stage = "validation_frozen_value_capture"
+                validation_site_values = capture_candidate_site_values(
+                    self.ctx, validation, validation_semantic, candidates,
+                    pad_token_id=pad_token_id, phase="validation",
+                    progress=self._trajectory_progress)
+                validation_mismatch = trajectory_mismatch_mapping(
+                    validation, seed=self.config.trajectory_seed + 107)
+                validation_route = evaluate_coarse_site_patches(
+                    self.ctx, validation, validation_semantic,
+                    path_candidates, validation_site_values,
+                    validation_mismatch,
+                    production_atlas=validation_atlas,
+                    pad_token_id=pad_token_id, config=self.config,
+                    phase="validation", patch_kinds=("route",),
+                    progress=self._trajectory_progress)
+                validation_residual_candidates = (
+                    deduplicate_residual_candidates(path_candidates))
+                validation_residual = evaluate_coarse_site_patches(
+                    self.ctx, validation, validation_semantic,
+                    validation_residual_candidates, validation_site_values,
+                    validation_mismatch,
+                    production_atlas=validation_atlas,
+                    pad_token_id=pad_token_id, config=self.config,
+                    phase="validation", patch_kinds=("residual",),
+                    progress=self._trajectory_progress)
+                validation_single = merge_staged_coarse_patch_results(
+                    validation_route, validation_residual)
+                last_successful_stage = stage
 
-            stage = "validation_frozen_path"
-            validation_path = evaluate_cumulative_path(
-                self.ctx, validation, path_record,
-                validation_site_values, validation_mismatch,
-                production_atlas=validation_atlas,
-                pad_token_id=pad_token_id, config=self.config,
-                phase="validation", evaluate_prefix_curve=False,
-                progress=self._trajectory_progress)
+                stage = "validation_frozen_path"
+                validation_path = evaluate_cumulative_path(
+                    self.ctx, validation, path_record,
+                    validation_site_values, validation_mismatch,
+                    production_atlas=validation_atlas,
+                    pad_token_id=pad_token_id, config=self.config,
+                    phase="validation", evaluate_prefix_curve=False,
+                    progress=self._trajectory_progress)
+            else:
+                stage = "validation_skipped_no_causal_path"
+                validation_site_values = {
+                    "status": "not_evaluated_no_causal_path",
+                    "sequence_length": int(
+                        discovery_site_values["sequence_length"]),
+                    "forward_call_count": 0,
+                }
+                validation_single = {
+                    "status": "no_causal_path",
+                    "phase": "validation",
+                    "candidate_count": 0,
+                    "evaluated_patch_count": 0,
+                    "patch_kinds_evaluated": [],
+                    "site_summaries": [],
+                    "_vectors": [],
+                    "forward_call_count": 0,
+                    "initial_intervention_batch_size": 0,
+                    "effective_intervention_batch_size": 0,
+                    "resource_retry_count": 0,
+                    "resource_retries": [],
+                    "validation_path_evaluated": False,
+                }
+                validation_path = evaluate_cumulative_path(
+                    self.ctx, validation, path_record, {}, {},
+                    production_atlas=validation_atlas,
+                    pad_token_id=pad_token_id, config=self.config,
+                    phase="validation", evaluate_prefix_curve=False,
+                    progress=self._trajectory_progress)
             if path_record["path_record_hash"] != path_hash_before_validation:
                 raise RuntimeError(
                     "validation changed the frozen discovery path")
@@ -1782,6 +1855,7 @@ class OperatorInterpretabilityRunner:
         compact_validation_path = self._trajectory_without_private(
             validation_path)
 
+        causal_path_supported = bool(path_record["sites"])
         first = extrema.get("first_divergence") or {}
         human_lines = [
             "The base/source trajectories satisfied the frozen S2-prefix "
@@ -1799,6 +1873,11 @@ class OperatorInterpretabilityRunner:
                 f"layer {first_path['layer']} {first_path['semantic_role']} "
                 f"{first_path['route']} and contains "
                 f"{len(path_record['sites'])} complete-route sites.")
+        else:
+            human_lines.append(
+                "No route site passed the paired and pair-specific gates in "
+                "each direction, so no causal path was claimed and held-out "
+                "path validation was not run.")
         group_rows = compact_groups.get("site_summaries") or []
         if group_rows:
             best_group = max(
@@ -1814,6 +1893,14 @@ class OperatorInterpretabilityRunner:
                 "exploratory evidence, not an additive operator claim.")
         final_validation = (
             compact_validation_path.get("prefixes") or [{}])[-1]
+        validation_uncertainty = compact_validation_path.get(
+            "final_frozen_path_uncertainty") or {}
+        if validation_uncertainty:
+            human_lines.append(
+                "The final discovery-frozen path was evaluated on validation "
+                "with bootstrap intervals and paired sign-flip permutation "
+                "tests for both the paired and paired-minus-mismatched "
+                "effects.")
         human_summary = {
             "narrative": human_lines,
             "first_divergence": first or None,
@@ -1825,6 +1912,13 @@ class OperatorInterpretabilityRunner:
                 "bidirectional_mismatched_effect_mean"),
             "validation_flip_fraction": final_validation.get(
                 "bidirectional_flip_fraction"),
+            "validation_paired_effect_ci": validation_uncertainty.get(
+                "paired_effect_ci"),
+            "validation_specific_effect_ci": validation_uncertainty.get(
+                "paired_minus_mismatched_effect_ci"),
+            "validation_causal_pair_specific_passed": (
+                validation_uncertainty.get(
+                    "causal_pair_specific_validation_passed")),
             "test_consulted": False,
         }
         artifact_warnings = []
@@ -1844,10 +1938,20 @@ class OperatorInterpretabilityRunner:
                     "threshold; artifact writing continued."),
             })
         return {
-            "status": "ready",
+            "status": (
+                "ready" if causal_path_supported else "no_causal_path"),
             "ready": True,
             "passed": None,
+            "descriptive_trace_ready": True,
+            "single_site_results_ready": True,
+            "causal_path_supported": causal_path_supported,
+            "validation_path_evaluated": bool(
+                validation_path.get("validation_path_evaluated", False)),
             "analysis_kind": "paired_operator_trajectory",
+            "interpretation_scope": (
+                "causal_site_trajectory_not_complete_token_to_token_"
+                "attention_flow_graph"),
+            "attention_edge_weights_captured": False,
             "algorithm_version": "paired_s2_operator_trajectory_v1",
             "scientific_role": "exploratory",
             "claim_role": "checkpoint_specific",
@@ -1906,6 +2010,12 @@ class OperatorInterpretabilityRunner:
                 "requested_shape": requested_trace_shape,
                 "trace_completeness": trace_completeness,
                 "capture_retries": trajectory["retries"],
+                "initial_widths_by_deep_example": trajectory[
+                    "initial_widths_by_batch"],
+                "widths_carried_forward_between_deep_examples": trajectory[
+                    "widths_carried_forward_between_deep_examples"],
+                "width_inheritance_monotonic": trajectory[
+                    "width_inheritance_monotonic"],
                 "closure": trajectory["closure"],
                 "trace_output_bytes": trace_output_bytes,
                 "compact_replay_trace_output_bytes": int(
@@ -1982,6 +2092,7 @@ class OperatorInterpretabilityRunner:
                 "candidate_state_rows_per_example": 2,
                 "deep_trace_candidate_rows_per_example": 4,
                 "coarse_patch_variants_per_site_direction": 4,
+                "operator_group_variants_per_site_direction": 5,
                 "answer_candidates_fused_per_variant": 2,
                 "candidate_intervention_batch_size_initial": (
                     self.config.trajectory_intervention_batch_size),
@@ -1996,6 +2107,12 @@ class OperatorInterpretabilityRunner:
                 "coarse_resource_retry_count": int(
                     discovery_coarse["resource_retry_count"])
                     + int(validation_single["resource_retry_count"]),
+                "path_prefix_batch_size_initial": int(
+                    discovery_path["initial_prefix_batch_size"]),
+                "path_prefix_batch_size_effective": int(
+                    discovery_path["effective_prefix_batch_size"]),
+                "path_prefix_resource_retry_count": int(
+                    discovery_path["resource_retry_count"]),
             },
             "memory_protection": {
                 "parameters_replicated_per_variant": False,
@@ -2005,6 +2122,11 @@ class OperatorInterpretabilityRunner:
                 "individual_operator_python_forward_loop": False,
                 "candidate_specific_recompilation": False,
                 "candidate_answer_variants_fused": True,
+                "cumulative_path_prefixes_fused": bool(
+                    discovery_path.get("prefix_batch_fusion_enabled", False)),
+                "cumulative_path_prefix_batch_size_configured": (
+                    self.config.trajectory_path_prefix_batch_size),
+                "cumulative_path_prefix_oom_fallback": "halve_to_one",
                 "fixed_intervention_slots": (
                     self.config.trajectory_max_patch_sites_per_variant),
                 "intervention_variants": (
@@ -2016,6 +2138,8 @@ class OperatorInterpretabilityRunner:
                 "semantic_position_state_gather_only": True,
                 "compact_replay_output_only": True,
                 "fixed_deep_trace_shapes_reused": True,
+                "deep_trace_widths_carried_forward_monotonically": bool(
+                    trajectory["width_inheritance_monotonic"]),
                 "active_operator_omission_on_resource_pressure": False,
             },
             "artifacts": {

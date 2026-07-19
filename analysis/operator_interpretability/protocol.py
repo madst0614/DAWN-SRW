@@ -108,6 +108,7 @@ class ProtocolConfig:
     trajectory_max_operator_followup_sites: int = 8
     trajectory_individual_operator_followup_limit: int = 0
     trajectory_max_path_sites: int = 8
+    trajectory_path_prefix_batch_size: int = 4
     trajectory_state_identity_atol: float = 1.0e-5
     trajectory_replay_atol: float = 5.0e-4
     trajectory_replay_rtol: float = 5.0e-4
@@ -203,6 +204,8 @@ class ProtocolConfig:
             "trajectory_max_operator_followup_sites": (
                 self.trajectory_max_operator_followup_sites),
             "trajectory_max_path_sites": self.trajectory_max_path_sites,
+            "trajectory_path_prefix_batch_size": (
+                self.trajectory_path_prefix_batch_size),
         }
         invalid = [
             name for name, value in trajectory_positive.items()

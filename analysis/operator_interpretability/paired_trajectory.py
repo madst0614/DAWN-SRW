@@ -45,6 +45,10 @@ from analysis.operator_interpretability.protocol import (
     PAIRED_TRAJECTORY_ALGORITHM_VERSION,
     ProtocolConfig,
 )
+from analysis.operator_interpretability.statistics import (
+    bootstrap_mean_ci,
+    paired_permutation_test,
+)
 
 
 ROUTES = ("q", "k", "v", "rst")
@@ -554,6 +558,31 @@ def _trace_width_overflow(
     return overflow
 
 
+def _expand_trajectory_widths(
+        widths: Mapping[str, int], pool_sizes: Mapping[str, int],
+        overflow: Mapping[str, int]
+) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    """Grow only overflowing pools while preserving every captured ID."""
+    updated_widths = {key: int(value) for key, value in widths.items()}
+    changed = {}
+    for pool, observed_value in overflow.items():
+        if pool not in updated_widths or pool not in pool_sizes:
+            raise ValueError(f"unknown trajectory overflow pool: {pool}")
+        observed = int(observed_value)
+        previous = int(updated_widths[pool])
+        updated = min(int(pool_sizes[pool]), max(previous * 2, observed))
+        if updated <= previous:
+            raise RuntimeError(
+                f"trajectory {pool} active count exceeds pool-size width")
+        updated_widths[pool] = updated
+        changed[pool] = {
+            "previous_width": previous,
+            "observed_active_count": observed,
+            "updated_width": updated,
+        }
+    return updated_widths, changed
+
+
 def _validate_complete_trace(
         trace: Mapping[str, Any], *, real_count: int) -> dict[str, Any]:
     route_summary = {}
@@ -655,6 +684,7 @@ def capture_full_active_trajectory(
         ctx: Any, examples: Sequence[BenchmarkExample],
         semantic: Mapping[str, IOISemanticRecord], *,
         pad_token_id: int, config: ProtocolConfig,
+        initial_widths: Mapping[str, int] | None = None,
         fixed_sequence_length: int | None = None,
         fixed_trace_width: int | None = None,
         progress: Any | None = None) -> dict[str, Any]:
@@ -670,11 +700,26 @@ def capture_full_active_trajectory(
             ctx.model_cfg["n_rst"]
             if "n_rst" in ctx.model_cfg else ctx.model_cfg["n_know"]),
     }
-    widths = {
+    configured_widths = {
         "qk": min(config.trajectory_capture_topk_qk, pool_sizes["qk"]),
         "v": min(config.trajectory_capture_topk_v, pool_sizes["v"]),
         "rst": min(config.trajectory_capture_topk_rst, pool_sizes["rst"]),
     }
+    if initial_widths is None:
+        widths = dict(configured_widths)
+    else:
+        if set(initial_widths) != set(pool_sizes):
+            raise ValueError(
+                "trajectory initial widths must define qk, v, and rst")
+        widths = {key: int(initial_widths[key]) for key in pool_sizes}
+        invalid = [
+            key for key, value in widths.items()
+            if value <= 0 or value > pool_sizes[key]]
+        if invalid:
+            raise ValueError(
+                "trajectory initial widths are outside their pools: "
+                + ",".join(invalid))
+    starting_widths = dict(widths)
     retries = []
     forward_call_count = 0
     started = time.monotonic()
@@ -704,19 +749,8 @@ def capture_full_active_trajectory(
             widths=widths)
         if not overflow:
             break
-        changed = {}
-        for pool, observed in overflow.items():
-            previous = int(widths[pool])
-            updated = min(pool_sizes[pool], max(previous * 2, observed))
-            if updated <= previous:
-                raise RuntimeError(
-                    f"trajectory {pool} active count exceeds pool-size width")
-            widths[pool] = updated
-            changed[pool] = {
-                "previous_width": previous,
-                "observed_active_count": int(observed),
-                "updated_width": int(updated),
-            }
+        widths, changed = _expand_trajectory_widths(
+            widths, pool_sizes, overflow)
         retries.append({
             "retry_index": len(retries) + 1,
             "affected_routes": changed,
@@ -779,6 +813,7 @@ def capture_full_active_trajectory(
         return {
             "status": "full_active_replay_parity_failed",
             "batch": batch,
+            "initial_widths": starting_widths,
             "widths": widths,
             "retries": retries,
             "completeness": completeness,
@@ -796,6 +831,7 @@ def capture_full_active_trajectory(
     return {
         "status": "ready",
         "batch": batch,
+        "initial_widths": starting_widths,
         "widths": widths,
         "retries": retries,
         "completeness": completeness,
@@ -882,6 +918,13 @@ def merge_trajectory_batch_summaries(
         "rtol": float(batches[0]["closure"]["rtol"]),
         "routes": closure_routes,
     }
+    width_inheritance_monotonic = all(
+        all(
+            int(batches[index].get(
+                "initial_widths", batches[index]["widths"])[pool])
+            >= int(batches[index - 1]["widths"][pool])
+            for pool in ("qk", "v", "rst"))
+        for index in range(1, len(batches)))
     return {
         "status": "ready" if authoritative else (
             "full_active_replay_parity_failed"),
@@ -890,6 +933,19 @@ def merge_trajectory_batch_summaries(
             pool: max(int(batch["widths"][pool]) for batch in batches)
             for pool in ("qk", "v", "rst")
         },
+        "initial_widths_by_batch": [
+            {
+                "example_id": str(batch["example_id"]),
+                "widths": {
+                    pool: int(batch.get(
+                        "initial_widths", batch["widths"])[pool])
+                    for pool in ("qk", "v", "rst")
+                },
+            }
+            for batch in batches
+        ],
+        "widths_carried_forward_between_deep_examples": True,
+        "width_inheritance_monotonic": width_inheritance_monotonic,
         "retries": retries,
         "completeness": completeness,
         "closure": closure,
@@ -1374,7 +1430,8 @@ def build_divergence_atlas(
                             common_amp_delta),
                         "base_only_support_amplitude": base_only_support,
                         "source_only_support_amplitude": source_only_support,
-                        "residual_divergence_growth": residual_growth,
+                        "block_residual_divergence_growth_context": (
+                            residual_growth),
                         "nontrivial_divergence": bool(
                             np.linalg.norm(base_output - source_output)
                             > epsilon
@@ -1409,7 +1466,7 @@ def build_divergence_atlas(
         "common_execution_weight_delta_mean",
         "common_executed_amplitude_delta_mean",
         "base_only_support_amplitude", "source_only_support_amplitude",
-        "residual_divergence_growth",
+        "block_residual_divergence_growth_context",
     )
     for (layer, role, route), rows in site_values.items():
         aggregate = {
@@ -1589,9 +1646,6 @@ def select_discovery_candidates(
         ranked_turnover = sorted(route_rows, key=lambda row: (
             -float(row["support_turnover_mean"]),
             int(row["layer"]), _semantic_role_order(row["semantic_role"])))
-        ranked_growth = sorted(route_rows, key=lambda row: (
-            -float(row["residual_divergence_growth_mean"]),
-            int(row["layer"]), _semantic_role_order(row["semantic_role"])))
         s2_rows = [row for row in ranked_route if row["semantic_role"] == "s2"]
         answer_rows = [
             row for row in ranked_route
@@ -1606,7 +1660,6 @@ def select_discovery_candidates(
         propose("top_route_output_difference", ranked_route, 2)
         propose("top_query_displacement", ranked_query)
         propose("top_support_turnover", ranked_turnover)
-        propose("top_residual_divergence_growth", ranked_growth)
         propose("mandatory_s2", s2_rows or ranked_route)
         propose("mandatory_answer_position", answer_rows or ranked_route)
         selected = []
@@ -1633,8 +1686,9 @@ def select_discovery_candidates(
                         row["query_angular_displacement_mean"]),
                     "support_turnover_mean": float(
                         row["support_turnover_mean"]),
-                    "residual_divergence_growth_mean": float(
-                        row["residual_divergence_growth_mean"]),
+                    "block_residual_divergence_growth_context_mean": float(
+                        row[
+                            "block_residual_divergence_growth_context_mean"]),
                     "nontrivial_fraction": float(
                         row["nontrivial_fraction"]),
                 },
@@ -2381,6 +2435,7 @@ def _evaluate_coarse_site_patches_once(
         site_values: Mapping[str, Any], mismatch: Mapping[str, Any], *,
         production_atlas: Mapping[str, Any], pad_token_id: int,
         config: ProtocolConfig, phase: str, task_batch_size: int,
+        patch_kinds: Sequence[str],
         progress: Any | None = None) -> dict[str, Any]:
     executable = _trajectory_patch_executable(ctx)
     data_multiple = max(1, int(ctx.mesh.shape["data"]))
@@ -2397,7 +2452,7 @@ def _evaluate_coarse_site_patches_once(
     definitions = []
     for candidate_index, candidate in enumerate(candidates):
         value_index = int(candidate.get("candidate_index", candidate_index))
-        for patch_kind in ("route", "residual"):
+        for patch_kind in patch_kinds:
             stage_name = (
                 str(candidate["route"])
                 if patch_kind == "route" else "residual_input")
@@ -2551,6 +2606,7 @@ def _evaluate_coarse_site_patches_once(
         "status": "ready",
         "phase": phase,
         "candidate_count": len(candidates),
+        "patch_kinds_evaluated": list(patch_kinds),
         "evaluated_patch_count": len(summaries),
         "intervention_batch_size": int(task_batch_size),
         "candidate_interventions_fused_per_forward": (
@@ -2576,7 +2632,15 @@ def evaluate_coarse_site_patches(
         site_values: Mapping[str, Any], mismatch: Mapping[str, Any], *,
         production_atlas: Mapping[str, Any], pad_token_id: int,
         config: ProtocolConfig, phase: str,
+        patch_kinds: Sequence[str] = ("route", "residual"),
         progress: Any | None = None) -> dict[str, Any]:
+    patch_kinds = tuple(str(value) for value in patch_kinds)
+    if (not patch_kinds or len(set(patch_kinds)) != len(patch_kinds)
+            or any(value not in {"route", "residual"}
+                   for value in patch_kinds)):
+        raise ValueError(
+            "coarse trajectory patch kinds must be unique route/residual "
+            "values")
     initial = int(config.trajectory_intervention_batch_size)
     effective = initial
     retries = []
@@ -2586,7 +2650,8 @@ def evaluate_coarse_site_patches(
                 ctx, examples, semantic, candidates, site_values, mismatch,
                 production_atlas=production_atlas,
                 pad_token_id=pad_token_id, config=config, phase=phase,
-                task_batch_size=effective, progress=progress)
+                task_batch_size=effective, patch_kinds=patch_kinds,
+                progress=progress)
             result["initial_intervention_batch_size"] = initial
             result["effective_intervention_batch_size"] = effective
             result["resource_retry_count"] = len(retries)
@@ -2612,6 +2677,161 @@ def evaluate_coarse_site_patches(
             effective = updated
 
 
+def deduplicate_residual_candidates(
+        candidates: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one residual diagnostic per layer/semantic position."""
+    selected = []
+    seen = set()
+    for candidate in candidates:
+        key = (int(candidate["layer"]), str(candidate["semantic_role"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(dict(candidate))
+    return selected
+
+
+def merge_staged_coarse_patch_results(
+        route_result: Mapping[str, Any],
+        residual_result: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Combine route results and layer/role-deduplicated residual diagnostics."""
+    if tuple(route_result.get("patch_kinds_evaluated") or ()) != ("route",):
+        raise ValueError("staged coarse evaluation requires a route-only first pass")
+    output = dict(route_result)
+    route_summaries = list(route_result.get("site_summaries") or ())
+    route_vectors = list(route_result.get("_vectors") or ())
+    stages = {
+        "route": {
+            "status": str(route_result.get("status")),
+            "candidate_count": int(route_result.get("candidate_count", 0)),
+            "evaluated_patch_count": int(
+                route_result.get("evaluated_patch_count", 0)),
+            "forward_call_count": int(
+                route_result.get("forward_call_count", 0)),
+            "effective_intervention_batch_size": int(
+                route_result.get("effective_intervention_batch_size", 0)),
+            "resource_retry_count": int(
+                route_result.get("resource_retry_count", 0)),
+        },
+    }
+    if residual_result is None:
+        residual_summaries = []
+        residual_vectors = []
+        stages["residual"] = {
+            "status": "not_evaluated_no_causal_route_sites",
+            "candidate_count": 0,
+            "evaluated_patch_count": 0,
+            "forward_call_count": 0,
+            "effective_intervention_batch_size": 0,
+            "resource_retry_count": 0,
+        }
+    else:
+        if tuple(residual_result.get("patch_kinds_evaluated") or ()) != (
+                "residual",):
+            raise ValueError(
+                "staged coarse evaluation requires a residual-only second pass")
+        if residual_result.get("phase") != route_result.get("phase"):
+            raise ValueError("staged coarse phases disagree")
+        if residual_result.get("mismatch_mapping_hash") != (
+                route_result.get("mismatch_mapping_hash")):
+            raise ValueError("staged coarse mismatch mappings disagree")
+        residual_summaries = list(
+            residual_result.get("site_summaries") or ())
+        residual_vectors = list(residual_result.get("_vectors") or ())
+        stages["residual"] = {
+            "status": str(residual_result.get("status")),
+            "candidate_count": int(
+                residual_result.get("candidate_count", 0)),
+            "evaluated_patch_count": int(
+                residual_result.get("evaluated_patch_count", 0)),
+            "forward_call_count": int(
+                residual_result.get("forward_call_count", 0)),
+            "effective_intervention_batch_size": int(
+                residual_result.get("effective_intervention_batch_size", 0)),
+            "resource_retry_count": int(
+                residual_result.get("resource_retry_count", 0)),
+        }
+    combined_summaries = route_summaries + residual_summaries
+    combined_vectors = route_vectors + residual_vectors
+    seen = set()
+    for row in combined_summaries:
+        key = (int(row["candidate_index"]), str(row["patch_kind"]))
+        if key in seen:
+            raise ValueError("staged coarse evaluation duplicated a patch")
+        seen.add(key)
+    combined_summaries.sort(key=lambda row: (
+        int(row["candidate_index"]),
+        0 if row["patch_kind"] == "route" else 1))
+    combined_vectors.sort(key=lambda row: (
+        int(row["candidate_index"]),
+        0 if row["patch_kind"] == "route" else 1))
+    route_positive = [
+        int(row["candidate_index"])
+        for row in route_summaries
+        if _patch_row_passes_per_direction(row, "route")
+    ]
+    residual_positive = [
+        {
+            "representative_candidate_index": int(row["candidate_index"]),
+            "layer": int(row["layer"]),
+            "semantic_role": str(row["semantic_role"]),
+        }
+        for row in residual_summaries
+        if _patch_row_passes_per_direction(row, "residual")
+    ]
+    resource_retries = list(route_result.get("resource_retries") or ())
+    if residual_result is not None:
+        resource_retries.extend(
+            residual_result.get("resource_retries") or ())
+    output.update({
+        "patch_kinds_evaluated": ["route", "residual"],
+        "evaluated_patch_count": len(combined_summaries),
+        "site_summaries": combined_summaries,
+        "_vectors": combined_vectors,
+        "forward_call_count": sum(
+            int(stage["forward_call_count"]) for stage in stages.values()),
+        "resource_retry_count": sum(
+            int(stage["resource_retry_count"]) for stage in stages.values()),
+        "resource_retries": resource_retries,
+        "route_first_staged_evaluation": True,
+        "residual_diagnostics_selection_basis": (
+            "all_candidates_deduplicated_by_layer_and_semantic_role"),
+        "positive_sites": {
+            "route_candidate_indices": route_positive,
+            "residual_layer_roles": residual_positive,
+            "operator_followup_basis": "route_positive_only",
+            "causal_path_basis": "route_positive_only",
+            "state_mediated_path_status": "exploratory_not_selected",
+        },
+        "stages": stages,
+    })
+    return output
+
+
+def _patch_row_passes_per_direction(
+        row: Mapping[str, Any], patch_kind: str) -> bool:
+    if row.get("patch_kind") != patch_kind:
+        return False
+    directions = row.get("directions") or {}
+    required = ("source_to_base", "base_to_source")
+    if any(direction not in directions for direction in required):
+        return False
+    for direction in required:
+        values = directions[direction]
+        if float(values["paired_margin_shift_mean"]) <= 0.0:
+            return False
+        if float(values["paired_minus_mismatched_effect_mean"]) <= 0.0:
+            return False
+        if not (values["self_reconstruction_passed"]
+                and values["disabled_noop_passed"]):
+            return False
+    return True
+
+
+def _route_row_passes_per_direction(row: Mapping[str, Any]) -> bool:
+    return _patch_row_passes_per_direction(row, "route")
+
+
 def freeze_operator_followup_sites(
         coarse: Mapping[str, Any],
         candidates: Sequence[Mapping[str, Any]], *,
@@ -2622,16 +2842,7 @@ def freeze_operator_followup_sites(
     }
     eligible = []
     for row in coarse["site_summaries"]:
-        if row["patch_kind"] != "route":
-            continue
-        if float(row["bidirectional_paired_effect_mean"]) <= 0.0:
-            continue
-        if float(row["bidirectional_specific_effect_mean"]) <= 0.0:
-            continue
-        if not all(
-                direction["self_reconstruction_passed"]
-                and direction["disabled_noop_passed"]
-                for direction in row["directions"].values()):
+        if not _route_row_passes_per_direction(row):
             continue
         eligible.append(dict(row))
     eligible.sort(key=lambda row: (
@@ -2654,11 +2865,14 @@ def freeze_operator_followup_sites(
                 row["bidirectional_specific_effect_mean"]),
         })
     record = {
+        "status": (
+            "ready" if sites else "no_causally_relevant_route_sites"),
         "algorithm_version": PAIRED_TRAJECTORY_ALGORITHM_VERSION,
         "selection_phase": "discovery",
         "selection_rule": (
-            "positive_bidirectional_paired_and_specific_complete_route_"
-            "effect_with_self_and_disabled_controls"),
+            "positive_paired_and_specific_complete_route_effect_in_each_"
+            "direction_with_self_and_disabled_controls"),
+        "per_direction_gate_required": True,
         "validation_results_used": False,
         "test_results_used": False,
         "max_sites": config.trajectory_max_operator_followup_sites,
@@ -2686,7 +2900,7 @@ def _operator_group_ids(
         np.asarray(row["base_only_ids"], dtype=np.int32),
         np.asarray(row["source_only_ids"], dtype=np.int32)).astype(
             np.int32, copy=False)
-    if group_kind == "common_coefficient_swap":
+    if group_kind == "common_id_realized_contribution_swap":
         return common
     if group_kind == "support_only_swap":
         return support
@@ -2762,12 +2976,16 @@ def _operator_group_capture_rows(
         else ("source", "base"))
     rows = []
     for example_index, example in enumerate(examples):
+        mismatch_index = int(mismatch_indices[example_index])
         variants = (
-            ("paired", example_index, donor_side),
-            ("mismatched", int(mismatch_indices[example_index]), donor_side),
-            ("self", example_index, recipient_side),
+            ("paired", example_index, donor_side, example_index),
+            ("same_group_mismatched_state", mismatch_index, donor_side,
+             example_index),
+            ("donor_own_group_mismatched_program", mismatch_index,
+             donor_side, mismatch_index),
+            ("self", example_index, recipient_side, example_index),
         )
-        for variant, donor_index, side in variants:
+        for variant, donor_index, side, group_index in variants:
             donor = examples[donor_index]
             prompt = (
                 donor.input_ids_base if side == "base"
@@ -2778,7 +2996,7 @@ def _operator_group_capture_rows(
                 "variant": variant,
                 "prompt": tuple(prompt),
                 "position": position,
-                "group": groups[example_index],
+                "group": groups[group_index],
             })
     real_count = len(rows)
     batch_size = _round_up(real_count, data_multiple)
@@ -2806,11 +3024,14 @@ def _operator_group_patch_rows(
         examples: Sequence[BenchmarkExample],
         semantic: Mapping[str, IOISemanticRecord], *, direction: str,
         site: Mapping[str, Any], groups: Sequence[np.ndarray],
-        contributions: np.ndarray, group_width: int,
+        mismatch_indices: np.ndarray, contributions: np.ndarray,
+        group_width: int,
         sequence_length: int, pad_token_id: int,
         data_multiple: int) -> dict[str, Any]:
     recipient_side = "source" if direction == "source_to_base" else "base"
-    variants = ("paired", "mismatched", "self", "suppressed")
+    variants = (
+        "paired", "same_group_mismatched_state",
+        "donor_own_group_mismatched_program", "self", "suppressed")
     rows = []
     for example_index, example in enumerate(examples):
         if direction == "source_to_base":
@@ -2822,16 +3043,20 @@ def _operator_group_patch_rows(
         position = _position_for_role(
             semantic[example.example_id], str(site["semantic_role"]))
         for variant_index, variant in enumerate(variants):
+            group_index = (
+                int(mismatch_indices[example_index])
+                if variant == "donor_own_group_mismatched_program"
+                else example_index)
             source = (
                 contributions[example_index, variant_index]
-                if variant_index < 3 else
+                if variant_index < 4 else
                 np.zeros((contributions.shape[-1],), dtype=np.float32))
             for answer in answers:
                 rows.append({
                     "tokens": tuple(prompt) + tuple(answer),
                     "prompt_length": len(prompt),
                     "position": position,
-                    "group": groups[example_index],
+                    "group": groups[group_index],
                     "source": source,
                     "variant": variant,
                     "recipient_side": recipient_side,
@@ -2869,23 +3094,45 @@ def _operator_group_patch_rows(
 def _summarize_operator_group_direction(
         margins: np.ndarray, residual: np.ndarray, *, before: np.ndarray,
         self_atol: float) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    paired, mismatched, self_margin, suppressed = (
-        margins[:, index] for index in range(4))
+    if margins.shape != (len(before), 5):
+        raise ValueError(
+            "operator group margins must contain paired, both mismatch "
+            "controls, self, and suppression variants")
+    (paired, same_group_mismatched_state,
+     donor_own_group_mismatched_program, self_margin, suppressed) = (
+        margins[:, index] for index in range(5))
     paired_effect = paired - before
-    mismatched_effect = mismatched - before
+    same_group_mismatched_state_effect = (
+        same_group_mismatched_state - before)
+    donor_own_group_mismatched_program_effect = (
+        donor_own_group_mismatched_program - before)
     self_error = np.abs(self_margin - before)
-    target_residual = residual.reshape(len(before), 4, -1)
+    target_residual = residual.reshape(len(before), 5, -1)
     downstream = np.linalg.norm(
-        target_residual[:, 0] - target_residual[:, 2], axis=-1)
+        target_residual[:, 0] - target_residual[:, 3], axis=-1)
     summary = {
         "before_margin_mean": float(before.mean()),
         "paired_after_margin_mean": float(paired.mean()),
         "paired_margin_shift_mean": float(paired_effect.mean()),
         "paired_answer_flip_fraction": float(np.mean(
             (before <= 0.0) & (paired > 0.0))),
-        "mismatched_margin_shift_mean": float(mismatched_effect.mean()),
+        "same_group_mismatched_state_margin_shift_mean": float(
+            same_group_mismatched_state_effect.mean()),
+        "donor_own_group_mismatched_program_margin_shift_mean": float(
+            donor_own_group_mismatched_program_effect.mean()),
+        # The donor-own program is the primary specificity control.  Keep the
+        # generic fields aligned to it so downstream causal gates remain
+        # conservative and backward-readable.
+        "mismatched_margin_shift_mean": float(
+            donor_own_group_mismatched_program_effect.mean()),
         "paired_minus_mismatched_effect_mean": float(np.mean(
-            paired_effect - mismatched_effect)),
+            paired_effect - donor_own_group_mismatched_program_effect)),
+        "paired_minus_same_group_mismatched_state_effect_mean": float(
+            np.mean(paired_effect - same_group_mismatched_state_effect)),
+        "paired_minus_donor_own_group_mismatched_program_effect_mean": float(
+            np.mean(
+                paired_effect
+                - donor_own_group_mismatched_program_effect)),
         "suppression_margin_shift_mean": float(
             np.mean(suppressed - before)),
         "self_reconstruction_max_abs": float(self_error.max()),
@@ -2896,11 +3143,18 @@ def _summarize_operator_group_direction(
     return summary, {
         "before": before,
         "paired": paired,
-        "mismatched": mismatched,
+        "same_group_mismatched_state": same_group_mismatched_state,
+        "donor_own_group_mismatched_program": (
+            donor_own_group_mismatched_program),
+        "mismatched": donor_own_group_mismatched_program,
         "self": self_margin,
         "suppressed": suppressed,
         "paired_effect": paired_effect,
-        "mismatched_effect": mismatched_effect,
+        "same_group_mismatched_state_effect": (
+            same_group_mismatched_state_effect),
+        "donor_own_group_mismatched_program_effect": (
+            donor_own_group_mismatched_program_effect),
+        "mismatched_effect": donor_own_group_mismatched_program_effect,
         "downstream_residual_divergence": downstream,
     }
 
@@ -2918,11 +3172,15 @@ def evaluate_operator_group_patches(
         return {
             "status": "no_causally_relevant_route_sites",
             "selection_record_hash": followup["selection_record_hash"],
+            "mismatch_group_policy": "dual_control",
+            "primary_mismatch_control": (
+                "donor_own_group_mismatched_program"),
+            "secondary_mismatch_control": "same_group_mismatched_state",
             "site_summaries": [], "_vectors": [],
             "forward_call_count": 0,
         }
     kinds = (
-        "support_only_swap", "common_coefficient_swap",
+        "support_only_swap", "common_id_realized_contribution_swap",
         "full_local_differential_patch",
     )
     group_cache = {}
@@ -2993,10 +3251,11 @@ def evaluate_operator_group_patches(
                 forward_call_count += 1
                 contribution = np.asarray(
                     contribution, dtype=np.float32).reshape(
-                        len(examples), 3, -1)
+                        len(examples), 4, -1)
                 patch_rows = _operator_group_patch_rows(
                     examples, semantic, direction=direction, site=site,
-                    groups=groups, contributions=contribution,
+                    groups=groups, mismatch_indices=mismatch_indices,
+                    contributions=contribution,
                     group_width=group_width,
                     sequence_length=sequence_length,
                     pad_token_id=pad_token_id,
@@ -3016,10 +3275,10 @@ def evaluate_operator_group_patches(
                 forward_call_count += 1
                 real_count = int(patch_rows["real_count"])
                 scores = np.asarray(score)[:real_count].reshape(
-                    len(examples), 4, 2)
+                    len(examples), 5, 2)
                 margins = scores[:, :, 0] - scores[:, :, 1]
                 residual_values = np.asarray(residual)[:real_count].reshape(
-                    len(examples), 4, 2, -1)[:, :, 0]
+                    len(examples), 5, 2, -1)[:, :, 0]
                 summary, vector = _summarize_operator_group_direction(
                     margins, residual_values,
                     before=before_by_direction[direction],
@@ -3062,7 +3321,7 @@ def evaluate_operator_group_patches(
                     "stage=operator_group_patch phase=discovery "
                     f"example_count={len(examples)} "
                     f"candidate_count={site_index + 1}/{len(sites)} "
-                    "intervention_variants=4 compile=reuse elapsed_s="
+                    "intervention_variants=5 compile=reuse elapsed_s="
                     f"{time.monotonic() - started:.1f} "
                     "capture_width=full_active_group retry_count=0")
     return {
@@ -3078,6 +3337,13 @@ def evaluate_operator_group_patches(
         "canonical_group_suppression_transplant_kernel": True,
         "forward_call_count": forward_call_count,
         "mismatch_mapping_hash": mismatch["mapping_hash"],
+        "mismatch_group_policy": "dual_control",
+        "primary_mismatch_control": (
+            "donor_own_group_mismatched_program"),
+        "secondary_mismatch_control": "same_group_mismatched_state",
+        "common_group_semantics": (
+            "common_id_realized_contribution_swap_transplants_the_realized_"
+            "group_contribution_not_coefficients_alone"),
         "site_summaries": summaries,
         "_vectors": vectors,
     }
@@ -3086,22 +3352,16 @@ def evaluate_operator_group_patches(
 def freeze_chronological_path(
         coarse: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]], *,
         config: ProtocolConfig) -> dict[str, Any]:
-    route_rows = [
+    eligible_rows = [
         row for row in coarse["site_summaries"]
-        if row["patch_kind"] == "route"
-        and all(direction["self_reconstruction_passed"]
-                and direction["disabled_noop_passed"]
-                for direction in row["directions"].values())
+        if _route_row_passes_per_direction(row)
     ]
-    ranked = sorted(route_rows, key=lambda row: (
+    ranked = sorted(eligible_rows, key=lambda row: (
         -float(row["bidirectional_specific_effect_mean"]),
         -float(row["bidirectional_paired_effect_mean"]),
         int(row["candidate_index"]),
     ))
-    positive = [
-        row for row in ranked
-        if float(row["bidirectional_paired_effect_mean"]) > 0.0]
-    chosen = (positive or ranked)[:config.trajectory_max_path_sites]
+    chosen = ranked[:config.trajectory_max_path_sites]
     sites = []
     for row in chosen:
         candidate_index = int(row["candidate_index"])
@@ -3119,18 +3379,22 @@ def freeze_chronological_path(
         })
     sites.sort(key=lambda row: (
         int(row["layer"]),
-        0 if row["route"] in {"q", "k", "v"} else 1,
-        _semantic_role_order(row["semantic_role"]),
         ROUTE_INDEX[row["route"]],
+        _semantic_role_order(row["semantic_role"]),
     ))
     record = {
+        "status": "ready" if sites else "no_causal_path",
         "algorithm_version": PAIRED_TRAJECTORY_ALGORITHM_VERSION,
         "selection_phase": "discovery",
         "selection_metric": (
-            "bidirectional_paired_effect_then_chronological_order"),
+            "positive_per_direction_paired_and_specific_effect_then_"
+            "chronological_order"),
+        "per_direction_gate_required": True,
         "validation_results_used": False,
         "test_results_used": False,
         "path_length": len(sites),
+        "causal_path_supported": bool(sites),
+        "validation_path_evaluated": False,
         "max_path_length": config.trajectory_max_path_sites,
         "sites": sites,
     }
@@ -3143,7 +3407,7 @@ def _path_intervention_rows(
         global_indices: np.ndarray,
         sequence_length: int, pad_token_id: int, data_multiple: int,
         patch_slots: int, d_model: int,
-        path_sites: Sequence[Mapping[str, Any]],
+        path_prefixes: Sequence[Sequence[Mapping[str, Any]]],
         site_values: Mapping[str, Any], donor_indices: np.ndarray
 ) -> dict[str, Any]:
     donor_side, recipient_side = (
@@ -3153,27 +3417,34 @@ def _path_intervention_rows(
     rows = []
     if np.asarray(global_indices).shape != (len(examples),):
         raise ValueError("path global example indices are misaligned")
-    for local_index, example in enumerate(examples):
-        example_index = int(global_indices[local_index])
-        if direction == "source_to_base":
-            prompt = example.input_ids_source
-            answers = (example.positive_ids, example.negative_ids)
-            target_position = example.trace_position_source
-        else:
-            prompt = example.input_ids_base
-            answers = (example.negative_ids, example.positive_ids)
-            target_position = example.trace_position_base
-        for variant_index, variant in enumerate(variant_names):
-            for answer_index, answer in enumerate(answers):
-                rows.append({
-                    "example_index": example_index,
-                    "variant_index": variant_index,
-                    "answer_index": answer_index,
-                    "tokens": tuple(prompt) + tuple(answer),
-                    "prompt_length": len(prompt),
-                    "target_position": int(target_position),
-                    "variant": variant,
-                })
+    if not path_prefixes:
+        raise ValueError("path prefix batch is empty")
+    if any(not prefix or len(prefix) > patch_slots
+           for prefix in path_prefixes):
+        raise ValueError("path prefix exceeds or omits fixed patch slots")
+    for task_index, _ in enumerate(path_prefixes):
+        for local_index, example in enumerate(examples):
+            example_index = int(global_indices[local_index])
+            if direction == "source_to_base":
+                prompt = example.input_ids_source
+                answers = (example.positive_ids, example.negative_ids)
+                target_position = example.trace_position_source
+            else:
+                prompt = example.input_ids_base
+                answers = (example.negative_ids, example.positive_ids)
+                target_position = example.trace_position_base
+            for variant_index, variant in enumerate(variant_names):
+                for answer_index, answer in enumerate(answers):
+                    rows.append({
+                        "task_index": task_index,
+                        "example_index": example_index,
+                        "variant_index": variant_index,
+                        "answer_index": answer_index,
+                        "tokens": tuple(prompt) + tuple(answer),
+                        "prompt_length": len(prompt),
+                        "target_position": int(target_position),
+                        "variant": variant,
+                    })
     real_count = len(rows)
     batch_size = _round_up(real_count, data_multiple)
     input_ids = np.full(
@@ -3196,6 +3467,7 @@ def _path_intervention_rows(
         input_ids[row_index, :len(tokens)] = tokens
         labels[row_index, prompt_length:len(tokens)] = tokens[prompt_length:]
         target_positions[row_index] = int(row["target_position"])
+        path_sites = path_prefixes[int(row["task_index"])]
         for slot, site in enumerate(path_sites):
             candidate_index = int(site["candidate_index"])
             patch_layers[row_index, slot] = int(site["layer"])
@@ -3230,21 +3502,27 @@ def _path_intervention_rows(
         "patch_enabled": patch_enabled,
         "patch_values": patch_values,
         "real_count": real_count,
+        "task_count": len(path_prefixes),
     }
 
 
-def evaluate_cumulative_path(
+def _evaluate_cumulative_path_once(
         ctx: Any, examples: Sequence[BenchmarkExample],
         path_record: Mapping[str, Any], site_values: Mapping[str, Any],
         mismatch: Mapping[str, Any], *, production_atlas: Mapping[str, Any],
         pad_token_id: int, config: ProtocolConfig, phase: str,
-        evaluate_prefix_curve: bool, progress: Any | None = None
+        evaluate_prefix_curve: bool, prefix_batch_size: int,
+        progress: Any | None = None
 ) -> dict[str, Any]:
     sites = list(path_record["sites"])
     if not sites:
         return {
             "status": "no_causal_path", "phase": phase,
             "path_record_hash": path_record["path_record_hash"],
+            "path_length": 0,
+            "path_evaluated": False,
+            "validation_path_evaluated": False,
+            "causal_path_supported": False,
             "prefixes": [], "_vectors": [], "forward_call_count": 0,
         }
     executable = _trajectory_patch_executable(ctx)
@@ -3257,20 +3535,30 @@ def evaluate_cumulative_path(
         "base_to_source": -np.asarray(
             production_atlas["_base_margin"], dtype=np.float64),
     }
-    lengths = (
+    lengths = list(
         range(1, len(sites) + 1) if evaluate_prefix_curve
         else (len(sites),))
+    prefix_batch_size = (
+        min(max(1, int(prefix_batch_size)), len(lengths))
+        if evaluate_prefix_curve else 1)
     prefixes = []
     vector_records = []
     forward_call_count = 0
     started = time.monotonic()
-    for prefix_index, path_length in enumerate(lengths):
-        prefix_sites = sites[:path_length]
-        direction_summaries = {}
-        direction_vectors = {}
+    for prefix_start in range(0, len(lengths), prefix_batch_size):
+        active_lengths = lengths[
+            prefix_start:prefix_start + prefix_batch_size]
+        execution_lengths = list(active_lengths)
+        execution_lengths.extend(
+            [active_lengths[-1]]
+            * (prefix_batch_size - len(execution_lengths)))
+        path_prefixes = [sites[:path_length]
+                         for path_length in execution_lengths]
+        summaries_by_task = [dict() for _ in active_lengths]
+        vectors_by_task = [dict() for _ in active_lengths]
         for direction in ("source_to_base", "base_to_source"):
-            all_margins = []
-            all_residual = []
+            margins_by_task = [[] for _ in active_lengths]
+            residual_by_task = [[] for _ in active_lengths]
             for batch_index, start in enumerate(
                     range(0, len(examples), examples_per_batch)):
                 stop = min(len(examples), start + examples_per_batch)
@@ -3291,58 +3579,209 @@ def evaluate_cumulative_path(
                     patch_slots=(
                         config.trajectory_max_patch_sites_per_variant),
                     d_model=int(ctx.model_cfg["d_model"]),
-                    path_sites=prefix_sites,
+                    path_prefixes=path_prefixes,
                     site_values=site_values,
                     donor_indices=donor_indices)
                 score, residual = _execute_patch_rows(ctx, executable, rows)
                 forward_call_count += 1
-                score = score.reshape(examples_per_batch, 4, 2)[:len(chunk)]
-                all_margins.append(score[:, :, 0] - score[:, :, 1])
-                all_residual.append(
-                    residual.reshape(
-                        examples_per_batch, 4, 2, -1
-                    )[:len(chunk), :, :, 0])
+                score = score.reshape(
+                    prefix_batch_size, examples_per_batch, 4, 2)
+                residual = residual.reshape(
+                    prefix_batch_size, examples_per_batch, 4, 2, -1)
+                for local_task in range(len(active_lengths)):
+                    margins_by_task[local_task].append(
+                        score[local_task, :len(chunk), :, 0]
+                        - score[local_task, :len(chunk), :, 1])
+                    residual_by_task[local_task].append(
+                        residual[local_task, :len(chunk), :, 0])
                 if progress is not None:
                     progress(
                         f"stage=cumulative_path phase={phase} "
                         f"batch_index={batch_index} "
                         f"example_count={len(chunk)} "
-                        f"candidate_count={path_length} "
+                        f"candidate_count={active_lengths[-1]} "
+                        f"prefixes_fused={len(active_lengths)} "
                         "intervention_variants=4 compile=reuse elapsed_s="
                         f"{time.monotonic() - started:.1f} "
                         "capture_width=none retry_count=0")
                 del execution_chunk, execution_indices, rows
-            margins = np.concatenate(all_margins, axis=0)
-            residual = np.concatenate(all_residual, axis=0)
-            summary, vectors = _summarize_patch_direction(
-                margins, residual, before=before_by_direction[direction],
-                self_atol=config.trajectory_replay_atol)
-            direction_summaries[direction] = summary
-            direction_vectors[direction] = vectors
-        prefixes.append({
-            "path_length": int(path_length),
-            "directions": direction_summaries,
-            "bidirectional_paired_effect_mean": float(np.mean([
-                value["paired_margin_shift_mean"]
-                for value in direction_summaries.values()])),
-            "bidirectional_mismatched_effect_mean": float(np.mean([
-                value["mismatched_margin_shift_mean"]
-                for value in direction_summaries.values()])),
-            "bidirectional_flip_fraction": float(np.mean([
-                value["paired_answer_flip_fraction"]
-                for value in direction_summaries.values()])),
-        })
-        vector_records.append({
-            "path_length": int(path_length),
-            "directions": direction_vectors,
-        })
-    return {
+            for local_task in range(len(active_lengths)):
+                margins = np.concatenate(
+                    margins_by_task[local_task], axis=0)
+                residual = np.concatenate(
+                    residual_by_task[local_task], axis=0)
+                summary, vectors = _summarize_patch_direction(
+                    margins, residual, before=before_by_direction[direction],
+                    self_atol=config.trajectory_replay_atol)
+                summaries_by_task[local_task][direction] = summary
+                vectors_by_task[local_task][direction] = vectors
+        for local_task, path_length in enumerate(active_lengths):
+            direction_summaries = summaries_by_task[local_task]
+            prefixes.append({
+                "path_length": int(path_length),
+                "directions": direction_summaries,
+                "bidirectional_paired_effect_mean": float(np.mean([
+                    value["paired_margin_shift_mean"]
+                    for value in direction_summaries.values()])),
+                "bidirectional_mismatched_effect_mean": float(np.mean([
+                    value["mismatched_margin_shift_mean"]
+                    for value in direction_summaries.values()])),
+                "bidirectional_flip_fraction": float(np.mean([
+                    value["paired_answer_flip_fraction"]
+                    for value in direction_summaries.values()])),
+            })
+            vector_records.append({
+                "path_length": int(path_length),
+                "directions": vectors_by_task[local_task],
+            })
+    result = {
         "status": "ready", "phase": phase,
         "path_record_hash": path_record["path_record_hash"],
         "forward_call_count": forward_call_count,
         "last_example_chunk_padded_to_fixed_shape": True,
+        "prefix_batch_fusion_enabled": bool(evaluate_prefix_curve),
+        "prefixes_fused_per_forward": int(prefix_batch_size),
         "prefixes": prefixes,
         "_vectors": vector_records,
+    }
+    if phase == "validation":
+        result["final_frozen_path_uncertainty"] = (
+            summarize_frozen_path_uncertainty(
+                vector_records[-1], config=config,
+                seed=config.trajectory_seed + 211))
+    return result
+
+
+def evaluate_cumulative_path(
+        ctx: Any, examples: Sequence[BenchmarkExample],
+        path_record: Mapping[str, Any], site_values: Mapping[str, Any],
+        mismatch: Mapping[str, Any], *, production_atlas: Mapping[str, Any],
+        pad_token_id: int, config: ProtocolConfig, phase: str,
+        evaluate_prefix_curve: bool, progress: Any | None = None
+) -> dict[str, Any]:
+    sites = list(path_record["sites"])
+    if not sites:
+        return {
+            "status": "no_causal_path", "phase": phase,
+            "path_record_hash": path_record["path_record_hash"],
+            "path_length": 0,
+            "path_evaluated": False,
+            "validation_path_evaluated": False,
+            "causal_path_supported": False,
+            "prefixes": [], "_vectors": [], "forward_call_count": 0,
+            "initial_prefix_batch_size": 0,
+            "effective_prefix_batch_size": 0,
+            "resource_retry_count": 0,
+            "resource_retries": [],
+        }
+    initial = (
+        min(int(config.trajectory_path_prefix_batch_size), len(sites))
+        if evaluate_prefix_curve else 1)
+    effective = max(1, initial)
+    retries = []
+    while True:
+        try:
+            result = _evaluate_cumulative_path_once(
+                ctx, examples, path_record, site_values, mismatch,
+                production_atlas=production_atlas,
+                pad_token_id=pad_token_id, config=config, phase=phase,
+                evaluate_prefix_curve=evaluate_prefix_curve,
+                prefix_batch_size=effective, progress=progress)
+            result["initial_prefix_batch_size"] = initial
+            result["effective_prefix_batch_size"] = effective
+            result["resource_retry_count"] = len(retries)
+            result["resource_retries"] = retries
+            result["path_length"] = len(sites)
+            result["path_evaluated"] = True
+            result["validation_path_evaluated"] = phase == "validation"
+            result["causal_path_supported"] = True
+            return result
+        except Exception as exc:
+            message = str(exc).lower()
+            exhausted = isinstance(exc, MemoryError) or any(
+                value in message for value in (
+                    "resource_exhausted", "out of memory", "oom",
+                    "allocation failed"))
+            if not exhausted or effective <= 1:
+                raise
+            updated = max(1, effective // 2)
+            retries.append({
+                "retry_index": len(retries) + 1,
+                "previous_prefix_batch_size": effective,
+                "updated_prefix_batch_size": updated,
+                "failed_stage": f"cumulative_path_{phase}",
+                "scientific_path_changed": False,
+            })
+            gc.collect()
+            effective = updated
+
+
+def summarize_frozen_path_uncertainty(
+        vector_record: Mapping[str, Any], *, config: ProtocolConfig,
+        seed: int) -> dict[str, Any]:
+    """Evaluate the discovery-frozen final path without reselection."""
+    directions = vector_record.get("directions") or {}
+    required = ("source_to_base", "base_to_source")
+    if any(direction not in directions for direction in required):
+        raise ValueError(
+            "frozen path uncertainty requires both intervention directions")
+    paired_by_direction = []
+    mismatch_by_direction = []
+    for direction in required:
+        values = directions[direction]
+        paired = np.asarray(values["paired_effect"], dtype=np.float64)
+        mismatched = np.asarray(
+            values["mismatched_effect"], dtype=np.float64)
+        if paired.ndim != 1 or paired.shape != mismatched.shape:
+            raise ValueError(
+                "frozen path effect vectors must be aligned one-dimensional "
+                "arrays")
+        paired_by_direction.append(paired)
+        mismatch_by_direction.append(mismatched)
+    if paired_by_direction[0].shape != paired_by_direction[1].shape:
+        raise ValueError(
+            "frozen path intervention directions have different cohorts")
+    paired_effect = np.mean(np.stack(paired_by_direction, axis=0), axis=0)
+    mismatched_effect = np.mean(
+        np.stack(mismatch_by_direction, axis=0), axis=0)
+    specific_effect = paired_effect - mismatched_effect
+    paired_ci = bootstrap_mean_ci(
+        paired_effect, samples=config.bootstrap_samples,
+        alpha=config.alpha, seed=seed)
+    specific_ci = bootstrap_mean_ci(
+        specific_effect, samples=config.bootstrap_samples,
+        alpha=config.alpha, seed=seed + 1)
+    paired_permutation = paired_permutation_test(
+        paired_effect, np.zeros_like(paired_effect),
+        samples=config.permutation_samples, seed=seed + 2)
+    specific_permutation = paired_permutation_test(
+        paired_effect, mismatched_effect,
+        samples=config.permutation_samples, seed=seed + 3)
+    paired_supported = bool(
+        paired_ci["ci_low"] is not None
+        and float(paired_ci["ci_low"]) > 0.0
+        and float(paired_permutation["p_value_two_sided"]) < config.alpha)
+    specific_supported = bool(
+        specific_ci["ci_low"] is not None
+        and float(specific_ci["ci_low"]) > 0.0
+        and float(specific_permutation["p_value_two_sided"]) < config.alpha)
+    return {
+        "evaluation_scope": (
+            "discovery_frozen_final_path_on_preregistered_validation_split"),
+        "path_length": int(vector_record["path_length"]),
+        "bidirectional_effect_aggregation": (
+            "per_example_mean_of_source_to_base_and_base_to_source"),
+        "paired_effect_ci": paired_ci,
+        "paired_minus_mismatched_effect_ci": specific_ci,
+        "paired_effect_paired_permutation": paired_permutation,
+        "paired_minus_mismatched_paired_permutation": specific_permutation,
+        "alpha": float(config.alpha),
+        "paired_effect_supported": paired_supported,
+        "pair_specific_effect_supported": specific_supported,
+        "causal_pair_specific_validation_passed": bool(
+            paired_supported and specific_supported),
+        "validation_used_for_path_selection": False,
+        "test_used": False,
     }
 
 
@@ -3372,7 +3811,8 @@ def divergence_extrema(atlas: Mapping[str, Any]) -> dict[str, Any]:
          if float(row["nontrivial_fraction"]) > 0.0),
         chronological[0])
     fields = {
-        "largest_divergence_growth": "residual_divergence_growth_mean",
+        "largest_block_residual_divergence_growth_context": (
+            "block_residual_divergence_growth_context_mean"),
         "largest_query_displacement": "query_angular_displacement_mean",
         "largest_support_turnover": "support_turnover_mean",
         "largest_route_difference": "route_output_difference_norm_mean",
@@ -3468,6 +3908,9 @@ def write_trajectory_graph(
     graph = {
         "algorithm_version": PAIRED_TRAJECTORY_ALGORITHM_VERSION,
         "protocol_hash": protocol_hash,
+        "graph_semantics": (
+            "causal_site_trajectory_not_token_to_token_attention_flow"),
+        "attention_edge_weights_captured": False,
         "selection_phase": "discovery",
         "validation_used_for_graph_selection": False,
         "test_used": False,
