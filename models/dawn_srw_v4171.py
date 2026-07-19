@@ -455,11 +455,13 @@ def _validate_v4171_sharded_fns(
         'attn_v_single': ('v', v_power),
         'v_single': ('v', v_power),
         'attn_v_single_minimal': ('v', v_power),
+        'attn_v_single_diagnostics_minimal': ('v', v_power),
         'attn_v_single_retention_minimal': ('v', v_power),
         'attn_v_single_suppression_minimal': ('v', v_power),
         'attn_v_single_trajectory_minimal': ('v', v_power),
         'rst_single': ('rst', rst_power),
         'rst_single_minimal': ('rst', rst_power),
+        'rst_single_diagnostics_minimal': ('rst', rst_power),
         'rst_single_retention_minimal': ('rst', rst_power),
         'rst_single_suppression_minimal': ('rst', rst_power),
         'rst_single_trajectory_minimal': ('rst', rst_power),
@@ -468,6 +470,7 @@ def _validate_v4171_sharded_fns(
         'qk_paired': ('qk', qk_power),
         'attn_qk_single_minimal': ('qk', qk_power),
         'attn_qk_paired_minimal': ('qk', qk_power),
+        'attn_qk_paired_diagnostics_minimal': ('qk', qk_power),
         'attn_qk_paired_retention_minimal': ('qk', qk_power),
         'attn_qk_paired_suppression_minimal': ('qk', qk_power),
         'attn_qk_paired_trajectory_minimal': ('qk', qk_power),
@@ -512,7 +515,8 @@ def _validate_v4171_sharded_fns(
                 f"model={expected_heat_kernel_beta}")
     profile = sharded_fns.get('_v4171_kernel_profile')
     if profile is not None and profile not in {
-            'production', 'retention', 'suppression', 'trajectory'}:
+            'production', 'production_diagnostics',
+            'retention', 'suppression', 'trajectory'}:
         raise ValueError(f"unknown v4171 minimal kernel profile: {profile!r}")
 
 
@@ -3289,14 +3293,141 @@ def _cached_v4171_minimal_bundle(route_kind, builder, *factory_args):
     return bundle
 
 
-def _make_sharded_srw_production_minimal_impl(
+def _make_sharded_srw_training_fast_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Build the production-only single-route minimal SRW executable."""
+    """Build the lean production single-route training executable."""
+    srw_composition_mode, admission_den_power, heat_kernel_beta = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            heat_kernel_beta,
+            context="make_sharded_srw_minimal"))
+    _validate_v4171_admission_den_grad_scale(
+        admission_den_grad_scale, context="make_sharded_srw_minimal")
+    del dead_exposure_target
+    den_power = jnp.float32(admission_den_power)
+    effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
+    composition_mode = srw_composition_mode
+    beta = jnp.float32(heat_kernel_beta)
+
+    def training_core(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        n_local = operator_keys_local.shape[0]
+        chunk_size = min(int(max_chunk_size), int(n_local))
+        n_chunks = (int(n_local) + chunk_size - 1) // chunk_size
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - int(n_local)
+        batch_size, sequence_length, d_model = x.shape
+
+        x_bf = x.astype(jnp.bfloat16)
+        operator_keys_padded = jnp.pad(
+            operator_keys_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(
+            read_vectors_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(
+            write_vectors_local, ((0, pad_n), (0, 0)))
+        valid_padded = jnp.arange(n_padded) < n_local
+        operator_query_unit_bf = _forward_unit_direction(
+            operator_query.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        operator_key_directions_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_dir_bf = _forward_unit_direction(
+            read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_dir_bf = _forward_unit_direction(
+            write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau)
+
+        @jax.checkpoint
+        def gate_srw_step(carry, chunk_index):
+            raw_out, total_gate_mass = carry
+            start = chunk_index * chunk_size
+            operator_keys = jax.lax.dynamic_slice_in_dim(
+                operator_key_directions_bf, start, chunk_size, axis=0)
+            read_chunk = jax.lax.dynamic_slice_in_dim(
+                read_dir_bf, start, chunk_size, axis=0)
+            write_chunk = jax.lax.dynamic_slice_in_dim(
+                write_dir_bf, start, chunk_size, axis=0)
+            valid_chunk = jax.lax.dynamic_slice_in_dim(
+                valid_padded, start, chunk_size, axis=0)
+            valid_mask = valid_chunk[None, None, :]
+            rho_raw = (
+                operator_query_unit_bf @ operator_keys.T
+            ).astype(jnp.float32)
+            rho_compute = jnp.where(valid_mask, rho_raw, tau)
+            _, admission, _, execution_weight, _ = _compute_admission_drive(
+                rho_compute, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=effective_active_eps,
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=composition_mode,
+                heat_kernel_beta=beta)
+            admission = jnp.where(valid_mask, admission, 0.0)
+            execution_weight = jnp.where(
+                valid_mask, execution_weight, 0.0)
+            read_value = x_bf @ read_chunk.T
+            amplitude = execution_weight * read_value.astype(jnp.float32)
+            chunk_out = (
+                amplitude.astype(jnp.bfloat16) @ write_chunk
+            ).astype(jnp.float32)
+            return (
+                raw_out + chunk_out,
+                total_gate_mass + admission.sum(axis=-1, keepdims=True),
+            ), None
+
+        (raw_out, total_gate_mass), _ = jax.lax.scan(
+            gate_srw_step,
+            (
+                jnp.zeros(
+                    (batch_size, sequence_length, d_model),
+                    dtype=jnp.float32),
+                jnp.zeros(
+                    (batch_size, sequence_length, 1),
+                    dtype=jnp.float32),
+            ),
+            jnp.arange(n_chunks))
+        global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
+        gate_den = _composition_den(
+            global_gate_mass, den_power, composition_mode)
+        out = raw_out / gate_den
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        return out.astype(jnp.float32)
+
+    common_in_specs = (
+        P('data', None, None), P('data', None, None), P('model', None),
+        P('data', None, None), P('model', None), P('model', None),
+        P(), P(), P(), P(), P())
+    training_kernel = shard_map(
+        training_core, mesh=mesh, in_specs=common_in_specs,
+        out_specs=P('data', None, None), check_rep=False)
+    _mark_v4171_srw_factory_output(
+        training_kernel, admission_den_power, composition_mode,
+        heat_kernel_beta)
+    training_kernel._v4171_kernel_profile = "production"
+    training_kernel._v4171_production_shard_map_kernel = training_kernel
+    return training_kernel
+
+
+def _make_sharded_srw_production_diagnostics_minimal_impl(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Build the observational production single-route executable."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4171_composition_settings(
             srw_composition_mode, admission_den_power,
@@ -3502,8 +3633,8 @@ def _make_sharded_srw_production_minimal_impl(
     _mark_v4171_srw_factory_output(
         production_kernel, admission_den_power, _srw_composition_mode,
         heat_kernel_beta)
-    production_kernel._v4171_kernel_profile = "production"
-    production_kernel._v4171_production_shard_map_kernel = production_kernel
+    production_kernel._v4171_kernel_profile = "production_diagnostics"
+    production_kernel._v4171_diagnostics_shard_map_kernel = production_kernel
     return production_kernel
 
 
@@ -4120,9 +4251,26 @@ def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                              admission_den_grad_scale=1.0,
                              srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                              heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Create the production single-route minimal SRW kernel."""
+    """Create the lean production single-route training kernel."""
     return _cached_v4171_minimal_bundle(
-        "single_production", _make_sharded_srw_production_minimal_impl,
+        "single_production", _make_sharded_srw_training_fast_minimal_impl,
+        mesh, max_chunk_size, dead_exposure_target,
+        soft_gate_effective_active_eps, admission_den_power,
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta)
+
+
+def make_sharded_srw_diagnostics_minimal(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Create the production-equivalent observational single-route kernel."""
+    return _cached_v4171_minimal_bundle(
+        "single_production_diagnostics",
+        _make_sharded_srw_production_diagnostics_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
         admission_den_grad_scale, srw_composition_mode,
@@ -4187,14 +4335,144 @@ def make_sharded_srw_trajectory_minimal(
     return kernel
 
 
-def _make_sharded_srw_paired_production_minimal_impl(
+def _make_sharded_srw_paired_training_fast_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Build the production-only paired Q/K minimal SRW executable."""
+    """Build the lean production paired Q/K training executable."""
+    srw_composition_mode, admission_den_power, heat_kernel_beta = (
+        _validate_v4171_composition_settings(
+            srw_composition_mode, admission_den_power,
+            heat_kernel_beta,
+            context="make_sharded_srw_paired_minimal"))
+    _validate_v4171_admission_den_grad_scale(
+        admission_den_grad_scale,
+        context="make_sharded_srw_paired_minimal")
+    del dead_exposure_target
+    den_power = jnp.float32(admission_den_power)
+    effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
+    composition_mode = srw_composition_mode
+    beta = jnp.float32(heat_kernel_beta)
+
+    def training_core(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        n_local = operator_keys_local.shape[0]
+        chunk_size = min(int(max_chunk_size), int(n_local))
+        n_chunks = (int(n_local) + chunk_size - 1) // chunk_size
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - int(n_local)
+        batch_size, sequence_length, _, _ = operator_query.shape
+        d_model = x.shape[-1]
+
+        x_bf = x.astype(jnp.bfloat16)
+        operator_keys_padded = jnp.pad(
+            operator_keys_local, ((0, pad_n), (0, 0)))
+        read_padded = jnp.pad(
+            read_vectors_local, ((0, pad_n), (0, 0)))
+        write_padded = jnp.pad(
+            write_vectors_local, ((0, pad_n), (0, 0)))
+        valid_padded = jnp.arange(n_padded) < n_local
+        operator_query_unit_bf = _forward_unit_direction(
+            operator_query.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        operator_key_directions_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_dir_bf = _forward_unit_direction(
+            read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_dir_bf = _forward_unit_direction(
+            write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau)
+
+        @jax.checkpoint
+        def gate_srw_step(carry, chunk_index):
+            raw_out, total_gate_mass = carry
+            start = chunk_index * chunk_size
+            operator_keys = jax.lax.dynamic_slice_in_dim(
+                operator_key_directions_bf, start, chunk_size, axis=0)
+            read_chunk = jax.lax.dynamic_slice_in_dim(
+                read_dir_bf, start, chunk_size, axis=0)
+            write_chunk = jax.lax.dynamic_slice_in_dim(
+                write_dir_bf, start, chunk_size, axis=0)
+            valid_chunk = jax.lax.dynamic_slice_in_dim(
+                valid_padded, start, chunk_size, axis=0)
+            valid_mask = valid_chunk[None, None, None, :]
+            rho_raw = jnp.einsum(
+                'bsrd,nd->bsrn', operator_query_unit_bf,
+                operator_keys).astype(jnp.float32)
+            rho_compute = jnp.where(valid_mask, rho_raw, tau)
+            _, admission, _, execution_weight, _ = _compute_admission_drive(
+                rho_compute, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=effective_active_eps,
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=composition_mode,
+                heat_kernel_beta=beta)
+            admission = jnp.where(valid_mask, admission, 0.0)
+            execution_weight = jnp.where(
+                valid_mask, execution_weight, 0.0)
+            read_value = x_bf @ read_chunk.T
+            amplitude = (
+                execution_weight
+                * read_value.astype(jnp.float32)[:, :, None, :])
+            chunk_out = jnp.einsum(
+                'bsrn,nd->bsrd', amplitude.astype(jnp.bfloat16),
+                write_chunk).astype(jnp.float32)
+            return (
+                raw_out + chunk_out,
+                total_gate_mass + admission.sum(axis=-1, keepdims=True),
+            ), None
+
+        route_shape = (batch_size, sequence_length, 2, 1)
+        (raw_out, total_gate_mass), _ = jax.lax.scan(
+            gate_srw_step,
+            (
+                jnp.zeros(
+                    (batch_size, sequence_length, 2, d_model),
+                    dtype=jnp.float32),
+                jnp.zeros(route_shape, dtype=jnp.float32),
+            ),
+            jnp.arange(n_chunks))
+        global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
+        gate_den = _composition_den(
+            global_gate_mass, den_power, composition_mode)
+        out = raw_out / gate_den
+        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        return out.astype(jnp.float32)
+
+    common_in_specs = (
+        P('data', None, None), P('data', None, None, None), P('model', None),
+        P('data', None, None, None), P('model', None), P('model', None),
+        P(), P(), P(), P(), P())
+    training_kernel = shard_map(
+        training_core, mesh=mesh, in_specs=common_in_specs,
+        out_specs=P('data', None, None, None), check_rep=False)
+    _mark_v4171_srw_factory_output(
+        training_kernel, admission_den_power, composition_mode,
+        heat_kernel_beta)
+    training_kernel._v4171_kernel_profile = "production"
+    training_kernel._v4171_production_shard_map_kernel = training_kernel
+    return training_kernel
+
+
+def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Build the observational production paired Q/K executable."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4171_composition_settings(
             srw_composition_mode, admission_den_power,
@@ -4440,8 +4718,8 @@ def _make_sharded_srw_paired_production_minimal_impl(
     _mark_v4171_srw_factory_output(
         production_kernel, admission_den_power, _srw_composition_mode,
         heat_kernel_beta)
-    production_kernel._v4171_kernel_profile = "production"
-    production_kernel._v4171_production_shard_map_kernel = production_kernel
+    production_kernel._v4171_kernel_profile = "production_diagnostics"
+    production_kernel._v4171_diagnostics_shard_map_kernel = production_kernel
     return production_kernel
 
 
@@ -5133,9 +5411,27 @@ def make_sharded_srw_paired_minimal(
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Create the production paired attention_q/attention_k minimal SRW kernel."""
+    """Create the lean production paired attention_q/attention_k kernel."""
     return _cached_v4171_minimal_bundle(
-        "paired_production", _make_sharded_srw_paired_production_minimal_impl,
+        "paired_production",
+        _make_sharded_srw_paired_training_fast_minimal_impl,
+        mesh, max_chunk_size, dead_exposure_target,
+        soft_gate_effective_active_eps, admission_den_power,
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta)
+
+
+def make_sharded_srw_paired_diagnostics_minimal(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Create the production-equivalent observational paired Q/K kernel."""
+    return _cached_v4171_minimal_bundle(
+        "paired_production_diagnostics",
+        _make_sharded_srw_paired_production_diagnostics_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
         admission_den_grad_scale, srw_composition_mode,
@@ -5338,7 +5634,95 @@ def _v4171_minimal_kernel_profile(sharded_fns, route_key):
     return getattr(fn, '_v4171_kernel_profile', None)
 
 
-def _attn_forward_production_minimal(
+def _attn_forward_training_fast(
+        x, pool_params, router_params, expand_O_kernel, rng,
+        n_qk, n_v, n_heads, d_model, n_layers,
+        router_dropout, dropout_rate, deterministic, sharded_fns,
+        soft_gate_temperature=0.07, soft_gate_t_final=0.07,
+        soft_gate_T_qk=None, soft_gate_T_v=None,
+        soft_gate_boundary_power=2.0,
+        soft_gate_boundary_power_final=4.0,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        execution_prune_eps=0.0):
+    """Lean training attention graph returning only the residual update."""
+    del n_qk, n_v, admission_den_power
+    batch_size, sequence_length, d_hidden = x.shape
+    soft_gate_T_qk = (
+        soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
+    soft_gate_T_v = (
+        soft_gate_temperature if soft_gate_T_v is None else soft_gate_T_v)
+    pool_params = _ensure_pool_operator_keys(pool_params)
+    if not isinstance(sharded_fns, dict):
+        raise ValueError("training fast attention requires dict sharded_fns")
+    fused_paired = sharded_fns.get('attn_qk_paired_minimal')
+    fused_single_v = sharded_fns.get('attn_v_single_minimal')
+    if fused_paired is None or fused_single_v is None:
+        raise ValueError("training fast attention requires QK and V kernels")
+    if any(getattr(fn, '_v4171_kernel_profile', None) != 'production'
+           for fn in (fused_paired, fused_single_v)):
+        raise ValueError("training fast attention received a non-production kernel")
+
+    rng, rng_drop = jax.random.split(rng)
+    operator_queries = (
+        x @ router_params['proj_attn']['kernel']
+        + router_params['proj_attn']['bias'])
+    operator_queries = safe_dropout(
+        operator_queries, router_dropout, deterministic, rng_drop)
+    q_query, k_query, v_query = jnp.split(operator_queries, 3, axis=-1)
+    raw_tau = (
+        x @ router_params['raw_tau_attn']['kernel']
+        + router_params['raw_tau_attn']['bias'])
+    qk_scale, v_scale, _ = _effective_pool_output_scales(
+        pool_params, d_model, n_layers)
+    qk_state = fused_paired(
+        x, jnp.stack((q_query, k_query), axis=2),
+        pool_params['attn_qk_op_key'],
+        jnp.stack((raw_tau[:, :, 0:1], raw_tau[:, :, 1:2]), axis=2),
+        pool_params['attn_qk_read'], pool_params['attn_qk_write'],
+        soft_gate_T_qk, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps)
+    value_state = fused_single_v(
+        x, v_query, pool_params['attn_v_op_key'], raw_tau[:, :, 2:3],
+        pool_params['attn_v_read'], pool_params['attn_v_write'],
+        soft_gate_T_v, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps)
+    query = qk_state[:, :, 0, :] * qk_scale
+    key = qk_state[:, :, 1, :] * qk_scale
+    value = value_state * v_scale
+    d_head = d_model // n_heads
+    query = query.reshape(
+        batch_size, sequence_length, n_heads, d_head).transpose(0, 2, 1, 3)
+    key = key.reshape(
+        batch_size, sequence_length, n_heads, d_head).transpose(0, 2, 1, 3)
+    value = value.reshape(
+        batch_size, sequence_length, n_heads, d_head).transpose(0, 2, 1, 3)
+    scale = jnp.sqrt(jnp.float32(d_head))
+    rng, rng_attn_drop = jax.random.split(rng)
+
+    @jax.checkpoint
+    def attention_update(query, key, value, rng_drop):
+        scores = jnp.einsum(
+            'bhsd,bhtd->bhst', query, key) / scale
+        causal = jnp.tril(jnp.ones(
+            (sequence_length, sequence_length), dtype=jnp.bool_))
+        scores = jnp.where(
+            causal, scores, jnp.finfo(scores.dtype).min)
+        weights = jax.nn.softmax(scores, axis=-1)
+        weights = safe_dropout(
+            weights, dropout_rate, deterministic, rng_drop)
+        return jnp.einsum('bhst,bhtd->bhsd', weights, value)
+
+    out = attention_update(query, key, value, rng_attn_drop)
+    out = out.transpose(0, 2, 1, 3).reshape(
+        batch_size, sequence_length, d_hidden)
+    out = out @ expand_O_kernel
+    rng, rng_out = jax.random.split(rng)
+    return safe_dropout(out, dropout_rate, deterministic, rng_out)
+
+
+def _attn_forward_production_diagnostics(
         x, pool_params, router_params, expand_O_kernel, rng,
         n_qk, n_v, n_heads, d_model, n_layers,
         router_dropout, dropout_rate, deterministic, sharded_fns,
@@ -5349,7 +5733,7 @@ def _attn_forward_production_minimal(
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         execution_prune_eps=0.0, parity_debug=False,
         **unused_analysis_kwargs):
-    """Production attention graph with no analysis inputs or sidecars."""
+    """Production-equivalent attention graph with observational metrics."""
     del n_qk, n_v, admission_den_power, unused_analysis_kwargs
     batch_size, sequence_length, d_hidden = x.shape
     soft_gate_T_qk = (
@@ -5370,10 +5754,11 @@ def _attn_forward_production_minimal(
     if fused_paired is None or fused_single_v is None:
         raise ValueError(
             "production minimal attention requires pure QK and V kernels")
-    if any(getattr(fn, '_v4171_kernel_profile', None) != 'production'
+    if any(getattr(fn, '_v4171_kernel_profile', None)
+           != 'production_diagnostics'
            for fn in (fused_paired, fused_single_v)):
         raise ValueError(
-            "production minimal attention received an analysis kernel profile")
+            "production diagnostics attention received the wrong profile")
 
     rng, rng_drop = jax.random.split(rng)
     attn_operator_queries = (
@@ -6067,7 +6452,52 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
     return result
 
 
-def _rst_forward_production_minimal(
+def _rst_forward_training_fast(
+        x, pool_params, router_params, rng,
+        router_dropout, dropout_rate, deterministic, sharded_fns,
+        d_model=None, n_layers=None,
+        soft_gate_temperature=0.07, soft_gate_t_final=0.07,
+        soft_gate_T_rst=None, soft_gate_boundary_power=2.0,
+        soft_gate_boundary_power_final=4.0,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        execution_prune_eps=0.0):
+    """Lean training RST graph returning only the residual update."""
+    del admission_den_power
+    if d_model is None or n_layers is None:
+        raise ValueError(
+            "depth-scaled pool outputs require d_model and n_layers.")
+    soft_gate_T_rst = (
+        soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
+    pool_params = _ensure_pool_operator_keys(pool_params)
+    if not isinstance(sharded_fns, dict):
+        raise ValueError("training fast RST requires dict sharded_fns")
+    fused_single = sharded_fns.get('rst_single_minimal')
+    if fused_single is None:
+        raise ValueError("training fast RST requires the production kernel")
+    if getattr(fused_single, '_v4171_kernel_profile', None) != 'production':
+        raise ValueError("training fast RST received a non-production kernel")
+    rng, rng_drop = jax.random.split(rng)
+    operator_query = (
+        x @ router_params['proj_rst']['kernel']
+        + router_params['proj_rst']['bias'])
+    operator_query = safe_dropout(
+        operator_query, router_dropout, deterministic, rng_drop)
+    raw_tau = (
+        x @ router_params['raw_tau_rst']['kernel']
+        + router_params['raw_tau_rst']['bias'])
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    out = fused_single(
+        x, operator_query, pool_params['rst_op_key'], raw_tau,
+        pool_params['rst_read'], pool_params['rst_write'],
+        soft_gate_T_rst, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps)
+    out = out * rst_scale
+    rng, rng_out = jax.random.split(rng)
+    return safe_dropout(out, dropout_rate, deterministic, rng_out)
+
+
+def _rst_forward_production_diagnostics(
         x, pool_params, router_params, rng,
         router_dropout, dropout_rate, deterministic, sharded_fns,
         d_model=None, n_layers=None,
@@ -6077,7 +6507,7 @@ def _rst_forward_production_minimal(
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         execution_prune_eps=0.0, parity_debug=False,
         **unused_analysis_kwargs):
-    """Production RST graph with no analysis inputs or sidecars."""
+    """Production-equivalent RST graph with observational metrics."""
     del admission_den_power, unused_analysis_kwargs
     if d_model is None or n_layers is None:
         raise ValueError(
@@ -6093,9 +6523,10 @@ def _rst_forward_production_minimal(
     fused_single = sharded_fns.get('rst_single_minimal')
     if fused_single is None:
         raise ValueError("production minimal RST requires the pure RST kernel")
-    if getattr(fused_single, '_v4171_kernel_profile', None) != 'production':
+    if (getattr(fused_single, '_v4171_kernel_profile', None)
+            != 'production_diagnostics'):
         raise ValueError(
-            "production minimal RST received an analysis kernel profile")
+            "production diagnostics RST received the wrong kernel profile")
 
     rng, rng_drop = jax.random.split(rng)
     operator_query = (
@@ -6427,7 +6858,9 @@ def _attn_forward_minimal(*args, **kwargs):
     profile = _v4171_minimal_kernel_profile(
         sharded_fns, 'attn_qk_paired_minimal')
     if profile == 'production':
-        return _attn_forward_production_minimal(*args, **kwargs)
+        return _attn_forward_training_fast(*args, **kwargs)
+    if profile == 'production_diagnostics':
+        return _attn_forward_production_diagnostics(*args, **kwargs)
     if profile not in {'retention', 'suppression', 'trajectory'}:
         raise ValueError(
             f"minimal attention has no static kernel profile: {profile!r}")
@@ -6440,7 +6873,9 @@ def _rst_forward_minimal(*args, **kwargs):
     profile = _v4171_minimal_kernel_profile(
         sharded_fns, 'rst_single_minimal')
     if profile == 'production':
-        return _rst_forward_production_minimal(*args, **kwargs)
+        return _rst_forward_training_fast(*args, **kwargs)
+    if profile == 'production_diagnostics':
+        return _rst_forward_production_diagnostics(*args, **kwargs)
     if profile not in {'retention', 'suppression', 'trajectory'}:
         raise ValueError(
             f"minimal RST has no static kernel profile: {profile!r}")
@@ -7161,6 +7596,7 @@ class DAWN_SRW_V4171(nn.Module):
                  heat_kernel_beta=None,
                  execution_prune_eps=0.0,
                  minimal_train=False,
+                 minimal_runtime_profile="training",
                  ce_token_chunk_size=32768,
                  compute_accuracy=True,
                  analysis_contribution=None,
@@ -7322,7 +7758,33 @@ class DAWN_SRW_V4171(nn.Module):
             _v4171_minimal_kernel_profile(
                 sharded_fns, 'attn_qk_paired_minimal')
             if minimal_train else None)
-        if minimal_kernel_profile == 'production':
+        runtime_profiles = {
+            'training': 'production',
+            'diagnostics': 'production_diagnostics',
+            'retention': 'retention',
+            'suppression': 'suppression',
+            'trajectory': 'trajectory',
+        }
+        if minimal_train:
+            if not isinstance(minimal_runtime_profile, str):
+                raise TypeError("minimal_runtime_profile must be a static string")
+            if minimal_runtime_profile not in runtime_profiles:
+                raise ValueError(
+                    "unknown minimal_runtime_profile="
+                    f"{minimal_runtime_profile!r}; expected one of "
+                    f"{tuple(runtime_profiles)}")
+            expected_kernel_profile = runtime_profiles[
+                minimal_runtime_profile]
+            if minimal_kernel_profile != expected_kernel_profile:
+                raise ValueError(
+                    "minimal runtime/kernel profile mismatch: "
+                    f"runtime={minimal_runtime_profile!r} expects "
+                    f"kernel={expected_kernel_profile!r}, got "
+                    f"{minimal_kernel_profile!r}")
+        training_fast = (
+            minimal_train and minimal_runtime_profile == 'training')
+        if minimal_kernel_profile in {
+                'production', 'production_diagnostics'}:
             production_analysis_request = (
                 analysis_program_enabled
                 or any_trajectory_analysis
@@ -7332,10 +7794,16 @@ class DAWN_SRW_V4171(nn.Module):
                 or analysis_keep_rst is not None
                 or analysis_position_mask is not None
                 or bool(analysis_capture_contribution)
-                or bool(analysis_program_capture_contribution))
+                or bool(analysis_program_capture_contribution)
+                or bool(analysis_interchange_enabled)
+                or bool(analysis_trajectory_replay_enabled)
+                or bool(analysis_return_residual)
+                or bool(analysis_return_logits)
+                or bool(analysis_parity_debug)
+                or bool(analysis_causal_trace))
             if production_analysis_request:
                 raise ValueError(
-                    "production minimal kernel profile cannot execute "
+                    "production or diagnostics kernel profile cannot execute "
                     "retention, suppression, interchange, program, or "
                     "trajectory analysis")
         if any_trajectory_analysis and not minimal_train:
@@ -7793,6 +8261,37 @@ class DAWN_SRW_V4171(nn.Module):
             isinstance(sharded_fns, dict)
             and sharded_fns.get("vocab_eval_stats") is not None)
 
+        def _compute_vocab_ce_loss(final_x):
+            """Static fast CE profile: return only the scalar loss."""
+            token_chunk_size = int(ce_token_chunk_size)
+            if token_chunk_size <= 0:
+                raise ValueError(
+                    "ce_token_chunk_size must be > 0, got "
+                    f"{token_chunk_size}")
+            embedding_matrix = self.token_emb.embedding
+            shift_x = final_x[:, :-1, :]
+            shift_labels = labels[:, 1:].astype(jnp.int32)
+            valid_mask = shift_labels != -100
+            vp_loss = (
+                sharded_fns.get("vocab_ce_loss")
+                if isinstance(sharded_fns, dict) else None)
+            if vp_loss is not None:
+                return vp_loss(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+            vp_ce = (
+                sharded_fns.get("vocab_ce")
+                if isinstance(sharded_fns, dict) else None)
+            if vp_ce is not None:
+                return vp_ce(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)[0]
+            logical_vocab_size, _ = self._vocab_sizes()
+            return _chunked_ce_loss_and_acc(
+                shift_x, embedding_matrix, shift_labels, valid_mask,
+                token_chunk_size=token_chunk_size,
+                compute_accuracy=False,
+                logical_vocab_size=logical_vocab_size,
+                compute_logit_stats=False)[0]
+
         def _compute_vocab_ce(final_x):
             _ce_token_chunk_size = int(ce_token_chunk_size)
             if _ce_token_chunk_size <= 0:
@@ -8039,6 +8538,84 @@ class DAWN_SRW_V4171(nn.Module):
 
             base_rng = self.make_rng('dropout')
             layer_rngs = jax.random.split(base_rng, self.n_layers)
+
+            if training_fast:
+                def scan_body_training_fast(carry, xs):
+                    x = carry
+                    bp = xs['params']
+                    rng = xs['rng']
+                    rng, rng_attn, rng_rst = jax.random.split(rng, 3)
+                    normed = _layer_norm(
+                        x, bp['norm1']['scale'], bp['norm1']['bias'])
+                    attn_update = _attn_forward_training_fast(
+                        normed, pool_params, router_params,
+                        bp['attn']['expand_O']['kernel'], rng_attn,
+                        self.n_qk, self.n_v,
+                        self.n_heads, self.d_model, self.n_layers,
+                        self.router_dropout, self.dropout_rate,
+                        deterministic, _sharded,
+                        soft_gate_temperature=soft_gate_temperature,
+                        soft_gate_t_final=soft_gate_t_final,
+                        soft_gate_T_qk=soft_gate_T_qk,
+                        soft_gate_T_v=soft_gate_T_v,
+                        soft_gate_boundary_power=soft_gate_boundary_power,
+                        soft_gate_boundary_power_final=(
+                            soft_gate_boundary_power_final),
+                        admission_den_power=admission_den_power_qk,
+                        execution_prune_eps=execution_prune_eps)
+                    x = x + attn_update
+                    normed = _layer_norm(
+                        x, bp['norm2']['scale'], bp['norm2']['bias'])
+                    rst_update = _rst_forward_training_fast(
+                        normed, pool_params, router_params, rng_rst,
+                        self.router_dropout, self.dropout_rate,
+                        deterministic, _sharded,
+                        d_model=self.d_model,
+                        n_layers=self.n_layers,
+                        soft_gate_temperature=soft_gate_temperature,
+                        soft_gate_t_final=soft_gate_t_final,
+                        soft_gate_T_rst=soft_gate_T_rst,
+                        soft_gate_boundary_power=soft_gate_boundary_power,
+                        soft_gate_boundary_power_final=(
+                            soft_gate_boundary_power_final),
+                        admission_den_power=admission_den_power_rst,
+                        execution_prune_eps=execution_prune_eps)
+                    return x + rst_update, ()
+
+                if self.gradient_checkpointing:
+                    scan_body_training_fast = jax.checkpoint(
+                        scan_body_training_fast)
+                x, _ = jax.lax.scan(
+                    scan_body_training_fast,
+                    x,
+                    {'params': stacked, 'rng': layer_rngs})
+                x = self.norm(x)
+                if labels is None:
+                    vocab_argmax = (
+                        sharded_fns.get("vocab_argmax")
+                        if isinstance(sharded_fns, dict) else None)
+                    if vocab_argmax is not None:
+                        return {'argmax_token_ids': vocab_argmax(
+                            x, self.token_emb.embedding)}
+                    if vp_embed is not None:
+                        raise NotImplementedError(
+                            "Full logits are disabled on the vocab-parallel "
+                            "training fast path. Pass labels.")
+                    logical_vocab_size, embedding_vocab_size = (
+                        self._vocab_sizes())
+                    logits = self.token_emb.attend(x)
+                    if embedding_vocab_size != logical_vocab_size:
+                        logits = logits[..., :logical_vocab_size]
+                    return {'logits': logits}
+                loss = _compute_vocab_ce_loss(x)
+                valid_count = (labels[:, 1:] != -100).astype(
+                    jnp.int32).sum()
+                return {
+                    'loss': loss,
+                    'aux_loss': jnp.float32(0.0),
+                    'correct': jnp.int32(0),
+                    'valid_count': valid_count,
+                }
 
             if minimal_train:
                 trace_minimal_layers = bool(
@@ -9957,6 +10534,8 @@ class DAWN_SRW_V4171(nn.Module):
         target positions are per-example arrays; ``route_selector`` is 0=attention_q,
         1=attention_k, 2=attention_v, or 3=RST.
         """
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "suppression")
         return self(
             input_ids,
             labels=labels,
@@ -9990,6 +10569,8 @@ class DAWN_SRW_V4171(nn.Module):
             raise ValueError(
                 "group operator ids must have shape [B, M], got "
                 f"{selected_global_operator_ids.shape}")
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "suppression")
         return self(
             input_ids,
             labels=labels,
@@ -10026,6 +10607,8 @@ class DAWN_SRW_V4171(nn.Module):
             raise ValueError(
                 f"Unsupported circuit retention mode={mode!r}; "
                 f"known={','.join(modes)}")
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "retention")
         return self(
             input_ids,
             labels=labels,
@@ -10053,6 +10636,8 @@ class DAWN_SRW_V4171(nn.Module):
         pool scale, and taken before attention head reshaping or residual
         addition.
         """
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "suppression")
         return self(
             input_ids,
             labels=labels,
@@ -10081,6 +10666,8 @@ class DAWN_SRW_V4171(nn.Module):
         The first two terms use the exact production suppression
         counterfactual, so an explicit zero source is suppression, not no-op.
         """
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "suppression")
         return self(
             input_ids,
             labels=labels,
@@ -10109,6 +10696,8 @@ class DAWN_SRW_V4171(nn.Module):
         state. Invalid padding is represented by id 0 plus a false validity
         bit and therefore contributes exactly zero.
         """
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "suppression")
         return self(
             input_ids,
             labels=labels,
@@ -10144,6 +10733,8 @@ class DAWN_SRW_V4171(nn.Module):
         and 4 source-contribution transplant. Only each example's target
         answer position is patched; all other positions remain production.
         """
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "suppression")
         return self(
             input_ids,
             labels=labels,
@@ -10185,6 +10776,8 @@ class DAWN_SRW_V4171(nn.Module):
         fixed ``[B,P]`` patch interface with the stage codes exported in
         :data:`TRAJECTORY_PATCH_STAGES`.
         """
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "trajectory")
         return self(
             input_ids,
             labels=labels,
@@ -10217,6 +10810,8 @@ class DAWN_SRW_V4171(nn.Module):
             attention_mask=None, return_residual=False,
             return_logits=False, **production_kwargs):
         """Apply a fixed batch-native patch schedule without trace capture."""
+        production_kwargs.setdefault(
+            "minimal_runtime_profile", "trajectory")
         return self(
             input_ids,
             labels=labels,

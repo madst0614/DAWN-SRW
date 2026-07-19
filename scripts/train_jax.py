@@ -2901,6 +2901,25 @@ def _v4170_compact_train_metrics(
         'grad_norm': grad_norm,
         'tau_lr_mult': tau_lr_mult,
     }
+    is_v417x_fast = _is_v417x_version(model_version)
+    if is_v417x_fast:
+        metrics.update({
+            'tau_update_qk_max_abs': tau_update_qk_max_abs,
+            'tau_update_v_max_abs': tau_update_v_max_abs,
+            'tau_update_rst_max_abs': tau_update_rst_max_abs,
+        })
+        if operator_key_gradient_metrics is None:
+            raise RuntimeError(
+                "v417x fast train metrics require operator-key gradient "
+                "scalars")
+        metrics.update({
+            key: operator_key_gradient_metrics[key]
+            for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
+        if str(model_version) == V4172_MODEL_VERSION:
+            metrics.update({
+                key: operator_key_gradient_metrics[key]
+                for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
+        return metrics
     metrics.update({
         key: result[key]
         for key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
@@ -4937,6 +4956,16 @@ def _model_accepts_minimal_train(model):
         return False
 
 
+def _model_accepts_minimal_runtime_profile(model):
+    """Return True if model.__call__ accepts a static minimal profile."""
+    import inspect as _inspect
+    try:
+        return 'minimal_runtime_profile' in _inspect.signature(
+            model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _model_accepts_training_tokens(model):
     """Return True if model.__call__ accepts consumed-token scheduling."""
     import inspect as _inspect
@@ -5976,6 +6005,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_heat_kernel_beta_kw = _model_accepts_heat_kernel_beta(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
+    _pass_minimal_runtime_profile_kw = (
+        _model_accepts_minimal_runtime_profile(model))
     _pass_training_tokens_kw = _model_accepts_training_tokens(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
@@ -6117,6 +6148,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['analysis'] = False
             if _use_minimal_train_path:
                 extra_kw['minimal_train'] = True
+                if _pass_minimal_runtime_profile_kw:
+                    extra_kw['minimal_runtime_profile'] = 'training'
             if _pass_training_tokens_kw:
                 if _fixed_runtime is not None:
                     if 'training_tokens' not in _fixed_runtime:
@@ -6210,7 +6243,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rngs={'dropout': dropout_key},
                 **extra_kw,
             )
-            if _is_linear_direct_tau_model:
+            if _is_linear_direct_tau_model and not _is_v417x_model:
                 missing_regular = tuple(
                     key for key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
                     if key not in result)
@@ -6718,16 +6751,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             )
             result_payload = result
             if _is_v4170_compact_train:
-                result_payload = {
-                    key: result[key]
-                    for key in (
-                        'correct', 'valid_count',
-                        *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES)
-                }
                 if _is_v417x_model:
-                    result_payload.update({
+                    result_payload = {
                         key: result[key]
-                        for key in V4171_COMPOSITION_METRIC_NAMES})
+                        for key in ('correct', 'valid_count')}
+                else:
+                    result_payload = {
+                        key: result[key]
+                        for key in (
+                            'correct', 'valid_count',
+                            *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES)
+                    }
             elif _compact_train_metrics:
                 result_payload = {
                     k: v for k, v in result.items()
@@ -8518,6 +8552,216 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     return train_step
 
 
+def create_production_diagnostic_step(
+        model, sharded_fns, *, total_training_steps=1,
+        soft_gate_schedule_active=False,
+        soft_gate_t_start=1.5, soft_gate_t_final=0.07,
+        soft_gate_t_hold_frac=0.10,
+        soft_gate_t_anneal_end_frac=0.80,
+        soft_gate_schedule='cosine', soft_gate_t_power=4.0,
+        soft_gate_t_gompertz_center=0.25,
+        soft_gate_t_gompertz_steepness=8.0,
+        pool_specific_gate_t=False, soft_gate_pool_schedules=None,
+        boundary_power_schedule_active=False,
+        soft_gate_boundary_power_start=3.0,
+        soft_gate_boundary_power_mid=3.15,
+        soft_gate_boundary_power_final=4.0,
+        soft_gate_boundary_power_start_frac=0.0,
+        soft_gate_boundary_power_mid_frac=0.800,
+        soft_gate_boundary_power_final_frac=0.950,
+        admission_den_power=1.0, ce_token_chunk_size=32768,
+        runtime_state=None):
+    """Create the read-only, pre-update production diagnostics executable."""
+    if not isinstance(sharded_fns, dict):
+        raise TypeError("production diagnostics require dict sharded_fns")
+    if sharded_fns.get('_v4171_kernel_profile') != 'production_diagnostics':
+        raise ValueError(
+            "production diagnostics require kernel profile "
+            "'production_diagnostics'")
+    model_version = getattr(
+        model, '__version__', getattr(type(model), '__version__', ''))
+    if not _is_v417x_version(model_version):
+        raise ValueError(
+            "production diagnostics executable is currently v417x-only")
+    pass_analysis = _model_accepts_analysis(model)
+    pass_schedule = _model_accepts_soft_gate_schedule(model)
+    pass_t_final = _model_accepts_soft_gate_t_final(model)
+    pass_boundary = _model_accepts_soft_gate_boundary_power(model)
+    pass_den = _model_accepts_admission_den_power(model)
+    pass_composition = _model_accepts_srw_composition_mode(model)
+    pass_beta = _model_accepts_heat_kernel_beta(model)
+    pass_execution_prune = _model_accepts_execution_prune_eps(model)
+    pass_minimal = _model_accepts_minimal_train(model)
+    pass_profile = _model_accepts_minimal_runtime_profile(model)
+    pass_ce_chunk = _model_accepts_ce_token_chunk_size(model)
+    pass_accuracy = _model_accepts_compute_accuracy(model)
+    if not pass_minimal or not pass_profile:
+        raise RuntimeError(
+            "v417x diagnostics require minimal_train and "
+            "minimal_runtime_profile model arguments")
+
+    ce_token_chunk_size = int(ce_token_chunk_size)
+    if ce_token_chunk_size <= 0:
+        raise ValueError("ce_token_chunk_size must be positive")
+    total_training_steps_f = jnp.float32(
+        max(1, int(total_training_steps or 1)))
+    is_linear_direct_tau = (
+        str(model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
+    schedule_enabled = bool(
+        soft_gate_schedule_active and not is_linear_direct_tau)
+    schedule_name = str(soft_gate_schedule).lower()
+    pool_defaults = {
+        'start': soft_gate_t_start,
+        'final': soft_gate_t_final,
+        'hold_frac': soft_gate_t_hold_frac,
+        'anneal_end_frac': soft_gate_t_anneal_end_frac,
+        'schedule': soft_gate_schedule,
+        'power': soft_gate_t_power,
+        'gompertz_center': soft_gate_t_gompertz_center,
+        'gompertz_steepness': soft_gate_t_gompertz_steepness,
+    }
+    pool_schedules = _coerce_pool_schedule_configs(
+        (soft_gate_pool_schedules
+         if (pool_specific_gate_t or schedule_name == 'developmental_band')
+         else None),
+        pool_defaults)
+    boundary_schedule_enabled = bool(
+        boundary_power_schedule_active and not is_linear_direct_tau)
+    boundary_start = jnp.float32(soft_gate_boundary_power_start)
+    boundary_mid = jnp.float32(soft_gate_boundary_power_mid)
+    boundary_final = jnp.float32(soft_gate_boundary_power_final)
+    boundary_start_frac = jnp.float32(
+        soft_gate_boundary_power_start_frac)
+    boundary_mid_frac = jnp.float32(soft_gate_boundary_power_mid_frac)
+    boundary_final_frac = jnp.float32(
+        soft_gate_boundary_power_final_frac)
+    t_final = jnp.float32(soft_gate_t_final)
+    runtime_den_power = _v4171_static_runtime_den_power(
+        model, admission_den_power,
+        context="v4171 production diagnostics runtime",
+        sharded_fns=sharded_fns)
+    runtime_composition = _v4171_static_runtime_composition_mode(
+        model, context="v4171 production diagnostics runtime",
+        sharded_fns=sharded_fns)
+    runtime_beta = _v4171_static_runtime_heat_kernel_beta(
+        model, context="v4171 production diagnostics runtime",
+        sharded_fns=sharded_fns)
+
+    fixed_runtime = None
+    if runtime_state is not None:
+        required = (
+            'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
+            'soft_gate_temperature', 'soft_gate_t_final',
+            'soft_gate_boundary_power',
+            'soft_gate_boundary_power_final', 'admission_den_power')
+        missing = [key for key in required if key not in runtime_state]
+        if missing:
+            raise RuntimeError(
+                "source_final_constant diagnostics runtime is missing: "
+                + ", ".join(missing))
+        fixed_runtime = {
+            key: jnp.float32(runtime_state[key])
+            for key in required if key != 'admission_den_power'}
+        fixed_runtime['admission_den_power'] = (
+            _v4171_static_runtime_den_power(
+                model, runtime_state['admission_den_power'],
+                context="v4171 source-final diagnostics runtime",
+                sharded_fns=sharded_fns))
+        fixed_runtime['srw_composition_mode'] = (
+            _v4171_static_runtime_composition_mode(
+                model,
+                runtime_state.get(
+                    'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+                context="v4171 source-final diagnostics runtime",
+                sharded_fns=sharded_fns))
+        fixed_runtime['heat_kernel_beta'] = (
+            _v4171_static_runtime_heat_kernel_beta(
+                model,
+                runtime_state.get(
+                    'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
+                context="v4171 source-final diagnostics runtime",
+                sharded_fns=sharded_fns))
+
+    @jax.jit
+    def diagnostic_step(
+            params, input_ids, labels, attention_mask, dropout_key, step):
+        extra_kw = {
+            'sharded_fns': sharded_fns,
+            'minimal_train': True,
+            'minimal_runtime_profile': 'diagnostics',
+        }
+        if pass_analysis:
+            extra_kw['analysis'] = False
+        if fixed_runtime is not None:
+            qk_temperature = fixed_runtime['soft_gate_T_qk']
+            v_temperature = fixed_runtime['soft_gate_T_v']
+            rst_temperature = fixed_runtime['soft_gate_T_rst']
+        elif schedule_enabled:
+            qk_temperature = _scheduled_from_config(
+                step, total_training_steps_f, pool_schedules['qk'])
+            v_temperature = _scheduled_from_config(
+                step, total_training_steps_f, pool_schedules['v'])
+            rst_temperature = _scheduled_from_config(
+                step, total_training_steps_f, pool_schedules['rst'])
+        else:
+            qk_temperature = jnp.float32(0.07)
+            v_temperature = jnp.float32(0.07)
+            rst_temperature = jnp.float32(0.07)
+        if pass_schedule and (fixed_runtime is not None or schedule_enabled):
+            extra_kw['soft_gate_temperature'] = (
+                fixed_runtime['soft_gate_temperature']
+                if fixed_runtime is not None else qk_temperature)
+            extra_kw['soft_gate_T_qk'] = qk_temperature
+            extra_kw['soft_gate_T_v'] = v_temperature
+            extra_kw['soft_gate_T_rst'] = rst_temperature
+        if pass_boundary:
+            boundary_power = (
+                fixed_runtime['soft_gate_boundary_power']
+                if fixed_runtime is not None
+                else scheduled_boundary_power_by_frac(
+                    step, total_training_steps_f,
+                    boundary_schedule_enabled,
+                    boundary_start, boundary_mid, boundary_final,
+                    boundary_mid_frac, boundary_final_frac,
+                    boundary_start_frac))
+            extra_kw['soft_gate_boundary_power'] = boundary_power
+            extra_kw['soft_gate_boundary_power_final'] = (
+                fixed_runtime['soft_gate_boundary_power_final']
+                if fixed_runtime is not None else boundary_final)
+        if pass_t_final:
+            extra_kw['soft_gate_t_final'] = (
+                fixed_runtime['soft_gate_t_final']
+                if fixed_runtime is not None else t_final)
+        if pass_den:
+            extra_kw['admission_den_power'] = (
+                fixed_runtime['admission_den_power']
+                if fixed_runtime is not None else runtime_den_power)
+        if pass_composition:
+            extra_kw['srw_composition_mode'] = (
+                fixed_runtime['srw_composition_mode']
+                if fixed_runtime is not None else runtime_composition)
+        if pass_beta:
+            extra_kw['heat_kernel_beta'] = (
+                fixed_runtime['heat_kernel_beta']
+                if fixed_runtime is not None else runtime_beta)
+        if pass_execution_prune:
+            extra_kw['execution_prune_eps'] = jnp.float32(0.0)
+        if pass_ce_chunk:
+            extra_kw['ce_token_chunk_size'] = ce_token_chunk_size
+        if pass_accuracy:
+            extra_kw['compute_accuracy'] = True
+        result = model.apply(
+            {'params': params}, input_ids, labels=labels,
+            attention_mask=attention_mask, deterministic=False,
+            rngs={'dropout': dropout_key}, **extra_kw)
+        return {
+            key: value for key, value in result.items()
+            if key not in ('per_token_ce', 'per_token_correct', 'valid_mask')
+        }
+
+    return diagnostic_step
+
+
 def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                      return_prune_stats=False, execution_prune_eps=0.0,
                      total_training_steps=1,
@@ -8557,6 +8801,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_heat_kernel_beta_kw = _model_accepts_heat_kernel_beta(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
+    _pass_minimal_runtime_profile_kw = (
+        _model_accepts_minimal_runtime_profile(model))
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
     _execution_prune_eps = jnp.float32(execution_prune_eps)
@@ -8590,6 +8836,19 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             V4168_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION,
             *V417X_MODEL_VERSIONS)
         and _pass_minimal_train_kw)
+    _minimal_eval_runtime_profile = None
+    if _is_v417x_model and _use_minimal_train_path:
+        if not _pass_minimal_runtime_profile_kw:
+            raise RuntimeError(
+                "v417x eval requires minimal_runtime_profile support")
+        kernel_profile = (
+            sharded_fns.get('_v4171_kernel_profile')
+            if isinstance(sharded_fns, dict) else None)
+        if kernel_profile != 'production_diagnostics':
+            raise ValueError(
+                "v417x eval requires production_diagnostics kernels, got "
+                f"{kernel_profile!r}")
+        _minimal_eval_runtime_profile = 'diagnostics'
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
         and _is_active_srw_version(_model_version)
@@ -8694,6 +8953,9 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             extra_kw['analysis'] = False
         if _use_minimal_train_path:
             extra_kw['minimal_train'] = True
+            if _minimal_eval_runtime_profile is not None:
+                extra_kw['minimal_runtime_profile'] = (
+                    _minimal_eval_runtime_profile)
         if ((_fixed_runtime is not None or _soft_gate_runtime_enabled)
                 and _pass_soft_gate_schedule_kw):
             soft_gate_T_qk = (
@@ -11432,7 +11694,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     fixed_pool_scale = _fixed_depth_pool_scale_from_ctx(ctx)
     is_rw_key_model = _is_rw_key_srw_version(ctx.get('model_version'))
     train_compute_accuracy = bool(ctx.get('train_compute_accuracy', True))
-    train_acc = win_avgs['acc'] if train_compute_accuracy else None
+    diagnostic_accuracy = ctx.get('diagnostic_accuracy')
+    train_acc = (
+        win_avgs['acc']
+        if train_compute_accuracy else diagnostic_accuracy)
 
     def _metric_present(*keys):
         return any(key in m for key in keys)
@@ -14464,11 +14729,23 @@ def _factory_supported_kwargs(factory, kwargs):
 
 
 def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
-                                analysis=False):
+                                analysis=False,
+                                kernel_profile='production'):
     """Canonical model-version sharded function construction."""
     model_cfg = cfg['model']
     training_cfg = cfg.get('training', {})
     version = str(model_cfg.get('model_version', ''))
+    kernel_profile = str(kernel_profile)
+    known_kernel_profiles = {
+        'production', 'production_diagnostics',
+        'retention', 'suppression', 'trajectory'}
+    if kernel_profile not in known_kernel_profiles:
+        raise ValueError(
+            f"unknown static kernel_profile={kernel_profile!r}; "
+            f"expected one of {tuple(sorted(known_kernel_profiles))}")
+    if not _is_v417x_version(version) and kernel_profile != 'production':
+        raise ValueError(
+            f"kernel_profile={kernel_profile!r} is v417x-only, got {version}")
     mesh_model = int(training_cfg.get('mesh_model', 1))
     if _is_baseline_version(version):
         return (create_baseline_sharded_fns(
@@ -14542,7 +14819,25 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         'paired': paired_qk,
         'attn_qk_paired': paired_qk,
     }
-    single_min = getattr(module, 'make_sharded_srw_minimal', None)
+    minimal_factory_names = {
+        'production': (
+            'make_sharded_srw_minimal',
+            'make_sharded_srw_paired_minimal'),
+        'production_diagnostics': (
+            'make_sharded_srw_diagnostics_minimal',
+            'make_sharded_srw_paired_diagnostics_minimal'),
+        'retention': (
+            'make_sharded_srw_retention_minimal',
+            'make_sharded_srw_paired_retention_minimal'),
+        'suppression': (
+            'make_sharded_srw_suppression_minimal',
+            'make_sharded_srw_paired_suppression_minimal'),
+        'trajectory': (
+            'make_sharded_srw_trajectory_minimal',
+            'make_sharded_srw_paired_trajectory_minimal'),
+    }
+    single_min_name, paired_min_name = minimal_factory_names[kernel_profile]
+    single_min = getattr(module, single_min_name, None)
     if single_min is not None:
         for pool, name in (
                 ('qk', 'attn_qk_single_minimal'),
@@ -14551,13 +14846,17 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             sharded[name] = single_min(
                 max_chunk_size=chunks[pool],
                 **_factory_supported_kwargs(single_min, pool_kwargs(pool)))
-    paired_min = getattr(module, 'make_sharded_srw_paired_minimal', None)
+    paired_min = getattr(module, paired_min_name, None)
     if paired_min is not None:
         sharded['attn_qk_paired_minimal'] = paired_min(
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
     if _is_v417x_version(version):
-        sharded['_v4171_kernel_profile'] = 'production'
+        if single_min is None or paired_min is None:
+            raise RuntimeError(
+                f"{version} is missing factories for static kernel profile "
+                f"{kernel_profile!r}")
+        sharded['_v4171_kernel_profile'] = kernel_profile
     if version == V4167_MODEL_VERSION:
         extra_factory = getattr(module, 'create_v4167_tp_sharded_fns', None)
         if extra_factory is None:
@@ -14576,6 +14875,7 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                     "canonical vocab-parallel execution")
         from models.vocab_parallel import (
             make_vocab_parallel_ce,
+            make_vocab_parallel_ce_loss,
             make_vocab_parallel_embedding,
         )
         logical_vocab = int(model_cfg['logical_vocab_size'])
@@ -14592,9 +14892,26 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             token_chunk_size=int(training_cfg.get(
                 'ce_token_chunk_size', 32768)),
             compute_accuracy=(
-                True if for_eval else bool(training_cfg.get(
-                    'train_compute_accuracy', True))),
+                True
+                if (for_eval
+                    or kernel_profile == 'production_diagnostics')
+                else (
+                    False
+                    if _is_v417x_version(version)
+                    else bool(training_cfg.get(
+                        'train_compute_accuracy', True)))),
+            compute_logit_stats=(
+                (for_eval or kernel_profile == 'production_diagnostics')
+                if _is_v417x_version(version) else True),
         )
+        if (_is_v417x_version(version)
+                and kernel_profile == 'production'):
+            sharded['vocab_ce_loss'] = make_vocab_parallel_ce_loss(
+                mesh,
+                logical_vocab_size=logical_vocab,
+                vocab_size_padded=padded_vocab,
+                token_chunk_size=int(training_cfg.get(
+                    'ce_token_chunk_size', 32768)))
     return sharded
 
 
@@ -14868,8 +15185,10 @@ def create_canonical_train_step(model, optimizer, cfg, sharded_fns, mesh,
         'tokens_per_step': int(t.get('batch_size', 1)) * int(
             m.get('max_seq_len', 1)),
         'ce_token_chunk_size': int(t.get('ce_token_chunk_size', 32768)),
-        'train_compute_accuracy': bool(t.get(
-            'train_compute_accuracy', True)),
+        'train_compute_accuracy': (
+            False
+            if _is_v417x_version(version)
+            else bool(t.get('train_compute_accuracy', True))),
         'runtime_state': runtime_state,
     }
     return create_train_step(
@@ -15122,12 +15441,17 @@ def main():
         raise ValueError(
             "training.ce_token_chunk_size must be > 0, got "
             f"{ce_token_chunk_size}")
-    train_compute_accuracy = _cfg_bool(
-        tcfg.get('train_compute_accuracy', True),
-        name='training.train_compute_accuracy')
     cfg.setdefault('training', {})['ce_token_chunk_size'] = ce_token_chunk_size
-    cfg.setdefault('training', {})['train_compute_accuracy'] = (
-        train_compute_accuracy)
+    if _is_v417x_version(model_version_cfg):
+        train_compute_accuracy = False
+        cfg['training'].pop('train_compute_accuracy', None)
+        cfg['training'].pop('diagnostic_compute_accuracy', None)
+        cfg['training'].pop('train_diagnostics_interval', None)
+    else:
+        train_compute_accuracy = _cfg_bool(
+            tcfg.get('train_compute_accuracy', True),
+            name='training.train_compute_accuracy')
+        cfg['training']['train_compute_accuracy'] = train_compute_accuracy
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -15615,13 +15939,19 @@ def main():
             raise ValueError(
                 "training.ce_token_chunk_size must be > 0, got "
                 f"{ce_token_chunk_size}")
-        train_compute_accuracy = _cfg_bool(
-            tcfg.get('train_compute_accuracy', True),
-            name='training.train_compute_accuracy')
         cfg.setdefault('training', {})['ce_token_chunk_size'] = (
             ce_token_chunk_size)
-        cfg.setdefault('training', {})['train_compute_accuracy'] = (
-            train_compute_accuracy)
+        if _is_v417x_version(model_version_cfg):
+            train_compute_accuracy = False
+            cfg['training'].pop('train_compute_accuracy', None)
+            cfg['training'].pop('diagnostic_compute_accuracy', None)
+            cfg['training'].pop('train_diagnostics_interval', None)
+        else:
+            train_compute_accuracy = _cfg_bool(
+                tcfg.get('train_compute_accuracy', True),
+                name='training.train_compute_accuracy')
+            cfg['training']['train_compute_accuracy'] = (
+                train_compute_accuracy)
         ckpt_interval = int(tcfg['checkpoint_interval'])
         checkpoint_keep_last = int(tcfg.get(
             'checkpoint_keep_last',
@@ -15922,14 +16252,20 @@ def main():
                 raise ValueError(
                     "training.ce_token_chunk_size must be > 0, got "
                     f"{ce_token_chunk_size}")
-            train_compute_accuracy = _cfg_bool(
-                saved_training_config.get(
-                    'train_compute_accuracy', train_compute_accuracy),
-                name='training.train_compute_accuracy')
             cfg.setdefault('training', {})['ce_token_chunk_size'] = (
                 ce_token_chunk_size)
-            cfg.setdefault('training', {})['train_compute_accuracy'] = (
-                train_compute_accuracy)
+            if _is_v417x_version(model_version_cfg):
+                train_compute_accuracy = False
+                cfg['training'].pop('train_compute_accuracy', None)
+                cfg['training'].pop('diagnostic_compute_accuracy', None)
+                cfg['training'].pop('train_diagnostics_interval', None)
+            else:
+                train_compute_accuracy = _cfg_bool(
+                    saved_training_config.get(
+                        'train_compute_accuracy', train_compute_accuracy),
+                    name='training.train_compute_accuracy')
+                cfg['training']['train_compute_accuracy'] = (
+                    train_compute_accuracy)
             ckpt_interval = int(saved_training_config['checkpoint_interval'])
             checkpoint_keep_last = int(saved_training_config.get(
                 'checkpoint_keep_last',
@@ -16335,11 +16671,12 @@ def main():
         'best_checkpoint_keep_last': best_checkpoint_keep_last,
         'training_log_append_on_resume': training_log_append_on_resume,
         'ce_token_chunk_size': ce_token_chunk_size,
-        'train_compute_accuracy': train_compute_accuracy,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
+    if not _is_v417x_version(model_version_cfg):
+        training_config['train_compute_accuracy'] = train_compute_accuracy
     if _is_rw_key_srw_version(model_version_cfg):
         for _key in (
                 'route_emb_lr_mult',
@@ -18009,6 +18346,7 @@ def main():
     # is the full observational path used only by analysis_step.
     _sharded_fns = None
     _sharded_fns_eval = None
+    _sharded_fns_diagnostics = None
     _sharded_fns_analysis = None
     _force_sharded = _is_active_srw_version(model_version_cfg)
     if is_baseline and mesh_model > 1:
@@ -18024,6 +18362,10 @@ def main():
         _sharded_fns = build_canonical_sharded_fns(cfg, mesh)
         _sharded_fns_eval = build_canonical_sharded_fns(
             cfg, mesh, for_eval=True)
+        if _is_v417x_version(model_version_cfg):
+            _sharded_fns_diagnostics = build_canonical_sharded_fns(
+                cfg, mesh, for_eval=True,
+                kernel_profile='production_diagnostics')
         _sharded_fns_analysis = build_canonical_sharded_fns(
             cfg, mesh, for_eval=True, analysis=True)
         if is_host0:
@@ -18310,12 +18652,14 @@ def main():
                     "sharded_fns.")
             from models.vocab_parallel import (
                 make_vocab_parallel_ce,
+                make_vocab_parallel_ce_loss,
                 make_vocab_parallel_embedding,
             )
             _vp_logical_vocab_size = int(
                 cfg['model']['logical_vocab_size'])
             _vp_vocab_size_padded = int(
                 cfg['model']['vocab_size_padded'])
+            _vp_is_v417x = _is_v417x_version(model_version_cfg)
             if _vp_vocab_size_padded % int(mesh_model) != 0:
                 raise ValueError(
                     "model.vocab_size_padded must be divisible by "
@@ -18328,17 +18672,45 @@ def main():
                 logical_vocab_size=_vp_logical_vocab_size,
                 vocab_size_padded=_vp_vocab_size_padded,
                 token_chunk_size=ce_token_chunk_size,
-                compute_accuracy=train_compute_accuracy)
+                compute_accuracy=(
+                    False if _vp_is_v417x else train_compute_accuracy),
+                compute_logit_stats=not _vp_is_v417x)
+            _vp_vocab_ce_train_loss = (
+                make_vocab_parallel_ce_loss(
+                    mesh,
+                    logical_vocab_size=_vp_logical_vocab_size,
+                    vocab_size_padded=_vp_vocab_size_padded,
+                    token_chunk_size=ce_token_chunk_size)
+                if _vp_is_v417x else None)
             _vp_vocab_ce_eval = make_vocab_parallel_ce(
                 mesh,
                 logical_vocab_size=_vp_logical_vocab_size,
                 vocab_size_padded=_vp_vocab_size_padded,
                 token_chunk_size=ce_token_chunk_size,
                 compute_accuracy=True)
+            _vp_vocab_ce_diagnostics = (
+                make_vocab_parallel_ce(
+                    mesh,
+                    logical_vocab_size=_vp_logical_vocab_size,
+                    vocab_size_padded=_vp_vocab_size_padded,
+                    token_chunk_size=ce_token_chunk_size,
+                    compute_accuracy=True,
+                    compute_logit_stats=True)
+                if _vp_is_v417x else None)
             _sharded_fns['vocab_parallel_embedding'] = _vp_vocab_embed
             _sharded_fns['vocab_ce'] = _vp_vocab_ce_train
+            if _vp_vocab_ce_train_loss is not None:
+                _sharded_fns['vocab_ce_loss'] = _vp_vocab_ce_train_loss
             _sharded_fns_eval = dict(_sharded_fns)
             _sharded_fns_eval['vocab_ce'] = _vp_vocab_ce_eval
+            if isinstance(_sharded_fns_diagnostics, dict):
+                _sharded_fns_diagnostics = dict(
+                    _sharded_fns_diagnostics)
+                _sharded_fns_diagnostics['vocab_parallel_embedding'] = (
+                    _vp_vocab_embed)
+                _sharded_fns_diagnostics['vocab_ce'] = (
+                    _vp_vocab_ce_diagnostics)
+                _sharded_fns_diagnostics.pop('vocab_ce_loss', None)
             if isinstance(_sharded_fns_analysis, dict):
                 _sharded_fns_analysis = dict(_sharded_fns_analysis)
                 _sharded_fns_analysis['vocab_parallel_embedding'] = (
@@ -18473,7 +18845,11 @@ def main():
                         flush=True)
 
     _eval_sharded_fns = (
-        _sharded_fns_eval if _sharded_fns_eval is not None else _sharded_fns)
+        _sharded_fns_diagnostics
+        if (_is_v417x_version(model_version_cfg)
+            and _sharded_fns_diagnostics is not None)
+        else (_sharded_fns_eval
+              if _sharded_fns_eval is not None else _sharded_fns))
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -18562,7 +18938,46 @@ def main():
         keep_train_layer_metrics=False,
         tokens_per_step=int(batch_size) * int(max_seq_len),
         ce_token_chunk_size=ce_token_chunk_size,
-        train_compute_accuracy=train_compute_accuracy)
+        train_compute_accuracy=(
+            False
+            if _is_v417x_version(model_version_cfg)
+            else train_compute_accuracy))
+    production_diagnostic_step_fn = None
+    if _is_v417x_version(model_version_cfg):
+        if _sharded_fns_diagnostics is None:
+            raise RuntimeError(
+                "v417x production diagnostics are enabled but the static "
+                "diagnostics sharded functions were not built")
+        production_diagnostic_step_fn = create_production_diagnostic_step(
+            model, _sharded_fns_diagnostics,
+            total_training_steps=total_steps,
+            soft_gate_schedule_active=soft_gate_schedule_active,
+            soft_gate_t_start=soft_gate_t_start,
+            soft_gate_t_final=soft_gate_t_final,
+            soft_gate_t_hold_frac=soft_gate_t_hold_frac,
+            soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
+            soft_gate_schedule=soft_gate_schedule,
+            soft_gate_t_power=soft_gate_t_power,
+            soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
+            soft_gate_t_gompertz_steepness=(
+                soft_gate_t_gompertz_steepness),
+            pool_specific_gate_t=pool_specific_gate_t,
+            soft_gate_pool_schedules=soft_gate_pool_schedules,
+            boundary_power_schedule_active=(
+                boundary_power_schedule_active),
+            soft_gate_boundary_power_start=(
+                soft_gate_boundary_power_start),
+            soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
+            soft_gate_boundary_power_final=(
+                soft_gate_boundary_power_final),
+            soft_gate_boundary_power_start_frac=(
+                soft_gate_boundary_power_start_frac),
+            soft_gate_boundary_power_mid_frac=(
+                soft_gate_boundary_power_mid_frac),
+            soft_gate_boundary_power_final_frac=(
+                soft_gate_boundary_power_final_frac),
+            admission_den_power=admission_den_power,
+            ce_token_chunk_size=ce_token_chunk_size)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_eval_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
@@ -19545,6 +19960,13 @@ def main():
     LOG_REGULAR = log_interval
     LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
     LOG_GEOMETRY = max(1, LOG_REGULAR * heavy_geometry_multiplier)
+    _v417x_split_runtime = _is_v417x_version(model_version_cfg)
+    _production_diagnostics_enabled = _v417x_split_runtime
+    if (_production_diagnostics_enabled
+            and production_diagnostic_step_fn is None):
+        raise RuntimeError(
+            "production diagnostics are enabled but their static executable "
+            "was not created")
     main_val_path = (
         'operation_space_tau_free_relu'
         if operation_space_tau_free_enabled else (
@@ -19557,6 +19979,17 @@ def main():
               f" geometry={LOG_GEOMETRY}"
               f" val={val_interval}",
               flush=True)
+        if _is_v417x_version(model_version_cfg):
+            print("  training_runtime_profile=fast", flush=True)
+            print(
+                "  production_diagnostics_cadence=regular_log", flush=True)
+            print(
+                "  production_diagnostics_parameter_timing=pre_update",
+                flush=True)
+            print(
+                "  production_diagnostics_same_batch=true", flush=True)
+            print(
+                "  production_diagnostics_same_rng=true", flush=True)
 
     # Operator-key drift snapshot. Non-compact runs refresh the real snap at
     # log events; compact/baseline runs carry dummy zero leaves.
@@ -19566,6 +19999,14 @@ def main():
         _prev_op_key_snap = _dummy_drift_snap()
     _latest_val_dead_stats = None
     _latest_val_dead_step = None
+    _latest_production_diagnostic_metrics = None
+    _latest_production_diagnostic_step = None
+    _production_diagnostic_seen = False
+    _production_diagnostic_parity_checked = False
+    # The optional startup OOM probe executes and blocks on train_step once.
+    # Otherwise the first real call is compile-inclusive and is excluded from
+    # steady-state timing below.
+    _fast_train_step_seen = bool(run_oom_check)
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -19591,6 +20032,8 @@ def main():
         _regular_cap_window_jax = _init_update_cap_window_stats()
         win_count = 0
         win_start_time = time.time()
+        _non_log_fast_step_time_ms_sum = 0.0
+        _non_log_fast_step_count = 0
 
         for local_step, (input_ids, attention_mask) in enumerate(train_loader):
 
@@ -19625,13 +20068,102 @@ def main():
                 attention_mask, data_sharding, (batch_size, max_seq_len))
             labels = jnp.where(attention_mask == 1, input_ids, -100)
 
-            params, opt_state, metrics = train_step_fn(
+            step_after_update = global_step + 1
+            _upcoming_is_early_log = step_after_update in (1, 5, 10, 20, 50)
+            _upcoming_is_regular = (
+                step_after_update % LOG_REGULAR == 0
+                or _upcoming_is_early_log)
+            _production_diagnostic_due = bool(
+                _production_diagnostics_enabled
+                and _upcoming_is_regular)
+
+            diagnostic_metrics = None
+            _diagnostic_forward_time_ms = 0.0
+            _diagnostic_step_total_time_ms = 0.0
+            _diagnostic_compile_time_ms = 0.0
+            _diagnostic_timing_excluded_compile = False
+            if _production_diagnostic_due:
+                # Every host enters this executable. It observes the exact
+                # params, batch, and dropout key that the following train step
+                # uses, before donation/update can invalidate the old state.
+                _diagnostic_t0 = time.perf_counter()
+                diagnostic_metrics = production_diagnostic_step_fn(
+                    params, input_ids, labels, attention_mask, step_rng,
+                    jnp.asarray(global_step, jnp.int32))
+                jax.block_until_ready(diagnostic_metrics)
+                _diagnostic_forward_done = time.perf_counter()
+                if 'loss' not in diagnostic_metrics:
+                    raise KeyError(
+                        "production diagnostics result is missing loss")
+                _ = float(diagnostic_metrics['loss'])
+                _diagnostic_done = time.perf_counter()
+                _raw_diagnostic_forward_ms = (
+                    (_diagnostic_forward_done - _diagnostic_t0) * 1000.0)
+                _raw_diagnostic_total_ms = (
+                    (_diagnostic_done - _diagnostic_t0) * 1000.0)
+                _diagnostic_timing_excluded_compile = bool(
+                    not _production_diagnostic_seen)
+                if _diagnostic_timing_excluded_compile:
+                    _diagnostic_compile_time_ms = _raw_diagnostic_total_ms
+                else:
+                    _diagnostic_forward_time_ms = (
+                        _raw_diagnostic_forward_ms)
+                    _diagnostic_step_total_time_ms = (
+                        _raw_diagnostic_total_ms)
+                _production_diagnostic_seen = True
+                _latest_production_diagnostic_metrics = diagnostic_metrics
+                _latest_production_diagnostic_step = step_after_update
+
+            _fast_timing_excluded_compile = bool(
+                _v417x_split_runtime and not _fast_train_step_seen)
+            _fast_train_t0 = (
+                time.perf_counter() if _v417x_split_runtime else None)
+            new_params, new_opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, labels, attention_mask, step_rng,
                 _prev_op_key_snap,
                 jnp.asarray(global_step, jnp.int32))
+            if _v417x_split_runtime:
+                jax.block_until_ready(metrics['total_loss'])
+                _raw_fast_step_time_ms = (
+                    (time.perf_counter() - _fast_train_t0) * 1000.0)
+                _fast_compile_time_ms = (
+                    _raw_fast_step_time_ms
+                    if _fast_timing_excluded_compile else 0.0)
+                _fast_step_time_ms = (
+                    0.0 if _fast_timing_excluded_compile
+                    else _raw_fast_step_time_ms)
+                _fast_train_step_seen = True
+            else:
+                _fast_compile_time_ms = 0.0
+                _fast_step_time_ms = 0.0
 
-            step_after_update = global_step + 1
+            if (_production_diagnostic_due
+                    and not _production_diagnostic_parity_checked):
+                _diagnostic_loss_value = np.asarray(jax.device_get(
+                    diagnostic_metrics['loss']))
+                _fast_loss_value = np.asarray(jax.device_get(
+                    metrics['ce_loss']))
+                if not np.array_equal(
+                        _diagnostic_loss_value, _fast_loss_value):
+                    _parity_abs_diff = float(np.max(np.abs(
+                        _diagnostic_loss_value.astype(np.float64)
+                        - _fast_loss_value.astype(np.float64))))
+                    raise RuntimeError(
+                        "training_fast/production_diagnostics loss parity "
+                        "failed before accepting the first optimizer update: "
+                        f"fast={float(_fast_loss_value):.9g}, "
+                        f"diagnostic={float(_diagnostic_loss_value):.9g}, "
+                        f"abs_diff={_parity_abs_diff:.9g}, tolerance=0")
+                _production_diagnostic_parity_checked = True
+                if is_host0:
+                    print(
+                        "  production diagnostics parity: "
+                        "fast_loss == diagnostic_loss (exact, pre_update)",
+                        flush=True)
+
+            params, opt_state = new_params, new_opt_state
+
             if operation_space_tau_free_enabled:
                 metrics.update({
                     k: jnp.asarray(v, dtype=jnp.float32)
@@ -19711,6 +20243,12 @@ def main():
 
             win_count += 1
             epoch_steps += 1
+            if (_v417x_split_runtime
+                    and not _upcoming_is_regular
+                    and not _production_diagnostic_due
+                    and not _fast_timing_excluded_compile):
+                _non_log_fast_step_time_ms_sum += _fast_step_time_ms
+                _non_log_fast_step_count += 1
 
             # Per-step NaN check on total_loss only. A single scalar sync
             # catches loss explosions immediately; the full 6-key check runs
@@ -19772,10 +20310,21 @@ def main():
             # ANALYSIS is driven from the val path (below), not from here -
             # the ANALYSIS stats now require a separate forward with the
             # full-stats kernels and only run on val ticks.
-            _is_early_log = global_step in (1, 5, 10, 20, 50)
-            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_log
+            _is_early_log = _upcoming_is_early_log
+            is_regular = _upcoming_is_regular
 
             if is_regular:
+                if _production_diagnostics_enabled:
+                    if diagnostic_metrics is None:
+                        raise RuntimeError(
+                            "regular log step did not run production "
+                            "diagnostics on every host")
+                    if _latest_production_diagnostic_step != global_step:
+                        raise RuntimeError(
+                            "regular log diagnostics are not from the same "
+                            f"pre-update step: diagnostic_step="
+                            f"{_latest_production_diagnostic_step}, "
+                            f"train_step={global_step}")
                 # Refresh the real op-key drift snapshot on every host when
                 # diagnostics are enabled; compact/baseline keep the dummy snap.
                 if drift_diagnostics_enabled:
@@ -19814,6 +20363,30 @@ def main():
                         f"NaN/INF window averages at epoch {epoch}, step {global_step}")
 
                 if is_host0:
+                    _regular_metrics = metrics
+                    _diagnostic_accuracy = None
+                    _diagnostic_loss = None
+                    if diagnostic_metrics is not None:
+                        _regular_metrics = dict(diagnostic_metrics)
+                        # Optimization/update scalars remain authoritative
+                        # from training_fast; observational fields come from
+                        # the read-only diagnostics forward.
+                        _regular_metrics.update(metrics)
+                        _diagnostic_loss = float(
+                            diagnostic_metrics['loss'])
+                        _diagnostic_counts = jax.device_get({
+                            'correct': diagnostic_metrics['correct'],
+                            'valid': diagnostic_metrics['valid_count'],
+                        })
+                        _diagnostic_valid = int(
+                            _diagnostic_counts['valid'])
+                        _diagnostic_accuracy = (
+                            int(_diagnostic_counts['correct'])
+                            / max(_diagnostic_valid, 1))
+                    _rolling_non_log_step_time_ms = (
+                        _non_log_fast_step_time_ms_sum
+                        / _non_log_fast_step_count
+                        if _non_log_fast_step_count > 0 else 0.0)
                     _elapsed = time.time() - win_start_time
                     _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
                     _opt_step = global_step // grad_accum_steps
@@ -19863,6 +20436,7 @@ def main():
                             _opspace_load_smoothing_ctx.get(
                                 'mode', 'neighbor')).strip().lower(),
                         'train_compute_accuracy': train_compute_accuracy,
+                        'diagnostic_accuracy': _diagnostic_accuracy,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':
                             regular_console_host_timing,
@@ -19907,11 +20481,33 @@ def main():
                             if _is_active_srw_version(model_version_cfg)
                             else 0),
                     }
-                    rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
+                    rec = _build_regular_record(
+                        _regular_metrics, win_avgs, ctx, global_step, epoch)
                     rec = _attach_update_cap_window_stats(
                         rec, jax.device_get(_regular_cap_window_jax))
                     rec['raw_step_time_window'] = float(_raw_step_time_window)
                     rec['logging_time'] = 0.0
+                    if _v417x_split_runtime:
+                        rec['fast_step_time_ms'] = float(
+                            _fast_step_time_ms)
+                        rec['diagnostic_forward_time_ms'] = float(
+                            _diagnostic_forward_time_ms)
+                        rec['diagnostic_step_total_time_ms'] = float(
+                            _diagnostic_step_total_time_ms)
+                        rec['rolling_non_log_step_time_ms'] = float(
+                            _rolling_non_log_step_time_ms)
+                        rec['diagnostic_loss'] = _diagnostic_loss
+                        rec['diagnostic_parameter_timing'] = 'pre_update'
+                        rec['diagnostic_step'] = int(
+                            _latest_production_diagnostic_step)
+                        rec['diagnostic_timing_excluded_compile'] = bool(
+                            _diagnostic_timing_excluded_compile)
+                        rec['diagnostic_compile_time_ms'] = float(
+                            _diagnostic_compile_time_ms)
+                        rec['fast_timing_excluded_compile'] = bool(
+                            _fast_timing_excluded_compile)
+                        rec['fast_compile_time_ms'] = float(
+                            _fast_compile_time_ms)
                     _print_regular_block(rec, ctx)
                     rec.pop('_active_tau_regular_available', None)
                     regular_jsonl_rec = rec
@@ -19919,20 +20515,53 @@ def main():
                             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
                         regular_jsonl_rec = (
                             _v4170_compact_regular_jsonl_record(rec, ctx))
+                    if _v417x_split_runtime:
+                        for _timing_key in (
+                                'fast_step_time_ms',
+                                'diagnostic_forward_time_ms',
+                                'diagnostic_step_total_time_ms',
+                                'rolling_non_log_step_time_ms',
+                                'diagnostic_loss',
+                                'diagnostic_parameter_timing',
+                                'diagnostic_step',
+                                'diagnostic_timing_excluded_compile',
+                                'diagnostic_compile_time_ms',
+                                'fast_timing_excluded_compile',
+                                'fast_compile_time_ms'):
+                            regular_jsonl_rec[_timing_key] = rec[_timing_key]
                     log_jsonl({'type': 'train', **regular_jsonl_rec})
                     sync_logs()
                     _regular_logging_time = time.time() - _regular_logging_t0
                     rec['logging_time'] = float(_regular_logging_time)
                     _print_regular_host_timing(
                         _raw_step_time_window, _regular_logging_time, ctx)
-                    log_jsonl({
+                    _train_timing_rec = {
                         'type': 'train_timing',
                         'step': int(global_step),
                         'epoch': int(epoch),
                         'raw_step_time_window': float(_raw_step_time_window),
                         'logging_time': float(_regular_logging_time),
                         'timestamp': datetime.now().isoformat(),
-                    })
+                    }
+                    if _v417x_split_runtime:
+                        _train_timing_rec.update({
+                            'fast_step_time_ms': float(_fast_step_time_ms),
+                            'diagnostic_forward_time_ms': float(
+                                _diagnostic_forward_time_ms),
+                            'diagnostic_step_total_time_ms': float(
+                                _diagnostic_step_total_time_ms),
+                            'rolling_non_log_step_time_ms': float(
+                                _rolling_non_log_step_time_ms),
+                            'diagnostic_timing_excluded_compile': bool(
+                                _diagnostic_timing_excluded_compile),
+                            'diagnostic_compile_time_ms': float(
+                                _diagnostic_compile_time_ms),
+                            'fast_timing_excluded_compile': bool(
+                                _fast_timing_excluded_compile),
+                            'fast_compile_time_ms': float(
+                                _fast_compile_time_ms),
+                        })
+                    log_jsonl(_train_timing_rec)
                     sync_logs()
 
                 # Reset window accumulators (all hosts)
@@ -19947,6 +20576,8 @@ def main():
                 _regular_cap_window_jax = _init_update_cap_window_stats()
                 win_count = 0
                 win_start_time = time.time()
+                _non_log_fast_step_time_ms_sum = 0.0
+                _non_log_fast_step_count = 0
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
             _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)

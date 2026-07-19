@@ -359,6 +359,30 @@ def make_vocab_parallel_ce(
     return vocab_parallel_ce
 
 
+def make_vocab_parallel_ce_loss(
+    mesh,
+    logical_vocab_size: int,
+    vocab_size_padded: int,
+    token_chunk_size: int = 32768,
+):
+    """Static training-fast CE profile returning only scalar loss."""
+    full_ce = make_vocab_parallel_ce(
+        mesh,
+        logical_vocab_size=logical_vocab_size,
+        vocab_size_padded=vocab_size_padded,
+        token_chunk_size=token_chunk_size,
+        compute_accuracy=False,
+        compute_logit_stats=False,
+    )
+
+    def vocab_parallel_ce_loss(
+            shift_x, embedding_local, shift_labels, valid_mask):
+        return full_ce(
+            shift_x, embedding_local, shift_labels, valid_mask)[0]
+
+    return vocab_parallel_ce_loss
+
+
 def make_vocab_parallel_eval_stats(
     mesh,
     logical_vocab_size: int,
