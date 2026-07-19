@@ -321,7 +321,22 @@ def _chunk_sizes_for_cfg(cfg: Dict[str, Any], mesh) -> Dict[str, int]:
 
 def create_or_reuse_sharded_fns(
         cfg: Dict[str, Any], mesh, *, analysis: bool = False,
+        kernel_profile: str = "production",
         trajectory_widths: Optional[Mapping[str, int]] = None):
+    kernel_profile = str(kernel_profile).strip().lower()
+    if kernel_profile not in {
+            "production", "retention", "suppression", "trajectory"}:
+        raise ValueError(f"unknown minimal kernel profile: {kernel_profile!r}")
+    if analysis and kernel_profile != "production":
+        raise ValueError(
+            "analysis=True non-minimal closures cannot select a minimal "
+            "kernel profile")
+    if trajectory_widths is not None and kernel_profile != "trajectory":
+        raise ValueError(
+            "trajectory_widths require kernel_profile='trajectory'")
+    if kernel_profile == "trajectory" and trajectory_widths is None:
+        raise ValueError(
+            "kernel_profile='trajectory' requires trajectory_widths")
     version = cfg.get("model", {}).get("model_version")
     train = get_train()
     module_name = train._model_registry_entry(version)["module"]
@@ -425,6 +440,10 @@ def create_or_reuse_sharded_fns(
     make_paired = getattr(mod, "make_sharded_srw_paired", None)
     make_single_min = getattr(mod, "make_sharded_srw_minimal", None)
     make_paired_min = getattr(mod, "make_sharded_srw_paired_minimal", None)
+    make_single_retention_min = getattr(
+        mod, "make_sharded_srw_retention_minimal", None)
+    make_paired_retention_min = getattr(
+        mod, "make_sharded_srw_paired_retention_minimal", None)
     make_single_suppression_min = getattr(
         mod, "make_sharded_srw_suppression_minimal", None)
     make_paired_suppression_min = getattr(
@@ -461,52 +480,90 @@ def create_or_reuse_sharded_fns(
         "paired": paired,
         "attn_qk_paired": paired,
     }
-    if not analysis and make_single_min is not None:
-        fns["attn_qk_single_minimal"] = make_single_min(
-            max_chunk_size=chunk["attn_qk"],
-            **factory_kwargs(make_single_min, srw_pool_kwargs("qk")),
-        )
-        fns["attn_v_single_minimal"] = make_single_min(
-            max_chunk_size=chunk["attn_v"],
-            **factory_kwargs(make_single_min, srw_pool_kwargs("v")),
-        )
-        fns["rst_single_minimal"] = make_single_min(
-            max_chunk_size=chunk["rst"],
-            **factory_kwargs(make_single_min, srw_pool_kwargs("rst")),
-        )
-        if make_single_suppression_min is not None:
-            fns["attn_v_single_suppression_minimal"] = (
-                make_single_suppression_min(
-                    max_chunk_size=chunk["attn_v"],
-                    **factory_kwargs(
-                        make_single_suppression_min, srw_pool_kwargs("v")),
-                ))
-            fns["rst_single_suppression_minimal"] = (
-                make_single_suppression_min(
-                    max_chunk_size=chunk["rst"],
-                    **factory_kwargs(
-                        make_single_suppression_min, srw_pool_kwargs("rst")),
-                ))
-    paired_min_factory = make_paired_min
-    if opspace_enabled and make_paired_dense_min is not None:
-        paired_min_factory = make_paired_dense_min
-    if not analysis and paired_min_factory is not None:
-        fns["attn_qk_paired_minimal"] = paired_min_factory(
-            max_chunk_size=chunk["attn_qk"],
-            **factory_kwargs(paired_min_factory, srw_pool_kwargs("qk")),
-        )
-        if make_paired_suppression_min is not None:
-            fns["attn_qk_paired_suppression_minimal"] = (
-                make_paired_suppression_min(
+    if not analysis and kernel_profile != "trajectory":
+        single_factories = {
+            "production": make_single_min,
+            "retention": make_single_retention_min,
+            "suppression": make_single_suppression_min,
+        }
+        paired_factories = {
+            "production": make_paired_min,
+            "retention": make_paired_retention_min,
+            "suppression": make_paired_suppression_min,
+        }
+        single_min_factory = single_factories[kernel_profile]
+        paired_min_factory = paired_factories[kernel_profile]
+        if (kernel_profile == "production" and opspace_enabled
+                and make_paired_dense_min is not None):
+            paired_min_factory = make_paired_dense_min
+        if single_min_factory is None or paired_min_factory is None:
+            if (kernel_profile != "production"
+                    or train._is_v417x_version(version)):
+                raise ValueError(
+                    f"model version {version} lacks {kernel_profile} minimal "
+                    "kernel factories")
+            # Preserve older analysis runtimes that expose only one of the
+            # optional minimal factories. v417x always requires both.
+            if single_min_factory is not None:
+                for pool, chunk_key, name in (
+                        ("qk", "attn_qk", "attn_qk_single_minimal"),
+                        ("v", "attn_v", "attn_v_single_minimal"),
+                        ("rst", "rst", "rst_single_minimal")):
+                    fns[name] = single_min_factory(
+                        max_chunk_size=chunk[chunk_key],
+                        **factory_kwargs(
+                            single_min_factory, srw_pool_kwargs(pool)),
+                    )
+            if paired_min_factory is not None:
+                fns["attn_qk_paired_minimal"] = paired_min_factory(
                     max_chunk_size=chunk["attn_qk"],
                     **factory_kwargs(
-                        make_paired_suppression_min,
-                        srw_pool_kwargs("qk")),
-                ))
-    if trajectory_widths is not None:
+                        paired_min_factory, srw_pool_kwargs("qk")),
+                )
+            return fns
+        single_qk_min = single_min_factory(
+            max_chunk_size=chunk["attn_qk"],
+            **factory_kwargs(
+                single_min_factory, srw_pool_kwargs("qk")),
+        )
+        single_v_min = single_min_factory(
+            max_chunk_size=chunk["attn_v"],
+            **factory_kwargs(
+                single_min_factory, srw_pool_kwargs("v")),
+        )
+        single_rst_min = single_min_factory(
+            max_chunk_size=chunk["rst"],
+            **factory_kwargs(
+                single_min_factory, srw_pool_kwargs("rst")),
+        )
+        paired_qk_min = paired_min_factory(
+            max_chunk_size=chunk["attn_qk"],
+            **factory_kwargs(
+                paired_min_factory, srw_pool_kwargs("qk")),
+        )
+        fns.update({
+            "attn_qk_single_minimal": single_qk_min,
+            "attn_v_single_minimal": single_v_min,
+            "rst_single_minimal": single_rst_min,
+            "attn_qk_paired_minimal": paired_qk_min,
+        })
+        if kernel_profile == "retention":
+            fns.update({
+                "attn_v_single_retention_minimal": single_v_min,
+                "rst_single_retention_minimal": single_rst_min,
+                "attn_qk_paired_retention_minimal": paired_qk_min,
+            })
+        elif kernel_profile == "suppression":
+            fns.update({
+                "attn_v_single_suppression_minimal": single_v_min,
+                "rst_single_suppression_minimal": single_rst_min,
+                "attn_qk_paired_suppression_minimal": paired_qk_min,
+            })
+        fns["_v4171_kernel_profile"] = kernel_profile
+    if kernel_profile == "trajectory":
         if analysis:
             raise ValueError(
-                "trajectory kernels require production minimal sharded_fns")
+                "trajectory kernels require minimal sharded_fns")
         required = {"qk", "v", "rst"}
         if set(trajectory_widths) != required:
             raise ValueError(
@@ -519,27 +576,44 @@ def create_or_reuse_sharded_fns(
                 or make_paired_trajectory_min is None):
             raise ValueError(
                 f"model version {version} lacks canonical trajectory kernels")
-        fns["attn_qk_paired_trajectory_minimal"] = (
-            make_paired_trajectory_min(
-                max_chunk_size=chunk["attn_qk"],
-                trajectory_capture_width=normalized_widths["qk"],
-                **factory_kwargs(
-                    make_paired_trajectory_min, srw_pool_kwargs("qk")),
-            ))
-        fns["attn_v_single_trajectory_minimal"] = (
-            make_single_trajectory_min(
-                max_chunk_size=chunk["attn_v"],
-                trajectory_capture_width=normalized_widths["v"],
-                **factory_kwargs(
-                    make_single_trajectory_min, srw_pool_kwargs("v")),
-            ))
-        fns["rst_single_trajectory_minimal"] = (
-            make_single_trajectory_min(
-                max_chunk_size=chunk["rst"],
-                trajectory_capture_width=normalized_widths["rst"],
-                **factory_kwargs(
-                    make_single_trajectory_min, srw_pool_kwargs("rst")),
-            ))
+        paired_trajectory = make_paired_trajectory_min(
+            max_chunk_size=chunk["attn_qk"],
+            trajectory_capture_width=normalized_widths["qk"],
+            **factory_kwargs(
+                make_paired_trajectory_min, srw_pool_kwargs("qk")),
+        )
+        single_v_trajectory = make_single_trajectory_min(
+            max_chunk_size=chunk["attn_v"],
+            trajectory_capture_width=normalized_widths["v"],
+            **factory_kwargs(
+                make_single_trajectory_min, srw_pool_kwargs("v")),
+        )
+        single_rst_trajectory = make_single_trajectory_min(
+            max_chunk_size=chunk["rst"],
+            trajectory_capture_width=normalized_widths["rst"],
+            **factory_kwargs(
+                make_single_trajectory_min, srw_pool_kwargs("rst")),
+        )
+        paired_base = getattr(
+            paired_trajectory, "_v4171_production_wrapper", None)
+        single_v_base = getattr(
+            single_v_trajectory, "_v4171_production_wrapper", None)
+        single_rst_base = getattr(
+            single_rst_trajectory, "_v4171_production_wrapper", None)
+        if (paired_base is None or single_v_base is None
+                or single_rst_base is None):
+            raise ValueError(
+                f"model version {version} trajectory kernels lack their "
+                "analysis base wrappers")
+        fns.update({
+            "attn_qk_paired_minimal": paired_base,
+            "attn_v_single_minimal": single_v_base,
+            "rst_single_minimal": single_rst_base,
+            "attn_qk_paired_trajectory_minimal": paired_trajectory,
+            "attn_v_single_trajectory_minimal": single_v_trajectory,
+            "rst_single_trajectory_minimal": single_rst_trajectory,
+            "_v4171_kernel_profile": "trajectory",
+        })
     return fns
 
 

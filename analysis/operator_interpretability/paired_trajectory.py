@@ -406,13 +406,13 @@ def _trajectory_executable(
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
     key = (
-        "paired_operator_trajectory",
+        "paired_operator_trajectory", "trajectory",
         int(widths["qk"]), int(widths["v"]), int(widths["rst"]),
         bool(compact_replay_output),
     )
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="production")
     kwargs["sharded_fns"] = sharded_fns
 
     @jax.jit
@@ -733,6 +733,7 @@ def capture_full_active_trajectory(
                 f"capture_width={widths} retry_count={len(retries)}")
         sharded_fns = create_or_reuse_sharded_fns(
             ctx.config, ctx.mesh, analysis=False,
+            kernel_profile="trajectory",
             trajectory_widths=widths)
         executable = _trajectory_executable(
             ctx, sharded_fns, widths=widths,
@@ -1819,10 +1820,10 @@ def _production_atlas_executable(ctx: Any):
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = "paired_trajectory_production_atlas"
+    key = ("paired_trajectory_production_atlas", "production")
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="production")
 
     @jax.jit
     def execute(params, input_ids, labels):
@@ -1851,10 +1852,10 @@ def _candidate_site_executable(ctx: Any):
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = "paired_trajectory_candidate_semantic_sites"
+    key = ("paired_trajectory_candidate_semantic_sites", "production")
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="production")
 
     @jax.jit
     def execute(params, input_ids, labels, positions, position_valid):
@@ -2247,10 +2248,10 @@ def _trajectory_patch_executable(ctx: Any):
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = "paired_trajectory_fixed_patch_score"
+    key = ("paired_trajectory_fixed_patch_score", "suppression")
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="suppression")
 
     @jax.jit
     def execute(
@@ -2914,10 +2915,10 @@ def _operator_group_executables(ctx: Any):
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = "paired_trajectory_operator_group"
+    key = ("paired_trajectory_operator_group", "suppression")
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="suppression")
 
     @jax.jit
     def capture(params, input_ids, positions, selected_ids, layer, route):

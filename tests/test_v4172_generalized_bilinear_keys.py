@@ -60,7 +60,8 @@ def _tiny_kwargs(n_layers: int = 1) -> dict:
 
 def _runtime_fns(
         mesh: Mesh, *, qk_power: float = 1.0, v_power: float = 1.0,
-        rst_power: float = 1.0, analysis: bool = False) -> dict:
+        rst_power: float = 1.0, analysis: bool = False,
+        kernel_profile: str = "production") -> dict:
     single_v_full = make_sharded_srw(
         mesh, max_chunk_size=2, analysis=analysis,
         admission_den_power=v_power)
@@ -70,21 +71,23 @@ def _runtime_fns(
     paired_full = make_sharded_srw_paired(
         mesh, max_chunk_size=2, analysis=analysis,
         admission_den_power=qk_power)
-    single_qk = make_sharded_srw_minimal(
+    if kernel_profile == "production":
+        single_min_factory = make_sharded_srw_minimal
+        paired_min_factory = make_sharded_srw_paired_minimal
+    elif kernel_profile == "suppression":
+        single_min_factory = make_sharded_srw_suppression_minimal
+        paired_min_factory = make_sharded_srw_paired_suppression_minimal
+    else:
+        raise ValueError(f"unsupported test kernel profile={kernel_profile}")
+    single_qk = single_min_factory(
         mesh, max_chunk_size=2, admission_den_power=qk_power)
-    single_v = make_sharded_srw_minimal(
+    single_v = single_min_factory(
         mesh, max_chunk_size=2, admission_den_power=v_power)
-    single_rst = make_sharded_srw_minimal(
+    single_rst = single_min_factory(
         mesh, max_chunk_size=2, admission_den_power=rst_power)
-    paired = make_sharded_srw_paired_minimal(
+    paired = paired_min_factory(
         mesh, max_chunk_size=2, admission_den_power=qk_power)
-    single_v_suppression = make_sharded_srw_suppression_minimal(
-        mesh, max_chunk_size=2, admission_den_power=v_power)
-    single_rst_suppression = make_sharded_srw_suppression_minimal(
-        mesh, max_chunk_size=2, admission_den_power=rst_power)
-    paired_suppression = make_sharded_srw_paired_suppression_minimal(
-        mesh, max_chunk_size=2, admission_den_power=qk_power)
-    return {
+    result = {
         "single": single_v_full,
         "attn_v_single": single_v_full,
         "rst_single": single_rst_full,
@@ -94,10 +97,15 @@ def _runtime_fns(
         "attn_v_single_minimal": single_v,
         "rst_single_minimal": single_rst,
         "attn_qk_paired_minimal": paired,
-        "attn_v_single_suppression_minimal": single_v_suppression,
-        "rst_single_suppression_minimal": single_rst_suppression,
-        "attn_qk_paired_suppression_minimal": paired_suppression,
+        "_v4171_kernel_profile": kernel_profile,
     }
+    if kernel_profile == "suppression":
+        result.update({
+            "attn_v_single_suppression_minimal": single_v,
+            "rst_single_suppression_minimal": single_rst,
+            "attn_qk_paired_suppression_minimal": paired,
+        })
+    return result
 
 
 def _one_device_mesh() -> Mesh:
@@ -342,7 +350,7 @@ def test_v4171_default_and_explicit_learned_mode_are_machine_exact() -> None:
 def test_v4172_query_attention_and_key_dimensions_forward_once_and_parity(
         monkeypatch: pytest.MonkeyPatch) -> None:
     mesh = _one_device_mesh()
-    sharded_fns = _runtime_fns(mesh)
+    sharded_fns = _runtime_fns(mesh, kernel_profile="suppression")
     input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
     model = DAWN_SRW_V4172(**_tiny_kwargs(n_layers=2))
     variables = model.init(
@@ -621,37 +629,44 @@ def test_v4172_pool_denominator_math_and_qk_pairing() -> None:
 
 def test_v4172_route_specific_factory_metadata_and_suppression_pairing() -> None:
     mesh = _one_device_mesh()
-    fns = _runtime_fns(
+    production_fns = _runtime_fns(
         mesh, qk_power=0.5, v_power=1.0, rst_power=1.2)
+    suppression_fns = _runtime_fns(
+        mesh, qk_power=0.5, v_power=1.0, rst_power=1.2,
+        kernel_profile="suppression")
     expected = {
         "attn_qk_paired": 0.5,
         "attn_qk_paired_minimal": 0.5,
-        "attn_qk_paired_suppression_minimal": 0.5,
         "attn_v_single": 1.0,
         "attn_v_single_minimal": 1.0,
-        "attn_v_single_suppression_minimal": 1.0,
         "rst_single": 1.2,
         "rst_single_minimal": 1.2,
-        "rst_single_suppression_minimal": 1.2,
     }
-    for name, power in expected.items():
-        assert getattr(fns[name], "_v4171_admission_den_power") == power
-    assert fns["attn_v_single_minimal"] is not fns["rst_single_minimal"]
-    for production, suppression in (
-            ("attn_qk_paired_minimal",
-             "attn_qk_paired_suppression_minimal"),
-            ("attn_v_single_minimal",
-             "attn_v_single_suppression_minimal"),
-            ("rst_single_minimal", "rst_single_suppression_minimal")):
+    for fns in (production_fns, suppression_fns):
+        for name, power in expected.items():
+            assert getattr(fns[name], "_v4171_admission_den_power") == power
+        assert fns["attn_v_single_minimal"] is not fns["rst_single_minimal"]
+    for name in (
+            "attn_qk_paired_minimal", "attn_v_single_minimal",
+            "rst_single_minimal"):
         assert getattr(
-            fns[production], "_v4171_canonical_shard_map_kernel") is getattr(
-                fns[suppression], "_v4171_canonical_shard_map_kernel")
+            production_fns[name], "_v4171_kernel_profile") == "production"
+        assert getattr(
+            suppression_fns[name], "_v4171_kernel_profile") == "suppression"
+        assert not hasattr(
+            production_fns[name], "_v4171_canonical_shard_map_kernel")
+        assert hasattr(
+            suppression_fns[name], "_v4171_canonical_shard_map_kernel")
 
     _validate_v4171_sharded_fns(
-        fns, 1.0, expected_power_qk=0.5,
+        production_fns, 1.0, expected_power_qk=0.5,
         expected_power_v=1.0, expected_power_rst=1.2)
-    wrong = dict(fns)
-    wrong["rst_single_minimal"] = fns["attn_v_single_minimal"]
+    _validate_v4171_sharded_fns(
+        suppression_fns, 1.0, expected_power_qk=0.5,
+        expected_power_v=1.0, expected_power_rst=1.2)
+    wrong = dict(production_fns)
+    wrong["rst_single_minimal"] = production_fns[
+        "attn_v_single_minimal"]
     with pytest.raises(ValueError, match="rst pool"):
         _validate_v4171_sharded_fns(
             wrong, 1.0, expected_power_qk=0.5,
@@ -755,12 +770,15 @@ def test_v4172_pool_powers_preserve_parameter_schema_and_default_forward() -> No
         pool_vars, input_ids, **{**apply_kwargs, "sharded_fns": pool_fns})
     assert np.isfinite(float(pool_out["loss"]))
     assert pool_model.get_config()["admission_den_power_rst"] == 1.2
+    suppression_pool_fns = _runtime_fns(
+        mesh, qk_power=0.5, v_power=1.0, rst_power=1.2,
+        kernel_profile="suppression")
     zero_suppression_out = pool_model.apply(
         pool_vars,
         input_ids,
         **{
             **apply_kwargs,
-            "sharded_fns": pool_fns,
+            "sharded_fns": suppression_pool_fns,
             "analysis_contribution": jnp.full(
                 (1, 8), -1, dtype=jnp.int32),
             "analysis_intervention_enabled": jnp.bool_(True),

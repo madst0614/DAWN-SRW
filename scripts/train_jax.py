@@ -14556,6 +14556,8 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         sharded['attn_qk_paired_minimal'] = paired_min(
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
+    if _is_v417x_version(version):
+        sharded['_v4171_kernel_profile'] = 'production'
     if version == V4167_MODEL_VERSION:
         extra_factory = getattr(module, 'create_v4167_tp_sharded_fns', None)
         if extra_factory is None:
@@ -18216,6 +18218,8 @@ def main():
             if _sharded_paired_attn_qk_minimal is not None:
                 _sharded_fns['attn_qk_paired_minimal'] = (
                     _sharded_paired_attn_qk_minimal)
+            if _is_v417x_version(model_version_cfg):
+                _sharded_fns['_v4171_kernel_profile'] = 'production'
         else:
             _sharded_fns = _sharded_single_rst
         if str(model_version_cfg) == V4167_MODEL_VERSION:

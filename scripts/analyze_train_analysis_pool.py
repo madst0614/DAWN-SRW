@@ -505,7 +505,17 @@ def _build_context(
     params, restored_metadata, model = restore_params_and_cfg(
         config, checkpoint_dir, int(checkpoint_step), mesh)
     checkpoint_metadata.update(restored_metadata or {})
-    sharded_fns = create_or_reuse_sharded_fns(config, mesh, analysis=False)
+    sharded_fns = create_or_reuse_sharded_fns(
+        config, mesh, analysis=False, kernel_profile="production")
+    sharded_fns_analysis = {}
+    train = get_train()
+    version = str(config.get("model", {}).get("model_version"))
+    if train._is_v417x_version(version):
+        sharded_fns_analysis = {
+            profile: create_or_reuse_sharded_fns(
+                config, mesh, analysis=False, kernel_profile=profile)
+            for profile in ("retention", "suppression")
+        }
     steps_per_epoch = int(checkpoint_metadata.get("steps_per_epoch") or 0)
     num_epochs = int(config.get("training", {}).get("num_epochs") or 0)
     accumulation = max(1, int(config.get("training", {}).get(
@@ -552,7 +562,7 @@ def _build_context(
         mesh=mesh,
         data_sharding=NamedSharding(mesh, P("data", None)),
         sharded_fns=sharded_fns,
-        sharded_fns_analysis=None,
+        sharded_fns_analysis=sharded_fns_analysis,
         model_cfg=model_cfg,
         model_info=model_info,
         host_id=int(jax.process_index()),

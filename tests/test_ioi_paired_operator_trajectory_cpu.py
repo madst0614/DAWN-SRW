@@ -183,9 +183,16 @@ def _make_trajectory_harness():
         mesh, max_chunk_size=2, trajectory_capture_width=harness.dim)
     sharded_fns = dict(harness.kwargs["sharded_fns"])
     sharded_fns.update({
+        "attn_v_single_minimal": (
+            trajectory_single._v4171_production_wrapper),
+        "rst_single_minimal": (
+            trajectory_single._v4171_production_wrapper),
+        "attn_qk_paired_minimal": (
+            trajectory_paired._v4171_production_wrapper),
         "attn_v_single_trajectory_minimal": trajectory_single,
         "rst_single_trajectory_minimal": trajectory_single,
         "attn_qk_paired_trajectory_minimal": trajectory_paired,
+        "_v4171_kernel_profile": "trajectory",
     })
     kwargs = dict(harness.kwargs)
     kwargs["sharded_fns"] = sharded_fns

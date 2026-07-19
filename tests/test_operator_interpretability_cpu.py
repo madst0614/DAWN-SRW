@@ -55,7 +55,9 @@ from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
     make_sharded_srw_minimal,
     make_sharded_srw_paired_minimal,
+    make_sharded_srw_paired_retention_minimal,
     make_sharded_srw_paired_suppression_minimal,
+    make_sharded_srw_retention_minimal,
     make_sharded_srw_suppression_minimal,
 )
 
@@ -156,7 +158,8 @@ def _build_mesh_and_kernels():
     )
 
 
-def test_retention_denominator_reference(production_single) -> None:
+def test_retention_denominator_reference(
+        production_single, retention_single) -> None:
     batch, seq, dim = 2, 2, 4
     x = jnp.asarray(np.tile(
         np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
@@ -178,7 +181,7 @@ def test_retention_denominator_reference(production_single) -> None:
     all_keep = jnp.ones((dim,), dtype=jnp.bool_)
     one_keep = jnp.asarray([True, False, False, False])
     no_keep = jnp.zeros((dim,), dtype=jnp.bool_)
-    kernel = production_single._v4171_canonical_shard_map_kernel
+    kernel = retention_single._v4171_canonical_shard_map_kernel
 
     production = production_single(
         x, query, keys, raw_tau, read, write, *scalar_args)
@@ -251,36 +254,65 @@ def _make_model_harness(mesh, production_single, suppression_single,
         {"params": jax.random.PRNGKey(4172),
          "dropout": jax.random.PRNGKey(4173)},
         base_ids, deterministic=True)
-    sharded_fns = {
+    retention_single = make_sharded_srw_retention_minimal(
+        mesh, max_chunk_size=2)
+    retention_paired = make_sharded_srw_paired_retention_minimal(
+        mesh, max_chunk_size=2)
+    production_sharded_fns = {
         "single": production_single,
         "paired": production_paired,
         "attn_v_single_minimal": production_single,
         "rst_single_minimal": production_single,
         "attn_qk_paired_minimal": production_paired,
+        "_v4171_kernel_profile": "production",
+    }
+    retention_sharded_fns = {
+        **{key: value for key, value in production_sharded_fns.items()
+           if key in {"single", "paired"}},
+        "attn_v_single_minimal": retention_single,
+        "rst_single_minimal": retention_single,
+        "attn_qk_paired_minimal": retention_paired,
+        "attn_v_single_retention_minimal": retention_single,
+        "rst_single_retention_minimal": retention_single,
+        "attn_qk_paired_retention_minimal": retention_paired,
+        "_v4171_kernel_profile": "retention",
+    }
+    suppression_sharded_fns = {
+        **{key: value for key, value in production_sharded_fns.items()
+           if key in {"single", "paired"}},
+        "attn_v_single_minimal": suppression_single,
+        "rst_single_minimal": suppression_single,
+        "attn_qk_paired_minimal": suppression_paired,
         "attn_v_single_suppression_minimal": suppression_single,
         "rst_single_suppression_minimal": suppression_single,
         "attn_qk_paired_suppression_minimal": suppression_paired,
+        "_v4171_kernel_profile": "suppression",
     }
-    kwargs = {
+    base_kwargs = {
         "deterministic": True,
         "rngs": {"dropout": jax.random.PRNGKey(4174)},
-        "sharded_fns": sharded_fns,
         "analysis": False,
         "compute_accuracy": False,
         "analysis_parity_debug": True,
     }
+    production_kwargs = {
+        **base_kwargs, "sharded_fns": production_sharded_fns}
+    retention_kwargs = {
+        **base_kwargs, "sharded_fns": retention_sharded_fns}
+    suppression_kwargs = {
+        **base_kwargs, "sharded_fns": suppression_sharded_fns}
 
     @jax.jit
     def production_and_suppression(
             params, ids, selected_group, positions, layer, route, apply):
         production = model.apply(
             params, ids, labels=ids, minimal_train=True,
-            analysis_return_residual=True, **kwargs)
+            analysis_return_residual=True, **production_kwargs)
         intervened = model.apply(
             params, ids, selected_group, layer, positions, route,
             labels=ids, apply_suppression=apply, return_residual=True,
             method=model.analysis_forward_with_operator_group_suppression,
-            **kwargs)
+            **suppression_kwargs)
         return _view(production), _view(intervened)
 
     @partial(jax.jit, static_argnames=("mode",))
@@ -291,7 +323,7 @@ def _make_model_harness(mesh, production_single, suppression_single,
             mode=mode, position_mask=position_mask, labels=ids,
             return_residual=True,
             method=model.analysis_forward_with_circuit_retention,
-            **kwargs)
+            **retention_kwargs)
         return _view(result)
 
     @jax.jit
@@ -302,7 +334,7 @@ def _make_model_harness(mesh, production_single, suppression_single,
             params, source, selected_group, layer, source_positions, route,
             labels=source, return_residual=False,
             method=model.analysis_capture_operator_group_contribution,
-            **kwargs)
+            **suppression_kwargs)
         contributions = captured["operator_route_contributions"]
         source_contribution = sum(
             contributions[name][layer] for name in ROUTES)
@@ -313,7 +345,7 @@ def _make_model_harness(mesh, production_single, suppression_single,
             params, base, selected_group, layer, base_positions, route,
             source_contribution, labels=base, return_residual=True,
             method=model.analysis_forward_with_operator_interchange,
-            **kwargs)
+            **suppression_kwargs)
         return contributions, source_contribution, _view(patched)
 
     return SimpleNamespace(
@@ -324,7 +356,10 @@ def _make_model_harness(mesh, production_single, suppression_single,
         production_and_suppression=production_and_suppression,
         retention=retention,
         capture_and_patch=capture_and_patch,
-        kwargs=kwargs,
+        kwargs=suppression_kwargs,
+        production_kwargs=production_kwargs,
+        retention_kwargs=retention_kwargs,
+        suppression_kwargs=suppression_kwargs,
         batch=batch,
         seq=seq,
         dim=dim,
@@ -476,7 +511,7 @@ def test_model_retention(harness) -> None:
             mode="conditional_execution_sufficiency",
             position_mask=all_positions, labels=harness.base_ids,
             method=harness.model.analysis_forward_with_circuit_retention,
-            **harness.kwargs),
+            **harness.retention_kwargs),
         "integer retention masks")
     print("MODEL_RETENTION_CONTRACTS_OK")
 
@@ -1238,7 +1273,10 @@ def test_high_level_fail_loud_contract() -> None:
 def main() -> None:
     (mesh, production_single, suppression_single,
      production_paired, suppression_paired) = _build_mesh_and_kernels()
-    test_retention_denominator_reference(production_single)
+    retention_single = make_sharded_srw_retention_minimal(
+        mesh, max_chunk_size=2)
+    test_retention_denominator_reference(
+        production_single, retention_single)
     harness = _make_model_harness(
         mesh, production_single, suppression_single,
         production_paired, suppression_paired)

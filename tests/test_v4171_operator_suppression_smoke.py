@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
+import models.dawn_srw_v4171 as v4171_module
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
     make_sharded_srw_minimal,
@@ -38,19 +39,15 @@ def main() -> None:
         mesh, max_chunk_size=2)
     suppression_paired = make_sharded_srw_paired_suppression_minimal(
         mesh, max_chunk_size=2)
-    assert (
-        production_single._v4171_canonical_shard_map_kernel
-        is suppression_single._v4171_canonical_shard_map_kernel)
-    assert (
-        production_single._v4171_canonical_factory_token
-        is suppression_single._v4171_canonical_factory_token)
-    assert (
-        production_paired._v4171_canonical_shard_map_kernel
-        is suppression_paired._v4171_canonical_shard_map_kernel)
-    assert (
-        production_paired._v4171_canonical_factory_token
-        is suppression_paired._v4171_canonical_factory_token)
-    print("PRODUCTION_CORE_CANONICAL_KERNEL_SHARED_OK")
+    assert production_single._v4171_kernel_profile == "production"
+    assert suppression_single._v4171_kernel_profile == "suppression"
+    assert production_paired._v4171_kernel_profile == "production"
+    assert suppression_paired._v4171_kernel_profile == "suppression"
+    assert not hasattr(
+        production_single, "_v4171_canonical_shard_map_kernel")
+    assert not hasattr(
+        production_paired, "_v4171_canonical_shard_map_kernel")
+    print("PRODUCTION_ANALYSIS_KERNELS_SEPARATE_OK")
 
     batch, seq, dim = 2, 3, 4
     x = jnp.asarray(np.tile(
@@ -70,7 +67,7 @@ def main() -> None:
 
     single_base = production_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args)
-    canonical_single = production_single._v4171_canonical_shard_map_kernel
+    canonical_single = suppression_single._v4171_canonical_shard_map_kernel
     single_neutral = canonical_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         jnp.full((batch,), -1, dtype=jnp.int32),
@@ -80,8 +77,8 @@ def main() -> None:
     single_disabled = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False))
-    assert _all_exact(single_base, single_neutral)
-    assert _all_exact(single_base[:-1], single_disabled[:-1])
+    assert _all_exact(single_base, single_neutral[:-1])
+    assert _all_exact(single_base, single_disabled[:-1])
 
     single_changed = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
@@ -96,7 +93,7 @@ def main() -> None:
     inactive = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         jnp.ones((batch,), dtype=jnp.int32), positions, jnp.bool_(True))
-    assert _all_exact(single_base, inactive)
+    assert _all_exact(single_base, inactive[:-1])
     print("PRODUCTION_CORE_INACTIVE_NOOP_OK")
     print("PRODUCTION_CORE_CAUSAL_PREFIX_OK")
 
@@ -120,7 +117,7 @@ def main() -> None:
     raw_tau_paired = jnp.zeros((batch, seq, 2, 1), dtype=jnp.float32)
     paired_base = production_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args)
-    canonical_paired = production_paired._v4171_canonical_shard_map_kernel
+    canonical_paired = suppression_paired._v4171_canonical_shard_map_kernel
     paired_neutral = canonical_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         jnp.full((batch,), -1, dtype=jnp.int32),
@@ -131,8 +128,8 @@ def main() -> None:
     paired_disabled = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False), jnp.int32(0))
-    assert _all_exact(paired_base, paired_neutral)
-    assert _all_exact(paired_base[:-1], paired_disabled[:-1])
+    assert _all_exact(paired_base, paired_neutral[:-1])
+    assert _all_exact(paired_base, paired_disabled[:-1])
 
     paired_non_target_route = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
@@ -182,15 +179,56 @@ def main() -> None:
     init_rng = {"params": jax.random.PRNGKey(7),
                 "dropout": jax.random.PRNGKey(8)}
     variables = model.init(init_rng, input_ids, deterministic=True)
-    sharded_fns = {
+    production_only_fns = {
         "single": production_single,
         "paired": production_paired,
         "attn_v_single_minimal": production_single,
         "rst_single_minimal": production_single,
         "attn_qk_paired_minimal": production_paired,
+        "_v4171_kernel_profile": "production",
+    }
+
+    def forbidden_analysis_factory(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("training called an analysis kernel factory")
+
+    analysis_factory_names = (
+        "make_sharded_srw_retention_minimal",
+        "make_sharded_srw_paired_retention_minimal",
+        "make_sharded_srw_suppression_minimal",
+        "make_sharded_srw_paired_suppression_minimal",
+        "make_sharded_srw_trajectory_minimal",
+        "make_sharded_srw_paired_trajectory_minimal",
+    )
+    original_analysis_factories = {
+        name: getattr(v4171_module, name) for name in analysis_factory_names}
+    try:
+        for name in analysis_factory_names:
+            setattr(v4171_module, name, forbidden_analysis_factory)
+        production_only_result = model.apply(
+            variables, input_ids, labels=input_ids,
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(81)},
+            sharded_fns=production_only_fns,
+            analysis=False, minimal_train=True,
+            analysis_return_residual=True,
+            compute_accuracy=False)
+    finally:
+        for name, factory in original_analysis_factories.items():
+            setattr(v4171_module, name, factory)
+    assert production_only_result["final_residual"].shape == (
+        batch, seq, dim)
+    print("PRODUCTION_TRAINING_ANALYSIS_FACTORY_ISOLATION_OK")
+    sharded_fns = {
+        "single": production_single,
+        "paired": production_paired,
+        "attn_v_single_minimal": suppression_single,
+        "rst_single_minimal": suppression_single,
+        "attn_qk_paired_minimal": suppression_paired,
         "attn_v_single_suppression_minimal": suppression_single,
         "rst_single_suppression_minimal": suppression_single,
         "attn_qk_paired_suppression_minimal": suppression_paired,
+        "_v4171_kernel_profile": "suppression",
     }
     model_kwargs = {
         "deterministic": True,
@@ -270,8 +308,8 @@ def main() -> None:
         **model_kwargs,
     )
     assert set(debug_result["parity_debug"]) == {
-        "q", "k", "v", "attention_update", "rst",
-        "post_layer_residual",
+        "residual_input", "q", "k", "v", "attention_update", "rst",
+        "post_attention", "post_layer_residual",
     }
     assert all(
         value.shape[0] == model.n_layers

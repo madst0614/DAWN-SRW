@@ -45,8 +45,32 @@ from analysis.operator_interpretability.units import (
 )
 
 
-def _runtime_kwargs(ctx: Any) -> dict[str, Any]:
+def _runtime_kwargs(
+        ctx: Any, *, kernel_profile: str = "production") -> dict[str, Any]:
     cfg = ctx.model_cfg
+    kernel_profile = str(kernel_profile).strip().lower()
+    if kernel_profile == "production":
+        sharded_fns = ctx.sharded_fns
+    else:
+        profiles = getattr(ctx, "sharded_fns_analysis", None)
+        if isinstance(profiles, Mapping) and kernel_profile in profiles:
+            sharded_fns = profiles[kernel_profile]
+        elif not profiles:
+            # Lightweight unit harnesses may provide one already-selected
+            # analysis closure instead of a full production context.
+            sharded_fns = ctx.sharded_fns
+            current_profile = (
+                sharded_fns.get("_v4171_kernel_profile")
+                if isinstance(sharded_fns, Mapping) else None)
+            if (current_profile is not None
+                    and str(current_profile) != kernel_profile):
+                raise ValueError(
+                    "analysis context kernel profile mismatch: "
+                    f"requested={kernel_profile!r} "
+                    f"available={current_profile!r}")
+        else:
+            raise ValueError(
+                f"analysis context lacks kernel profile {kernel_profile!r}")
     temperature = float(cfg["soft_gate_temperature"])
     boundary = float(cfg["soft_gate_boundary_power"])
     # QK/V/RST denominator powers are immutable constructor fields on the
@@ -55,7 +79,7 @@ def _runtime_kwargs(ctx: Any) -> dict[str, Any]:
     return {
         "deterministic": True,
         "rngs": {"dropout": jax.random.PRNGKey(0)},
-        "sharded_fns": ctx.sharded_fns,
+        "sharded_fns": sharded_fns,
         "analysis": False,
         "soft_gate_temperature": temperature,
         "soft_gate_t_final": float(cfg.get("soft_gate_t_final", temperature)),
@@ -172,10 +196,10 @@ def _plain_score_executable(
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = f"plain_score:{normalization}"
+    key = ("plain_score", "production", normalization)
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="production")
 
     @jax.jit
     def score(params, input_ids, labels):
@@ -226,10 +250,10 @@ def _retention_score_executable(ctx: Any):
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = "retention_score:dynamic_mode"
+    key = ("retention_score", "retention", "dynamic_mode")
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="retention")
 
     @jax.jit
     def score(params, input_ids, labels, keep_qk, keep_v, keep_rst,
@@ -517,7 +541,7 @@ def evaluate_operator_interchange(
         (source_arrays[0].shape[0], 1))
     selected_ids = jax.device_put(
         jnp.asarray(selected), NamedSharding(ctx.mesh, P("data", None)))
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="suppression")
     route_index = ROUTE_INDEX[route]
 
     @jax.jit
@@ -707,10 +731,10 @@ def _program_score_executable(
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = f"native_program_score:{normalization}"
+    key = ("native_program_score", "suppression", normalization)
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="suppression")
 
     @jax.jit
     def score(
@@ -750,10 +774,10 @@ def _program_capture_executable(ctx: Any):
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = "native_program_capture"
+    key = ("native_program_capture", "suppression")
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx)
+    kwargs = _runtime_kwargs(ctx, kernel_profile="suppression")
 
     @jax.jit
     def capture(
