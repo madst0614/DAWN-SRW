@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
 
@@ -68,6 +69,30 @@ from analysis.operator_interpretability.program import (
     reindex_program_schedule,
     select_validation_program,
     write_program_schedule_artifact,
+)
+from analysis.operator_interpretability.paired_trajectory import (
+    build_divergence_atlas,
+    capture_candidate_site_values,
+    capture_full_active_trajectory,
+    capture_production_atlas,
+    deterministic_deep_selection,
+    deterministic_mismatch_mapping as trajectory_mismatch_mapping,
+    divergence_extrema,
+    evaluate_coarse_site_patches,
+    evaluate_cumulative_path,
+    evaluate_operator_group_patches,
+    freeze_chronological_path,
+    freeze_operator_followup_sites,
+    ioi_semantic_record,
+    merge_divergence_atlases,
+    merge_trajectory_batch_summaries,
+    operator_parameter_provenance,
+    select_discovery_candidates,
+    write_atlas_metric_artifact,
+    write_causal_vector_artifact,
+    write_deep_trace_shards,
+    write_trajectory_graph,
+    write_trajectory_manifest,
 )
 from analysis.operator_interpretability.protocol import (
     CIRCUIT_FRACTIONS,
@@ -236,6 +261,8 @@ class OperatorInterpretabilityRunner:
         self._active_kind: str | None = None
         self._examples: dict[str, dict[str, list[Any]]] = {}
         self._pool_host: dict[str, np.ndarray] | None = None
+        self._requested_items: tuple[str, ...] = ()
+        self._paired_trajectory_test_isolated = False
 
     def _print(self, message: str) -> None:
         if self.ctx.is_primary:
@@ -273,15 +300,26 @@ class OperatorInterpretabilityRunner:
             item_result["benchmark_id"] = str(benchmark_id)
         else:
             item_result = dict(result)
-        return {
+        payload = {
             "item_id": item_id,
             "backend": definition["backend"],
             "analysis_kind": kind,
             "benchmark_id": benchmark_id,
             "claim_role": definition["claim_role"],
+            "scientific_role": definition.get("scientific_role"),
             "status": item_result.get("status"),
             "result": item_result,
         }
+        if "test_used" in definition:
+            payload["test_used"] = bool(definition["test_used"])
+        artifact_warnings = item_result.get("artifact_warnings")
+        if isinstance(artifact_warnings, Sequence) and not isinstance(
+                artifact_warnings, (str, bytes)):
+            payload["artifact_warnings"] = [
+                dict(row) for row in artifact_warnings
+                if isinstance(row, Mapping)
+            ]
+        return payload
 
     @staticmethod
     def _strip_nested_rows(value: Any) -> Any:
@@ -412,6 +450,8 @@ class OperatorInterpretabilityRunner:
             result = self._strip_nested_rows(result)
         elif kind == "native_operator_program":
             result = self._strip_nested_rows(result)
+        elif kind == "paired_operator_trajectory":
+            result = self._trajectory_without_private(result)
         elif kind == "scientific_claims":
             result = self._compact_scientific_claims(item_id, result)
         output["result"] = result
@@ -447,6 +487,16 @@ class OperatorInterpretabilityRunner:
         return result
 
     def run(self, items: Sequence[str]) -> dict[str, Any]:
+        self._requested_items = tuple(str(item) for item in items)
+        requested_set = set(self._requested_items)
+        trajectory_only_items = {
+            "mib_ioi.input_contract",
+            "mib_ioi.behavioral_eligibility",
+            "mib_ioi.paired_operator_trajectory",
+        }
+        self._paired_trajectory_test_isolated = (
+            "mib_ioi.paired_operator_trajectory" in requested_set
+            and requested_set <= trajectory_only_items)
         executed = dependency_closure(items)
         kind_order: list[str] = []
         for item_id in executed:
@@ -503,82 +553,86 @@ class OperatorInterpretabilityRunner:
                 summary, protocol=self.protocol)
         return summary
 
+    def _load_phase_examples(
+            self, benchmark_id: str, phase: str) -> list[Any]:
+        if phase not in {"discovery", "validation", "test"}:
+            raise ValueError(f"unknown benchmark phase={phase}")
+        phases = self._examples.setdefault(benchmark_id, {})
+        if phase in phases:
+            return phases[phase]
+        values = load_benchmark_examples(
+            self.build, benchmark_id, phase=phase)
+        phase_cap = self.config.max_examples_for(benchmark_id)
+        if benchmark_id == "ravel":
+            spec = benchmark_spec("ravel")
+            grouped: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
+            for example in values:
+                source_column = str(example.metadata.get(
+                    "official_counterfactual_column") or "")
+                key = (
+                    str(example.causal_variable),
+                    str(example.pair_type),
+                    source_column,
+                )
+                grouped[key].append(example)
+            expected_strata = [
+                (variable, pair_type, source_column)
+                for variable in spec.causal_variables
+                for pair_type in ("cause", "isolation")
+                for source_column in spec.counterfactual_columns
+            ]
+            missing = [key for key in expected_strata if not grouped[key]]
+            if missing:
+                raise ValueError(
+                    "RAVEL phase lacks an official causal stratum: "
+                    + ",".join("/".join(key) for key in missing))
+            if phase_cap < len(expected_strata):
+                raise ValueError(
+                    "RAVEL phase cap cannot represent every RAVEL stratum; "
+                    f"minimum={len(expected_strata)}")
+            for group in grouped.values():
+                group.sort(key=lambda example: (
+                    canonical_hash(example.example_id), example.example_id))
+            selected = []
+            cursors = {key: 0 for key in expected_strata}
+            used_group_ids = {"cause": set(), "isolation": set()}
+            while len(selected) < phase_cap:
+                added = False
+                for key in expected_strata:
+                    group = grouped[key]
+                    pair_type = key[1]
+                    while cursors[key] < len(group):
+                        candidate = group[cursors[key]]
+                        cursors[key] += 1
+                        group_id = str(candidate.metadata["pair_group_id"])
+                        if group_id in used_group_ids[pair_type]:
+                            continue
+                        used_group_ids[pair_type].add(group_id)
+                        selected.append(candidate)
+                        added = True
+                        break
+                    if len(selected) == phase_cap:
+                        break
+                if not added:
+                    break
+            if len(selected) != phase_cap:
+                raise ValueError(
+                    "RAVEL prepared phase cannot satisfy the pre-registered "
+                    f"runtime cap: phase={phase} requested={phase_cap} "
+                    f"available={len(selected)}; publish a non-truncated "
+                    "benchmark build")
+            phases[phase] = selected
+        else:
+            values.sort(key=lambda example: (
+                canonical_hash(example.example_id), example.example_id))
+            phases[phase] = values[:phase_cap]
+        return phases[phase]
+
     def _load_examples(self, benchmark_id: str) -> dict[str, list[Any]]:
-        if benchmark_id not in self._examples:
-            phases = {}
-            phase_cap = self.config.max_examples_for(benchmark_id)
-            for phase in ("discovery", "validation", "test"):
-                values = load_benchmark_examples(
-                    self.build, benchmark_id, phase=phase)
-                if benchmark_id == "ravel":
-                    spec = benchmark_spec("ravel")
-                    grouped: dict[tuple[str, str, str], list[Any]] = (
-                        defaultdict(list))
-                    for example in values:
-                        source_column = str(example.metadata.get(
-                            "official_counterfactual_column") or "")
-                        key = (
-                            str(example.causal_variable),
-                            str(example.pair_type),
-                            source_column,
-                        )
-                        grouped[key].append(example)
-                    expected_strata = [
-                        (variable, pair_type, source_column)
-                        for variable in spec.causal_variables
-                        for pair_type in ("cause", "isolation")
-                        for source_column in spec.counterfactual_columns
-                    ]
-                    missing = [key for key in expected_strata if not grouped[key]]
-                    if missing:
-                        raise ValueError(
-                            "RAVEL phase lacks an official causal stratum: "
-                            + ",".join("/".join(key) for key in missing))
-                    if phase_cap < len(expected_strata):
-                        raise ValueError(
-                            "RAVEL phase cap cannot represent every "
-                            f"RAVEL stratum; minimum={len(expected_strata)}")
-                    for group in grouped.values():
-                        group.sort(key=lambda example: (
-                            canonical_hash(example.example_id),
-                            example.example_id))
-                    selected = []
-                    cursors = {key: 0 for key in expected_strata}
-                    used_group_ids = {
-                        "cause": set(), "isolation": set()}
-                    while len(selected) < phase_cap:
-                        added = False
-                        for key in expected_strata:
-                            group = grouped[key]
-                            pair_type = key[1]
-                            while cursors[key] < len(group):
-                                candidate = group[cursors[key]]
-                                cursors[key] += 1
-                                group_id = str(
-                                    candidate.metadata["pair_group_id"])
-                                if group_id in used_group_ids[pair_type]:
-                                    continue
-                                used_group_ids[pair_type].add(group_id)
-                                selected.append(candidate)
-                                added = True
-                                break
-                            if len(selected) == phase_cap:
-                                break
-                        if not added:
-                            break
-                    if len(selected) != phase_cap:
-                        raise ValueError(
-                            "RAVEL prepared phase cannot satisfy the "
-                            f"pre-registered runtime cap: phase={phase} "
-                            f"requested={phase_cap} available={len(selected)}; "
-                            "publish a non-truncated benchmark build")
-                    phases[phase] = selected
-                else:
-                    values.sort(key=lambda example: (
-                        canonical_hash(example.example_id), example.example_id))
-                    phases[phase] = values[:phase_cap]
-            self._examples[benchmark_id] = phases
-        return self._examples[benchmark_id]
+        return {
+            phase: self._load_phase_examples(benchmark_id, phase)
+            for phase in ("discovery", "validation", "test")
+        }
 
     @staticmethod
     def _independent_capture_examples(
@@ -599,7 +653,7 @@ class OperatorInterpretabilityRunner:
         behavior = self.results["behavioral_eligibility"]["benchmarks"][
             benchmark_id]["phases"][phase]
         mask = list(behavior["known_correct"])
-        examples = self._load_examples(benchmark_id)[phase]
+        examples = self._load_phase_examples(benchmark_id, phase)
         if len(mask) != len(examples):
             raise ValueError("behavior mask and benchmark examples are misaligned")
         return [example for example, keep in zip(examples, mask) if keep]
@@ -627,7 +681,15 @@ class OperatorInterpretabilityRunner:
         output: dict[str, Any] = {}
         for benchmark_id in self._scope("behavioral_eligibility"):
             phase_results = {}
-            for phase, examples in self._load_examples(benchmark_id).items():
+            isolated_trajectory = (
+                benchmark_id == "mib_ioi"
+                and self._paired_trajectory_test_isolated)
+            phases = (
+                ("discovery", "validation")
+                if isolated_trajectory
+                else ("discovery", "validation", "test"))
+            for phase in phases:
+                examples = self._load_phase_examples(benchmark_id, phase)
                 result = evaluate_behavior(
                     self.ctx, examples,
                     pad_token_id=int(self.tokenizer.pad_token_id))
@@ -649,6 +711,19 @@ class OperatorInterpretabilityRunner:
                     benchmark_id)
                 result["runtime_selected_row_count"] = len(examples)
                 phase_results[phase] = result
+            if isolated_trajectory:
+                phase_results["test"] = {
+                    "status": "not_evaluated",
+                    "phase": "test",
+                    "known_correct": [],
+                    "known_correct_count": 0,
+                    "eligible_for_mechanistic_claims": False,
+                    "test_evaluated": False,
+                    "test_evaluation_count": 0,
+                    "test_data_accessor_called": False,
+                    "reason": (
+                        "paired_operator_trajectory_v1_forbids_test_access"),
+                }
             output[benchmark_id] = {
                 "status": "ready",
                 "track": benchmark_spec(benchmark_id).track,
@@ -1205,6 +1280,771 @@ class OperatorInterpretabilityRunner:
                 "strongest_supported_claim"],
             "checkpoint_specific_claim": True,
             "scientific_claims_primary_modified": False,
+            "human_summary": human_summary,
+        }
+
+    @staticmethod
+    def _trajectory_without_private(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): OperatorInterpretabilityRunner.
+                _trajectory_without_private(child)
+                for key, child in value.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                OperatorInterpretabilityRunner._trajectory_without_private(
+                    child) for child in value
+            ]
+        return value
+
+    def _trajectory_progress(self, message: str) -> None:
+        self._print(f"TRAIN_ANALYSIS_POOL paired_trajectory {message}")
+
+    def _run_paired_operator_trajectory(self) -> dict[str, Any]:
+        if self._scope("paired_operator_trajectory") != ("mib_ioi",):
+            raise ValueError(
+                "paired operator trajectory is registered only for mib_ioi")
+        if self.config.trajectory_test_enabled:
+            raise ValueError("paired trajectory v1 forbids test evaluation")
+        protocol_hash = canonical_hash(self.protocol)
+        pad_token_id = int(self.tokenizer.pad_token_id)
+        discovery_known = self._known_correct("mib_ioi", "discovery")
+        validation_known = self._known_correct("mib_ioi", "validation")
+        if len(discovery_known) < 2 or len(validation_known) < 2:
+            return {
+                "status": "insufficient_behavior",
+                "algorithm_version": "paired_s2_operator_trajectory_v1",
+                "discovery_paired_correct_count": len(discovery_known),
+                "validation_paired_correct_count": len(validation_known),
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+                "test_used": False,
+            }
+
+        discovery = deterministic_deep_selection(
+            discovery_known,
+            limit=self.config.trajectory_discovery_examples,
+            seed=self.config.trajectory_seed)
+        validation = deterministic_deep_selection(
+            validation_known,
+            limit=self.config.trajectory_validation_examples,
+            seed=self.config.trajectory_seed + 1)
+        deep = deterministic_deep_selection(
+            discovery,
+            limit=self.config.trajectory_deep_examples,
+            seed=self.config.trajectory_seed + 2)
+        discovery_semantic = {
+            example.example_id: ioi_semantic_record(example, self.tokenizer)
+            for example in discovery
+        }
+        validation_semantic = {
+            example.example_id: ioi_semantic_record(example, self.tokenizer)
+            for example in validation
+        }
+        deep_semantic = {
+            example.example_id: discovery_semantic[example.example_id]
+            for example in deep
+        }
+        maximum_trace_positions = max(
+            len(record.positions) for record in deep_semantic.values())
+        maximum_trace_sequence_length = max(
+            len(prompt) + len(answer)
+            for example in deep
+            for prompt, answer in (
+                (example.input_ids_base, example.positive_ids),
+                (example.input_ids_base, example.negative_ids),
+                (example.input_ids_source, example.source_positive_ids),
+                (example.input_ids_source, example.source_negative_ids),
+            )
+        )
+        n_rst = int(
+            self.ctx.model_cfg["n_rst"]
+            if "n_rst" in self.ctx.model_cfg
+            else self.ctx.model_cfg["n_know"])
+        initial_widths = {
+            "qk": min(
+                self.config.trajectory_capture_topk_qk,
+                int(self.ctx.model_cfg["n_qk"])),
+            "v": min(
+                self.config.trajectory_capture_topk_v,
+                int(self.ctx.model_cfg["n_v"])),
+            "rst": min(
+                self.config.trajectory_capture_topk_rst, n_rst),
+        }
+        layer_count = int(self.ctx.model_cfg["n_layers"])
+        model_width = int(self.ctx.model_cfg["d_model"])
+        data_multiple = max(1, int(self.ctx.mesh.shape["data"]))
+        streamed_batch_size = (
+            (4 + data_multiple - 1) // data_multiple) * data_multiple
+        trace_row_count = (
+            layer_count * streamed_batch_size * maximum_trace_positions)
+        operator_width_sum = (
+            2 * initial_widths["qk"]
+            + initial_widths["v"] + initial_widths["rst"])
+        estimated_capture_trace_output_bytes = int(
+            trace_row_count * (
+                92 * model_width + 84 + 25 * operator_width_sum)
+            + 5 * streamed_batch_size * maximum_trace_positions
+            + 16 * layer_count)
+        estimated_compact_replay_output_bytes = int(
+            trace_row_count * 64 * model_width)
+        estimated_score_residual_output_bytes_per_pass = int(
+            streamed_batch_size
+            * (maximum_trace_sequence_length * model_width + 1) * 4)
+        requested_trace_shape = {
+            "layers": layer_count,
+            "deep_example_count": len(deep),
+            "streamed_fused_candidate_rows_per_batch": 4,
+            "streamed_padded_rows_per_batch": streamed_batch_size,
+            "sequence_length": maximum_trace_sequence_length,
+            "trace_positions": maximum_trace_positions,
+            "initial_widths": initial_widths,
+            "estimated_capture_trace_output_bytes_initial_width": (
+                estimated_capture_trace_output_bytes),
+            "estimated_compact_replay_output_bytes": (
+                estimated_compact_replay_output_bytes),
+            "estimated_score_residual_output_bytes_per_pass": (
+                estimated_score_residual_output_bytes_per_pass),
+            "estimated_peak_trace_outputs_bytes_initial_width": (
+                estimated_capture_trace_output_bytes
+                + estimated_compact_replay_output_bytes),
+            "estimated_peak_materialized_output_bytes_initial_width": (
+                estimated_capture_trace_output_bytes
+                + estimated_compact_replay_output_bytes
+                + 2 * estimated_score_residual_output_bytes_per_pass),
+            "estimate_basis": (
+                "materialized_array_shape_and_dtype_sum_for_semantic_"
+                "position_states_full_active_operator_fields_and_compact_"
+                "replay_route_outputs"),
+        }
+        stage = "production_atlas_discovery"
+        trace_output_bytes = 0
+        last_successful_stage = "pair_preparation"
+        try:
+            discovery_atlas = capture_production_atlas(
+                self.ctx, discovery, discovery_semantic,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="discovery", progress=self._trajectory_progress)
+            discovery_atlas_artifact = write_atlas_metric_artifact(
+                self.store, discovery_atlas, phase="discovery",
+                protocol_hash=protocol_hash)
+            last_successful_stage = stage
+            stage = "production_atlas_validation"
+            validation_atlas = capture_production_atlas(
+                self.ctx, validation, validation_semantic,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="validation", progress=self._trajectory_progress)
+            validation_atlas_artifact = write_atlas_metric_artifact(
+                self.store, validation_atlas, phase="validation",
+                protocol_hash=protocol_hash)
+            last_successful_stage = stage
+            if (discovery_atlas["status"] != "ready"
+                    or validation_atlas["status"] != "ready"):
+                return {
+                    "status": "s2_prefix_identity_failed",
+                    "algorithm_version": (
+                        "paired_s2_operator_trajectory_v1"),
+                    "discovery": self._trajectory_without_private(
+                        discovery_atlas),
+                    "validation": self._trajectory_without_private(
+                        validation_atlas),
+                    "atlas_artifacts": {
+                        "discovery": discovery_atlas_artifact,
+                        "validation": validation_atlas_artifact,
+                    },
+                    "causal_intervention_executed": False,
+                    "test_evaluated": False,
+                    "test_evaluation_count": 0,
+                    "test_data_accessor_called": False,
+                    "test_used": False,
+                }
+
+            stage = "streamed_full_active_trace"
+            operator_provenance, operator_keys = (
+                operator_parameter_provenance(self.ctx))
+            operator_provenance["checkpoint_identity"] = self.protocol[
+                "checkpoint_identity"]
+            trajectory_batches = []
+            divergence = None
+            deep_shards = []
+            for deep_index, example in enumerate(deep):
+                example_semantic = {
+                    example.example_id: deep_semantic[example.example_id]}
+                trajectory_batch = capture_full_active_trajectory(
+                    self.ctx, [example], example_semantic,
+                    pad_token_id=pad_token_id, config=self.config,
+                    fixed_sequence_length=maximum_trace_sequence_length,
+                    fixed_trace_width=maximum_trace_positions,
+                    progress=self._trajectory_progress)
+                trace_output_bytes = max(
+                    trace_output_bytes,
+                    int(trajectory_batch.get("trace_output_bytes", 0)))
+                if trajectory_batch["status"] != "ready":
+                    return {
+                        "status": "full_active_replay_parity_failed",
+                        "algorithm_version": (
+                            "paired_s2_operator_trajectory_v1"),
+                        "failed_example_id": example.example_id,
+                        "requested_trace_shape": requested_trace_shape,
+                        "final_capture_widths": trajectory_batch["widths"],
+                        "capture_retries": trajectory_batch["retries"],
+                        "trace_completeness": trajectory_batch[
+                            "completeness"],
+                        "full_active_replay": trajectory_batch["closure"],
+                        "causal_intervention_executed": False,
+                        "test_evaluated": False,
+                        "test_evaluation_count": 0,
+                        "test_data_accessor_called": False,
+                        "test_used": False,
+                    }
+                persisted = write_deep_trace_shards(
+                    self.store, trajectory_batch, [example],
+                    example_semantic, protocol_hash=protocol_hash,
+                    shard_index_offset=deep_index,
+                    write_intermediate_manifest=False)
+                deep_shards.extend(persisted.get("shards", ()))
+                example_divergence = build_divergence_atlas(
+                    trajectory_batch, [example], example_semantic,
+                    operator_keys=operator_keys,
+                    epsilon=self.config.trajectory_divergence_epsilon)
+                divergence = (
+                    example_divergence if divergence is None
+                    else merge_divergence_atlases(
+                        (divergence, example_divergence)))
+                trajectory_batches.append({
+                    "example_id": example.example_id,
+                    "widths": trajectory_batch["widths"],
+                    "retries": trajectory_batch["retries"],
+                    "completeness": trajectory_batch["completeness"],
+                    "closure": trajectory_batch["closure"],
+                    "trace_output_bytes": trajectory_batch[
+                        "trace_output_bytes"],
+                    "replay_trace_output_bytes": trajectory_batch[
+                        "replay_trace_output_bytes"],
+                    "capture_score_residual_bytes": trajectory_batch[
+                        "capture_score_residual_bytes"],
+                    "replay_score_residual_bytes": trajectory_batch[
+                        "replay_score_residual_bytes"],
+                    "peak_materialized_output_bytes": trajectory_batch[
+                        "peak_materialized_output_bytes"],
+                    "forward_call_count": trajectory_batch[
+                        "forward_call_count"],
+                })
+                del trajectory_batch, persisted, example_divergence
+                gc.collect()
+            trajectory = merge_trajectory_batch_summaries(
+                trajectory_batches)
+            if divergence is None:
+                raise RuntimeError("streamed divergence atlas is empty")
+            deep_trace_artifacts = {
+                "status": "complete",
+                "shards": deep_shards,
+                "shard_count": 2 * len(deep),
+                "streamed_trace_batch_count": len(deep),
+            }
+            extrema = divergence_extrema(divergence)
+            last_successful_stage = stage
+            del operator_keys, trajectory_batches
+            gc.collect()
+
+            stage = "discovery_candidate_freeze"
+            selection = select_discovery_candidates(
+                divergence, config=self.config)
+            candidates = list(selection["candidates"])
+            selection_hash_before_causal = str(
+                selection["selection_record_hash"])
+            last_successful_stage = stage
+
+            stage = "discovery_candidate_value_capture"
+            discovery_site_values = capture_candidate_site_values(
+                self.ctx, discovery, discovery_semantic, candidates,
+                pad_token_id=pad_token_id, phase="discovery",
+                progress=self._trajectory_progress)
+            discovery_mismatch = trajectory_mismatch_mapping(
+                discovery, seed=self.config.trajectory_seed + 101)
+            last_successful_stage = stage
+
+            stage = "discovery_coarse_patch"
+            discovery_coarse = evaluate_coarse_site_patches(
+                self.ctx, discovery, discovery_semantic, candidates,
+                discovery_site_values, discovery_mismatch,
+                production_atlas=discovery_atlas,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="discovery", progress=self._trajectory_progress)
+            if selection["selection_record_hash"] != (
+                    selection_hash_before_causal):
+                raise RuntimeError(
+                    "causal patching changed the frozen candidate record")
+            discovery_site_artifact = write_causal_vector_artifact(
+                self.store, "discovery_site_patches.npz",
+                discovery_coarse, protocol_hash=protocol_hash)
+            last_successful_stage = stage
+
+            stage = "operator_followup_freeze"
+            operator_followup = freeze_operator_followup_sites(
+                discovery_coarse, candidates, config=self.config)
+            discovery_index = {
+                example.example_id: index
+                for index, example in enumerate(discovery)
+            }
+            deep_indices = np.asarray([
+                discovery_index[example.example_id] for example in deep
+            ], dtype=np.int32)
+            deep_production_atlas = {
+                "_base_margin": np.asarray(
+                    discovery_atlas["_base_margin"])[deep_indices],
+                "_source_margin": np.asarray(
+                    discovery_atlas["_source_margin"])[deep_indices],
+            }
+            deep_mismatch = trajectory_mismatch_mapping(
+                deep, seed=self.config.trajectory_seed + 103)
+            last_successful_stage = stage
+
+            stage = "operator_group_patch"
+            operator_groups = evaluate_operator_group_patches(
+                self.ctx, deep, deep_semantic, divergence,
+                operator_followup, deep_mismatch,
+                production_atlas=deep_production_atlas,
+                sequence_length=int(discovery_site_values[
+                    "sequence_length"]),
+                pad_token_id=pad_token_id, config=self.config,
+                progress=self._trajectory_progress)
+            operator_group_artifact = write_causal_vector_artifact(
+                self.store, "discovery_operator_group_patches.npz",
+                operator_groups, protocol_hash=protocol_hash)
+            last_successful_stage = stage
+
+            stage = "chronological_path_freeze"
+            path_record = freeze_chronological_path(
+                discovery_coarse, candidates, config=self.config)
+            path_hash_before_validation = str(
+                path_record["path_record_hash"])
+            last_successful_stage = stage
+
+            stage = "discovery_cumulative_path"
+            discovery_path = evaluate_cumulative_path(
+                self.ctx, discovery, path_record,
+                discovery_site_values, discovery_mismatch,
+                production_atlas=discovery_atlas,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="discovery", evaluate_prefix_curve=True,
+                progress=self._trajectory_progress)
+            discovery_path_artifact = write_causal_vector_artifact(
+                self.store, "discovery_cumulative_path.npz",
+                discovery_path, protocol_hash=protocol_hash)
+            last_successful_stage = stage
+
+            stage = "validation_frozen_value_capture"
+            validation_site_values = capture_candidate_site_values(
+                self.ctx, validation, validation_semantic, candidates,
+                pad_token_id=pad_token_id, phase="validation",
+                progress=self._trajectory_progress)
+            validation_mismatch = trajectory_mismatch_mapping(
+                validation, seed=self.config.trajectory_seed + 107)
+            path_indices = {
+                int(row["candidate_index"])
+                for row in path_record["sites"]
+            }
+            path_candidates = [
+                candidate for candidate in candidates
+                if int(candidate["candidate_index"]) in path_indices
+            ]
+            validation_single = evaluate_coarse_site_patches(
+                self.ctx, validation, validation_semantic,
+                path_candidates, validation_site_values,
+                validation_mismatch,
+                production_atlas=validation_atlas,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="validation", progress=self._trajectory_progress)
+            last_successful_stage = stage
+
+            stage = "validation_frozen_path"
+            validation_path = evaluate_cumulative_path(
+                self.ctx, validation, path_record,
+                validation_site_values, validation_mismatch,
+                production_atlas=validation_atlas,
+                pad_token_id=pad_token_id, config=self.config,
+                phase="validation", evaluate_prefix_curve=False,
+                progress=self._trajectory_progress)
+            if path_record["path_record_hash"] != path_hash_before_validation:
+                raise RuntimeError(
+                    "validation changed the frozen discovery path")
+            validation_vectors = [
+                {**record, "evaluation_kind": "frozen_single_site"}
+                for record in validation_single.get("_vectors", ())
+            ] + [
+                {**record, "evaluation_kind": "frozen_cumulative_path"}
+                for record in validation_path.get("_vectors", ())
+            ]
+            validation_path_artifact = write_causal_vector_artifact(
+                self.store, "validation_frozen_path.npz",
+                {"_vectors": validation_vectors},
+                protocol_hash=protocol_hash)
+            last_successful_stage = stage
+
+            stage = "trajectory_graph"
+            graph_artifact = write_trajectory_graph(
+                self.store, candidates, path_record,
+                operator_followup, protocol_hash=protocol_hash)
+            artifacts = {
+                "atlas_discovery": discovery_atlas_artifact,
+                "atlas_validation": validation_atlas_artifact,
+                "discovery_site_patches": discovery_site_artifact,
+                "discovery_operator_group_patches": (
+                    operator_group_artifact),
+                "discovery_cumulative_path": discovery_path_artifact,
+                "validation_frozen_path": validation_path_artifact,
+                "trajectory_graph": graph_artifact,
+            }
+            manifest_artifact = write_trajectory_manifest(
+                self.store, protocol_hash=protocol_hash,
+                deep_trace=deep_trace_artifacts,
+                artifacts=artifacts,
+                trace_output_bytes=trace_output_bytes,
+                replay_trace_output_bytes=int(
+                    trajectory["replay_trace_output_bytes"]),
+                peak_materialized_output_bytes=int(
+                    trajectory["peak_materialized_output_bytes"]),
+                operator_provenance=operator_provenance)
+            artifacts["manifest"] = manifest_artifact
+            last_successful_stage = stage
+        except Exception as exc:
+            message = str(exc).lower()
+            resource_limit = isinstance(exc, MemoryError) or any(
+                value in message for value in (
+                    "resource_exhausted", "out of memory", "oom",
+                    "allocation failed"))
+            if not resource_limit:
+                raise
+            return {
+                "status": "resource_limit",
+                "algorithm_version": "paired_s2_operator_trajectory_v1",
+                "failed_stage": stage,
+                "last_successful_stage": last_successful_stage,
+                "requested_shape": requested_trace_shape,
+                "estimated_output_bytes": (
+                    trace_output_bytes + estimated_compact_replay_output_bytes
+                    + 2 * estimated_score_residual_output_bytes_per_pass
+                    if trace_output_bytes else (
+                        estimated_capture_trace_output_bytes
+                        + estimated_compact_replay_output_bytes
+                        + 2
+                        * estimated_score_residual_output_bytes_per_pass)),
+                "resource_error_type": type(exc).__name__,
+                "resource_error": str(exc),
+                "active_operator_truncation_applied": False,
+                "scientific_invariant_disabled": False,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+                "test_used": False,
+            }
+
+        behavior = self.results["behavioral_eligibility"]["benchmarks"][
+            "mib_ioi"]["phases"]
+        trace_completeness = {}
+        for route, row in trajectory["completeness"].items():
+            pool = "qk" if route in {"q", "k"} else route
+            retry_count = sum(
+                pool in retry["affected_routes"]
+                for retry in trajectory["retries"])
+            trace_completeness[route] = {
+                "initial_width": initial_widths[pool],
+                "final_width": int(trajectory["widths"][pool]),
+                "max_active_count": int(
+                    row["numerator_active_count_max"]),
+                "omitted_active_count": int(
+                    row["omitted_active_count"]),
+                "retry_count": int(retry_count),
+                "all_active_replay_error": float(
+                    trajectory["closure"]["routes"][route][
+                        "canonical_selected_replay_max_abs"]),
+            }
+        compact_discovery_atlas = self._trajectory_without_private(
+            discovery_atlas)
+        compact_validation_atlas = self._trajectory_without_private(
+            validation_atlas)
+        compact_discovery_atlas.pop("metric_rows", None)
+        compact_validation_atlas.pop("metric_rows", None)
+        compact_divergence = self._trajectory_without_private(divergence)
+        compact_divergence.pop("site_rows", None)
+        compact_divergence.pop("state_rows", None)
+        compact_divergence["extrema"] = extrema
+        compact_coarse = self._trajectory_without_private(discovery_coarse)
+        compact_groups = self._trajectory_without_private(operator_groups)
+        compact_discovery_path = self._trajectory_without_private(
+            discovery_path)
+        compact_validation_single = self._trajectory_without_private(
+            validation_single)
+        compact_validation_path = self._trajectory_without_private(
+            validation_path)
+
+        first = extrema.get("first_divergence") or {}
+        human_lines = [
+            "The base/source trajectories satisfied the frozen S2-prefix "
+            "identity tolerance before the official S2 span.",
+        ]
+        if first:
+            human_lines.append(
+                "The first measured operator-space divergence appeared at "
+                f"layer {first['layer']}, role {first['semantic_role']}, "
+                f"route {first['route']}.")
+        if path_record["sites"]:
+            first_path = path_record["sites"][0]
+            human_lines.append(
+                "The discovery-frozen chronological path begins at "
+                f"layer {first_path['layer']} {first_path['semantic_role']} "
+                f"{first_path['route']} and contains "
+                f"{len(path_record['sites'])} complete-route sites.")
+        group_rows = compact_groups.get("site_summaries") or []
+        if group_rows:
+            best_group = max(
+                group_rows,
+                key=lambda row: float(
+                    row["bidirectional_specific_effect_mean"]))
+            human_lines.append(
+                "Within the followed-up route sites, the largest observed "
+                "group-specific shift was the "
+                f"{best_group['group_kind']} intervention at layer "
+                f"{best_group['layer']} {best_group['semantic_role']} "
+                f"{best_group['route']}; this is checkpoint-specific "
+                "exploratory evidence, not an additive operator claim.")
+        final_validation = (
+            compact_validation_path.get("prefixes") or [{}])[-1]
+        human_summary = {
+            "narrative": human_lines,
+            "first_divergence": first or None,
+            "frozen_path_hash": path_record["path_record_hash"],
+            "frozen_path_length": int(path_record["path_length"]),
+            "validation_paired_effect": final_validation.get(
+                "bidirectional_paired_effect_mean"),
+            "validation_mismatched_effect": final_validation.get(
+                "bidirectional_mismatched_effect_mean"),
+            "validation_flip_fraction": final_validation.get(
+                "bidirectional_flip_fraction"),
+            "test_consulted": False,
+        }
+        artifact_warnings = []
+        if (isinstance(graph_artifact, Mapping)
+                and graph_artifact.get("advisory_threshold_exceeded")):
+            artifact_warnings.append({
+                "code": "trajectory_graph_json_advisory_threshold_exceeded",
+                "severity": "warning",
+                "path": graph_artifact.get("path"),
+                "encoded_bytes": int(graph_artifact["encoded_bytes"]),
+                "warning_threshold_bytes": int(
+                    graph_artifact["warning_threshold_bytes"]),
+                "write_continued": True,
+                "artifact_discarded": False,
+                "message": (
+                    "Trajectory graph JSON exceeded the advisory size "
+                    "threshold; artifact writing continued."),
+            })
+        return {
+            "status": "ready",
+            "ready": True,
+            "passed": None,
+            "analysis_kind": "paired_operator_trajectory",
+            "algorithm_version": "paired_s2_operator_trajectory_v1",
+            "scientific_role": "exploratory",
+            "claim_role": "checkpoint_specific",
+            "checkpoint_specific_claim": True,
+            "existing_native_operator_program_modified": False,
+            "behavioral_baseline": {
+                phase: {
+                    "behavior_rows": int(
+                        behavior[phase]["runtime_selected_row_count"]),
+                    "paired_correct_available": int(
+                        behavior[phase]["known_correct_count"]),
+                    "paired_correct_used": len(
+                        discovery if phase == "discovery" else validation),
+                    "base_accuracy": behavior[phase]["accuracy"],
+                    "source_accuracy": behavior[phase]["source_accuracy"],
+                    "base_margin_mean": behavior[phase]["mean_margin"],
+                    "source_own_margin_mean": behavior[phase][
+                        "mean_source_own_margin"],
+                }
+                for phase in ("discovery", "validation")
+            },
+            "cohorts": {
+                "selection_algorithm": (
+                    "seeded_hash_order_with_answer_disjoint_same_template_"
+                    "mismatch_closure"),
+                "seed": self.config.trajectory_seed,
+                "discovery_count": len(discovery),
+                "validation_count": len(validation),
+                "deep_count": len(deep),
+                "deep_example_ids": [
+                    example.example_id for example in deep],
+                "deep_cohort_hash": canonical_hash([
+                    example.example_id for example in deep]),
+            },
+            "production_active_definition": {
+                "numerator_active": (
+                    "canonical production valid mask after "
+                    "execution_prune_eps with execution_weight_nonzero"),
+                "denominator_active": (
+                    "canonical production admission contribution_nonzero"),
+                "execution_prune_eps": float(
+                    self.ctx.model_cfg.get("execution_prune_eps", 0.0)),
+                "mass_prefix_or_compactness_selection_used": False,
+                "production_kernel_is_authoritative": True,
+            },
+            "production_atlas": {
+                "discovery": compact_discovery_atlas,
+                "validation": compact_validation_atlas,
+                "broad_full_state_vectors_persisted": False,
+                "runtime_metric_dtype": "float32",
+                "aggregate_dtype": "float64",
+                "answer_projection_interpretation": (
+                    "descriptive_logit_lens_not_intermediate_causal_effect"),
+            },
+            "full_active_trace": {
+                "requested_shape": requested_trace_shape,
+                "trace_completeness": trace_completeness,
+                "capture_retries": trajectory["retries"],
+                "closure": trajectory["closure"],
+                "trace_output_bytes": trace_output_bytes,
+                "compact_replay_trace_output_bytes": int(
+                    trajectory["replay_trace_output_bytes"]),
+                "capture_score_residual_output_bytes": int(
+                    trajectory["capture_score_residual_bytes"]),
+                "replay_score_residual_output_bytes": int(
+                    trajectory["replay_score_residual_bytes"]),
+                "total_streamed_trace_output_bytes": int(
+                    trajectory["total_streamed_trace_output_bytes"]),
+                "estimated_peak_capture_plus_replay_output_bytes": (
+                    int(trajectory["peak_materialized_output_bytes"])),
+                "deep_trace_streamed_one_example_at_a_time": True,
+                "canonical_minimal_kernel_reused": True,
+                "precast_closure_is_descriptive": True,
+                "canonical_replay_is_authoritative": True,
+                "per_operator_scalar_interpretation": (
+                    "nonlinear_reroute_execution_trace_not_bitwise_"
+                    "additive_route_or_logit_contribution"),
+                "exact_causal_units": (
+                    "canonical_full_active_group_replay_and_complete_"
+                    "route_or_state_patches"),
+                "full_vocab_logits_materialized": False,
+                "final_logits_parity_basis": (
+                    "shared_output_projection_of_parity_checked_final_"
+                    "residual_plus_candidate_log_probability_parity"),
+            },
+            "operator_parameter_provenance": operator_provenance,
+            "divergence_atlas": compact_divergence,
+            "candidate_selection": selection,
+            "discovery_causal_patch": compact_coarse,
+            "operator_followup_selection": operator_followup,
+            "operator_decomposition": compact_groups,
+            "frozen_path": path_record,
+            "discovery_cumulative_path": compact_discovery_path,
+            "validation_frozen_single_sites": compact_validation_single,
+            "validation_frozen_path": compact_validation_path,
+            "tpu_execution": {
+                "successful_forward_call_count": sum((
+                    int(discovery_atlas["forward_call_count"]),
+                    int(validation_atlas["forward_call_count"]),
+                    int(trajectory["forward_call_count"]),
+                    int(discovery_site_values["forward_call_count"]),
+                    int(validation_site_values["forward_call_count"]),
+                    int(discovery_coarse["forward_call_count"]),
+                    int(operator_groups["forward_call_count"]),
+                    int(discovery_path["forward_call_count"]),
+                    int(validation_single["forward_call_count"]),
+                    int(validation_path["forward_call_count"]),
+                )),
+                "stage_forward_call_count": {
+                    "production_atlas_discovery": int(
+                        discovery_atlas["forward_call_count"]),
+                    "production_atlas_validation": int(
+                        validation_atlas["forward_call_count"]),
+                    "full_active_capture_and_replay": int(
+                        trajectory["forward_call_count"]),
+                    "candidate_value_capture_discovery": int(
+                        discovery_site_values["forward_call_count"]),
+                    "candidate_value_capture_validation": int(
+                        validation_site_values["forward_call_count"]),
+                    "coarse_patch_discovery": int(
+                        discovery_coarse["forward_call_count"]),
+                    "operator_group_patch_discovery": int(
+                        operator_groups["forward_call_count"]),
+                    "cumulative_path_discovery": int(
+                        discovery_path["forward_call_count"]),
+                    "frozen_single_site_validation": int(
+                        validation_single["forward_call_count"]),
+                    "frozen_path_validation": int(
+                        validation_path["forward_call_count"]),
+                },
+                "production_scoring_rows_per_example": 4,
+                "candidate_state_rows_per_example": 2,
+                "deep_trace_candidate_rows_per_example": 4,
+                "coarse_patch_variants_per_site_direction": 4,
+                "answer_candidates_fused_per_variant": 2,
+                "candidate_intervention_batch_size_initial": (
+                    self.config.trajectory_intervention_batch_size),
+                "candidate_intervention_batch_size_effective_discovery": (
+                    discovery_coarse[
+                        "effective_intervention_batch_size"]),
+                "candidate_intervention_batch_size_effective_validation": (
+                    validation_single[
+                        "effective_intervention_batch_size"]),
+                "full_active_capture_retry_count": len(
+                    trajectory["retries"]),
+                "coarse_resource_retry_count": int(
+                    discovery_coarse["resource_retry_count"])
+                    + int(validation_single["resource_retry_count"]),
+            },
+            "memory_protection": {
+                "parameters_replicated_per_variant": False,
+                "full_pool_activation_tensor_materialized": False,
+                "static_operator_key_tables_materialized_once": True,
+                "static_operator_vectors_repeated_per_occurrence": False,
+                "individual_operator_python_forward_loop": False,
+                "candidate_specific_recompilation": False,
+                "candidate_answer_variants_fused": True,
+                "fixed_intervention_slots": (
+                    self.config.trajectory_max_patch_sites_per_variant),
+                "intervention_variants": (
+                    self.config.trajectory_intervention_batch_size),
+                "candidate_interventions_fused_per_forward": (
+                    self.config.trajectory_intervention_batch_size),
+                "raw_trace_streaming": (
+                    "one_example_side_sparse_shard_then_release"),
+                "semantic_position_state_gather_only": True,
+                "compact_replay_output_only": True,
+                "fixed_deep_trace_shapes_reused": True,
+                "active_operator_omission_on_resource_pressure": False,
+            },
+            "artifacts": {
+                **artifacts,
+                "deep_trace": {
+                    "shard_count": deep_trace_artifacts["shard_count"],
+                    "shards": deep_trace_artifacts.get("shards", []),
+                },
+            },
+            "item_json_contract": {
+                "target_bytes": 2 * 1024 * 1024,
+                "raw_state_arrays_embedded": False,
+                "raw_operator_arrays_embedded": False,
+                "raw_effect_vectors_embedded": False,
+                "overflow_policy": "warning_and_write_continues",
+            },
+            "split_isolation": {
+                "candidate_selection_phase": "discovery",
+                "validation_used_for_selection": False,
+                "test_used_for_selection": False,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+            },
+            "test_evaluated": False,
+            "test_evaluation_count": 0,
+            "test_data_accessor_called": False,
+            "test_used": False,
+            "artifact_warnings": artifact_warnings,
             "human_summary": human_summary,
         }
 

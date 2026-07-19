@@ -456,15 +456,18 @@ def _validate_v4171_sharded_fns(
         'v_single': ('v', v_power),
         'attn_v_single_minimal': ('v', v_power),
         'attn_v_single_suppression_minimal': ('v', v_power),
+        'attn_v_single_trajectory_minimal': ('v', v_power),
         'rst_single': ('rst', rst_power),
         'rst_single_minimal': ('rst', rst_power),
         'rst_single_suppression_minimal': ('rst', rst_power),
+        'rst_single_trajectory_minimal': ('rst', rst_power),
         'paired': ('qk', qk_power),
         'attn_qk_paired': ('qk', qk_power),
         'qk_paired': ('qk', qk_power),
         'attn_qk_single_minimal': ('qk', qk_power),
         'attn_qk_paired_minimal': ('qk', qk_power),
         'attn_qk_paired_suppression_minimal': ('qk', qk_power),
+        'attn_qk_paired_trajectory_minimal': ('qk', qk_power),
     }
     for name, (pool, route_power) in wrapper_pools.items():
         fn = sharded_fns.get(name)
@@ -885,6 +888,194 @@ def _analysis_group_nonempty(selected_operator_ids):
     raise ValueError(
         "selected operator ids must have shape [B] or [B, M], got "
         f"{selected_operator_ids.shape}")
+
+
+TRAJECTORY_PATCH_STAGES = {
+    "q": 0,
+    "k": 1,
+    "v": 2,
+    "rst": 3,
+    "residual_input": 4,
+    "post_attention": 5,
+    "post_rst": 6,
+}
+
+TRAJECTORY_TRACE_FIELDS = (
+    "production_output",
+    "selected_replay_output",
+    "production_precast_output",
+    "selected_replay_precast_output",
+    "query",
+    "tau",
+    "admission_mass",
+    "denominator",
+    "numerator_active_count",
+    "denominator_active_count",
+    "operator_id",
+    "operator_valid",
+    "read_scalar_bf16_bits",
+    "prewrite_amplitude_bf16_bits",
+    "execution_weight",
+    "admission",
+    "margin",
+    "rho",
+    "position_valid",
+)
+
+
+def _analysis_apply_trajectory_patch(
+        value, *, layer_index, stage_code, patch_layers, patch_positions,
+        patch_stages, patch_enabled, patch_values):
+    """Apply one fixed-width batch-native trajectory patch schedule.
+
+    Every schedule has shape ``[B, P]`` and every replacement has shape
+    ``[B, P, D]``.  Host validation rejects duplicate enabled sites, so the
+    sum below selects either exactly one replacement or the untouched value.
+    """
+    B, S, D = value.shape
+    slot_match = (
+        jnp.asarray(patch_enabled, dtype=jnp.bool_)
+        & (jnp.asarray(patch_layers, dtype=jnp.int32)
+           == jnp.asarray(layer_index, dtype=jnp.int32))
+        & (jnp.asarray(patch_stages, dtype=jnp.int32)
+           == jnp.int32(stage_code)))
+    position_match = (
+        jnp.arange(S, dtype=jnp.int32)[None, None, :]
+        == jnp.asarray(patch_positions, dtype=jnp.int32)[:, :, None])
+    site_mask = slot_match[:, :, None] & position_match
+    replacement = jnp.einsum(
+        "bps,bpd->bsd", site_mask.astype(jnp.float32),
+        jnp.asarray(patch_values, dtype=jnp.float32))
+    apply_mask = jnp.any(site_mask, axis=1)[:, :, None]
+    return jnp.where(apply_mask, replacement, value)
+
+
+def _analysis_replace_trajectory_positions(
+        value, replacements, positions, position_valid):
+    """Replace unique fixed-width positions without a Python-side loop."""
+    _, S, _ = value.shape
+    position_mask = (
+        jnp.arange(S, dtype=jnp.int32)[None, None, :]
+        == jnp.asarray(positions, dtype=jnp.int32)[:, :, None])
+    position_mask &= jnp.asarray(position_valid, dtype=jnp.bool_)[:, :, None]
+    replacement = jnp.einsum(
+        "bts,btd->bsd", position_mask.astype(jnp.float32),
+        jnp.asarray(replacements, dtype=jnp.float32))
+    return jnp.where(
+        jnp.any(position_mask, axis=1)[:, :, None], replacement, value)
+
+
+def _validate_concrete_analysis_trajectory(
+        *, positions, position_valid, selected_ids_by_route,
+        selected_valid_by_route, patch_layers, patch_positions, patch_stages,
+        patch_enabled, patch_values, batch_size, sequence_length, n_layers,
+        route_pool_sizes):
+    """Fail closed on host-visible trajectory schedules before tracing."""
+    values = (
+        positions, position_valid, patch_layers, patch_positions,
+        patch_stages, patch_enabled, patch_values,
+        *selected_ids_by_route.values(), *selected_valid_by_route.values())
+    if any(isinstance(value, jax.core.Tracer) for value in values):
+        return
+    positions_host = np.asarray(jax.device_get(positions), dtype=np.int64)
+    position_valid_host = np.asarray(
+        jax.device_get(position_valid), dtype=np.bool_)
+    if positions_host.ndim != 2 or positions_host.shape[0] != batch_size:
+        raise ValueError("trajectory positions must have shape [B, T]")
+    if position_valid_host.shape != positions_host.shape:
+        raise ValueError("trajectory position validity shape mismatch")
+    for row_positions, row_valid in zip(
+            positions_host, position_valid_host):
+        active = row_positions[row_valid]
+        if np.any((active < 0) | (active >= sequence_length)):
+            raise ValueError("trajectory position is outside the sequence")
+        if len(set(int(value) for value in active.tolist())) != active.size:
+            raise ValueError("trajectory positions must be unique per example")
+    expected_prefix = (n_layers, batch_size, positions_host.shape[1])
+    for route, ids in selected_ids_by_route.items():
+        ids_host = np.asarray(jax.device_get(ids), dtype=np.int64)
+        valid_host = np.asarray(
+            jax.device_get(selected_valid_by_route[route]), dtype=np.bool_)
+        if ids_host.ndim != 4 or ids_host.shape[:3] != expected_prefix:
+            raise ValueError(
+                f"trajectory {route} ids must have shape [L,B,T,K]")
+        if valid_host.shape != ids_host.shape:
+            raise ValueError(f"trajectory {route} validity shape mismatch")
+        pool_size = int(route_pool_sizes[route])
+        if np.any((ids_host[valid_host] < 0)
+                  | (ids_host[valid_host] >= pool_size)):
+            raise ValueError(f"trajectory {route} operator id is out of range")
+    patch_layers_host = np.asarray(
+        jax.device_get(patch_layers), dtype=np.int64)
+    patch_positions_host = np.asarray(
+        jax.device_get(patch_positions), dtype=np.int64)
+    patch_stages_host = np.asarray(
+        jax.device_get(patch_stages), dtype=np.int64)
+    patch_enabled_host = np.asarray(
+        jax.device_get(patch_enabled), dtype=np.bool_)
+    patch_values_host = np.asarray(jax.device_get(patch_values))
+    if patch_layers_host.ndim != 2 or patch_layers_host.shape[0] != batch_size:
+        raise ValueError("trajectory patch schedule must have shape [B, P]")
+    patch_shape = patch_layers_host.shape
+    if any(value.shape != patch_shape for value in (
+            patch_positions_host, patch_stages_host, patch_enabled_host)):
+        raise ValueError("trajectory patch schedule shapes disagree")
+    if patch_values_host.shape[:2] != patch_shape:
+        raise ValueError("trajectory patch values shape mismatch")
+    known_stages = set(TRAJECTORY_PATCH_STAGES.values())
+    for row in range(batch_size):
+        sites = []
+        for slot in np.flatnonzero(patch_enabled_host[row]):
+            layer = int(patch_layers_host[row, slot])
+            position = int(patch_positions_host[row, slot])
+            stage = int(patch_stages_host[row, slot])
+            if not 0 <= layer < n_layers:
+                raise ValueError("trajectory patch layer is out of range")
+            if not 0 <= position < sequence_length:
+                raise ValueError("trajectory patch position is out of range")
+            if stage not in known_stages:
+                raise ValueError("trajectory patch stage is unknown")
+            sites.append((layer, position, stage))
+        if len(set(sites)) != len(sites):
+            raise ValueError("trajectory patch schedule contains duplicates")
+
+
+def _validate_concrete_trajectory_patches(
+        *, patch_layers, patch_positions, patch_stages, patch_enabled,
+        patch_values, batch_size, sequence_length, n_layers):
+    values = (
+        patch_layers, patch_positions, patch_stages, patch_enabled,
+        patch_values)
+    if any(isinstance(value, jax.core.Tracer) for value in values):
+        return
+    layers = np.asarray(jax.device_get(patch_layers), dtype=np.int64)
+    positions = np.asarray(jax.device_get(patch_positions), dtype=np.int64)
+    stages = np.asarray(jax.device_get(patch_stages), dtype=np.int64)
+    enabled = np.asarray(jax.device_get(patch_enabled), dtype=np.bool_)
+    patch_values_host = np.asarray(jax.device_get(patch_values))
+    if layers.ndim != 2 or layers.shape[0] != batch_size:
+        raise ValueError("trajectory patch schedule must have shape [B, P]")
+    if any(value.shape != layers.shape for value in (
+            positions, stages, enabled)):
+        raise ValueError("trajectory patch schedule shapes disagree")
+    if patch_values_host.shape[:2] != layers.shape:
+        raise ValueError("trajectory patch values shape mismatch")
+    known_stages = set(TRAJECTORY_PATCH_STAGES.values())
+    for row in range(batch_size):
+        sites = []
+        for slot in np.flatnonzero(enabled[row]):
+            layer = int(layers[row, slot])
+            position = int(positions[row, slot])
+            stage = int(stages[row, slot])
+            if not 0 <= layer < n_layers:
+                raise ValueError("trajectory patch layer is out of range")
+            if not 0 <= position < sequence_length:
+                raise ValueError("trajectory patch position is out of range")
+            if stage not in known_stages:
+                raise ValueError("trajectory patch stage is unknown")
+            sites.append((layer, position, stage))
+        if len(set(sites)) != len(sites):
+            raise ValueError("trajectory patch schedule contains duplicates")
 
 
 def _validate_concrete_analysis_interchange(
@@ -3090,12 +3281,14 @@ _V4171_MINIMAL_KERNEL_BUNDLES = {}
 def _v4171_minimal_bundle_key(
         route_kind, mesh, max_chunk_size, dead_exposure_target,
         soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta):
+        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta,
+        trajectory_capture_width=0):
     return (
         str(route_kind), id(mesh), int(max_chunk_size),
         float(dead_exposure_target), float(soft_gate_effective_active_eps),
         float(admission_den_power), float(admission_den_grad_scale),
         str(srw_composition_mode), float(heat_kernel_beta),
+        int(trajectory_capture_width),
     )
 
 
@@ -3114,8 +3307,9 @@ def _make_sharded_srw_minimal_impl(
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Build both single-route wrappers around one canonical shard-map."""
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
+        trajectory_capture_width=0):
+    """Build production, suppression, and exact-trajectory wrappers."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4171_composition_settings(
             srw_composition_mode, admission_den_power,
@@ -3131,6 +3325,9 @@ def _make_sharded_srw_minimal_impl(
     del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
+    _trajectory_capture_width = int(trajectory_capture_width)
+    if _trajectory_capture_width < 0:
+        raise ValueError("trajectory_capture_width must be >= 0")
 
     def _sharded_srw_minimal_core(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
@@ -3138,7 +3335,9 @@ def _make_sharded_srw_minimal_impl(
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local,
-            position_mask, retention_mode):
+            position_mask, retention_mode, *, capture_trajectory=False,
+            trajectory_positions=None, trajectory_position_valid=None,
+            trajectory_selected_ids=None, trajectory_selected_valid=None):
         del soft_gate_t_final, soft_gate_boundary_power_final
         N_local = operator_keys_local.shape[0]
         selected_global_operator_id = jnp.asarray(
@@ -3154,6 +3353,18 @@ def _make_sharded_srw_minimal_impl(
         if target_positions.ndim == 0:
             target_positions = jnp.broadcast_to(
                 target_positions, (x.shape[0],))
+        if capture_trajectory:
+            trajectory_positions = jnp.asarray(
+                trajectory_positions, dtype=jnp.int32)
+            trajectory_position_valid = jnp.asarray(
+                trajectory_position_valid, dtype=jnp.bool_)
+            trajectory_selected_ids = jnp.asarray(
+                trajectory_selected_ids, dtype=jnp.int32)
+            trajectory_selected_valid = jnp.asarray(
+                trajectory_selected_valid, dtype=jnp.bool_)
+            if _trajectory_capture_width <= 0:
+                raise ValueError(
+                    "trajectory wrapper requires a positive capture width")
         retain_mask_local = jnp.asarray(retain_mask_local, dtype=jnp.bool_)
         position_mask = jnp.asarray(position_mask, dtype=jnp.bool_)
         retention_mode = jnp.asarray(retention_mode, dtype=jnp.int32)
@@ -3218,20 +3429,28 @@ def _make_sharded_srw_minimal_impl(
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32)
                 .sum(axis=-1, keepdims=True))
-            return admission, angular_amplitude, execution_weight, active_count
+            return (margin, admission, angular_amplitude, execution_weight,
+                    active_count)
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (raw_out, total_gate_mass, total_gate_sq,
              total_gate_max, total_active_count,
-             total_angular_amplitude, selected_raw_out) = carry
+             total_angular_amplitude, selected_raw_out) = carry[:7]
+            if capture_trajectory:
+                (trace_score, trace_ids, trace_read_bits,
+                 trace_amplitude_bits, trace_execution_weight,
+                 trace_admission, trace_margin, trace_rho,
+                 trace_numerator_count, trace_denominator_count,
+                 trace_selected_raw) = carry[7:]
             s = i * cs
             operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
             valid_bsn = valid_chunk[None, None, :]
             rho_raw = operator_scores_from_keys(operator_keys)
             rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-            (admission, angular_amplitude, execution_weight,
-             chunk_active_count) = angular_compose_parts(rho_compute, valid_bsn)
+            (margin, admission, angular_amplitude, execution_weight,
+             chunk_active_count) = angular_compose_parts(
+                 rho_compute, valid_bsn)
             global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
             token_match = (
                 jnp.arange(S, dtype=jnp.int32)[None, :, None]
@@ -3277,27 +3496,116 @@ def _make_sharded_srw_minimal_impl(
             chunk_gate_sq = jnp.square(admission_for_den).sum(
                 axis=-1, keepdims=True)
             chunk_gate_max = admission_for_den.max(axis=-1, keepdims=True)
-            return (raw_out + c_out,
-                    total_gate_mass + chunk_gate_mass,
-                    total_gate_sq + chunk_gate_sq,
-                    jnp.maximum(total_gate_max, chunk_gate_max),
-                    total_active_count + chunk_active_count,
-                    total_angular_amplitude + angular_amplitude.sum(
-                        axis=-1, keepdims=True),
-                    selected_raw_out + selected_c_out), None
+            next_carry = (
+                raw_out + c_out,
+                total_gate_mass + chunk_gate_mass,
+                total_gate_sq + chunk_gate_sq,
+                jnp.maximum(total_gate_max, chunk_gate_max),
+                total_active_count + chunk_active_count,
+                total_angular_amplitude + angular_amplitude.sum(
+                    axis=-1, keepdims=True),
+                selected_raw_out + selected_c_out)
+            if capture_trajectory:
+                trace_batch = jnp.arange(B, dtype=jnp.int32)[:, None]
+                trace_position = jnp.clip(
+                    trajectory_positions, 0, S - 1)
 
+                def gather_target(value):
+                    return value[trace_batch, trace_position, :]
+
+                rho_target = gather_target(rho_compute)
+                margin_target = gather_target(margin)
+                admission_target = gather_target(admission)
+                execution_target = gather_target(execution_weight)
+                xr_target = gather_target(xr)
+                amplitude_target = (
+                    execution_target * xr_target.astype(jnp.float32))
+                target_valid = trajectory_position_valid[:, :, None]
+                valid_target = valid_chunk[None, None, :] & target_valid
+                numerator_active = (
+                    valid_target
+                    & (execution_target != jnp.float32(0.0)))
+                denominator_active = (
+                    valid_target & (admission_target != jnp.float32(0.0)))
+                chunk_score = jnp.where(
+                    numerator_active, jnp.abs(amplitude_target),
+                    -jnp.inf)
+                chunk_ids = jnp.broadcast_to(
+                    global_ids[None, None, :], chunk_score.shape)
+                candidate_score = jnp.concatenate(
+                    (trace_score, chunk_score), axis=-1)
+                candidate_fields = tuple(jnp.concatenate(
+                    (previous, current), axis=-1) for previous, current in (
+                        (trace_ids, chunk_ids),
+                        (trace_read_bits, jax.lax.bitcast_convert_type(
+                            xr_target.astype(jnp.bfloat16), jnp.uint16)),
+                        (trace_amplitude_bits, jax.lax.bitcast_convert_type(
+                            amplitude_target.astype(jnp.bfloat16),
+                            jnp.uint16)),
+                        (trace_execution_weight, execution_target),
+                        (trace_admission, admission_target),
+                        (trace_margin, margin_target),
+                        (trace_rho, rho_target),
+                    ))
+                trace_score, top_index = jax.lax.top_k(
+                    candidate_score, _trajectory_capture_width)
+                top_fields = tuple(jnp.take_along_axis(
+                    field, top_index, axis=-1)
+                    for field in candidate_fields)
+                selected_ids = jnp.where(
+                    trajectory_selected_valid, trajectory_selected_ids,
+                    jnp.int32(N_local * jax.device_count() + 1))
+                selected_ids = jnp.sort(selected_ids, axis=-1)
+                selected_match = _analysis_sorted_operator_membership(
+                    global_ids, selected_ids)
+                selected_execution = jnp.where(
+                    selected_match & valid_target, execution_target,
+                    jnp.float32(0.0))
+                selected_amplitude = (
+                    selected_execution * xr_target.astype(jnp.float32))
+                selected_chunk_raw = (
+                    selected_amplitude.astype(jnp.bfloat16) @ wc
+                ).astype(jnp.float32)
+                next_carry += (
+                    trace_score, *top_fields,
+                    trace_numerator_count + numerator_active.astype(
+                        jnp.int32).sum(axis=-1),
+                    trace_denominator_count + denominator_active.astype(
+                        jnp.int32).sum(axis=-1),
+                    trace_selected_raw + selected_chunk_raw,
+                )
+            return next_carry, None
+
+        initial_carry = (
+            jnp.zeros((B, S, D), dtype=jnp.float32),
+            jnp.zeros((B, S, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, D), dtype=jnp.float32))
+        if capture_trajectory:
+            trace_shape = (
+                B, trajectory_positions.shape[1],
+                _trajectory_capture_width)
+            initial_carry += (
+                jnp.full(trace_shape, -jnp.inf, dtype=jnp.float32),
+                jnp.full(trace_shape, -1, dtype=jnp.int32),
+                jnp.zeros(trace_shape, dtype=jnp.uint16),
+                jnp.zeros(trace_shape, dtype=jnp.uint16),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape[:2], dtype=jnp.int32),
+                jnp.zeros(trace_shape[:2], dtype=jnp.int32),
+                jnp.zeros(trace_shape[:2] + (D,), dtype=jnp.float32),
+            )
+        scan_carry, _ = jax.lax.scan(
+            gate_srw_step, initial_carry, jnp.arange(nc))
         (raw_out, total_gate_mass, total_gate_sq,
          total_gate_max, total_active_count,
-         total_angular_amplitude, selected_raw_out), _ = jax.lax.scan(
-            gate_srw_step,
-            (jnp.zeros((B, S, D), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, D), dtype=jnp.float32)),
-            jnp.arange(nc))
+         total_angular_amplitude, selected_raw_out) = scan_carry[:7]
 
         global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
         global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
@@ -3352,7 +3660,7 @@ def _make_sharded_srw_minimal_impl(
             raw_out_global, axis=-1).mean()
         normalized_srw_out_norm = jnp.linalg.norm(
             jax.lax.stop_gradient(out).astype(jnp.float32), axis=-1).mean()
-        return (
+        base_result = (
             out.astype(jnp.float32),
             jax.lax.stop_gradient(active_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(active_n_mean.astype(jnp.float32)),
@@ -3370,6 +3678,83 @@ def _make_sharded_srw_minimal_impl(
             jax.lax.stop_gradient(normalized_srw_out_norm.astype(jnp.float32)),
             jax.lax.stop_gradient(selected_target.astype(jnp.float32)),
         )
+        if not capture_trajectory:
+            return base_result
+
+        (trace_score, trace_ids, trace_read_bits,
+         trace_amplitude_bits, trace_execution_weight,
+         trace_admission, trace_margin, trace_rho,
+         trace_numerator_count, trace_denominator_count,
+         trace_selected_raw) = scan_carry[7:]
+
+        def gather_model_axis(value):
+            return jax.lax.all_gather(
+                value, 'model', axis=-1, tiled=True)
+
+        gathered_score = gather_model_axis(trace_score)
+        global_score, global_index = jax.lax.top_k(
+            gathered_score, _trajectory_capture_width)
+        gathered_fields = tuple(gather_model_axis(value) for value in (
+            trace_ids, trace_read_bits, trace_amplitude_bits,
+            trace_execution_weight, trace_admission, trace_margin,
+            trace_rho))
+        (global_ids, global_read_bits, global_amplitude_bits,
+         global_execution_weight, global_admission, global_margin,
+         global_rho) = tuple(jnp.take_along_axis(
+             value, global_index, axis=-1) for value in gathered_fields)
+        global_valid = (
+            jnp.isfinite(global_score)
+            & trajectory_position_valid[:, :, None])
+        global_ids = jnp.where(global_valid, global_ids, jnp.int32(-1))
+        global_numerator_count = jax.lax.psum(
+            trace_numerator_count, 'model')
+        global_denominator_count = jax.lax.psum(
+            trace_denominator_count, 'model')
+        trace_batch = jnp.arange(B, dtype=jnp.int32)[:, None]
+        trace_position = jnp.clip(trajectory_positions, 0, S - 1)
+        denominator_target = gate_den[
+            trace_batch, trace_position, :]
+        admission_mass_target = global_gate_mass[
+            trace_batch, trace_position, :]
+        production_target = out[
+            trace_batch, trace_position, :].astype(jnp.float32)
+        local_production_precast = raw_out[
+            trace_batch, trace_position, :] / denominator_target
+        production_precast_target = jax.lax.psum(
+            local_production_precast, 'model')
+        local_replay_precast = trace_selected_raw / denominator_target
+        replay_precast_target = jax.lax.psum(
+            local_replay_precast, 'model')
+        replay_target = jax.lax.psum(
+            local_replay_precast.astype(jnp.bfloat16), 'model'
+        ).astype(jnp.float32)
+        query_target = operator_query[
+            trace_batch, trace_position, :].astype(jnp.float32)
+        tau_target = tau[
+            trace_batch, trace_position, :].astype(jnp.float32)
+        valid_vector = trajectory_position_valid[:, :, None]
+        trace_result = tuple(jax.lax.stop_gradient(value) for value in (
+            jnp.where(valid_vector, production_target, 0.0),
+            jnp.where(valid_vector, replay_target, 0.0),
+            jnp.where(valid_vector, production_precast_target, 0.0),
+            jnp.where(valid_vector, replay_precast_target, 0.0),
+            jnp.where(valid_vector, query_target, 0.0),
+            jnp.where(valid_vector, tau_target, 0.0),
+            jnp.where(valid_vector, admission_mass_target, 0.0),
+            jnp.where(valid_vector, denominator_target, 0.0),
+            jnp.where(trajectory_position_valid, global_numerator_count, 0),
+            jnp.where(trajectory_position_valid, global_denominator_count, 0),
+            global_ids,
+            global_valid,
+            jnp.where(global_valid, global_read_bits, jnp.uint16(0)),
+            jnp.where(global_valid, global_amplitude_bits, jnp.uint16(0)),
+            jnp.where(global_valid, global_execution_weight, 0.0),
+            jnp.where(global_valid, global_admission, 0.0),
+            jnp.where(global_valid, global_margin, 0.0),
+            jnp.where(global_valid, global_rho, 0.0),
+            trajectory_position_valid,
+        ))
+        return base_result, trace_result
 
     common_in_specs = (
         P('data', None, None), P('data', None, None), P('model', None),
@@ -3397,6 +3782,51 @@ def _make_sharded_srw_minimal_impl(
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local,
             position_mask, retention_mode)
+
+    trajectory_out_specs = (
+        P('data', None, None), P('data', None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None), P('data', None),
+        P('data', None, None), P('data', None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None),
+    )
+
+    @partial(
+        shard_map, mesh=mesh,
+        in_specs=common_in_specs + (
+            P('data', None), P('data', None),
+            P('data', None, None), P('data', None, None)),
+        out_specs=(out_specs, trajectory_out_specs), check_rep=False)
+    def canonical_single_trajectory_kernel(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, trajectory_positions,
+            trajectory_position_valid, trajectory_selected_ids,
+            trajectory_selected_valid):
+        batch_size = x.shape[0]
+        return _sharded_srw_minimal_core(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps,
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.bool_(False),
+            jnp.ones((operator_keys_local.shape[0],), dtype=jnp.bool_),
+            jnp.ones(x.shape[:2], dtype=jnp.bool_), jnp.int32(0),
+            capture_trajectory=True,
+            trajectory_positions=trajectory_positions,
+            trajectory_position_valid=trajectory_position_valid,
+            trajectory_selected_ids=trajectory_selected_ids,
+            trajectory_selected_valid=trajectory_selected_valid)
 
     def fused_gate_srw_minimal(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
@@ -3436,20 +3866,45 @@ def _make_sharded_srw_minimal_impl(
             target_positions, apply_suppression, retain_mask_local,
             position_mask, retention_mode)
 
+    def fused_gate_srw_trajectory_minimal(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, trajectory_positions,
+            trajectory_position_valid, trajectory_selected_ids,
+            trajectory_selected_valid):
+        return canonical_single_trajectory_kernel(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, trajectory_positions,
+            trajectory_position_valid, trajectory_selected_ids,
+            trajectory_selected_valid)
+
     factory_token = object()
     for wrapper in (
             fused_gate_srw_minimal,
-            fused_gate_srw_suppression_minimal):
+            fused_gate_srw_suppression_minimal,
+            fused_gate_srw_trajectory_minimal):
         _mark_v4171_srw_factory_output(
             wrapper, admission_den_power, _srw_composition_mode,
             heat_kernel_beta)
         wrapper._v4171_canonical_shard_map_kernel = canonical_single_kernel
         wrapper._v4171_canonical_factory_token = factory_token
+    fused_gate_srw_trajectory_minimal._v4171_trajectory_shard_map_kernel = (
+        canonical_single_trajectory_kernel)
+    fused_gate_srw_trajectory_minimal._v4171_trajectory_capture_width = (
+        _trajectory_capture_width)
     fused_gate_srw_minimal._v4171_suppression_wrapper = (
         fused_gate_srw_suppression_minimal)
     fused_gate_srw_suppression_minimal._v4171_production_wrapper = (
         fused_gate_srw_minimal)
-    return fused_gate_srw_minimal, fused_gate_srw_suppression_minimal
+    fused_gate_srw_trajectory_minimal._v4171_production_wrapper = (
+        fused_gate_srw_minimal)
+    return (fused_gate_srw_minimal, fused_gate_srw_suppression_minimal,
+            fused_gate_srw_trajectory_minimal)
 
 
 def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
@@ -3484,14 +3939,34 @@ def make_sharded_srw_suppression_minimal(
         heat_kernel_beta)[1]
 
 
+def make_sharded_srw_trajectory_minimal(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
+        trajectory_capture_width=1024):
+    """Create the analysis-only exact active-operator trace kernel."""
+    if int(trajectory_capture_width) <= 0:
+        raise ValueError("trajectory_capture_width must be positive")
+    return _cached_v4171_minimal_bundle(
+        "single", _make_sharded_srw_minimal_impl,
+        mesh, max_chunk_size, dead_exposure_target,
+        soft_gate_effective_active_eps, admission_den_power,
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta, int(trajectory_capture_width))[2]
+
+
 def _make_sharded_srw_paired_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Build both paired-route wrappers around one canonical shard-map."""
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
+        trajectory_capture_width=0):
+    """Build production, suppression, and exact paired-trajectory wrappers."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4171_composition_settings(
             srw_composition_mode, admission_den_power,
@@ -3507,6 +3982,9 @@ def _make_sharded_srw_paired_minimal_impl(
     del dead_exposure_target
     _soft_gate_effective_active_eps = jnp.float32(
         soft_gate_effective_active_eps)
+    _trajectory_capture_width = int(trajectory_capture_width)
+    if _trajectory_capture_width < 0:
+        raise ValueError("trajectory_capture_width must be >= 0")
 
     def _sharded_srw_paired_minimal_core(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
@@ -3514,7 +3992,10 @@ def _make_sharded_srw_paired_minimal_impl(
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
-            retain_mask_local, position_mask, retention_mode):
+            retain_mask_local, position_mask, retention_mode, *,
+            capture_trajectory=False, trajectory_positions=None,
+            trajectory_position_valid=None, trajectory_selected_ids=None,
+            trajectory_selected_valid=None):
         del soft_gate_t_final, soft_gate_boundary_power_final
         N_local = operator_keys_local.shape[0]
         selected_global_operator_id = jnp.asarray(
@@ -3530,6 +4011,18 @@ def _make_sharded_srw_paired_minimal_impl(
         if target_positions.ndim == 0:
             target_positions = jnp.broadcast_to(
                 target_positions, (x.shape[0],))
+        if capture_trajectory:
+            trajectory_positions = jnp.asarray(
+                trajectory_positions, dtype=jnp.int32)
+            trajectory_position_valid = jnp.asarray(
+                trajectory_position_valid, dtype=jnp.bool_)
+            trajectory_selected_ids = jnp.asarray(
+                trajectory_selected_ids, dtype=jnp.int32)
+            trajectory_selected_valid = jnp.asarray(
+                trajectory_selected_valid, dtype=jnp.bool_)
+            if _trajectory_capture_width <= 0:
+                raise ValueError(
+                    "trajectory wrapper requires a positive capture width")
         retain_mask_local = jnp.asarray(retain_mask_local, dtype=jnp.bool_)
         position_mask = jnp.asarray(position_mask, dtype=jnp.bool_)
         retention_mode = jnp.asarray(retention_mode, dtype=jnp.int32)
@@ -3597,19 +4090,26 @@ def _make_sharded_srw_paired_minimal_impl(
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32)
                 .sum(axis=-1, keepdims=True))
-            return admission, angular_amplitude, execution_weight, active_count
+            return (margin, admission, angular_amplitude, execution_weight,
+                    active_count)
 
         @jax.checkpoint
         def gate_srw_step(carry, i):
             (raw_out, total_gate_mass, total_gate_sq,
              total_gate_max, total_active_count,
-             total_angular_amplitude, selected_raw_out) = carry
+             total_angular_amplitude, selected_raw_out) = carry[:7]
+            if capture_trajectory:
+                (trace_score, trace_ids, trace_read_bits,
+                 trace_amplitude_bits, trace_execution_weight,
+                 trace_admission, trace_margin, trace_rho,
+                 trace_numerator_count, trace_denominator_count,
+                 trace_selected_raw) = carry[7:]
             s = i * cs
             operator_keys, rc, wc, valid_chunk = operator_keys_rw_chunk(s)
             valid_bsrn = valid_chunk[None, None, None, :]
             rho_raw = operator_scores_from_keys(operator_keys)
             rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-            (admission, angular_amplitude, execution_weight,
+            (margin, admission, angular_amplitude, execution_weight,
              chunk_active_count) = angular_compose_parts(
                 rho_compute, valid_bsrn)
             global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
@@ -3676,27 +4176,123 @@ def _make_sharded_srw_paired_minimal_impl(
             chunk_gate_sq = jnp.square(admission_for_den).sum(
                 axis=-1, keepdims=True)
             chunk_gate_max = admission_for_den.max(axis=-1, keepdims=True)
-            return (raw_out + c_out,
-                    total_gate_mass + chunk_gate_mass,
-                    total_gate_sq + chunk_gate_sq,
-                    jnp.maximum(total_gate_max, chunk_gate_max),
-                    total_active_count + chunk_active_count,
-                    total_angular_amplitude + angular_amplitude.sum(
-                        axis=-1, keepdims=True),
-                    selected_raw_out + selected_c_out), None
+            next_carry = (
+                raw_out + c_out,
+                total_gate_mass + chunk_gate_mass,
+                total_gate_sq + chunk_gate_sq,
+                jnp.maximum(total_gate_max, chunk_gate_max),
+                total_active_count + chunk_active_count,
+                total_angular_amplitude + angular_amplitude.sum(
+                    axis=-1, keepdims=True),
+                selected_raw_out + selected_c_out)
+            if capture_trajectory:
+                trace_batch = jnp.arange(B, dtype=jnp.int32)[:, None]
+                trace_position = jnp.clip(
+                    trajectory_positions, 0, S - 1)
 
+                def gather_target(value):
+                    return value[trace_batch, trace_position, ...]
+
+                rho_target = gather_target(rho_compute)
+                margin_target = gather_target(margin)
+                admission_target = gather_target(admission)
+                execution_target = gather_target(execution_weight)
+                xr_target = gather_target(xr)[:, :, None, :]
+                amplitude_target = (
+                    execution_target * xr_target.astype(jnp.float32))
+                target_valid = trajectory_position_valid[:, :, None, None]
+                valid_target = (
+                    valid_chunk[None, None, None, :] & target_valid)
+                numerator_active = (
+                    valid_target
+                    & (execution_target != jnp.float32(0.0)))
+                denominator_active = (
+                    valid_target & (admission_target != jnp.float32(0.0)))
+                chunk_score = jnp.where(
+                    numerator_active, jnp.abs(amplitude_target), -jnp.inf)
+                chunk_ids = jnp.broadcast_to(
+                    global_ids[None, None, None, :], chunk_score.shape)
+                candidate_score = jnp.concatenate(
+                    (trace_score, chunk_score), axis=-1)
+                candidate_fields = tuple(jnp.concatenate(
+                    (previous, current), axis=-1) for previous, current in (
+                        (trace_ids, chunk_ids),
+                        (trace_read_bits, jnp.broadcast_to(
+                            jax.lax.bitcast_convert_type(
+                                xr_target.astype(jnp.bfloat16), jnp.uint16),
+                            chunk_score.shape)),
+                        (trace_amplitude_bits, jax.lax.bitcast_convert_type(
+                            amplitude_target.astype(jnp.bfloat16),
+                            jnp.uint16)),
+                        (trace_execution_weight, execution_target),
+                        (trace_admission, admission_target),
+                        (trace_margin, margin_target),
+                        (trace_rho, rho_target),
+                    ))
+                trace_score, top_index = jax.lax.top_k(
+                    candidate_score, _trajectory_capture_width)
+                top_fields = tuple(jnp.take_along_axis(
+                    field, top_index, axis=-1)
+                    for field in candidate_fields)
+                selected_ids = jnp.where(
+                    trajectory_selected_valid, trajectory_selected_ids,
+                    jnp.int32(N_local * jax.device_count() + 1))
+                selected_ids = jnp.sort(selected_ids, axis=-1)
+                selected_match = jnp.stack((
+                    _analysis_sorted_operator_membership(
+                        global_ids, selected_ids[:, :, 0, :]),
+                    _analysis_sorted_operator_membership(
+                        global_ids, selected_ids[:, :, 1, :]),
+                ), axis=2)
+                selected_execution = jnp.where(
+                    selected_match & valid_target, execution_target,
+                    jnp.float32(0.0))
+                selected_amplitude = (
+                    selected_execution * xr_target.astype(jnp.float32))
+                selected_chunk_raw = jnp.einsum(
+                    'btrn,nd->btrd',
+                    selected_amplitude.astype(jnp.bfloat16), wc
+                ).astype(jnp.float32)
+                next_carry += (
+                    trace_score, *top_fields,
+                    trace_numerator_count + numerator_active.astype(
+                        jnp.int32).sum(axis=-1),
+                    trace_denominator_count + denominator_active.astype(
+                        jnp.int32).sum(axis=-1),
+                    trace_selected_raw + selected_chunk_raw,
+                )
+            return next_carry, None
+
+        initial_carry = (
+            jnp.zeros((B, S, 2, D), dtype=jnp.float32),
+            jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
+            jnp.zeros((B, S, 2, D), dtype=jnp.float32))
+        if capture_trajectory:
+            trace_shape = (
+                B, trajectory_positions.shape[1], 2,
+                _trajectory_capture_width)
+            initial_carry += (
+                jnp.full(trace_shape, -jnp.inf, dtype=jnp.float32),
+                jnp.full(trace_shape, -1, dtype=jnp.int32),
+                jnp.zeros(trace_shape, dtype=jnp.uint16),
+                jnp.zeros(trace_shape, dtype=jnp.uint16),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape, dtype=jnp.float32),
+                jnp.zeros(trace_shape[:3], dtype=jnp.int32),
+                jnp.zeros(trace_shape[:3], dtype=jnp.int32),
+                jnp.zeros(trace_shape[:3] + (D,), dtype=jnp.float32),
+            )
+        scan_carry, _ = jax.lax.scan(
+            gate_srw_step, initial_carry, jnp.arange(nc))
         (raw_out, total_gate_mass, total_gate_sq,
          total_gate_max, total_active_count,
-         total_angular_amplitude, selected_raw_out), _ = jax.lax.scan(
-            gate_srw_step,
-            (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, 1), dtype=jnp.float32),
-             jnp.zeros((B, S, 2, D), dtype=jnp.float32)),
-            jnp.arange(nc))
+         total_angular_amplitude, selected_raw_out) = scan_carry[:7]
 
         global_gate_mass = jax.lax.psum(total_gate_mass, 'model')
         global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
@@ -3774,7 +4370,7 @@ def _make_sharded_srw_paired_minimal_impl(
         def route_min(value, route_index):
             return value[:, :, route_index, :].min()
 
-        return (
+        base_result = (
             out.astype(jnp.float32),
             jax.lax.stop_gradient(q_active_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(k_active_frac.astype(jnp.float32)),
@@ -3806,6 +4402,87 @@ def _make_sharded_srw_paired_minimal_impl(
             jax.lax.stop_gradient(normalized_norm_by_route[1]),
             jax.lax.stop_gradient(selected_target.astype(jnp.float32)),
         )
+        if not capture_trajectory:
+            return base_result
+
+        (trace_score, trace_ids, trace_read_bits,
+         trace_amplitude_bits, trace_execution_weight,
+         trace_admission, trace_margin, trace_rho,
+         trace_numerator_count, trace_denominator_count,
+         trace_selected_raw) = scan_carry[7:]
+
+        def gather_model_axis(value):
+            return jax.lax.all_gather(
+                value, 'model', axis=-1, tiled=True)
+
+        gathered_score = gather_model_axis(trace_score)
+        global_score, global_index = jax.lax.top_k(
+            gathered_score, _trajectory_capture_width)
+        gathered_fields = tuple(gather_model_axis(value) for value in (
+            trace_ids, trace_read_bits, trace_amplitude_bits,
+            trace_execution_weight, trace_admission, trace_margin,
+            trace_rho))
+        (global_ids, global_read_bits, global_amplitude_bits,
+         global_execution_weight, global_admission, global_margin,
+         global_rho) = tuple(jnp.take_along_axis(
+             value, global_index, axis=-1) for value in gathered_fields)
+        global_valid = (
+            jnp.isfinite(global_score)
+            & trajectory_position_valid[:, :, None, None])
+        global_ids = jnp.where(global_valid, global_ids, jnp.int32(-1))
+        global_numerator_count = jax.lax.psum(
+            trace_numerator_count, 'model')
+        global_denominator_count = jax.lax.psum(
+            trace_denominator_count, 'model')
+        trace_batch = jnp.arange(B, dtype=jnp.int32)[:, None]
+        trace_position = jnp.clip(trajectory_positions, 0, S - 1)
+        denominator_target = gate_den[
+            trace_batch, trace_position, :, :]
+        admission_mass_target = global_gate_mass[
+            trace_batch, trace_position, :, :]
+        production_target = out[
+            trace_batch, trace_position, :, :].astype(jnp.float32)
+        local_production_precast = raw_out[
+            trace_batch, trace_position, :, :] / denominator_target
+        production_precast_target = jax.lax.psum(
+            local_production_precast, 'model')
+        local_replay_precast = trace_selected_raw / denominator_target
+        replay_precast_target = jax.lax.psum(
+            local_replay_precast, 'model')
+        replay_target = jax.lax.psum(
+            local_replay_precast.astype(jnp.bfloat16), 'model'
+        ).astype(jnp.float32)
+        query_target = operator_query[
+            trace_batch, trace_position, :, :].astype(jnp.float32)
+        tau_target = tau[
+            trace_batch, trace_position, :, :].astype(jnp.float32)
+        valid_vector = trajectory_position_valid[:, :, None, None]
+        trace_result = tuple(jax.lax.stop_gradient(value) for value in (
+            jnp.where(valid_vector, production_target, 0.0),
+            jnp.where(valid_vector, replay_target, 0.0),
+            jnp.where(valid_vector, production_precast_target, 0.0),
+            jnp.where(valid_vector, replay_precast_target, 0.0),
+            jnp.where(valid_vector, query_target, 0.0),
+            jnp.where(valid_vector, tau_target, 0.0),
+            jnp.where(valid_vector, admission_mass_target, 0.0),
+            jnp.where(valid_vector, denominator_target, 0.0),
+            jnp.where(
+                trajectory_position_valid[:, :, None],
+                global_numerator_count, 0),
+            jnp.where(
+                trajectory_position_valid[:, :, None],
+                global_denominator_count, 0),
+            global_ids,
+            global_valid,
+            jnp.where(global_valid, global_read_bits, jnp.uint16(0)),
+            jnp.where(global_valid, global_amplitude_bits, jnp.uint16(0)),
+            jnp.where(global_valid, global_execution_weight, 0.0),
+            jnp.where(global_valid, global_admission, 0.0),
+            jnp.where(global_valid, global_margin, 0.0),
+            jnp.where(global_valid, global_rho, 0.0),
+            trajectory_position_valid,
+        ))
+        return base_result, trace_result
 
     common_in_specs = (
         P('data', None, None), P('data', None, None, None), P('model', None),
@@ -3835,6 +4512,53 @@ def _make_sharded_srw_paired_minimal_impl(
             execution_prune_eps, selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
             retain_mask_local, position_mask, retention_mode)
+
+    trajectory_out_specs = (
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None), P('data', None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None, None, None), P('data', None, None, None),
+        P('data', None),
+    )
+
+    @partial(
+        shard_map, mesh=mesh,
+        in_specs=common_in_specs + (
+            P('data', None), P('data', None),
+            P('data', None, None, None),
+            P('data', None, None, None)),
+        out_specs=(out_specs, trajectory_out_specs), check_rep=False)
+    def canonical_paired_trajectory_kernel(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, trajectory_positions,
+            trajectory_position_valid, trajectory_selected_ids,
+            trajectory_selected_valid):
+        batch_size = x.shape[0]
+        return _sharded_srw_paired_minimal_core(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps,
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.full((batch_size,), -1, dtype=jnp.int32),
+            jnp.bool_(False), jnp.int32(-1),
+            jnp.ones(
+                (2, operator_keys_local.shape[0]), dtype=jnp.bool_),
+            jnp.ones(x.shape[:2], dtype=jnp.bool_), jnp.int32(0),
+            capture_trajectory=True,
+            trajectory_positions=trajectory_positions,
+            trajectory_position_valid=trajectory_position_valid,
+            trajectory_selected_ids=trajectory_selected_ids,
+            trajectory_selected_valid=trajectory_selected_valid)
 
     def fused_gate_srw_paired_minimal(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
@@ -3873,21 +4597,46 @@ def _make_sharded_srw_paired_minimal_impl(
             target_positions, apply_suppression, route_selector,
             retain_mask_local, position_mask, retention_mode)
 
+    def fused_gate_srw_paired_trajectory_minimal(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, trajectory_positions,
+            trajectory_position_valid, trajectory_selected_ids,
+            trajectory_selected_valid):
+        return canonical_paired_trajectory_kernel(
+            x, operator_query, operator_keys_local, raw_tau,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, trajectory_positions,
+            trajectory_position_valid, trajectory_selected_ids,
+            trajectory_selected_valid)
+
     factory_token = object()
     for wrapper in (
             fused_gate_srw_paired_minimal,
-            fused_gate_srw_paired_suppression_minimal):
+            fused_gate_srw_paired_suppression_minimal,
+            fused_gate_srw_paired_trajectory_minimal):
         _mark_v4171_srw_factory_output(
             wrapper, admission_den_power, _srw_composition_mode,
             heat_kernel_beta)
         wrapper._v4171_canonical_shard_map_kernel = canonical_paired_kernel
         wrapper._v4171_canonical_factory_token = factory_token
+    fused_gate_srw_paired_trajectory_minimal._v4171_trajectory_shard_map_kernel = (
+        canonical_paired_trajectory_kernel)
+    fused_gate_srw_paired_trajectory_minimal._v4171_trajectory_capture_width = (
+        _trajectory_capture_width)
     fused_gate_srw_paired_minimal._v4171_suppression_wrapper = (
         fused_gate_srw_paired_suppression_minimal)
     fused_gate_srw_paired_suppression_minimal._v4171_production_wrapper = (
         fused_gate_srw_paired_minimal)
+    fused_gate_srw_paired_trajectory_minimal._v4171_production_wrapper = (
+        fused_gate_srw_paired_minimal)
     return (fused_gate_srw_paired_minimal,
-            fused_gate_srw_paired_suppression_minimal)
+            fused_gate_srw_paired_suppression_minimal,
+            fused_gate_srw_paired_trajectory_minimal)
 
 
 def make_sharded_srw_paired_minimal(
@@ -3920,6 +4669,25 @@ def make_sharded_srw_paired_suppression_minimal(
         soft_gate_effective_active_eps, admission_den_power,
         admission_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)[1]
+
+
+def make_sharded_srw_paired_trajectory_minimal(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
+        trajectory_capture_width=1024):
+    """Create the analysis-only exact Q/K active-operator trace kernel."""
+    if int(trajectory_capture_width) <= 0:
+        raise ValueError("trajectory_capture_width must be positive")
+    return _cached_v4171_minimal_bundle(
+        "paired", _make_sharded_srw_paired_minimal_impl,
+        mesh, max_chunk_size, dead_exposure_target,
+        soft_gate_effective_active_eps, admission_den_power,
+        admission_den_grad_scale, srw_composition_mode,
+        heat_kernel_beta, int(trajectory_capture_width))[2]
 
 
 # ================================================================
@@ -4083,6 +4851,22 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
                           analysis_program_source_q=None,
                           analysis_program_source_k=None,
                           analysis_program_source_v=None,
+                          analysis_trajectory_enabled=False,
+                          analysis_trajectory_positions=None,
+                          analysis_trajectory_position_valid=None,
+                          analysis_trajectory_ids_q=None,
+                          analysis_trajectory_ids_k=None,
+                          analysis_trajectory_ids_v=None,
+                          analysis_trajectory_valid_q=None,
+                          analysis_trajectory_valid_k=None,
+                          analysis_trajectory_valid_v=None,
+                          analysis_trajectory_replay_enabled=False,
+                          analysis_trajectory_patch_schedule_enabled=False,
+                          analysis_trajectory_patch_layers=None,
+                          analysis_trajectory_patch_positions=None,
+                          analysis_trajectory_patch_stages=None,
+                          analysis_trajectory_patch_enabled=None,
+                          analysis_trajectory_patch_values=None,
                           parity_debug=False):
     """Canonical shared v417x minimal attention path."""
     del n_qk, n_v
@@ -4133,6 +4917,8 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     qk_scale, v_scale, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
 
+    trajectory_paired = None
+    trajectory_single_v = None
     if isinstance(sharded_fns, dict):
         fused_paired = sharded_fns.get(
             'attn_qk_paired_minimal',
@@ -4140,6 +4926,10 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         fused_single_v = sharded_fns.get(
             'attn_v_single_minimal',
             sharded_fns.get('attn_v_single', sharded_fns['single']))
+        trajectory_paired = sharded_fns.get(
+            'attn_qk_paired_trajectory_minimal')
+        trajectory_single_v = sharded_fns.get(
+            'attn_v_single_trajectory_minimal')
     else:
         fused_single_v, fused_paired = sharded_fns
     canonical_paired = getattr(
@@ -4149,6 +4939,10 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
     if canonical_paired is None or canonical_single_v is None:
         raise ValueError(
             "minimal attention requires canonical v4171 shard-map kernels")
+    if analysis_trajectory_enabled and (
+            trajectory_paired is None or trajectory_single_v is None):
+        raise ValueError(
+            "trajectory analysis requires canonical QK and V trace kernels")
 
     qk_operator_queries = jnp.stack([q_operator_query, k_operator_query], axis=2)
     raw_tau_QK = jnp.stack(
@@ -4181,13 +4975,28 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         qk_selected_positions = analysis_program_target_positions
         qk_apply_suppression = jnp.bool_(False)
         qk_selected_route = jnp.int32(-1)
-    qk_result = canonical_paired(
-        x, qk_operator_queries, qk_operator_keys, raw_tau_QK, qk_read, qk_write,
-        soft_gate_T_qk, soft_gate_t_final, soft_gate_boundary_power,
-        soft_gate_boundary_power_final, execution_prune_eps,
-        qk_selected_ids, qk_selected_positions,
-        qk_apply_suppression, qk_selected_route, analysis_keep_qk,
-        analysis_position_mask, analysis_retention_mode)
+    qk_trajectory_trace = None
+    if analysis_trajectory_enabled:
+        qk_trajectory_ids = jnp.stack(
+            (analysis_trajectory_ids_q, analysis_trajectory_ids_k), axis=2)
+        qk_trajectory_valid = jnp.stack(
+            (analysis_trajectory_valid_q, analysis_trajectory_valid_k),
+            axis=2)
+        qk_result, qk_trajectory_trace = trajectory_paired(
+            x, qk_operator_queries, qk_operator_keys, raw_tau_QK,
+            qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, analysis_trajectory_positions,
+            analysis_trajectory_position_valid, qk_trajectory_ids,
+            qk_trajectory_valid)
+    else:
+        qk_result = canonical_paired(
+            x, qk_operator_queries, qk_operator_keys, raw_tau_QK,
+            qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, qk_selected_ids, qk_selected_positions,
+            qk_apply_suppression, qk_selected_route, analysis_keep_qk,
+            analysis_position_mask, analysis_retention_mode)
     (qk_state_transitions,
      q_active_frac, k_active_frac,
      q_active_n_mean, k_active_n_mean,
@@ -4204,6 +5013,22 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
      q_raw_srw_out_norm, k_raw_srw_out_norm,
      q_normalized_srw_out_norm, k_normalized_srw_out_norm,
      qk_selected_target) = qk_result
+    if analysis_trajectory_enabled:
+        replayed_q = _analysis_replace_trajectory_positions(
+            qk_state_transitions[:, :, 0, :],
+            qk_trajectory_trace[1][:, :, 0, :],
+            analysis_trajectory_positions,
+            analysis_trajectory_position_valid)
+        replayed_k = _analysis_replace_trajectory_positions(
+            qk_state_transitions[:, :, 1, :],
+            qk_trajectory_trace[1][:, :, 1, :],
+            analysis_trajectory_positions,
+            analysis_trajectory_position_valid)
+        replayed_qk = jnp.stack((replayed_q, replayed_k), axis=2)
+        qk_state_transitions = jnp.where(
+            jnp.asarray(
+                analysis_trajectory_replay_enabled, dtype=jnp.bool_),
+            replayed_qk, qk_state_transitions)
     apply_v = (
         jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
         & (jnp.asarray(analysis_layer_index, dtype=jnp.int32)
@@ -4216,18 +5041,40 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         v_selected_ids = analysis_program_ids_v
         v_selected_positions = analysis_program_target_positions
         v_apply_suppression = jnp.bool_(False)
-    v_result = canonical_single_v(
-        x, v_operator_query, v_operator_keys, raw_tau_all[:, :, 2:3], v_read, v_write,
-        soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-        soft_gate_boundary_power_final, execution_prune_eps,
-        v_selected_ids, v_selected_positions, v_apply_suppression,
-        analysis_keep_v, analysis_position_mask, analysis_retention_mode)
+    v_trajectory_trace = None
+    if analysis_trajectory_enabled:
+        v_result, v_trajectory_trace = trajectory_single_v(
+            x, v_operator_query, v_operator_keys,
+            raw_tau_all[:, :, 2:3], v_read, v_write,
+            soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps,
+            analysis_trajectory_positions,
+            analysis_trajectory_position_valid,
+            analysis_trajectory_ids_v, analysis_trajectory_valid_v)
+    else:
+        v_result = canonical_single_v(
+            x, v_operator_query, v_operator_keys,
+            raw_tau_all[:, :, 2:3], v_read, v_write,
+            soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
+            soft_gate_boundary_power_final, execution_prune_eps,
+            v_selected_ids, v_selected_positions, v_apply_suppression,
+            analysis_keep_v, analysis_position_mask,
+            analysis_retention_mode)
     (attention_v, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
      v_den_floor_frac, v_tau_mean,
      v_admission_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm, v_selected_target) = v_result
+    if analysis_trajectory_enabled:
+        replayed_v = _analysis_replace_trajectory_positions(
+            attention_v, v_trajectory_trace[1],
+            analysis_trajectory_positions,
+            analysis_trajectory_position_valid)
+        attention_v = jnp.where(
+            jnp.asarray(
+                analysis_trajectory_replay_enabled, dtype=jnp.bool_),
+            replayed_v, attention_v)
     program_selected_q = jnp.zeros((B, D), dtype=jnp.float32)
     program_selected_k = jnp.zeros((B, D), dtype=jnp.float32)
     program_selected_v = jnp.zeros((B, D), dtype=jnp.float32)
@@ -4405,6 +5252,24 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         attention_v = apply_program_route(
             attention_v, program_selected_v,
             analysis_program_source_v)
+    if analysis_trajectory_patch_schedule_enabled:
+        patch_kwargs = {
+            "layer_index": analysis_layer_index,
+            "patch_layers": analysis_trajectory_patch_layers,
+            "patch_positions": analysis_trajectory_patch_positions,
+            "patch_stages": analysis_trajectory_patch_stages,
+            "patch_enabled": analysis_trajectory_patch_enabled,
+            "patch_values": analysis_trajectory_patch_values,
+        }
+        attention_q = _analysis_apply_trajectory_patch(
+            attention_q, stage_code=TRAJECTORY_PATCH_STAGES["q"],
+            **patch_kwargs)
+        attention_k = _analysis_apply_trajectory_patch(
+            attention_k, stage_code=TRAJECTORY_PATCH_STAGES["k"],
+            **patch_kwargs)
+        attention_v = _analysis_apply_trajectory_patch(
+            attention_v, stage_code=TRAJECTORY_PATCH_STAGES["v"],
+            **patch_kwargs)
     q_debug = attention_q
     k_debug = attention_k
     v_debug = attention_v
@@ -4492,6 +5357,13 @@ def _attn_forward_minimal(x, pool_params, router_params, expand_O_kernel, rng,
         program_selected_k,
         program_selected_v,
     )
+    if analysis_trajectory_enabled:
+        result += ((
+            qk_trajectory_trace,
+            v_trajectory_trace,
+            jax.lax.stop_gradient(qk_scale.astype(jnp.float32)),
+            jax.lax.stop_gradient(v_scale.astype(jnp.float32)),
+        ),)
     if parity_debug:
         return result + ((
             q_debug, k_debug, v_debug, out, x,
@@ -4529,6 +5401,18 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
                          analysis_program_target_positions=None,
                          analysis_program_mode=0,
                          analysis_program_source_rst=None,
+                         analysis_trajectory_enabled=False,
+                         analysis_trajectory_positions=None,
+                         analysis_trajectory_position_valid=None,
+                         analysis_trajectory_ids_rst=None,
+                         analysis_trajectory_valid_rst=None,
+                         analysis_trajectory_replay_enabled=False,
+                         analysis_trajectory_patch_schedule_enabled=False,
+                         analysis_trajectory_patch_layers=None,
+                         analysis_trajectory_patch_positions=None,
+                         analysis_trajectory_patch_stages=None,
+                         analysis_trajectory_patch_enabled=None,
+                         analysis_trajectory_patch_values=None,
                          parity_debug=False):
     """Canonical shared v417x minimal RST path."""
     admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
@@ -4563,10 +5447,13 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         x @ router_params['raw_tau_rst']['kernel']
         + router_params['raw_tau_rst']['bias'])
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    trajectory_single = None
     if isinstance(sharded_fns, dict):
         fused_single = sharded_fns.get(
             'rst_single_minimal',
             sharded_fns.get('rst_single', sharded_fns['single']))
+        trajectory_single = sharded_fns.get(
+            'rst_single_trajectory_minimal')
     else:
         fused_single, _ = sharded_fns
     canonical_single = getattr(
@@ -4574,6 +5461,9 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
     if canonical_single is None:
         raise ValueError(
             "minimal RST requires a canonical v4171 shard-map kernel")
+    if analysis_trajectory_enabled and trajectory_single is None:
+        raise ValueError(
+            "trajectory analysis requires a canonical RST trace kernel")
 
     apply_rst = (
         jnp.asarray(analysis_intervention_enabled, dtype=jnp.bool_)
@@ -4587,18 +5477,39 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_selected_ids = analysis_program_ids_rst
         rst_selected_positions = analysis_program_target_positions
         rst_apply_suppression = jnp.bool_(False)
-    rst_result = canonical_single(
-        x, operator_query, rst_operator_keys, raw_tau, rst_read, rst_write,
-        soft_gate_T_rst, soft_gate_t_final, soft_gate_boundary_power,
-        soft_gate_boundary_power_final, execution_prune_eps,
-        rst_selected_ids, rst_selected_positions, rst_apply_suppression,
-        analysis_keep_rst, analysis_position_mask, analysis_retention_mode)
+    rst_trajectory_trace = None
+    if analysis_trajectory_enabled:
+        rst_result, rst_trajectory_trace = trajectory_single(
+            x, operator_query, rst_operator_keys, raw_tau,
+            rst_read, rst_write, soft_gate_T_rst, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, analysis_trajectory_positions,
+            analysis_trajectory_position_valid,
+            analysis_trajectory_ids_rst, analysis_trajectory_valid_rst)
+    else:
+        rst_result = canonical_single(
+            x, operator_query, rst_operator_keys, raw_tau,
+            rst_read, rst_write, soft_gate_T_rst, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, rst_selected_ids,
+            rst_selected_positions, rst_apply_suppression,
+            analysis_keep_rst, analysis_position_mask,
+            analysis_retention_mode)
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
      rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
      rst_admission_mass_max, rst_composition_den_min,
      rst_composition_den_max, rst_raw_srw_out_norm,
      rst_normalized_srw_out_norm, rst_selected_target) = rst_result
+    if analysis_trajectory_enabled:
+        replayed_rst = _analysis_replace_trajectory_positions(
+            out, rst_trajectory_trace[1],
+            analysis_trajectory_positions,
+            analysis_trajectory_position_valid)
+        out = jnp.where(
+            jnp.asarray(
+                analysis_trajectory_replay_enabled, dtype=jnp.bool_),
+            replayed_rst, out)
     program_selected_rst = jnp.zeros(
         (x.shape[0], x.shape[-1]), dtype=jnp.float32)
     if analysis_program_enabled:
@@ -4698,6 +5609,15 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         out = jnp.where(
             program_position_mask[:, :, None],
             patched_target[:, None, :], out)
+    if analysis_trajectory_patch_schedule_enabled:
+        out = _analysis_apply_trajectory_patch(
+            out, layer_index=analysis_layer_index,
+            stage_code=TRAJECTORY_PATCH_STAGES["rst"],
+            patch_layers=analysis_trajectory_patch_layers,
+            patch_positions=analysis_trajectory_patch_positions,
+            patch_stages=analysis_trajectory_patch_stages,
+            patch_enabled=analysis_trajectory_patch_enabled,
+            patch_values=analysis_trajectory_patch_values)
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     rst_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
@@ -4722,6 +5642,11 @@ def _rst_forward_minimal(x, pool_params, router_params, rng,
         rst_selected_target,
         program_selected_rst,
     )
+    if analysis_trajectory_enabled:
+        result += ((
+            rst_trajectory_trace,
+            jax.lax.stop_gradient(rst_scale.astype(jnp.float32)),
+        ),)
     if parity_debug:
         return result + ((out, x, operator_query, raw_tau),)
     return result
@@ -5474,7 +6399,23 @@ class DAWN_SRW_V4171(nn.Module):
                  analysis_program_source_k=None,
                  analysis_program_source_v=None,
                  analysis_program_source_rst=None,
-                 analysis_program_capture_contribution=False):
+                 analysis_program_capture_contribution=False,
+                 analysis_trajectory_positions=None,
+                 analysis_trajectory_position_valid=None,
+                 analysis_trajectory_ids_q=None,
+                 analysis_trajectory_ids_k=None,
+                 analysis_trajectory_ids_v=None,
+                 analysis_trajectory_ids_rst=None,
+                 analysis_trajectory_valid_q=None,
+                 analysis_trajectory_valid_k=None,
+                 analysis_trajectory_valid_v=None,
+                 analysis_trajectory_valid_rst=None,
+                 analysis_trajectory_replay_enabled=False,
+                 analysis_trajectory_patch_layers=None,
+                 analysis_trajectory_patch_positions=None,
+                 analysis_trajectory_patch_stages=None,
+                 analysis_trajectory_patch_enabled=None,
+                 analysis_trajectory_patch_values=None):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -5559,6 +6500,43 @@ class DAWN_SRW_V4171(nn.Module):
         )
         analysis_program_enabled = any(
             value is not None for value in analysis_program_values)
+        analysis_trajectory_capture_values = (
+            analysis_trajectory_positions,
+            analysis_trajectory_position_valid,
+            analysis_trajectory_ids_q, analysis_trajectory_ids_k,
+            analysis_trajectory_ids_v, analysis_trajectory_ids_rst,
+            analysis_trajectory_valid_q, analysis_trajectory_valid_k,
+            analysis_trajectory_valid_v, analysis_trajectory_valid_rst,
+        )
+        analysis_trajectory_patch_values_all = (
+            analysis_trajectory_patch_layers,
+            analysis_trajectory_patch_positions,
+            analysis_trajectory_patch_stages,
+            analysis_trajectory_patch_enabled,
+            analysis_trajectory_patch_values,
+        )
+        analysis_trajectory_enabled = any(
+            value is not None for value in analysis_trajectory_capture_values)
+        analysis_trajectory_patch_schedule_enabled = any(
+            value is not None
+            for value in analysis_trajectory_patch_values_all)
+        any_trajectory_analysis = (
+            analysis_trajectory_enabled
+            or analysis_trajectory_patch_schedule_enabled)
+        if any_trajectory_analysis and not minimal_train:
+            raise ValueError(
+                "trajectory analysis requires the canonical minimal scan")
+        if analysis_trajectory_enabled and any(
+                value is None
+                for value in analysis_trajectory_capture_values):
+            raise ValueError(
+                "trajectory capture requires positions and per-route ids "
+                "with validity")
+        if analysis_trajectory_patch_schedule_enabled and any(
+                value is None
+                for value in analysis_trajectory_patch_values_all):
+            raise ValueError(
+                "trajectory patching requires one complete fixed schedule")
         if analysis_program_enabled and not minimal_train:
             raise ValueError(
                 "analysis operator programs require the canonical minimal scan")
@@ -5578,6 +6556,162 @@ class DAWN_SRW_V4171(nn.Module):
             raise ValueError("non-production program mode lacks a schedule")
 
         if minimal_train:
+            if analysis_trajectory_enabled:
+                analysis_trajectory_positions = _analysis_int32_array(
+                    analysis_trajectory_positions,
+                    name="analysis_trajectory_positions")
+                analysis_trajectory_position_valid = jnp.asarray(
+                    analysis_trajectory_position_valid)
+                if analysis_trajectory_position_valid.dtype != jnp.bool_:
+                    raise TypeError(
+                        "analysis_trajectory_position_valid must be bool")
+                if (analysis_trajectory_positions.ndim != 2
+                        or analysis_trajectory_positions.shape[0] != B
+                        or analysis_trajectory_positions.shape[1] <= 0):
+                    raise ValueError(
+                        "analysis_trajectory_positions must have shape "
+                        "[B, positive_T]")
+                if analysis_trajectory_position_valid.shape != (
+                        analysis_trajectory_positions.shape):
+                    raise ValueError(
+                        "analysis trajectory position validity mismatch")
+                trajectory_prefix = (
+                    self.n_layers, B,
+                    analysis_trajectory_positions.shape[1])
+
+                def normalize_trajectory_route(ids, valid, route):
+                    ids = _analysis_int32_array(
+                        ids, name=f"analysis_trajectory_ids_{route}")
+                    valid = jnp.asarray(valid)
+                    if valid.dtype != jnp.bool_:
+                        raise TypeError(
+                            f"analysis_trajectory_valid_{route} must be bool")
+                    if (ids.ndim != 4 or ids.shape[:3] != trajectory_prefix
+                            or ids.shape[3] <= 0):
+                        raise ValueError(
+                            f"analysis_trajectory_ids_{route} must have shape "
+                            "[L,B,T,positive_K]")
+                    if valid.shape != ids.shape:
+                        raise ValueError(
+                            f"analysis trajectory {route} validity mismatch")
+                    return ids, valid
+
+                (analysis_trajectory_ids_q,
+                 analysis_trajectory_valid_q) = normalize_trajectory_route(
+                     analysis_trajectory_ids_q,
+                     analysis_trajectory_valid_q, "q")
+                (analysis_trajectory_ids_k,
+                 analysis_trajectory_valid_k) = normalize_trajectory_route(
+                     analysis_trajectory_ids_k,
+                     analysis_trajectory_valid_k, "k")
+                (analysis_trajectory_ids_v,
+                 analysis_trajectory_valid_v) = normalize_trajectory_route(
+                     analysis_trajectory_ids_v,
+                     analysis_trajectory_valid_v, "v")
+                (analysis_trajectory_ids_rst,
+                 analysis_trajectory_valid_rst) = normalize_trajectory_route(
+                     analysis_trajectory_ids_rst,
+                     analysis_trajectory_valid_rst, "rst")
+                analysis_trajectory_replay_enabled = jnp.asarray(
+                    analysis_trajectory_replay_enabled, dtype=jnp.bool_)
+                if analysis_trajectory_replay_enabled.shape != ():
+                    raise ValueError(
+                        "trajectory replay flag must be a scalar")
+            if analysis_trajectory_patch_schedule_enabled:
+                analysis_trajectory_patch_layers = _analysis_int32_array(
+                    analysis_trajectory_patch_layers,
+                    name="analysis_trajectory_patch_layers")
+                analysis_trajectory_patch_positions = _analysis_int32_array(
+                    analysis_trajectory_patch_positions,
+                    name="analysis_trajectory_patch_positions")
+                analysis_trajectory_patch_stages = _analysis_int32_array(
+                    analysis_trajectory_patch_stages,
+                    name="analysis_trajectory_patch_stages")
+                analysis_trajectory_patch_enabled = jnp.asarray(
+                    analysis_trajectory_patch_enabled)
+                if analysis_trajectory_patch_enabled.dtype != jnp.bool_:
+                    raise TypeError(
+                        "analysis_trajectory_patch_enabled must be bool")
+                patch_shape = analysis_trajectory_patch_layers.shape
+                if (len(patch_shape) != 2 or patch_shape[0] != B
+                        or patch_shape[1] <= 0):
+                    raise ValueError(
+                        "trajectory patch schedule must have shape "
+                        "[B, positive_P]")
+                if any(value.shape != patch_shape for value in (
+                        analysis_trajectory_patch_positions,
+                        analysis_trajectory_patch_stages,
+                        analysis_trajectory_patch_enabled)):
+                    raise ValueError("trajectory patch schedule shape mismatch")
+                patch_dtype = getattr(
+                    analysis_trajectory_patch_values, "dtype", None)
+                if patch_dtype != jnp.float32:
+                    raise TypeError(
+                        "analysis_trajectory_patch_values must be explicit "
+                        "float32")
+                analysis_trajectory_patch_values = jnp.asarray(
+                    analysis_trajectory_patch_values)
+                if analysis_trajectory_patch_values.shape != (
+                        patch_shape + (self.d_model,)):
+                    raise ValueError(
+                        "trajectory patch values must have shape [B,P,D]")
+                _validate_concrete_trajectory_patches(
+                    patch_layers=analysis_trajectory_patch_layers,
+                    patch_positions=analysis_trajectory_patch_positions,
+                    patch_stages=analysis_trajectory_patch_stages,
+                    patch_enabled=analysis_trajectory_patch_enabled,
+                    patch_values=analysis_trajectory_patch_values,
+                    batch_size=B, sequence_length=S,
+                    n_layers=self.n_layers)
+            if analysis_trajectory_enabled:
+                if analysis_trajectory_patch_schedule_enabled:
+                    validation_patch_layers = (
+                        analysis_trajectory_patch_layers)
+                    validation_patch_positions = (
+                        analysis_trajectory_patch_positions)
+                    validation_patch_stages = (
+                        analysis_trajectory_patch_stages)
+                    validation_patch_enabled = (
+                        analysis_trajectory_patch_enabled)
+                    validation_patch_values = (
+                        analysis_trajectory_patch_values)
+                else:
+                    validation_patch_layers = jnp.zeros(
+                        (B, 1), dtype=jnp.int32)
+                    validation_patch_positions = jnp.zeros(
+                        (B, 1), dtype=jnp.int32)
+                    validation_patch_stages = jnp.zeros(
+                        (B, 1), dtype=jnp.int32)
+                    validation_patch_enabled = jnp.zeros(
+                        (B, 1), dtype=jnp.bool_)
+                    validation_patch_values = jnp.zeros(
+                        (B, 1, self.d_model), dtype=jnp.float32)
+                _validate_concrete_analysis_trajectory(
+                    positions=analysis_trajectory_positions,
+                    position_valid=analysis_trajectory_position_valid,
+                    selected_ids_by_route={
+                        "q": analysis_trajectory_ids_q,
+                        "k": analysis_trajectory_ids_k,
+                        "v": analysis_trajectory_ids_v,
+                        "rst": analysis_trajectory_ids_rst,
+                    },
+                    selected_valid_by_route={
+                        "q": analysis_trajectory_valid_q,
+                        "k": analysis_trajectory_valid_k,
+                        "v": analysis_trajectory_valid_v,
+                        "rst": analysis_trajectory_valid_rst,
+                    },
+                    patch_layers=validation_patch_layers,
+                    patch_positions=validation_patch_positions,
+                    patch_stages=validation_patch_stages,
+                    patch_enabled=validation_patch_enabled,
+                    patch_values=validation_patch_values,
+                    batch_size=B, sequence_length=S,
+                    n_layers=self.n_layers,
+                    route_pool_sizes={
+                        "q": self.n_qk, "k": self.n_qk,
+                        "v": self.n_v, "rst": n_rst_eff,
+                    })
             if analysis_program_enabled:
                 def normalize_program_route(ids, valid, route):
                     ids = _analysis_int32_array(
@@ -6093,7 +7227,8 @@ class DAWN_SRW_V4171(nn.Module):
 
             if minimal_train:
                 trace_minimal_layers = bool(
-                    analysis_parity_debug or analysis_causal_trace)
+                    analysis_parity_debug or analysis_causal_trace
+                    or analysis_trajectory_enabled)
 
                 def scan_body_minimal(carry, xs):
                     x = carry
@@ -6101,6 +7236,18 @@ class DAWN_SRW_V4171(nn.Module):
                     bp = xs['params']
                     rng = xs['rng']
                     layer_index = xs['layer_index']
+                    if analysis_trajectory_patch_schedule_enabled:
+                        x = _analysis_apply_trajectory_patch(
+                            x, layer_index=layer_index,
+                            stage_code=TRAJECTORY_PATCH_STAGES[
+                                "residual_input"],
+                            patch_layers=analysis_trajectory_patch_layers,
+                            patch_positions=(
+                                analysis_trajectory_patch_positions),
+                            patch_stages=analysis_trajectory_patch_stages,
+                            patch_enabled=analysis_trajectory_patch_enabled,
+                            patch_values=analysis_trajectory_patch_values)
+                        pre_layer_residual = x
                     if analysis_program_enabled:
                         # The public schedule uses logical id 0 plus a false
                         # validity bit. Indexed membership receives a sorted
@@ -6175,12 +7322,48 @@ class DAWN_SRW_V4171(nn.Module):
                         analysis_program_source_q=program_source_q,
                         analysis_program_source_k=program_source_k,
                         analysis_program_source_v=program_source_v,
+                        analysis_trajectory_enabled=(
+                            analysis_trajectory_enabled),
+                        analysis_trajectory_positions=(
+                            analysis_trajectory_positions),
+                        analysis_trajectory_position_valid=(
+                            analysis_trajectory_position_valid),
+                        analysis_trajectory_ids_q=(
+                            xs.get('trajectory_ids_q')),
+                        analysis_trajectory_ids_k=(
+                            xs.get('trajectory_ids_k')),
+                        analysis_trajectory_ids_v=(
+                            xs.get('trajectory_ids_v')),
+                        analysis_trajectory_valid_q=(
+                            xs.get('trajectory_valid_q')),
+                        analysis_trajectory_valid_k=(
+                            xs.get('trajectory_valid_k')),
+                        analysis_trajectory_valid_v=(
+                            xs.get('trajectory_valid_v')),
+                        analysis_trajectory_replay_enabled=(
+                            analysis_trajectory_replay_enabled),
+                        analysis_trajectory_patch_schedule_enabled=(
+                            analysis_trajectory_patch_schedule_enabled),
+                        analysis_trajectory_patch_layers=(
+                            analysis_trajectory_patch_layers),
+                        analysis_trajectory_patch_positions=(
+                            analysis_trajectory_patch_positions),
+                        analysis_trajectory_patch_stages=(
+                            analysis_trajectory_patch_stages),
+                        analysis_trajectory_patch_enabled=(
+                            analysis_trajectory_patch_enabled),
+                        analysis_trajectory_patch_values=(
+                            analysis_trajectory_patch_values),
                         parity_debug=trace_minimal_layers)
                     if trace_minimal_layers:
                         attn_values = attn_result[:-1]
                         attn_debug = attn_result[-1]
                     else:
                         attn_values = attn_result
+                    attn_trajectory = None
+                    if analysis_trajectory_enabled:
+                        attn_trajectory = attn_values[-1]
+                        attn_values = attn_values[:-1]
                     (attn_out, q_active_frac, k_active_frac, v_active_frac,
                      q_active_n_mean, k_active_n_mean, v_active_n_mean,
                      q_gate_mass_mean, k_gate_mass_mean, v_gate_mass_mean,
@@ -6209,6 +7392,17 @@ class DAWN_SRW_V4171(nn.Module):
                      program_selected_k_contribution,
                      program_selected_v_contribution) = attn_values
                     x = x + attn_out
+                    if analysis_trajectory_patch_schedule_enabled:
+                        x = _analysis_apply_trajectory_patch(
+                            x, layer_index=layer_index,
+                            stage_code=TRAJECTORY_PATCH_STAGES[
+                                "post_attention"],
+                            patch_layers=analysis_trajectory_patch_layers,
+                            patch_positions=(
+                                analysis_trajectory_patch_positions),
+                            patch_stages=analysis_trajectory_patch_stages,
+                            patch_enabled=analysis_trajectory_patch_enabled,
+                            patch_values=analysis_trajectory_patch_values)
                     post_attention_residual = x
 
                     normed = _layer_norm(
@@ -6247,12 +7441,40 @@ class DAWN_SRW_V4171(nn.Module):
                             analysis_program_target_positions),
                         analysis_program_mode=analysis_program_mode,
                         analysis_program_source_rst=program_source_rst,
+                        analysis_trajectory_enabled=(
+                            analysis_trajectory_enabled),
+                        analysis_trajectory_positions=(
+                            analysis_trajectory_positions),
+                        analysis_trajectory_position_valid=(
+                            analysis_trajectory_position_valid),
+                        analysis_trajectory_ids_rst=(
+                            xs.get('trajectory_ids_rst')),
+                        analysis_trajectory_valid_rst=(
+                            xs.get('trajectory_valid_rst')),
+                        analysis_trajectory_replay_enabled=(
+                            analysis_trajectory_replay_enabled),
+                        analysis_trajectory_patch_schedule_enabled=(
+                            analysis_trajectory_patch_schedule_enabled),
+                        analysis_trajectory_patch_layers=(
+                            analysis_trajectory_patch_layers),
+                        analysis_trajectory_patch_positions=(
+                            analysis_trajectory_patch_positions),
+                        analysis_trajectory_patch_stages=(
+                            analysis_trajectory_patch_stages),
+                        analysis_trajectory_patch_enabled=(
+                            analysis_trajectory_patch_enabled),
+                        analysis_trajectory_patch_values=(
+                            analysis_trajectory_patch_values),
                         parity_debug=trace_minimal_layers)
                     if trace_minimal_layers:
                         rst_values = rst_result[:-1]
                         rst_debug = rst_result[-1]
                     else:
                         rst_values = rst_result
+                    rst_trajectory = None
+                    if analysis_trajectory_enabled:
+                        rst_trajectory = rst_values[-1]
+                        rst_values = rst_values[:-1]
                     (rst_out, rst_active_frac, rst_active_n_mean,
                      rst_gate_mass_mean, rst_gate_den_mean,
                      rst_depth_active_mean, rst_gate_eff_n_mean,
@@ -6265,6 +7487,16 @@ class DAWN_SRW_V4171(nn.Module):
                      selected_rst_contribution,
                      program_selected_rst_contribution) = rst_values
                     x_next = x + rst_out
+                    if analysis_trajectory_patch_schedule_enabled:
+                        x_next = _analysis_apply_trajectory_patch(
+                            x_next, layer_index=layer_index,
+                            stage_code=TRAJECTORY_PATCH_STAGES["post_rst"],
+                            patch_layers=analysis_trajectory_patch_layers,
+                            patch_positions=(
+                                analysis_trajectory_patch_positions),
+                            patch_stages=analysis_trajectory_patch_stages,
+                            patch_enabled=analysis_trajectory_patch_enabled,
+                            patch_values=analysis_trajectory_patch_values)
                     residual_norm = jnp.linalg.norm(
                         x_next.astype(jnp.float32), axis=-1).mean()
                     layer_stats = (
@@ -6341,6 +7573,11 @@ class DAWN_SRW_V4171(nn.Module):
                             program_selected_v_contribution,
                             program_selected_rst_contribution,
                         )
+                    if analysis_trajectory_enabled:
+                        layer_stats += (
+                            attn_trajectory,
+                            rst_trajectory,
+                        )
                     if trace_minimal_layers:
                         trace_values = (
                             pre_layer_residual,
@@ -6362,7 +7599,21 @@ class DAWN_SRW_V4171(nn.Module):
                             rst_debug[3],
                             x_next,
                         )
-                        if analysis_causal_trace and not analysis_parity_debug:
+                        if analysis_trajectory_enabled:
+                            trace_batch = jnp.arange(
+                                B, dtype=jnp.int32)[:, None]
+                            trace_positions = jnp.clip(
+                                analysis_trajectory_positions, 0, S - 1)
+
+                            def trajectory_debug(value):
+                                return value[
+                                    trace_batch, trace_positions, :]
+
+                            trace_values = tuple(
+                                trajectory_debug(value)
+                                for value in trace_values)
+                        elif (analysis_causal_trace
+                              and not analysis_parity_debug):
                             trace_batch = jnp.arange(B, dtype=jnp.int32)
                             trace_positions = jnp.clip(
                                 jnp.asarray(
@@ -6402,6 +7653,17 @@ class DAWN_SRW_V4171(nn.Module):
                         'program_source_v': analysis_program_source_v,
                         'program_source_rst': analysis_program_source_rst,
                     })
+                if analysis_trajectory_enabled:
+                    xs_minimal.update({
+                        'trajectory_ids_q': analysis_trajectory_ids_q,
+                        'trajectory_ids_k': analysis_trajectory_ids_k,
+                        'trajectory_ids_v': analysis_trajectory_ids_v,
+                        'trajectory_ids_rst': analysis_trajectory_ids_rst,
+                        'trajectory_valid_q': analysis_trajectory_valid_q,
+                        'trajectory_valid_k': analysis_trajectory_valid_k,
+                        'trajectory_valid_v': analysis_trajectory_valid_v,
+                        'trajectory_valid_rst': analysis_trajectory_valid_rst,
+                    })
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
                 if trace_minimal_layers:
@@ -6420,6 +7682,13 @@ class DAWN_SRW_V4171(nn.Module):
                      parity_post_layer_residual_all) = minimal_stats[-18:]
                 else:
                     minimal_values = minimal_stats
+                operator_trajectory_layers = None
+                if analysis_trajectory_enabled:
+                    operator_trajectory_layers = {
+                        'attention': minimal_values[-2],
+                        'rst': minimal_values[-1],
+                    }
+                    minimal_values = minimal_values[:-2]
                 program_route_contributions = None
                 if analysis_program_capture_contribution:
                     program_route_contributions = {
@@ -6526,6 +7795,78 @@ class DAWN_SRW_V4171(nn.Module):
                         'post_layer_residual': target_trace(
                             parity_post_layer_residual_all),
                     }
+                if analysis_trajectory_enabled:
+                    attention_trajectory = operator_trajectory_layers[
+                        'attention']
+                    rst_trajectory = operator_trajectory_layers['rst']
+                    qk_fields = attention_trajectory[0]
+                    v_fields = attention_trajectory[1]
+                    rst_fields = rst_trajectory[0]
+                    trajectory_positions = jnp.clip(
+                        jnp.asarray(
+                            analysis_trajectory_positions,
+                            dtype=jnp.int32),
+                        0, S - 1)
+                    trajectory_batch = jnp.arange(
+                        B, dtype=jnp.int32)[:, None]
+                    trajectory_valid = jnp.asarray(
+                        analysis_trajectory_position_valid,
+                        dtype=jnp.bool_)
+
+                    def trajectory_target_trace(value):
+                        gathered = value[
+                            :, trajectory_batch, trajectory_positions, :]
+                        return jnp.where(
+                            trajectory_valid[None, :, :, None],
+                            gathered, jnp.zeros_like(gathered))
+
+                    def paired_route_fields(route_index):
+                        output_fields = {}
+                        for field_index, field_name in enumerate(
+                                TRAJECTORY_TRACE_FIELDS):
+                            value = qk_fields[field_index]
+                            if field_index <= 7:
+                                value = value[:, :, :, route_index, :]
+                            elif field_index <= 9:
+                                value = value[:, :, :, route_index]
+                            elif field_index <= 17:
+                                value = value[:, :, :, route_index, :]
+                            output_fields[field_name] = value
+                        output_fields['scale'] = attention_trajectory[2]
+                        return output_fields
+
+                    def single_route_fields(fields, scale):
+                        output_fields = {
+                            field_name: fields[field_index]
+                            for field_index, field_name in enumerate(
+                                TRAJECTORY_TRACE_FIELDS)
+                        }
+                        output_fields['scale'] = scale
+                        return output_fields
+
+                    operator_trajectory_trace = {
+                        'positions': analysis_trajectory_positions,
+                        'position_valid': (
+                            analysis_trajectory_position_valid),
+                        'states': {
+                            'residual_input': (
+                                trajectory_target_trace(
+                                    parity_pre_layer_residual_all)),
+                            'post_attention': (
+                                trajectory_target_trace(
+                                    parity_post_attention_residual_all)),
+                            'post_rst': trajectory_target_trace(
+                                parity_post_layer_residual_all),
+                        },
+                        'routes': {
+                            'q': paired_route_fields(0),
+                            'k': paired_route_fields(1),
+                            'v': single_route_fields(
+                                v_fields, attention_trajectory[3]),
+                            'rst': single_route_fields(
+                                rst_fields, rst_trajectory[1]),
+                        },
+                    }
                 x = self.norm(x)
                 if labels is None:
                     vocab_argmax = (
@@ -6539,17 +7880,24 @@ class DAWN_SRW_V4171(nn.Module):
                             output['final_residual'] = x
                         if analysis_parity_debug:
                             output['parity_debug'] = {
+                                'residual_input': (
+                                    parity_pre_layer_residual_all),
                                 'q': parity_q_all,
                                 'k': parity_k_all,
                                 'v': parity_v_all,
                                 'attention_update': (
                                     parity_attention_update_all),
                                 'rst': parity_rst_all,
+                                'post_attention': (
+                                    parity_post_attention_residual_all),
                                 'post_layer_residual': (
                                     parity_post_layer_residual_all),
                             }
                         if analysis_causal_trace:
                             output['causal_trace'] = causal_trace
+                        if analysis_trajectory_enabled:
+                            output['operator_trajectory_trace'] = (
+                                operator_trajectory_trace)
                         if analysis_capture_contribution:
                             output['operator_route_contributions'] = (
                                 route_contributions)
@@ -6572,16 +7920,22 @@ class DAWN_SRW_V4171(nn.Module):
                         output['final_residual'] = x
                     if analysis_parity_debug:
                         output['parity_debug'] = {
+                            'residual_input': parity_pre_layer_residual_all,
                             'q': parity_q_all,
                             'k': parity_k_all,
                             'v': parity_v_all,
                             'attention_update': parity_attention_update_all,
                             'rst': parity_rst_all,
+                            'post_attention': (
+                                parity_post_attention_residual_all),
                             'post_layer_residual': (
                                 parity_post_layer_residual_all),
                         }
                     if analysis_causal_trace:
                         output['causal_trace'] = causal_trace
+                    if analysis_trajectory_enabled:
+                        output['operator_trajectory_trace'] = (
+                            operator_trajectory_trace)
                     if analysis_capture_contribution:
                         output['operator_route_contributions'] = (
                             route_contributions)
@@ -6760,16 +8114,22 @@ class DAWN_SRW_V4171(nn.Module):
                     output['logits'] = logits
                 if analysis_parity_debug:
                     output['parity_debug'] = {
+                        'residual_input': parity_pre_layer_residual_all,
                         'q': parity_q_all,
                         'k': parity_k_all,
                         'v': parity_v_all,
                         'attention_update': parity_attention_update_all,
                         'rst': parity_rst_all,
+                        'post_attention': (
+                            parity_post_attention_residual_all),
                         'post_layer_residual': (
                             parity_post_layer_residual_all),
                     }
                 if analysis_causal_trace:
                     output['causal_trace'] = causal_trace
+                if analysis_trajectory_enabled:
+                    output['operator_trajectory_trace'] = (
+                        operator_trajectory_trace)
                 if analysis_capture_contribution:
                     output['operator_route_contributions'] = (
                         route_contributions)
@@ -7989,6 +9349,71 @@ class DAWN_SRW_V4171(nn.Module):
             analysis_program_source_v=source_contribution_v,
             analysis_program_source_rst=source_contribution_rst,
             analysis_return_residual=return_residual,
+            **production_kwargs,
+        )
+
+    def analysis_forward_with_paired_operator_trajectory(
+            self, input_ids, *, trajectory_positions,
+            trajectory_position_valid, selected_ids_q, selected_ids_k,
+            selected_ids_v, selected_ids_rst, selected_valid_q,
+            selected_valid_k, selected_valid_v, selected_valid_rst,
+            replay_full_active=False, patch_layers, patch_positions,
+            patch_stages, patch_enabled, patch_values, labels=None,
+            attention_mask=None, return_residual=True,
+            return_logits=False, **production_kwargs):
+        """Capture or replay an exact S2-to-answer paired trajectory.
+
+        The per-route ID tensors are fixed ``[L,B,T,K]`` schedules.  A first
+        pass supplies all-false validity and captures numerator-active IDs;
+        the fail-closed replay pass supplies those exact IDs and sets
+        ``replay_full_active=True``.  State and route interventions share one
+        fixed ``[B,P]`` patch interface with the stage codes exported in
+        :data:`TRAJECTORY_PATCH_STAGES`.
+        """
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_return_residual=return_residual,
+            analysis_return_logits=return_logits,
+            analysis_trajectory_positions=trajectory_positions,
+            analysis_trajectory_position_valid=trajectory_position_valid,
+            analysis_trajectory_ids_q=selected_ids_q,
+            analysis_trajectory_ids_k=selected_ids_k,
+            analysis_trajectory_ids_v=selected_ids_v,
+            analysis_trajectory_ids_rst=selected_ids_rst,
+            analysis_trajectory_valid_q=selected_valid_q,
+            analysis_trajectory_valid_k=selected_valid_k,
+            analysis_trajectory_valid_v=selected_valid_v,
+            analysis_trajectory_valid_rst=selected_valid_rst,
+            analysis_trajectory_replay_enabled=replay_full_active,
+            analysis_trajectory_patch_layers=patch_layers,
+            analysis_trajectory_patch_positions=patch_positions,
+            analysis_trajectory_patch_stages=patch_stages,
+            analysis_trajectory_patch_enabled=patch_enabled,
+            analysis_trajectory_patch_values=patch_values,
+            **production_kwargs,
+        )
+
+    def analysis_forward_with_trajectory_patches(
+            self, input_ids, *, patch_layers, patch_positions,
+            patch_stages, patch_enabled, patch_values, labels=None,
+            attention_mask=None, return_residual=False,
+            return_logits=False, **production_kwargs):
+        """Apply a fixed batch-native patch schedule without trace capture."""
+        return self(
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            minimal_train=True,
+            analysis_return_residual=return_residual,
+            analysis_return_logits=return_logits,
+            analysis_trajectory_patch_layers=patch_layers,
+            analysis_trajectory_patch_positions=patch_positions,
+            analysis_trajectory_patch_stages=patch_stages,
+            analysis_trajectory_patch_enabled=patch_enabled,
+            analysis_trajectory_patch_values=patch_values,
             **production_kwargs,
         )
 

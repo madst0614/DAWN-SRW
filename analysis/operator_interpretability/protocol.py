@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 
 PROTOCOL_ID = "dawn_operator_interpretability"
-PROTOCOL_SCHEMA_VERSION = 9
+PROTOCOL_SCHEMA_VERSION = 10
 ANALYSIS_ENGINE = "train_analysis_pool"
 SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
@@ -19,6 +19,7 @@ UNIT_LEVELS = (
     "address_neighborhood",
     "functional_family",
     "multilayer_trajectory",
+    "paired_operator_trajectory",
 )
 RETENTION_MODES = (
     "conditional_execution_sufficiency",
@@ -41,6 +42,7 @@ NATIVE_PROGRAM_CLAIM_LADDER = (
     "counterfactual_operator_selection_transfer",
     "counterfactual_contribution_transplant",
 )
+PAIRED_TRAJECTORY_ALGORITHM_VERSION = "paired_s2_operator_trajectory_v1"
 
 # MIB circuit-track fractions, including the mandatory full-model endpoint.
 CIRCUIT_FRACTIONS = (
@@ -91,6 +93,25 @@ class ProtocolConfig:
         "selected_complement_first_without_replacement")
     program_faithfulness_endpoint: str = (
         "paired_counterfactual_source_prompt_base_answer_margin")
+    trajectory_deep_examples: int = 8
+    trajectory_discovery_examples: int = 128
+    trajectory_validation_examples: int = 128
+    trajectory_seed: int = 4172
+    trajectory_test_enabled: bool = False
+    trajectory_capture_topk_qk: int = 1024
+    trajectory_capture_topk_v: int = 2048
+    trajectory_capture_topk_rst: int = 4096
+    trajectory_max_candidate_sites: int = 32
+    trajectory_max_candidates_per_route: int = 8
+    trajectory_intervention_batch_size: int = 4
+    trajectory_max_patch_sites_per_variant: int = 8
+    trajectory_max_operator_followup_sites: int = 8
+    trajectory_individual_operator_followup_limit: int = 0
+    trajectory_max_path_sites: int = 8
+    trajectory_state_identity_atol: float = 1.0e-5
+    trajectory_replay_atol: float = 5.0e-4
+    trajectory_replay_rtol: float = 5.0e-4
+    trajectory_divergence_epsilon: float = 1.0e-6
 
     def validate(self) -> "ProtocolConfig":
         if self.max_examples_per_phase <= 0:
@@ -165,6 +186,61 @@ class ProtocolConfig:
         if self.program_faithfulness_endpoint != (
                 "paired_counterfactual_source_prompt_base_answer_margin"):
             raise ValueError("unsupported program_faithfulness_endpoint")
+        trajectory_positive = {
+            "trajectory_deep_examples": self.trajectory_deep_examples,
+            "trajectory_discovery_examples": self.trajectory_discovery_examples,
+            "trajectory_validation_examples": self.trajectory_validation_examples,
+            "trajectory_capture_topk_qk": self.trajectory_capture_topk_qk,
+            "trajectory_capture_topk_v": self.trajectory_capture_topk_v,
+            "trajectory_capture_topk_rst": self.trajectory_capture_topk_rst,
+            "trajectory_max_candidate_sites": self.trajectory_max_candidate_sites,
+            "trajectory_max_candidates_per_route": (
+                self.trajectory_max_candidates_per_route),
+            "trajectory_intervention_batch_size": (
+                self.trajectory_intervention_batch_size),
+            "trajectory_max_patch_sites_per_variant": (
+                self.trajectory_max_patch_sites_per_variant),
+            "trajectory_max_operator_followup_sites": (
+                self.trajectory_max_operator_followup_sites),
+            "trajectory_max_path_sites": self.trajectory_max_path_sites,
+        }
+        invalid = [
+            name for name, value in trajectory_positive.items()
+            if isinstance(value, bool) or int(value) <= 0
+        ]
+        if invalid:
+            raise ValueError(
+                "trajectory positive integer settings are invalid: "
+                + ",".join(invalid))
+        if self.trajectory_discovery_examples < self.trajectory_deep_examples:
+            raise ValueError(
+                "trajectory discovery examples must cover the deep cohort")
+        if self.trajectory_max_candidate_sites < (
+                self.trajectory_max_candidates_per_route):
+            raise ValueError(
+                "trajectory global candidate cap is smaller than route cap")
+        if self.trajectory_max_path_sites > (
+                self.trajectory_max_patch_sites_per_variant):
+            raise ValueError(
+                "trajectory path length exceeds fixed patch-slot capacity")
+        if self.trajectory_max_operator_followup_sites > (
+                self.trajectory_max_candidate_sites):
+            raise ValueError(
+                "trajectory operator follow-up cap exceeds site cap")
+        if self.trajectory_individual_operator_followup_limit != 0:
+            raise ValueError(
+                "paired trajectory v1 forbids individual operator leave-one-out")
+        if self.trajectory_test_enabled:
+            raise ValueError("paired trajectory v1 must not evaluate test")
+        for name, value in (
+                ("trajectory_state_identity_atol",
+                 self.trajectory_state_identity_atol),
+                ("trajectory_replay_atol", self.trajectory_replay_atol),
+                ("trajectory_replay_rtol", self.trajectory_replay_rtol),
+                ("trajectory_divergence_epsilon",
+                 self.trajectory_divergence_epsilon)):
+            if not 0.0 <= float(value) < 1.0:
+                raise ValueError(f"{name} must be in [0, 1)")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,6 +286,8 @@ def protocol_record(config: ProtocolConfig, *, model_version: str,
         "retention_modes": list(RETENTION_MODES),
         "claim_ladder": list(CLAIM_LADDER),
         "native_program_claim_ladder": list(NATIVE_PROGRAM_CLAIM_LADDER),
+        "paired_trajectory_algorithm_version": (
+            PAIRED_TRAJECTORY_ALGORITHM_VERSION),
         "circuit_fractions": list(CIRCUIT_FRACTIONS),
         "config": config.to_dict(),
         "test_selection_forbidden": True,

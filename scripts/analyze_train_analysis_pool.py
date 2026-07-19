@@ -152,6 +152,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--isolation-max-absolute-effect", type=float,
         default=defaults.isolation_max_absolute_effect)
+    parser.add_argument(
+        "--trajectory-deep-examples", type=int,
+        default=defaults.trajectory_deep_examples)
+    parser.add_argument(
+        "--trajectory-discovery-examples", type=int,
+        default=defaults.trajectory_discovery_examples)
+    parser.add_argument(
+        "--trajectory-validation-examples", type=int,
+        default=defaults.trajectory_validation_examples)
+    parser.add_argument(
+        "--trajectory-seed", type=int, default=defaults.trajectory_seed)
+    parser.add_argument(
+        "--trajectory-capture-topk-qk", type=int,
+        default=defaults.trajectory_capture_topk_qk)
+    parser.add_argument(
+        "--trajectory-capture-topk-v", type=int,
+        default=defaults.trajectory_capture_topk_v)
+    parser.add_argument(
+        "--trajectory-capture-topk-rst", type=int,
+        default=defaults.trajectory_capture_topk_rst)
+    parser.add_argument(
+        "--trajectory-max-candidate-sites", type=int,
+        default=defaults.trajectory_max_candidate_sites)
+    parser.add_argument(
+        "--trajectory-max-candidates-per-route", type=int,
+        default=defaults.trajectory_max_candidates_per_route)
+    parser.add_argument(
+        "--trajectory-intervention-batch-size", type=int,
+        default=defaults.trajectory_intervention_batch_size)
+    parser.add_argument(
+        "--trajectory-max-patch-sites-per-variant", type=int,
+        default=defaults.trajectory_max_patch_sites_per_variant)
+    parser.add_argument(
+        "--trajectory-max-operator-followup-sites", type=int,
+        default=defaults.trajectory_max_operator_followup_sites)
+    parser.add_argument(
+        "--trajectory-max-path-sites", type=int,
+        default=defaults.trajectory_max_path_sites)
     return parser.parse_args()
 
 
@@ -252,6 +290,23 @@ def _protocol_config(args: argparse.Namespace) -> ProtocolConfig:
         circuit_faithfulness_min=args.circuit_faithfulness_min,
         interchange_success_min=args.interchange_success_min,
         isolation_max_absolute_effect=args.isolation_max_absolute_effect,
+        trajectory_deep_examples=args.trajectory_deep_examples,
+        trajectory_discovery_examples=args.trajectory_discovery_examples,
+        trajectory_validation_examples=args.trajectory_validation_examples,
+        trajectory_seed=args.trajectory_seed,
+        trajectory_capture_topk_qk=args.trajectory_capture_topk_qk,
+        trajectory_capture_topk_v=args.trajectory_capture_topk_v,
+        trajectory_capture_topk_rst=args.trajectory_capture_topk_rst,
+        trajectory_max_candidate_sites=args.trajectory_max_candidate_sites,
+        trajectory_max_candidates_per_route=(
+            args.trajectory_max_candidates_per_route),
+        trajectory_intervention_batch_size=(
+            args.trajectory_intervention_batch_size),
+        trajectory_max_patch_sites_per_variant=(
+            args.trajectory_max_patch_sites_per_variant),
+        trajectory_max_operator_followup_sites=(
+            args.trajectory_max_operator_followup_sites),
+        trajectory_max_path_sites=args.trajectory_max_path_sites,
     ).validate()
 
 

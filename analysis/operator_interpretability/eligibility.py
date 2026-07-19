@@ -41,6 +41,84 @@ def _encode(tokenizer: Any, text: str) -> tuple[int, ...]:
     return tuple(int(token) for token in ids)
 
 
+def _token_span_from_char_span(
+        tokenizer: Any, prompt: str, span: Any, *,
+        role: str) -> tuple[int, int]:
+    if (not isinstance(span, (list, tuple)) or len(span) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int)
+                   for value in span)):
+        raise ValueError(f"invalid IOI semantic char span for {role}")
+    start, end = (int(span[0]), int(span[1]))
+    if not 0 <= start < end <= len(prompt):
+        raise ValueError(f"out-of-range IOI semantic char span for {role}")
+    try:
+        encoded = tokenizer(
+            prompt, add_special_tokens=False, return_offsets_mapping=True)
+        offsets = encoded["offset_mapping"]
+        indices = [
+            index for index, (left, right) in enumerate(offsets)
+            if int(left) < end and int(right) > start
+        ]
+        if not indices:
+            raise BenchmarkEligibilityError(
+                f"tokenizer offsets do not cover IOI semantic role {role}")
+        return int(indices[0]), int(indices[-1]) + 1
+    except (KeyError, TypeError, NotImplementedError):
+        prefix = _encode(tokenizer, prompt[:start])
+        through = _encode(tokenizer, prompt[:end])
+        if len(through) <= len(prefix):
+            raise BenchmarkEligibilityError(
+                f"tokenizer does not preserve IOI semantic role {role}")
+        return len(prefix), len(through)
+
+
+def _ioi_semantic_token_spans(
+        tokenizer: Any, base_prompt: str, source_prompt: str,
+        metadata: Mapping[str, Any], *,
+        base_ids: tuple[int, ...], source_ids: tuple[int, ...]
+) -> dict[str, Any] | None:
+    char_spans = metadata.get("semantic_char_spans")
+    if not isinstance(char_spans, Mapping):
+        return None
+    output: dict[str, dict[str, list[int]]] = {}
+    for side, prompt, token_ids in (
+            ("base", base_prompt, base_ids),
+            ("source", source_prompt, source_ids)):
+        side_spans = char_spans.get(side)
+        if not isinstance(side_spans, Mapping):
+            raise ValueError(f"IOI semantic char spans omit side={side}")
+        token_spans: dict[str, list[int]] = {}
+        for role in ("first_name_a", "first_name_b", "s2_counterfactual"):
+            start, end = _token_span_from_char_span(
+                tokenizer, prompt, side_spans.get(role),
+                role=f"{side}/{role}")
+            token_spans[role] = [start, end]
+        s2_end = token_spans["s2_counterfactual"][1]
+        if s2_end >= len(token_ids):
+            raise BenchmarkEligibilityError(
+                f"IOI {side} prompt has no token immediately after S2")
+        token_spans["post_s2"] = [
+            s2_end, s2_end + 1,
+        ]
+        token_spans["answer_position"] = [
+            len(token_ids) - 1, len(token_ids)]
+        output[side] = token_spans
+    base_s2_start = output["base"]["s2_counterfactual"][0]
+    source_s2_start = output["source"]["s2_counterfactual"][0]
+    if base_s2_start != source_s2_start:
+        raise BenchmarkEligibilityError(
+            "IOI S2 base/source token spans start at different positions")
+    if base_ids[:base_s2_start] != source_ids[:source_s2_start]:
+        raise BenchmarkEligibilityError(
+            "IOI base/source token IDs diverge before the S2 semantic span")
+    return {
+        "base": output["base"],
+        "source": output["source"],
+        "s2_prefix_token_count": base_s2_start,
+        "token_span_convention": "half_open",
+    }
+
+
 def _anchor_last_token(tokenizer: Any, prompt: str, anchor: str) -> int:
     # Match the official RAVEL token-position function: first entity occurrence.
     start = prompt.find(anchor)
@@ -297,6 +375,12 @@ def tokenize_adapted_pair(
         "intervention_negative_token_count": len(intervention_negative_ids),
         "token_position_audited": True,
     })
+    semantic_token_spans = _ioi_semantic_token_spans(
+        tokenizer, base_prompt, source_prompt, metadata,
+        base_ids=base_ids, source_ids=source_ids)
+    if semantic_token_spans is not None:
+        metadata["semantic_token_spans"] = semantic_token_spans
+        metadata["s2_prefix_state_identity_required"] = True
     return BenchmarkExample(
         benchmark_id=benchmark_id,
         example_id=str(adapted["example_id"]),

@@ -42,6 +42,7 @@ _DETAIL_ONLY_KEYS = {
     "protocol",
     "ranked_site_preview",
     "rows",
+    "site_summaries",
     "selected_units_by_causal_variable",
     "source_behavior_scored",
     "source_known_correct",
@@ -152,6 +153,149 @@ def _result_lines(result: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _paired_trajectory_lines(result: Mapping[str, Any]) -> list[str]:
+    lines = ["Paired S2 operator trajectory summary:"]
+    baseline = result.get("behavioral_baseline")
+    if isinstance(baseline, Mapping):
+        lines.extend([
+            "  Behavioral baseline:",
+            "    phase | paired-correct | base accuracy | source accuracy | base margin | source margin",
+        ])
+        for phase in ("discovery", "validation"):
+            row = baseline.get(phase)
+            if not isinstance(row, Mapping):
+                continue
+            lines.append(
+                "    " + " | ".join((
+                    phase,
+                    _scalar(row.get("paired_correct_used")),
+                    _scalar(row.get("base_accuracy")),
+                    _scalar(row.get("source_accuracy")),
+                    _scalar(row.get("base_margin_mean")),
+                    _scalar(row.get("source_own_margin_mean")),
+                )))
+    trace = result.get("full_active_trace")
+    if isinstance(trace, Mapping):
+        completeness = trace.get("trace_completeness")
+        if isinstance(completeness, Mapping):
+            lines.extend([
+                "  Trace completeness:",
+                "    route | initial K | final K | max active | omitted | retries | replay max error",
+            ])
+            for route in ("q", "k", "v", "rst"):
+                row = completeness.get(route)
+                if not isinstance(row, Mapping):
+                    continue
+                lines.append(
+                    "    " + " | ".join((
+                        route,
+                        _scalar(row.get("initial_width")),
+                        _scalar(row.get("final_width")),
+                        _scalar(row.get("max_active_count")),
+                        _scalar(row.get("omitted_active_count")),
+                        _scalar(row.get("retry_count")),
+                        _scalar(row.get("all_active_replay_error")),
+                    )))
+    execution = result.get("tpu_execution")
+    if isinstance(execution, Mapping):
+        lines.append(
+            "  TPU forward calls (successful): "
+            f"{_scalar(execution.get('successful_forward_call_count'))}")
+        stage_counts = execution.get("stage_forward_call_count")
+        if isinstance(stage_counts, Mapping):
+            lines.extend(
+                f"    {stage}: {_scalar(count)}"
+                for stage, count in stage_counts.items())
+    divergence = result.get("divergence_atlas")
+    if isinstance(divergence, Mapping) and isinstance(
+            divergence.get("extrema"), Mapping):
+        lines.extend([
+            "  Divergence atlas:",
+            "    event | layer | role | route | effect",
+        ])
+        for name, row in divergence["extrema"].items():
+            if not isinstance(row, Mapping):
+                continue
+            lines.append(
+                "    " + " | ".join((
+                    str(name), _scalar(row.get("layer")),
+                    _scalar(row.get("semantic_role")),
+                    _scalar(row.get("route")),
+                    _scalar(row.get("effect_size")),
+                )))
+    causal = result.get("discovery_causal_patch")
+    if isinstance(causal, Mapping):
+        rows = [
+            row for row in causal.get("site_summaries", ())
+            if isinstance(row, Mapping) and row.get("patch_kind") == "route"
+        ]
+        rows.sort(key=lambda row: -float(
+            row.get("bidirectional_specific_effect_mean", 0.0)))
+        if rows:
+            lines.extend([
+                "  Causal complete-route patch (top discovery sites):",
+                "    site | source-to-base shift | base-to-source shift | paired flip | mismatch shift | self max error",
+            ])
+            for row in rows[:8]:
+                directions = row.get("directions") or {}
+                sb = directions.get("source_to_base") or {}
+                bs = directions.get("base_to_source") or {}
+                lines.append(
+                    "    " + " | ".join((
+                        f"L{row.get('layer')}:{row.get('semantic_role')}:{row.get('route')}",
+                        _scalar(sb.get("paired_margin_shift_mean")),
+                        _scalar(bs.get("paired_margin_shift_mean")),
+                        _scalar((float(sb.get("paired_answer_flip_fraction", 0.0))
+                                 + float(bs.get("paired_answer_flip_fraction", 0.0))) / 2.0),
+                        _scalar(row.get("bidirectional_mismatched_effect_mean")),
+                        _scalar(max(
+                            float(sb.get("self_reconstruction_max_abs", 0.0)),
+                            float(bs.get("self_reconstruction_max_abs", 0.0)))),
+                    )))
+    operator = result.get("operator_decomposition")
+    if isinstance(operator, Mapping):
+        rows = [
+            row for row in operator.get("site_summaries", ())
+            if isinstance(row, Mapping)
+        ]
+        rows.sort(key=lambda row: (
+            int(row.get("candidate_index", 0)),
+            str(row.get("group_kind", ""))))
+        if rows:
+            lines.extend([
+                "  Operator group decomposition:",
+                "    site | group | common fraction | base-only | source-only | paired shift | specific shift",
+            ])
+            for row in rows[:24]:
+                lines.append(
+                    "    " + " | ".join((
+                        f"L{row.get('layer')}:{row.get('semantic_role')}:{row.get('route')}",
+                        _scalar(row.get("group_kind")),
+                        _scalar(row.get("common_active_fraction_mean")),
+                        _scalar(row.get("base_only_count_mean")),
+                        _scalar(row.get("source_only_count_mean")),
+                        _scalar(row.get("bidirectional_paired_effect_mean")),
+                        _scalar(row.get("bidirectional_specific_effect_mean")),
+                    )))
+    human = result.get("human_summary")
+    if isinstance(human, Mapping):
+        lines.extend([
+            "  Frozen validation path:",
+            f"    selection hash: {_scalar(human.get('frozen_path_hash'))}",
+            f"    path length: {_scalar(human.get('frozen_path_length'))}",
+            f"    paired effect: {_scalar(human.get('validation_paired_effect'))}",
+            f"    mismatched effect: {_scalar(human.get('validation_mismatched_effect'))}",
+            f"    paired flip rate: {_scalar(human.get('validation_flip_fraction'))}",
+            f"    test consulted: {_scalar(human.get('test_consulted'))}",
+        ])
+        narrative = human.get("narrative")
+        if isinstance(narrative, Sequence) and not isinstance(
+                narrative, (str, bytes)):
+            lines.append("  Interpretation:")
+            lines.extend(f"    {str(value)}" for value in narrative)
+    return lines
+
+
 def format_item_text(payload: Mapping[str, Any], *, artifact_path: str,
                      event: str) -> str:
     item_id = str(payload.get("item_id") or "unknown")
@@ -168,9 +312,12 @@ def format_item_text(payload: Mapping[str, Any], *, artifact_path: str,
         f"  scientific_question: {definition['scientific_question']}",
         f"  decision_standard: {definition['standard']}",
         f"  claim_role: {definition['claim_role']}",
+        f"  scientific_role: {definition.get('scientific_role') or 'not_set'}",
         f"  backend: {payload.get('backend')}",
         f"  analysis_kind: {payload.get('analysis_kind')}",
     ]
+    if payload.get("test_used") is not None:
+        lines.append(f"  test_used: {_scalar(payload.get('test_used'))}")
     if payload.get("benchmark_id") is not None:
         lines.append(f"  benchmark: {payload.get('benchmark_id')}")
     if payload.get("task_id") is not None:
@@ -189,6 +336,8 @@ def format_item_text(payload: Mapping[str, Any], *, artifact_path: str,
                 "Native operator program decision:",
                 *_result_lines(human_summary),
             ])
+    if payload.get("analysis_kind") == "paired_operator_trajectory":
+        lines.extend(_paired_trajectory_lines(result))
     lines.extend([
         f"  artifact: {artifact_path}",
         "Result:",

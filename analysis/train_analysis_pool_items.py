@@ -26,11 +26,13 @@ def _item(
         title: str, question: str, standard: str, *, backend: str,
         analysis_kind: str, benchmark_id: str | None = None,
         task_id: str | None = None, requires: Iterable[str] = (),
-        claim_role: str = "scientific") -> dict[str, Any]:
+        claim_role: str = "scientific",
+        scientific_role: str | None = None,
+        test_used: bool | None = None) -> dict[str, Any]:
     if (benchmark_id is None) == (task_id is None) and analysis_kind != "scientific_claims":
         raise ValueError(
             "an item must identify exactly one benchmark or zero-shot task")
-    return {
+    definition = {
         "title": title,
         "scientific_question": question,
         "standard": standard,
@@ -40,14 +42,20 @@ def _item(
         "task_id": task_id,
         "requires": tuple(requires),
         "claim_role": claim_role,
+        "scientific_role": scientific_role,
         "supported_model_versions": SUPPORTED_MODEL_VERSIONS,
     }
+    if test_used is not None:
+        definition["test_used"] = bool(test_used)
+    return definition
 
 
 def _mechanistic_item(
         benchmark_id: str, analysis_kind: str, title: str, question: str,
         standard: str, *requires: str,
-        claim_role: str = "scientific") -> dict[str, Any]:
+        claim_role: str = "scientific",
+        scientific_role: str | None = None,
+        test_used: bool | None = None) -> dict[str, Any]:
     return _item(
         title, question, standard,
         backend="operator_interpretability",
@@ -55,6 +63,8 @@ def _mechanistic_item(
         benchmark_id=benchmark_id,
         requires=requires,
         claim_role=claim_role,
+        scientific_role=scientific_role,
+        test_used=test_used,
     )
 
 
@@ -132,6 +142,22 @@ _register("mib_ioi.native_operator_program", _mechanistic_item(
     "mib_ioi.behavioral_eligibility",
     claim_role="checkpoint_specific"))
 
+_register("mib_ioi.paired_operator_trajectory", _mechanistic_item(
+    "mib_ioi", "paired_operator_trajectory",
+    "IOI paired operator trajectory",
+    "Where does the official S2 base/source token divergence first alter "
+    "production residual and operator execution, and which chronological "
+    "Q/K/V/RST path causally transports that difference to the answer?",
+    "Trace every production numerator-active operator without mass "
+    "truncation, require all-active canonical replay parity, freeze "
+    "discovery-selected sites and paths, evaluate only frozen validation "
+    "interventions, and never consult held-out test.",
+    "mib_ioi.input_contract",
+    "mib_ioi.behavioral_eligibility",
+    claim_role="checkpoint_specific",
+    scientific_role="exploratory",
+    test_used=False))
+
 _register("ravel.operator_localization", _mechanistic_item(
     "ravel", "operator_localization", "RAVEL operator-site localization",
     "Which sites carry captured contribution on independent official RAVEL base groups?",
@@ -202,6 +228,8 @@ TRAIN_ANALYSIS_POOL_PRESETS: dict[str, tuple[str, ...]] = {
     "zero_shot": ZERO_SHOT_ITEMS,
     "mechanistic_screen": MECHANISTIC_SCREEN_ITEMS,
     "ioi_native_program": ("mib_ioi.native_operator_program",),
+    "ioi_paired_operator_trajectory": (
+        "mib_ioi.paired_operator_trajectory",),
     "mib_ioi_circuit": _mib_circuit_preset("mib_ioi"),
     "mib_mcqa_circuit": _mib_circuit_preset("mib_mcqa"),
     "mib_arithmetic_circuit": _mib_circuit_preset("mib_arithmetic"),

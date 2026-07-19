@@ -13,7 +13,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -319,7 +319,9 @@ def _chunk_sizes_for_cfg(cfg: Dict[str, Any], mesh) -> Dict[str, int]:
     }
 
 
-def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = False):
+def create_or_reuse_sharded_fns(
+        cfg: Dict[str, Any], mesh, *, analysis: bool = False,
+        trajectory_widths: Optional[Mapping[str, int]] = None):
     version = cfg.get("model", {}).get("model_version")
     train = get_train()
     module_name = train._model_registry_entry(version)["module"]
@@ -427,6 +429,10 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
         mod, "make_sharded_srw_suppression_minimal", None)
     make_paired_suppression_min = getattr(
         mod, "make_sharded_srw_paired_suppression_minimal", None)
+    make_single_trajectory_min = getattr(
+        mod, "make_sharded_srw_trajectory_minimal", None)
+    make_paired_trajectory_min = getattr(
+        mod, "make_sharded_srw_paired_trajectory_minimal", None)
     make_paired_dense_min = getattr(
         mod, "make_sharded_srw_paired_dense_minimal", None)
 
@@ -497,6 +503,43 @@ def create_or_reuse_sharded_fns(cfg: Dict[str, Any], mesh, *, analysis: bool = F
                         make_paired_suppression_min,
                         srw_pool_kwargs("qk")),
                 ))
+    if trajectory_widths is not None:
+        if analysis:
+            raise ValueError(
+                "trajectory kernels require production minimal sharded_fns")
+        required = {"qk", "v", "rst"}
+        if set(trajectory_widths) != required:
+            raise ValueError(
+                "trajectory_widths must define exactly qk, v, and rst")
+        normalized_widths = {
+            route: int(trajectory_widths[route]) for route in required}
+        if any(width <= 0 for width in normalized_widths.values()):
+            raise ValueError("trajectory capture widths must be positive")
+        if (make_single_trajectory_min is None
+                or make_paired_trajectory_min is None):
+            raise ValueError(
+                f"model version {version} lacks canonical trajectory kernels")
+        fns["attn_qk_paired_trajectory_minimal"] = (
+            make_paired_trajectory_min(
+                max_chunk_size=chunk["attn_qk"],
+                trajectory_capture_width=normalized_widths["qk"],
+                **factory_kwargs(
+                    make_paired_trajectory_min, srw_pool_kwargs("qk")),
+            ))
+        fns["attn_v_single_trajectory_minimal"] = (
+            make_single_trajectory_min(
+                max_chunk_size=chunk["attn_v"],
+                trajectory_capture_width=normalized_widths["v"],
+                **factory_kwargs(
+                    make_single_trajectory_min, srw_pool_kwargs("v")),
+            ))
+        fns["rst_single_trajectory_minimal"] = (
+            make_single_trajectory_min(
+                max_chunk_size=chunk["rst"],
+                trajectory_capture_width=normalized_widths["rst"],
+                **factory_kwargs(
+                    make_single_trajectory_min, srw_pool_kwargs("rst")),
+            ))
     return fns
 
 
