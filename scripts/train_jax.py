@@ -1233,6 +1233,11 @@ V4171_RESUME_REQUIRED_FIELDS = (
     ('model', 'admission_den_power'),
 )
 
+V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES = (
+    'up_proj_grad',
+    'local_write_grad',
+)
+
 V4173_RESUME_REQUIRED_FIELDS = (
     *V4171_RESUME_REQUIRED_FIELDS,
 )
@@ -3016,6 +3021,10 @@ def _v4170_compact_train_metrics(
             metrics.update({
                 key: operator_key_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
+        if str(model_version) == V4173_MODEL_VERSION:
+            metrics.update({
+                key: operator_key_gradient_metrics[key]
+                for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
         return metrics
     metrics.update({
         key: result[key]
@@ -3042,15 +3051,23 @@ def _v4170_compact_train_metrics(
             metrics.update({
                 key: operator_key_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
+        if str(model_version) == V4173_MODEL_VERSION:
+            metrics.update({
+                key: operator_key_gradient_metrics[key]
+                for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
     v4172_alias_names = (
         V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES
         if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
         else ())
+    v4173_local_write_names = (
+        V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES
+        if str(model_version) == V4173_MODEL_VERSION else ())
     expected = (
         V4170_COMPACT_TRAIN_METRIC_NAMES
         + V4171_COMPOSITION_METRIC_NAMES
         + V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES
         + v4172_alias_names
+        + v4173_local_write_names
         if is_v4171 else V4170_COMPACT_TRAIN_METRIC_NAMES)
     if tuple(metrics.keys()) != expected:
         raise RuntimeError(
@@ -6957,7 +6974,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 return (('router/proj_attn' in ps)
-                        or ('router/proj_rst' in ps))
+                        or ('router/proj_rst' in ps)
+                        or (str(_model_version) == V4173_MODEL_VERSION
+                            and (('router/up_qk' in ps)
+                                 or ('router/up_v' in ps)
+                                 or ('router/up_rst' in ps))))
             return (('router/proj_attn' in ps)
                     or ('router/proj_rst' in ps)
                     or ('router/q_op_write_query_proj' in ps)
@@ -6994,7 +7015,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         def _is_router_proj_attn_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
-                return 'router/proj_attn' in ps
+                return (('router/proj_attn' in ps)
+                        or (str(_model_version) == V4173_MODEL_VERSION
+                            and (('router/up_qk' in ps)
+                                 or ('router/up_v' in ps))))
             return (('router/proj_attn' in ps)
                     or ('router/q_op_write_query_proj' in ps)
                     or ('router/k_op_write_query_proj' in ps)
@@ -7002,7 +7026,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         def _is_router_proj_rst_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
-                return 'router/proj_rst' in ps
+                return (('router/proj_rst' in ps)
+                        or (str(_model_version) == V4173_MODEL_VERSION
+                            and 'router/up_rst' in ps))
             return (('router/proj_rst' in ps)
                     or ('router/rst_op_write_query_proj' in ps))
 
@@ -7406,6 +7432,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _ppool = params.get('neuron_pool', {})
         _shared_probe_metrics = _shared_probe_gradient_diagnostics(
             _ppool, _gpool, _model_version)
+        _grouter = grads.get('router', {})
+        if str(_model_version) == V4173_MODEL_VERSION:
+            up_proj_grad = jnp.sqrt(sum(
+                jnp.square(_child_norm(_grouter, name))
+                for name in ('up_qk', 'up_v', 'up_rst')) + 1e-12)
+            local_write_grad = jnp.sqrt(sum(
+                jnp.square(_pool_partition_norm(_gpool, prefix, 'write'))
+                for prefix in ('attn_qk', 'attn_v', 'rst')) + 1e-12)
+        else:
+            up_proj_grad = jnp.float32(0.0)
+            local_write_grad = jnp.float32(0.0)
         grad_norm = _tree_norm(grads)
         if _is_v4170_compact_train:
             compact_operator_key_metrics = dict(_shared_probe_metrics)
@@ -7415,6 +7452,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                         'grad_pool_shared_key_probe'],
                     'grad_pool_attn_v_op_key': jnp.float32(0.0),
                     'grad_pool_rst_op_key': jnp.float32(0.0),
+                })
+            if str(_model_version) == V4173_MODEL_VERSION:
+                compact_operator_key_metrics.update({
+                    'up_proj_grad': up_proj_grad,
+                    'local_write_grad': local_write_grad,
                 })
             metrics = _v4170_compact_train_metrics(
                 result,
@@ -7448,10 +7490,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         else:
             grad_global_postclip = grad_norm
 
-        _grouter = grads.get('router', {})
         if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
             grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
             grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
+            if str(_model_version) == V4173_MODEL_VERSION:
+                grad_router_proj_attn = jnp.sqrt(
+                    jnp.square(grad_router_proj_attn)
+                    + jnp.square(_child_norm(_grouter, 'up_qk'))
+                    + jnp.square(_child_norm(_grouter, 'up_v')))
+                grad_router_proj_rst = jnp.sqrt(
+                    jnp.square(grad_router_proj_rst)
+                    + jnp.square(_child_norm(_grouter, 'up_rst')))
         else:
             grad_router_proj_attn = (
                 _child_norm(_grouter, 'proj_attn')
@@ -8007,6 +8056,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pool_op_key': grad_pool_op_key,
             'grad_pool_read': grad_pool_read,
             'grad_pool_write': grad_pool_write,
+            **({
+                'up_proj_grad': up_proj_grad,
+                'local_write_grad': local_write_grad,
+            } if str(_model_version) == V4173_MODEL_VERSION else {}),
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'rst_aux': result.get('rst_aux', jnp.float32(0.0)),
             'drive_mean': result.get('drive_mean', jnp.float32(0.0)),
@@ -11001,8 +11054,51 @@ def _match_tree_to_template_on_mesh(restored_tree, template_tree, mesh, *, name)
         ) from exc
 
 
-def _validate_v4171_checkpoint_param_schema(restored_params, target_params):
+def _validate_v4173_native_local_write_checkpoint_schema(
+        restored_params, target_params):
+    """Reject the pre-native v4173 full-write tree without migration."""
+    restored_pool = restored_params.get('neuron_pool', {})
+    target_pool = target_params.get('neuron_pool', {})
+    restored_router = restored_params.get('router', {})
+    incompatibilities = []
+    for name in ('attn_qk_write', 'attn_v_write', 'rst_write'):
+        if name not in restored_pool or name not in target_pool:
+            incompatibilities.append(f'missing neuron_pool/{name}')
+            continue
+        restored_shape = tuple(getattr(restored_pool[name], 'shape', ()))
+        target_shape = tuple(getattr(target_pool[name], 'shape', ()))
+        if restored_shape != target_shape:
+            incompatibilities.append(
+                f'neuron_pool/{name} checkpoint_shape={restored_shape} '
+                f'expected_shape={target_shape}')
+    probe_name = 'rw_key_write_probe'
+    if probe_name not in restored_pool or probe_name not in target_pool:
+        incompatibilities.append(f'missing neuron_pool/{probe_name}')
+    else:
+        restored_shape = tuple(
+            getattr(restored_pool[probe_name], 'shape', ()))
+        target_shape = tuple(getattr(target_pool[probe_name], 'shape', ()))
+        if restored_shape != target_shape:
+            incompatibilities.append(
+                f'neuron_pool/{probe_name} checkpoint_shape={restored_shape} '
+                f'expected_shape={target_shape}')
+    for name in ('up_qk', 'up_v', 'up_rst'):
+        if (name not in restored_router
+                or 'kernel' not in restored_router.get(name, {})):
+            incompatibilities.append(f'missing router/{name}/kernel')
+    if incompatibilities:
+        raise RuntimeError(
+            "legacy v4173 full-write checkpoint is incompatible with native "
+            "v4173 local-write architecture; start a fresh run: "
+            + "; ".join(incompatibilities))
+
+
+def _validate_v4171_checkpoint_param_schema(
+        restored_params, target_params, model_version=None):
     """Fail loud with the exact parameter path and shapes before mesh put."""
+    if str(model_version) == V4173_MODEL_VERSION:
+        _validate_v4173_native_local_write_checkpoint_schema(
+            restored_params, target_params)
     def _leaves(tree):
         return {
             jax.tree_util.keystr(path): value
@@ -12149,6 +12245,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'grad_pool_rst_op_key', 0.0)),
         'grad_pool_rst_read': float(m.get('grad_pool_rst_read', 0.0)),
         'grad_pool_rst_write': float(m.get('grad_pool_rst_write', 0.0)),
+        'up_proj_grad': float(m.get('up_proj_grad', 0.0)),
+        'local_write_grad': float(m.get('local_write_grad', 0.0)),
         'grad_pool_scales': float(m.get('grad_pool_scales', 0.0)),
         'grad_expand_O': float(m.get('grad_expand_O', 0.0)),
         'grad_layernorms': float(m.get('grad_layernorms', 0.0)),
@@ -13324,6 +13422,11 @@ def _print_regular_block(rec, ctx):
             f"read={_g('grad_pool_shared_read_probe'):.3e} "
             f"write={_g('grad_pool_shared_write_probe'):.3e}"
         )
+    if str(ctx.get('model_version')) == V4173_MODEL_VERSION:
+        log_message(
+            "  native_rw_grad: "
+            f"up_proj={_g('up_proj_grad'):.3e} "
+            f"local_write={_g('local_write_grad'):.3e}")
     if opspace_active:
         _print_v4168_opspace_regular_block(rec)
         _print_train_progress_line(rec, ctx)
@@ -14117,6 +14220,9 @@ def _build_analysis_record(base, metrics, ctx):
     for _key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    for _key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
     rec.pop('attn_den_cost', None)
     rec.pop('rst_den_cost', None)
     rec.update({
@@ -14173,6 +14279,11 @@ def _print_analysis_block(rec, ctx):
             f"read={_g('grad_pool_shared_read_probe'):.3e} "
             f"write={_g('grad_pool_shared_write_probe'):.3e}"
         )
+    if str(ctx.get('model_version')) == V4173_MODEL_VERSION:
+        log_message(
+            "  native_rw_grad: "
+            f"up_proj={_g('up_proj_grad'):.3e} "
+            f"local_write={_g('local_write_grad'):.3e}")
 
     log_message(
         f"  dist k[skew={rec['rst_score_skew']:+.2f} kurt={rec['rst_score_kurt']:.2f}"
@@ -14961,6 +15072,14 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         sharded['attn_qk_paired_minimal'] = paired_min(
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
+    if (version == V4173_MODEL_VERSION
+            and kernel_profile == 'trajectory'):
+        sharded['attn_qk_paired_trajectory_minimal'] = sharded[
+            'attn_qk_paired_minimal']
+        sharded['attn_v_single_trajectory_minimal'] = sharded[
+            'attn_v_single_minimal']
+        sharded['rst_single_trajectory_minimal'] = sharded[
+            'rst_single_minimal']
     if _is_v417x_version(version):
         if single_min is None or paired_min is None:
             raise RuntimeError(
@@ -15111,7 +15230,8 @@ def restore_transfer_params(source_checkpoint, target_params, mesh):
             'model_version', ''))
     if _is_v417x_version(source_version):
         _validate_v4171_checkpoint_param_schema(
-            restored_state['params'], target_params)
+            restored_state['params'], target_params,
+            model_version=source_version)
     return _match_tree_to_template_on_mesh(
         restored_state['params'], target_params, mesh, name='params')
 
@@ -17414,7 +17534,7 @@ def main():
                     int(cfg['model'][key])
                     for key in ('n_qk', 'n_v', 'n_rst'))
                 expected_by_operator_count = {
-                    87_324: 393_798_660,
+                    87_324: 216_204_292,
                 }
                 expected_parameters = expected_by_operator_count.get(
                     current_operator_count)
@@ -18380,7 +18500,8 @@ def main():
         _validate_restored_state_keys(restored_state, target_state)
         if _is_v417x_version(model_version_cfg):
             _validate_v4171_checkpoint_param_schema(
-                restored_state['params'], target_params)
+                restored_state['params'], target_params,
+                model_version=model_version_cfg)
         _validate_restored_array_tree(
             restored_state['params'],
             target_params,
@@ -20016,17 +20137,20 @@ def main():
                         f"d_route={cfg['model']['d_route']}")
                     log_message(
                         "Execution write width: "
-                        f"d_model={cfg['model']['d_model']}")
+                        f"d_route={cfg['model']['d_route']}")
                     log_message("Routes: Q, K, V, RST")
                     log_message(
                         "Operator address: generalized bilinear "
-                        "low-read/full-write RW key")
+                        "local-read/local-write RW key")
                     log_message(
                         "Read vectors: [N, "
                         f"{cfg['model']['d_route']}]")
                     log_message(
                         "Write vectors: [N, "
-                        f"{cfg['model']['d_model']}]")
+                        f"{cfg['model']['d_route']}]")
+                    log_message(
+                        "Route up projections: "
+                        "up_qk/up_v/up_rst [d_route, d_model]")
                     _v4173_counts = _v4173_symbolic_parameter_count(
                         cfg['model'])
                     log_message(

@@ -1,4 +1,4 @@
-# DAWN-SRW v4.1.7.3 - parameter-matched to baseline d432 4x
+# DAWN-SRW v4.1.7.3 - native local-write 40M POC configuration
 #
 # Baseline target:
 #   train_config_baseline_tpu_40M_c4_5B
@@ -6,10 +6,10 @@
 #
 # v4173 exact params:
 #   d_model=384, d_route=128, n_layers=12
-#   n_qk=2,596, n_v=12,856, n_rst=36,059
+#   n_qk=4,896, n_v=15,432, n_rst=31,183
 #   total operators=51,511
-#   exact params = 40,343,556
-#   delta vs baseline = -60 params (-0.000149%)
+#   exact params = 27,271,428
+#   delta vs baseline = -13,072,188 params (-32.402123%)
 #
 # Pool allocation preserves the existing 40M DAWN pool ratio
 # 1,480 : 7,330 : 20,560 as closely as integer counts allow.
@@ -45,9 +45,9 @@ model:
   admission_den_power_rst: 1.2
   srw_composition_mode: linear_angular
 
-  n_qk: 4896
-  n_v: 15432
-  n_rst: 31183
+  n_qk: 9748
+  n_v: 30730
+  n_rst: 62094
 
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
