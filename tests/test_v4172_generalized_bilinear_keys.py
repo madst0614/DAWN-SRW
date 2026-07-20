@@ -396,6 +396,7 @@ def test_v4172_query_attention_and_key_dimensions_forward_once_and_parity(
         "sharded_fns": sharded_fns,
         "analysis": False,
         "minimal_train": True,
+        "minimal_runtime_profile": "suppression",
         "analysis_target_layer": jnp.int32(0),
         "analysis_target_positions": jnp.asarray([1], dtype=jnp.int32),
         "analysis_target_route": jnp.int32(2),
@@ -779,14 +780,15 @@ def test_v4172_pool_powers_preserve_parameter_schema_and_default_forward() -> No
         **{
             **apply_kwargs,
             "sharded_fns": suppression_pool_fns,
+            "minimal_runtime_profile": "suppression",
             "analysis_contribution": jnp.full(
                 (1, 8), -1, dtype=jnp.int32),
             "analysis_intervention_enabled": jnp.bool_(True),
         },
     )
-    for production, suppression in zip(
-            _tree_arrays(pool_out), _tree_arrays(zero_suppression_out)):
-        np.testing.assert_array_equal(production, suppression)
+    for key in ("loss", "correct", "valid_count"):
+        np.testing.assert_array_equal(
+            np.asarray(pool_out[key]), np.asarray(zero_suppression_out[key]))
 
     legacy_checkpoint_cfg = {
         "model_version": V4172_MODEL_VERSION,
@@ -823,6 +825,9 @@ def test_v4172_pool_power_experiment_config_only_changes_requested_fields() -> N
         "admission_den_power_qk": 0.5,
         "admission_den_power_v": 1.0,
         "admission_den_power_rst": 1.2,
+        "tau_init_target_qk_frac": 0.05,
+        "tau_init_target_v_frac": 0.03,
+        "tau_init_target_rst_frac": 0.01,
     })
     assert experiment["model"] == expected_model
     assert symbolic_parameter_count(experiment)["total"] == (

@@ -77,23 +77,21 @@ def main() -> None:
     single_disabled = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False))
-    assert _all_exact(single_base, single_neutral[:-1])
-    assert _all_exact(single_base, single_disabled[:-1])
+    assert _all_exact(single_base, single_neutral[0])
+    assert _all_exact(single_base, single_disabled[0])
 
     single_changed = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(True))
     assert not np.array_equal(
-        np.asarray(single_base[0][:, 1]), np.asarray(single_changed[0][:, 1]))
+        np.asarray(single_base[:, 1]), np.asarray(single_changed[0][:, 1]))
     assert np.array_equal(
-        np.asarray(single_base[0][:, 0]), np.asarray(single_changed[0][:, 0]))
-    assert np.array_equal(np.asarray(single_base[3]), np.asarray(single_changed[3]))
-    assert np.array_equal(np.asarray(single_base[4]), np.asarray(single_changed[4]))
+        np.asarray(single_base[:, 0]), np.asarray(single_changed[0][:, 0]))
 
     inactive = suppression_single(
         x, h_single, op_key, raw_tau, read, write, *scalar_args,
         jnp.ones((batch,), dtype=jnp.int32), positions, jnp.bool_(True))
-    assert _all_exact(single_base, inactive[:-1])
+    assert _all_exact(single_base, inactive[0])
     print("PRODUCTION_CORE_INACTIVE_NOOP_OK")
     print("PRODUCTION_CORE_CAUSAL_PREFIX_OK")
 
@@ -107,7 +105,7 @@ def main() -> None:
         jnp.asarray([0, 2], dtype=jnp.int32), positions, jnp.bool_(True))
     assert all(
         not np.array_equal(
-            np.asarray(per_example_base[0][index, 1]),
+            np.asarray(per_example_base[index, 1]),
             np.asarray(per_example_changed[0][index, 1]))
         for index in range(batch))
 
@@ -128,8 +126,8 @@ def main() -> None:
     paired_disabled = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(False), jnp.int32(0))
-    assert _all_exact(paired_base, paired_neutral[:-1])
-    assert _all_exact(paired_base, paired_disabled[:-1])
+    assert _all_exact(paired_base, paired_neutral[0])
+    assert _all_exact(paired_base, paired_disabled[0])
 
     paired_non_target_route = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
@@ -137,16 +135,16 @@ def main() -> None:
     # The final leaf is the route-selected analysis sidecar.  It is expected
     # to be zero for an out-of-range route while all production outputs remain
     # machine exact.
-    assert _all_exact(paired_disabled[:-1], paired_non_target_route[:-1])
+    assert _all_exact(paired_disabled[0], paired_non_target_route[0])
 
     q_changed = suppression_paired(
         x, h_paired, op_key, raw_tau_paired, read, write, *scalar_args,
         selected_zero, positions, jnp.bool_(True), jnp.int32(0))
     assert not np.array_equal(
-        np.asarray(paired_base[0][:, 1, 0]),
+        np.asarray(paired_base[:, 1, 0]),
         np.asarray(q_changed[0][:, 1, 0]))
     assert np.array_equal(
-        np.asarray(paired_base[0][..., 1, :]),
+        np.asarray(paired_base[..., 1, :]),
         np.asarray(q_changed[0][..., 1, :]))
 
     k_changed = suppression_paired(
@@ -154,10 +152,10 @@ def main() -> None:
         jnp.ones((batch,), dtype=jnp.int32), positions,
         jnp.bool_(True), jnp.int32(1))
     assert np.array_equal(
-        np.asarray(paired_base[0][..., 0, :]),
+        np.asarray(paired_base[..., 0, :]),
         np.asarray(k_changed[0][..., 0, :]))
     assert not np.array_equal(
-        np.asarray(paired_base[0][:, 1, 1]),
+        np.asarray(paired_base[:, 1, 1]),
         np.asarray(k_changed[0][:, 1, 1]))
     print("PRODUCTION_CORE_QK_ROUTE_ISOLATION_OK")
 
@@ -166,7 +164,7 @@ def main() -> None:
         branch = suppression_single(
             x, h_single, op_key, raw_tau, read, write, *scalar_args,
             selected_zero, positions, jnp.bool_(True))
-        assert not np.array_equal(np.asarray(single_base[0]), np.asarray(branch[0]))
+        assert not np.array_equal(np.asarray(single_base), np.asarray(branch[0]))
     print("PRODUCTION_CORE_V_RST_BRANCHES_OK")
 
     model = DAWN_SRW_V4171(
@@ -211,13 +209,11 @@ def main() -> None:
             rngs={"dropout": jax.random.PRNGKey(81)},
             sharded_fns=production_only_fns,
             analysis=False, minimal_train=True,
-            analysis_return_residual=True,
             compute_accuracy=False)
     finally:
         for name, factory in original_analysis_factories.items():
             setattr(v4171_module, name, factory)
-    assert production_only_result["final_residual"].shape == (
-        batch, seq, dim)
+    assert np.isfinite(float(production_only_result["loss"]))
     print("PRODUCTION_TRAINING_ANALYSIS_FACTORY_ISOLATION_OK")
     sharded_fns = {
         "single": production_single,
@@ -236,6 +232,7 @@ def main() -> None:
         "sharded_fns": sharded_fns,
         "analysis": False,
         "minimal_train": True,
+        "minimal_runtime_profile": "suppression",
         "analysis_return_residual": True,
         "analysis_return_logits": True,
         "compute_accuracy": False,

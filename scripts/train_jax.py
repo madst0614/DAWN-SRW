@@ -126,6 +126,16 @@ from models.dawn_srw_v4171 import (
     _tau_init_calibration_scores as _v4171_tau_init_calibration_scores,
 )
 from models.dawn_srw_v4172 import DAWN_SRW_V4172
+from models.dawn_srw_v4173 import (
+    DAWN_SRW_V4173,
+    _pool_operator_keys as _v4173_pool_operator_keys,
+    _query_geometry_diagnostics as _v4173_query_geometry_diagnostics,
+    _raw_tau_init_from_cosine_tau as _v4173_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4173_tau_init_calibration_scores,
+    _validate_v4173_sharded_fns,
+    generalized_bilinear_operator_key_diagnostics as _v4173_operator_key_diagnostics,
+    symbolic_parameter_count as _v4173_symbolic_parameter_count,
+)
 from models.baseline_transformer_jax import (
     VanillaTransformer,
     create_baseline_sharded_fns,
@@ -346,18 +356,22 @@ V4169_MODEL_VERSION = 'spatial-r1-v4.1.6.9'
 V4170_MODEL_VERSION = 'spatial-r1-v4.1.7.0'
 V4171_MODEL_VERSION = 'spatial-r1-v4.1.7.1'
 V4172_MODEL_VERSION = 'spatial-r1-v4.1.7.2'
+V4173_MODEL_VERSION = 'spatial-r1-v4.1.7.3'
 BASELINE_MODEL_VERSION = 'baseline-JAX'
 LEGACY_BASELINE_MODEL_VERSION = 'baseline'
 OFFICIAL_MODEL_VERSION = V4164_MODEL_VERSION
 ACTIVE_SRW_MODEL_VERSIONS = (
     V4164_MODEL_VERSION, V4166_MODEL_VERSION, V4167_MODEL_VERSION,
     V4168_MODEL_VERSION, V4169_MODEL_VERSION, V4170_MODEL_VERSION,
-    V4171_MODEL_VERSION, V4172_MODEL_VERSION)
+    V4171_MODEL_VERSION, V4172_MODEL_VERSION, V4173_MODEL_VERSION)
 RW_KEY_SRW_MODEL_VERSIONS = (
     V4166_MODEL_VERSION, V4167_MODEL_VERSION, V4168_MODEL_VERSION,
     V4169_MODEL_VERSION, V4170_MODEL_VERSION, V4171_MODEL_VERSION,
-    V4172_MODEL_VERSION)
-V417X_MODEL_VERSIONS = (V4171_MODEL_VERSION, V4172_MODEL_VERSION)
+    V4172_MODEL_VERSION, V4173_MODEL_VERSION)
+V417X_MODEL_VERSIONS = (
+    V4171_MODEL_VERSION, V4172_MODEL_VERSION, V4173_MODEL_VERSION)
+GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS = (
+    V4172_MODEL_VERSION, V4173_MODEL_VERSION)
 V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS = (
     V4169_MODEL_VERSION, V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS)
 DIRECT_STATE_QUERY_MODEL_VERSIONS = (
@@ -416,6 +430,7 @@ MODEL_REGISTRY = {
         'tau_init_calibration_scores': _v4171_tau_init_calibration_scores,
         'pool_operator_keys': _v4171_pool_operator_keys,
         'query_geometry_diagnostics': _v4171_query_geometry_diagnostics,
+        'symbolic_parameter_count': _v417x_symbolic_parameter_count,
     },
     V4172_MODEL_VERSION: {
         'class': DAWN_SRW_V4172,
@@ -424,6 +439,18 @@ MODEL_REGISTRY = {
         'tau_init_calibration_scores': _v4171_tau_init_calibration_scores,
         'pool_operator_keys': _v4171_pool_operator_keys,
         'query_geometry_diagnostics': _v4171_query_geometry_diagnostics,
+        'operator_key_diagnostics': _v4172_operator_key_diagnostics,
+        'symbolic_parameter_count': _v417x_symbolic_parameter_count,
+    },
+    V4173_MODEL_VERSION: {
+        'class': DAWN_SRW_V4173,
+        'module': 'models.dawn_srw_v4173',
+        'raw_tau_init_from_cosine_tau': _v4173_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4173_tau_init_calibration_scores,
+        'pool_operator_keys': _v4173_pool_operator_keys,
+        'query_geometry_diagnostics': _v4173_query_geometry_diagnostics,
+        'operator_key_diagnostics': _v4173_operator_key_diagnostics,
+        'symbolic_parameter_count': _v4173_symbolic_parameter_count,
     },
 }
 
@@ -495,6 +522,15 @@ def _is_v417x_version(version):
     return str(version) in V417X_MODEL_VERSIONS
 
 
+def _v417x_kernel_profile_key(version):
+    if not _is_v417x_version(version):
+        raise ValueError(f"kernel profile key is v417x-only, got {version!r}")
+    return (
+        '_v4173_kernel_profile'
+        if str(version) == V4173_MODEL_VERSION
+        else '_v4171_kernel_profile')
+
+
 def _is_fixed_tau_srw_version(version):
     return str(version) in FIXED_TAU_SRW_MODEL_VERSIONS
 
@@ -515,6 +551,14 @@ def _pool_operator_keys_for_version(version):
     if version == V4170_MODEL_VERSION:
         return _v4170_pool_operator_keys
     raise ValueError(f"{version} does not expose operator keys.")
+
+
+def _registry_helper_for_version(version, name):
+    entry = _model_registry_entry(version)
+    helper = entry.get(name)
+    if helper is None:
+        raise ValueError(f"{version} does not expose registry helper {name!r}")
+    return helper
 
 
 def _model_registry_entry(version):
@@ -1159,6 +1203,10 @@ V4171_RESUME_REQUIRED_FIELDS = (
     ('model', 'admission_den_power'),
 )
 
+V4173_RESUME_REQUIRED_FIELDS = (
+    *V4171_RESUME_REQUIRED_FIELDS,
+)
+
 V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
     ('model', 'model_version'),
     ('model', 'd_model'),
@@ -1481,7 +1529,11 @@ def _v4171_static_runtime_den_power(model, value, *, context,
         raise ValueError(
             f"{context} admission_den_power={runtime_value} does not match "
             f"v4171 model constructor admission_den_power={model_value}")
-    _validate_v4171_sharded_fns(
+    sharded_validator = (
+        _validate_v4173_sharded_fns
+        if str(getattr(model, '__version__', '')) == V4173_MODEL_VERSION
+        else _validate_v4171_sharded_fns)
+    sharded_validator(
         sharded_fns, model_value, model_mode, model_beta,
         expected_power_qk=model_qk_power,
         expected_power_v=model_v_power,
@@ -1511,7 +1563,11 @@ def _v4171_static_runtime_composition_mode(
             f"{context} srw_composition_mode={runtime_mode!r} does not match "
             "v4171 model constructor "
             f"srw_composition_mode={model_mode!r}")
-    _validate_v4171_sharded_fns(
+    sharded_validator = (
+        _validate_v4173_sharded_fns
+        if str(getattr(model, '__version__', '')) == V4173_MODEL_VERSION
+        else _validate_v4171_sharded_fns)
+    sharded_validator(
         sharded_fns, model_power, model_mode, model_beta,
         expected_power_qk=model_qk_power,
         expected_power_v=model_v_power,
@@ -1540,7 +1596,11 @@ def _v4171_static_runtime_heat_kernel_beta(
         raise ValueError(
             f"{context} heat_kernel_beta={runtime_beta} does not match "
             f"v4171 model constructor heat_kernel_beta={model_beta}")
-    _validate_v4171_sharded_fns(
+    sharded_validator = (
+        _validate_v4173_sharded_fns
+        if str(getattr(model, '__version__', '')) == V4173_MODEL_VERSION
+        else _validate_v4171_sharded_fns)
+    sharded_validator(
         sharded_fns, model_power, model_mode, model_beta,
         expected_power_qk=model_qk_power,
         expected_power_v=model_v_power,
@@ -1610,7 +1670,9 @@ def _require_resume_materialized_fields(full_config):
 
     if str(model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS:
         required_fields = (
-            V4171_RESUME_REQUIRED_FIELDS
+            (V4173_RESUME_REQUIRED_FIELDS
+             if str(model_version) == V4173_MODEL_VERSION
+             else V4171_RESUME_REQUIRED_FIELDS)
             if _is_v417x_version(model_version)
             else (V4170_RESUME_REQUIRED_FIELDS
                   if str(model_version) == V4170_MODEL_VERSION
@@ -1740,6 +1802,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
             V4170_MODEL_VERSION,
             V4171_MODEL_VERSION,
             V4172_MODEL_VERSION,
+            V4173_MODEL_VERSION,
             BASELINE_MODEL_VERSION,
             LEGACY_BASELINE_MODEL_VERSION):
         return
@@ -1769,6 +1832,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
                 V4170_MODEL_VERSION: "V4170",
                 V4171_MODEL_VERSION: "V4171",
                 V4172_MODEL_VERSION: "V4172",
+                V4173_MODEL_VERSION: "V4173",
             }[model_version]
             print(
                 f"vocab_parallel: enabled model={_model_label} "
@@ -2774,7 +2838,10 @@ def _validate_v4171_model_config(model_cfg):
         raise ValueError(
             f"v4171 model.d_route must be a positive integer, got {d_route!r}")
     obsolete = tuple(
-        key for key in ('rw_role_read_dim', 'rw_role_write_dim')
+        key for key in (
+            'rw_role_read_dim', 'rw_role_write_dim',
+            'execution_read_mode', 'read_mode',
+            'low_dimensional_read', 'operation_projection_read')
         if key in model_cfg)
     if obsolete:
         raise ValueError(
@@ -2915,7 +2982,7 @@ def _v4170_compact_train_metrics(
         metrics.update({
             key: operator_key_gradient_metrics[key]
             for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
-        if str(model_version) == V4172_MODEL_VERSION:
+        if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
                 key: operator_key_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
@@ -2941,13 +3008,14 @@ def _v4170_compact_train_metrics(
         metrics.update({
             key: operator_key_gradient_metrics[key]
             for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
-        if str(model_version) == V4172_MODEL_VERSION:
+        if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
                 key: operator_key_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
     v4172_alias_names = (
         V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES
-        if str(model_version) == V4172_MODEL_VERSION else ())
+        if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
+        else ())
     expected = (
         V4170_COMPACT_TRAIN_METRIC_NAMES
         + V4171_COMPOSITION_METRIC_NAMES
@@ -5474,10 +5542,10 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
         _v4170_pool_operator_keys(pool)
         if str(model_version) == V4170_MODEL_VERSION else None)
     v417x_op_keys = (
-        _v4171_pool_operator_keys(pool)
+        _pool_operator_keys_for_version(model_version)(pool)
         if _is_v417x_version(model_version) else None)
 
-    if str(model_version) == V4172_MODEL_VERSION:
+    if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         for probe_name, prefix in (
                 ('rw_key_read_probe', 'read_probe'),
                 ('rw_key_write_probe', 'write_probe')):
@@ -5532,9 +5600,11 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
             operator_keys = v417x_op_keys[f'{name}_op_key']
             out.update(_row_norm_stats(
                 operator_keys, f'{name}_op_key_norm', full))
-            if (full and str(model_version) == V4172_MODEL_VERSION
+            if (full and str(model_version)
+                    in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
                     and read is not None and write is not None):
-                generated = _v4172_operator_key_diagnostics(
+                generated = _registry_helper_for_version(
+                    model_version, 'operator_key_diagnostics')(
                     read, write,
                     pool['rw_key_read_probe'],
                     pool['rw_key_write_probe'])
@@ -5580,7 +5650,7 @@ def _shared_probe_gradient_diagnostics(
         pool_params, pool_grads, model_version):
     """Return v4172 shared-probe norms without changing optimization state."""
     zero = jnp.float32(0.0)
-    if str(model_version) != V4172_MODEL_VERSION:
+    if str(model_version) not in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         return {
             'grad_pool_shared_key_probe': zero,
             'grad_pool_shared_read_probe': zero,
@@ -5630,7 +5700,7 @@ def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
             'attn_v': _norm('attn_v_op_key'),
             'rst': _norm('rst_op_key'),
         }
-    if str(model_version) == V4172_MODEL_VERSION:
+    if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         shared_probe_metrics = _shared_probe_gradient_diagnostics(
             {}, pool_grads, model_version)
         return {
@@ -5691,7 +5761,7 @@ def _pool_update_diagnostics(params, grads, model_version=None):
             ('attn_v', 'op_key', 'attn_v_op_key'),
             ('rst', 'op_key', 'rst_op_key'),
         )
-    elif str(model_version) == V4172_MODEL_VERSION:
+    elif str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         op_specs = (
             ('shared', 'read_probe', 'rw_key_read_probe'),
             ('shared', 'write_probe', 'rw_key_write_probe'),
@@ -7309,7 +7379,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_norm = _tree_norm(grads)
         if _is_v4170_compact_train:
             compact_operator_key_metrics = dict(_shared_probe_metrics)
-            if str(_model_version) == V4172_MODEL_VERSION:
+            if str(_model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
                 compact_operator_key_metrics.update({
                     'grad_pool_attn_qk_op_key': _shared_probe_metrics[
                         'grad_pool_shared_key_probe'],
@@ -7340,7 +7410,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_v': jnp.float32(0.0),
                 'rst': jnp.float32(0.0),
             }
-            if str(_model_version) == V4172_MODEL_VERSION
+            if str(_model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
             else _canonical_pool_op_key_grad_norms(
                 _gpool, _model_version))
         if float(global_grad_clip) > 0.0:
@@ -7540,10 +7610,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _cur_v = _v4170_keys['attn_v_op_key']
                 _cur_rst = _v4170_keys['rst_op_key']
             elif _is_v417x_version(_model_version):
-                _v4171_keys = _v4171_pool_operator_keys(_pool)
-                _cur_qk = _v4171_keys['attn_qk_op_key']
-                _cur_v = _v4171_keys['attn_v_op_key']
-                _cur_rst = _v4171_keys['rst_op_key']
+                _v417x_keys = _pool_operator_keys_for_version(
+                    _model_version)(_pool)
+                _cur_qk = _v417x_keys['attn_qk_op_key']
+                _cur_v = _v417x_keys['attn_v_op_key']
+                _cur_rst = _v417x_keys['rst_op_key']
             elif ('attn_qk_read_global' in _pool
                     or 'attn_qk_read_shared' in _pool):
                 def _flat_partitioned_op_key(prefix):
@@ -8572,14 +8643,15 @@ def create_production_diagnostic_step(
         admission_den_power=1.0, ce_token_chunk_size=32768,
         runtime_state=None):
     """Create the read-only, pre-update production diagnostics executable."""
+    model_version = getattr(
+        model, '__version__', getattr(type(model), '__version__', ''))
     if not isinstance(sharded_fns, dict):
         raise TypeError("production diagnostics require dict sharded_fns")
-    if sharded_fns.get('_v4171_kernel_profile') != 'production_diagnostics':
+    if (sharded_fns.get(_v417x_kernel_profile_key(model_version))
+            != 'production_diagnostics'):
         raise ValueError(
             "production diagnostics require kernel profile "
             "'production_diagnostics'")
-    model_version = getattr(
-        model, '__version__', getattr(type(model), '__version__', ''))
     if not _is_v417x_version(model_version):
         raise ValueError(
             "production diagnostics executable is currently v417x-only")
@@ -8842,7 +8914,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             raise RuntimeError(
                 "v417x eval requires minimal_runtime_profile support")
         kernel_profile = (
-            sharded_fns.get('_v4171_kernel_profile')
+            sharded_fns.get(_v417x_kernel_profile_key(_model_version))
             if isinstance(sharded_fns, dict) else None)
         if kernel_profile != 'production_diagnostics':
             raise ValueError(
@@ -9238,7 +9310,9 @@ def create_analysis_step(model, sharded_fns=None,
         result.update(_pool_param_diagnostics(params, full=True, model=model))
         if _is_v4170_model:
             query_geometry = (
-                _v4171_query_geometry_diagnostics
+                _registry_helper_for_version(
+                    getattr(model, '__version__', ''),
+                    'query_geometry_diagnostics')
                 if _is_v417x_version(getattr(model, '__version__', ''))
                 else _v4170_query_geometry_diagnostics)
             result.update(query_geometry(params, input_ids, max_tokens=4096))
@@ -9389,7 +9463,7 @@ def create_geometry_step(max_sample=512, model_version=None):
             _v4170_pool_operator_keys(pool)
             if str(model_version) == V4170_MODEL_VERSION else None)
         v417x_keys = (
-            _v4171_pool_operator_keys(pool)
+            _pool_operator_keys_for_version(model_version)(pool)
             if _is_v417x_version(model_version) else None)
         for name, emb_key, read_key, write_key, op_read_key, op_write_key in (
                 ('attn_qk', 'attn_qk_emb', 'attn_qk_read',
@@ -12653,7 +12727,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 def _v4170_compact_regular_jsonl_record(rec, ctx):
     """Whitelist the low-cost v4170 regular record without fake fallbacks."""
     model_version = str(ctx.get('model_version'))
-    if model_version == V4172_MODEL_VERSION:
+    if model_version in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         rec_keys = V4172_COMPACT_REGULAR_JSONL_REC_KEYS
         output_keys = V4172_COMPACT_REGULAR_JSONL_KEYS
     elif _is_v417x_version(model_version):
@@ -13213,7 +13287,7 @@ def _print_regular_block(rec, ctx):
         f"grad={rec['grad_norm']:.2f} | "
         f"acc={acc_text} lr={rec['lr']:.2e}"
     )
-    if str(ctx.get('model_version')) == V4172_MODEL_VERSION:
+    if str(ctx.get('model_version')) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         log_message(
             "  key_probe_grad: "
             f"shared={_g('grad_pool_shared_key_probe'):.3e} "
@@ -14062,7 +14136,7 @@ def _print_analysis_block(rec, ctx):
                 f" p95={_g(f'{prefix}_p95'):.2f} p99={_g(f'{prefix}_p99'):.2f}"
                 f" max={_g(f'{prefix}_max'):.2f}")
 
-    if str(ctx.get('model_version')) == V4172_MODEL_VERSION:
+    if str(ctx.get('model_version')) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         log_message(
             "  key_probe_grad: "
             f"shared={_g('grad_pool_shared_key_probe'):.3e} "
@@ -14762,6 +14836,12 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
 
     entry = _model_registry_entry(version)
     module = __import__(entry['module'], fromlist=['make_sharded_srw'])
+    if (_is_v417x_version(version)
+            and str(getattr(module, 'MODEL_VERSION', '')) != version):
+        raise RuntimeError(
+            f"{version} registry resolved the wrong sharded factory module: "
+            f"module={entry['module']!r}, "
+            f"module_version={getattr(module, 'MODEL_VERSION', None)!r}")
     single_factory = module.make_sharded_srw
     paired_factory = getattr(module, 'make_sharded_srw_paired', None)
     if paired_factory is None:
@@ -14856,7 +14936,11 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             raise RuntimeError(
                 f"{version} is missing factories for static kernel profile "
                 f"{kernel_profile!r}")
-        sharded['_v4171_kernel_profile'] = kernel_profile
+        profile_key = (
+            '_v4173_kernel_profile'
+            if version == V4173_MODEL_VERSION
+            else '_v4171_kernel_profile')
+        sharded[profile_key] = kernel_profile
     if version == V4167_MODEL_VERSION:
         extra_factory = getattr(module, 'create_v4167_tp_sharded_fns', None)
         if extra_factory is None:
@@ -17144,7 +17228,8 @@ def main():
 
     n_params = count_parameters(params)
     symbolic_counts = (
-        _v417x_symbolic_parameter_count(cfg['model'])
+        _registry_helper_for_version(
+            model_version_cfg, 'symbolic_parameter_count')(cfg['model'])
         if _is_v417x_version(model_version_cfg) else None)
     if (symbolic_counts is not None
             and int(symbolic_counts['total']) != int(n_params)):
@@ -17207,11 +17292,17 @@ def main():
             print(f"Operator key mode: {cfg['model']['operator_key_mode']}")
             print("Operator key probe scope: "
                   + ("shared_across_qk_v_rst"
-                     if str(model_version_cfg) == V4172_MODEL_VERSION
+                     if str(model_version_cfg)
+                     in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
                      else "not_applicable"))
             if str(model_version_cfg) == V4172_MODEL_VERSION:
                 print(
                     "v4172 legacy grad_pool_attn_qk_op_key is an alias for "
+                    "the shared QK/V/RST bilinear probe gradient.")
+                print("It is not a QK-only gradient.")
+            elif str(model_version_cfg) == V4173_MODEL_VERSION:
+                print(
+                    "v4173 legacy grad_pool_attn_qk_op_key is an alias for "
                     "the shared QK/V/RST bilinear probe gradient.")
                 print("It is not a QK-only gradient.")
             print("Learned operator key table params: "
@@ -17261,6 +17352,32 @@ def main():
                 print(f"Current operator count: {current_operator_count}")
                 print("Operator count delta: "
                       f"{current_operator_count - reference_operator_count:+d}")
+            if str(model_version_cfg) == V4173_MODEL_VERSION:
+                current_operator_count = sum(
+                    int(cfg['model'][key])
+                    for key in ('n_qk', 'n_v', 'n_rst'))
+                expected_by_operator_count = {
+                    87_324: 393_798_660,
+                }
+                expected_parameters = expected_by_operator_count.get(
+                    current_operator_count)
+                if (official_400m_shape
+                        and expected_parameters is not None
+                        and int(symbolic_counts['total'])
+                        != expected_parameters):
+                    raise RuntimeError(
+                        "v4173 official parameter policy mismatch: "
+                        f"operators={current_operator_count} "
+                        f"expected={expected_parameters} "
+                        f"actual={symbolic_counts['total']}")
+                print(f"Pool parameters: {symbolic_counts['read_write_pools']}")
+                print("Shared probe parameters: "
+                      f"{symbolic_counts['bilinear_probe_matrices']}")
+                print("Execution read: raw operation projection")
+                print(
+                    "Parameter reference: v4172=393800708 "
+                    f"current={symbolic_counts['total']} "
+                    f"delta={int(symbolic_counts['total']) - 393_800_708}")
         for line in model.get_model_info():
             print(line)
         if str(model_version_cfg) == V4167_MODEL_VERSION:
@@ -18561,7 +18678,9 @@ def main():
                 _sharded_fns['attn_qk_paired_minimal'] = (
                     _sharded_paired_attn_qk_minimal)
             if _is_v417x_version(model_version_cfg):
-                _sharded_fns['_v4171_kernel_profile'] = 'production'
+                _sharded_fns[
+                    _v417x_kernel_profile_key(model_version_cfg)] = (
+                        'production')
         else:
             _sharded_fns = _sharded_single_rst
         if str(model_version_cfg) == V4167_MODEL_VERSION:
@@ -19091,7 +19210,7 @@ def main():
 
         pool = p['neuron_pool']
         if _is_v417x_version(model_version_cfg):
-            return _v4171_pool_operator_keys(pool)
+            return _pool_operator_keys_for_version(model_version_cfg)(pool)
         if str(model_version_cfg) == V4170_MODEL_VERSION:
             return _v4170_pool_operator_keys(pool)
         if ('attn_qk_read_global' in pool
@@ -19831,10 +19950,46 @@ def main():
                 f"tau_lr_mult={tau_lr_mult}")
         if _is_rw_key_srw_version(model_version_cfg):
             if _is_v417x_version(model_version_cfg):
-                log_message(
-                    f"Operator address: {cfg['model']['operator_key_mode']} "
-                    "with direct state-to-operation queries; "
-                    "execution remains full rank-1 RW")
+                if str(model_version_cfg) == V4173_MODEL_VERSION:
+                    log_message("DAWN spatial-r1-v4.1.7.3")
+                    log_message(
+                        "Execution read: raw operation projection")
+                    log_message(
+                        "Execution read width: "
+                        f"d_route={cfg['model']['d_route']}")
+                    log_message(
+                        "Execution write width: "
+                        f"d_model={cfg['model']['d_model']}")
+                    log_message("Routes: Q, K, V, RST")
+                    log_message(
+                        "Operator address: generalized bilinear "
+                        "low-read/full-write RW key")
+                    log_message(
+                        "Read vectors: [N, "
+                        f"{cfg['model']['d_route']}]")
+                    log_message(
+                        "Write vectors: [N, "
+                        f"{cfg['model']['d_model']}]")
+                    _v4173_counts = _v4173_symbolic_parameter_count(
+                        cfg['model'])
+                    log_message(
+                        "Pool parameters: "
+                        f"{_v4173_counts['read_write_pools']}")
+                    log_message(
+                        "Shared probe parameters: "
+                        f"{_v4173_counts['bilinear_probe_matrices']}")
+                    log_message(
+                        f"Parameters: {_v4173_counts['total']:,}")
+                    log_message(
+                        "Reference v4172 parameters: 393,800,708")
+                    log_message(
+                        "Parameter delta: "
+                        f"{int(_v4173_counts['total']) - 393_800_708:+,}")
+                else:
+                    log_message(
+                        f"Operator address: {cfg['model']['operator_key_mode']} "
+                        "with direct state-to-operation queries; "
+                        "execution remains full rank-1 RW")
                 _composition_mode = cfg['model']['srw_composition_mode']
                 _den_power_summary = (
                     "den_power["
@@ -20714,7 +20869,7 @@ def main():
                             for _key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES:
                                 analysis_payload[_key] = metrics.get(
                                     _key, jnp.float32(0.0))
-                            if str(model_version) == V4172_MODEL_VERSION:
+                            if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
                                 for _key in (
                                         V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES):
                                     analysis_payload[_key] = metrics.get(
