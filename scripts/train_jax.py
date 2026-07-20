@@ -1127,6 +1127,36 @@ def _materialized_config_snapshot(cfg, training_config):
     return _json_safe(full_cfg)
 
 
+def _materialize_mesh_config(cfg):
+    """Persist an auto-resolved global mesh before checkpoint snapshots."""
+    training_cfg = cfg.get('training')
+    if not isinstance(training_cfg, dict):
+        raise ValueError("config.training must be a mapping")
+    try:
+        mesh_model = int(training_cfg.get('mesh_model', 1))
+        mesh_data = int(training_cfg.get('mesh_data', 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "training.mesh_model and training.mesh_data must be integers") from exc
+    if mesh_model <= 0 or mesh_data < 0:
+        raise ValueError(
+            "training mesh dimensions require mesh_model > 0 and mesh_data >= 0")
+    total_devices = int(jax.device_count())
+    if mesh_data == 0:
+        if total_devices % mesh_model != 0:
+            raise ValueError(
+                f"Auto mesh_data cannot divide {total_devices} devices by "
+                f"mesh_model={mesh_model}")
+        mesh_data = total_devices // mesh_model
+    if mesh_data * mesh_model != total_devices:
+        raise ValueError(
+            f"mesh_data({mesh_data}) * mesh_model({mesh_model}) = "
+            f"{mesh_data * mesh_model} != {total_devices} devices")
+    training_cfg['mesh_model'] = mesh_model
+    training_cfg['mesh_data'] = mesh_data
+    return mesh_data, mesh_model
+
+
 ACTIVE_SRW_RESUME_REQUIRED_FIELDS = (
     ('model', 'model_version'),
     ('model', 'd_model'),
@@ -15492,6 +15522,7 @@ def main():
     _require_orbax_checkpoint_compat()
     raw_cfg_snapshot = deepcopy(cfg)
     current_yaml_config_snapshot = deepcopy(cfg)
+    _materialize_mesh_config(cfg)
     seed = cfg.get('seed', 42)
     set_seed(seed)
 

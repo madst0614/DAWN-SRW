@@ -359,6 +359,17 @@ def test_v4173_config_registry_resume_and_fail_loud_contracts(
             {"production_diagnostic_parity_rtol": -1.0},
             train_jax.V4173_MODEL_VERSION)
 
+    poc_path = "configs/train_config_v4173_40M_c4_5B.yaml"
+    with open(poc_path, "r", encoding="utf-8") as handle:
+        poc_cfg = yaml.safe_load(handle)
+    assert poc_cfg["training"]["mesh_data"] == 4
+    auto_mesh_cfg = deepcopy(poc_cfg)
+    auto_mesh_cfg["training"].pop("mesh_data")
+    monkeypatch.setattr(train_jax.jax, "device_count", lambda: 4)
+    assert train_jax._materialize_mesh_config(auto_mesh_cfg) == (4, 1)
+    assert auto_mesh_cfg["training"]["mesh_data"] == 4
+    train_jax._require_resume_materialized_fields(auto_mesh_cfg)
+
     registry = train_jax.MODEL_REGISTRY[train_jax.V4173_MODEL_VERSION]
     monkeypatch.setitem(registry, "module", "models.dawn_srw_v4171")
     with pytest.raises(RuntimeError, match="wrong sharded factory module"):

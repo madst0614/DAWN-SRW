@@ -58,6 +58,7 @@ model:
 
 training:
   mesh_model: 1
+  mesh_data: 4
   batch_size: 128
   gradient_accumulation_steps: 1
   num_epochs: 1
