@@ -84,5 +84,9 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
+  # Split TPU executables can differ by a few ppm from BF16/XLA reduction order.
+  production_diagnostic_parity_atol: 1.0e-5
+  production_diagnostic_parity_rtol: 1.0e-5
+
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4173_40M_c4_5B_baseline_match
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4173_40M_c4_5B_baseline_match

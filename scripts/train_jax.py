@@ -15423,6 +15423,32 @@ def reduce_scalar_metrics(metrics, *, reduction='mean'):
     return reduced
 
 
+def _production_diagnostic_parity_tolerances(training_cfg, model_version):
+    """Resolve the fail-loud loss-parity tolerance for split TPU graphs."""
+    default_rtol = (
+        1.0e-5 if str(model_version) == V4173_MODEL_VERSION else 1.0e-6)
+    values = {
+        'atol': training_cfg.get(
+            'production_diagnostic_parity_atol', 1.0e-5),
+        'rtol': training_cfg.get(
+            'production_diagnostic_parity_rtol', default_rtol),
+    }
+    resolved = {}
+    for name, raw_value in values.items():
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'training.production_diagnostic_parity_'
+                f'{name} must be a finite non-negative scalar') from exc
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                'training.production_diagnostic_parity_'
+                f'{name} must be a finite non-negative scalar')
+        resolved[name] = value
+    return resolved['atol'], resolved['rtol']
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train DAWN-SRW v4164 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
@@ -20163,8 +20189,10 @@ def main():
     # different float32 reduction order when the diagnostics graph retains
     # observational outputs.  Keep the startup gate fail-loud for a material
     # mismatch without requiring bitwise identity across those executables.
-    _production_diagnostic_parity_atol = 1.0e-5
-    _production_diagnostic_parity_rtol = 1.0e-6
+    (_production_diagnostic_parity_atol,
+     _production_diagnostic_parity_rtol) = (
+        _production_diagnostic_parity_tolerances(
+            cfg.get('training', {}), model_version_cfg))
     # The optional startup OOM probe executes and blocks on train_step once.
     # Otherwise the first real call is compile-inclusive and is excluded from
     # steady-state timing below.

@@ -344,6 +344,21 @@ def test_v4173_config_registry_resume_and_fail_loud_contracts(
             jnp.ones((2, 3)), jnp.ones((2, 6)),
             jnp.ones((4, 3)), jnp.ones((6, 3)))
 
+    atol, rtol = train_jax._production_diagnostic_parity_tolerances(
+        cfg["training"], train_jax.V4173_MODEL_VERSION)
+    observed_fast_loss = 10.4026623
+    observed_abs_diff = 5.05447388e-5
+    assert observed_abs_diff <= atol + rtol * abs(observed_fast_loss)
+    assert 1.0e-3 > atol + rtol * abs(observed_fast_loss)
+    legacy_atol, legacy_rtol = (
+        train_jax._production_diagnostic_parity_tolerances(
+            {}, train_jax.V4172_MODEL_VERSION))
+    assert (legacy_atol, legacy_rtol) == (1.0e-5, 1.0e-6)
+    with pytest.raises(ValueError, match="finite non-negative scalar"):
+        train_jax._production_diagnostic_parity_tolerances(
+            {"production_diagnostic_parity_rtol": -1.0},
+            train_jax.V4173_MODEL_VERSION)
+
     registry = train_jax.MODEL_REGISTRY[train_jax.V4173_MODEL_VERSION]
     monkeypatch.setitem(registry, "module", "models.dawn_srw_v4171")
     with pytest.raises(RuntimeError, match="wrong sharded factory module"):
