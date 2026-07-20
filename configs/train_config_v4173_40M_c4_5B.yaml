@@ -1,0 +1,88 @@
+# DAWN-SRW v4.1.7.3 - parameter-matched to baseline d432 4x
+#
+# Baseline target:
+#   train_config_baseline_tpu_40M_c4_5B
+#   exact params = 40,343,616
+#
+# v4173 exact params:
+#   d_model=384, d_route=128, n_layers=12
+#   n_qk=2,596, n_v=12,856, n_rst=36,059
+#   total operators=51,511
+#   exact params = 40,343,556
+#   delta vs baseline = -60 params (-0.000149%)
+#
+# Pool allocation preserves the existing 40M DAWN pool ratio
+# 1,480 : 7,330 : 20,560 as closely as integer counts allow.
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: spatial-r1-v4.1.7.3
+  operator_key_mode: generalized_bilinear_rw
+  operator_query_mode: direct_state_projection
+
+  vocab_size: 30522
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+
+  d_route: 128
+
+  admission_den_power: 1.0
+  admission_den_power_qk: 0.5
+  admission_den_power_v: 1.0
+  admission_den_power_rst: 1.2
+  srw_composition_mode: linear_angular
+
+  n_qk: 4896
+  n_v: 15432
+  n_rst: 31183
+
+  tau_init_mode: quantile_frac
+  tau_init_min: -0.95
+  tau_init_max: 0.95
+  tau_init_target_qk_frac: 0.05
+  tau_init_target_v_frac: 0.03
+  tau_init_target_rst_frac: 0.01
+
+training:
+  mesh_model: 1
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+
+  # Keep local scan chunks in the same range as the validated 400M v4173 config.
+  n_chunks_qk: 1
+  n_chunks_v: 2
+  n_chunks_rst: 8
+
+  lr: 0.00065
+  tau_lr_mult: 0.001
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+
+  eval_effective_prune_enabled: false
+  eval_effective_prune_eps_list:
+    - 1.0e-06
+    - 1.0e-05
+    - 0.0001
+
+  checkpoint_interval: 500
+  val_interval: 500
+  log_interval: 100
+  log_analysis_multiplier: 1000000
+  heavy_geometry_multiplier: 1000000
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4173_40M_c4_5B_baseline_match
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4173_40M_c4_5B_baseline_match
