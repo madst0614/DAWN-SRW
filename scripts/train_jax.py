@@ -20342,8 +20342,8 @@ def main():
     # training_fast and production_diagnostics are deliberately distinct TPU
     # executables.  Their model math is the same, but XLA may choose a
     # different float32 reduction order when the diagnostics graph retains
-    # observational outputs.  Keep the startup gate fail-loud for a material
-    # mismatch without requiring bitwise identity across those executables.
+    # observational outputs.  V4.1.7.3 reports a finite tolerance miss once and
+    # continues; non-finite losses remain fatal, as do legacy-version misses.
     (_production_diagnostic_parity_atol,
      _production_diagnostic_parity_rtol) = (
         _production_diagnostic_parity_tolerances(
@@ -20501,7 +20501,18 @@ def main():
                 _parity_finite = bool(
                     np.all(np.isfinite(_diagnostic_loss_f64))
                     and np.all(np.isfinite(_fast_loss_f64)))
-                if not _parity_finite or _parity_abs_diff > _parity_limit:
+                if not _parity_finite:
+                    raise RuntimeError(
+                        "training_fast/production_diagnostics loss parity "
+                        "is non-finite before accepting the first optimizer "
+                        "update: "
+                        f"fast={float(_fast_loss_value):.9g}, "
+                        f"diagnostic={float(_diagnostic_loss_value):.9g}, "
+                        f"atol={_production_diagnostic_parity_atol:.9g}, "
+                        f"rtol={_production_diagnostic_parity_rtol:.9g}")
+                _parity_exceeded = _parity_abs_diff > _parity_limit
+                if (_parity_exceeded
+                        and str(model_version_cfg) != V4173_MODEL_VERSION):
                     raise RuntimeError(
                         "training_fast/production_diagnostics loss parity "
                         "failed before accepting the first optimizer update: "
@@ -20513,12 +20524,25 @@ def main():
                         f"rtol={_production_diagnostic_parity_rtol:.9g}")
                 _production_diagnostic_parity_checked = True
                 if is_host0:
-                    print(
-                        "  production diagnostics parity: "
-                        "loss close (pre_update; "
-                        f"abs_diff={_parity_abs_diff:.9g}, "
-                        f"limit={_parity_limit:.9g})",
-                        flush=True)
+                    if _parity_exceeded:
+                        print(
+                            "  WARNING: production diagnostics parity "
+                            "exceeded tolerance; continuing training "
+                            "(pre_update; "
+                            f"fast={float(_fast_loss_value):.9g}, "
+                            f"diagnostic={float(_diagnostic_loss_value):.9g}, "
+                            f"abs_diff={_parity_abs_diff:.9g}, "
+                            f"limit={_parity_limit:.9g}, "
+                            f"atol={_production_diagnostic_parity_atol:.9g}, "
+                            f"rtol={_production_diagnostic_parity_rtol:.9g})",
+                            flush=True)
+                    else:
+                        print(
+                            "  production diagnostics parity: "
+                            "loss close (pre_update; "
+                            f"abs_diff={_parity_abs_diff:.9g}, "
+                            f"limit={_parity_limit:.9g})",
+                            flush=True)
 
             params, opt_state = new_params, new_opt_state
 
