@@ -7,6 +7,7 @@ Strict behavior:
   - QR WAITING/PROVISIONING/etc.: wait quietly; log only state changes.
   - QR ACTIVE: start SSH readiness loop every 20 seconds by default.
   - ACTIVE + SSH_READY: call scripts/launch_tpu_pod.sh exactly once for this keeper process.
+  - After launch: monitor queued-resource state only; do not probe SSH.
   - ACTIVE + SSH_NOT_READY longer than timeout, 300 seconds by default: delete QR/node and recreate.
   - QR FAILED/SUSPENDED/etc.: delete QR/node and recreate.
   - Every gcloud subprocess has a timeout so the keeper poll loop cannot freeze forever.
@@ -535,6 +536,12 @@ def main() -> int:
             continue
 
         if state in ACTIVE_QR_STATES:
+            # SSH is only a pre-launch readiness check. After launch, QR state
+            # changes are the source of truth for preemption and recovery.
+            if args._launch_called:
+                time.sleep(args.poll_seconds)
+                continue
+
             now = time.time()
             if args._active_since is None:
                 args._active_since = now
