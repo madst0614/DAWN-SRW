@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
+from functools import wraps
 from typing import Any, Callable, Optional
 
 import flax.linen as nn
@@ -1419,6 +1420,7 @@ def analysis_forward(params, model_cfg, input_ids, mode="full"):
 
 
 def _factory_profile_wrapper(factory: Callable, profile: str) -> Callable:
+    @wraps(factory)
     def wrapped(*args, **kwargs):
         kernel = factory(*args, **kwargs)
         kernel._v4174_kernel_profile = profile
@@ -1453,6 +1455,7 @@ make_sharded_srw_paired_trajectory_minimal = _factory_profile_wrapper(
     _v4173.make_sharded_srw_paired_trajectory_minimal, "trajectory")
 
 
+@wraps(_v4173.make_sharded_rst_multispace_dense_minimal)
 def make_sharded_address_dense_minimal(*args, **kwargs):
     """Create a production ``[M,T,R]`` grouped-dense address kernel."""
     kernel = _v4173.make_sharded_rst_multispace_dense_minimal(*args, **kwargs)
@@ -1461,6 +1464,7 @@ def make_sharded_address_dense_minimal(*args, **kwargs):
     return kernel
 
 
+@wraps(_v4173.make_sharded_rst_multispace_dense_diagnostics)
 def make_sharded_address_dense_diagnostics(*args, **kwargs):
     """Create the matching observational kernel with ``[M,T,1]`` aggregates."""
     kernel = _v4173.make_sharded_rst_multispace_dense_diagnostics(*args, **kwargs)
@@ -1469,6 +1473,7 @@ def make_sharded_address_dense_diagnostics(*args, **kwargs):
     return kernel
 
 
+@wraps(_v4173.make_sharded_rst_multispace_dense_minimal)
 def make_sharded_qk_address_dense_minimal(*args, **kwargs):
     """Create the paired Q/K ``[M,T,2,R]`` production interface.
 
@@ -1493,6 +1498,7 @@ def make_sharded_qk_address_dense_minimal(*args, **kwargs):
     return paired
 
 
+@wraps(_v4173.make_sharded_rst_multispace_dense_diagnostics)
 def make_sharded_qk_address_dense_diagnostics(*args, **kwargs):
     """Create paired Q/K observational execution without full operator tensors."""
     single = make_sharded_address_dense_diagnostics(*args, **kwargs)
