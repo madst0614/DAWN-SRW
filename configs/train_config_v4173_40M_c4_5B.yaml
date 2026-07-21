@@ -1,18 +1,12 @@
 # DAWN-SRW v4.1.7.3 - native local-write 40M POC configuration
 #
-# Baseline target:
-#   train_config_baseline_tpu_40M_c4_5B
-#   exact params = 40,343,616
-#
-# v4173 exact params:
+# v4173 parameter count (symbolic counter and initialized tree):
 #   d_model=384, d_route=128, n_layers=12
-#   n_qk=4,896, n_v=15,432, n_rst=31,183
-#   total operators=51,511
-#   exact params = 27,271,428
-#   delta vs baseline = -13,072,188 params (-32.402123%)
+#   n_qk=9,748, n_v=30,730, n_rst=62,094
+#   total operators=102,572
+#   exact params = 40,343,044
 #
-# Pool allocation preserves the existing 40M DAWN pool ratio
-# 1,480 : 7,330 : 20,560 as closely as integer counts allow.
+# Pool allocation preserves the existing 40M DAWN pool ratio.
 
 seed: 1
 

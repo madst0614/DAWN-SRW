@@ -10,6 +10,10 @@
 #   n_rst_per_space:            7,399
 #   n_operation_spaces:             8
 #   operation_space_top_k:           2
+#
+# Per-space RST tau target:
+#   2 selected spaces * 7,399 operators/space * 4% ~= 592 active
+#   baseline: 62,094 operators * 1% ~= 621 active
 
 seed: 1
 
@@ -53,7 +57,7 @@ model:
   tau_init_max: 0.95
   tau_init_target_qk_frac: 0.05
   tau_init_target_v_frac: 0.03
-  tau_init_target_rst_frac: 0.01
+  tau_init_target_rst_frac: 0.04
 
 training:
   mesh_model: 1

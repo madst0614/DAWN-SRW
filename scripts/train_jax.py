@@ -536,6 +536,13 @@ def _is_fixed_tau_srw_version(version):
     return str(version) in FIXED_TAU_SRW_MODEL_VERSIONS
 
 
+def _is_v4173_space_selector_router_path(path):
+    """Return whether a parameter belongs to the v4173 space selector."""
+    path = str(path)
+    return (('router/rst_space_query' in path)
+            or ('router/rst_space_keys' in path))
+
+
 def _pool_operator_keys_for_version(version):
     version = str(version)
     entry = MODEL_REGISTRY.get(version, {})
@@ -791,10 +798,6 @@ V4173_OPERATION_SPACE_METRIC_NAMES = (
     'space_usage_max',
     'space_usage_std',
     'space_dead_frac',
-    'space_selected_requests',
-    'space_processed_requests',
-    'space_all_processed',
-    'space_overflow_requests',
 )
 
 V4170_COMPACT_TRAIN_METRIC_NAMES = (
@@ -3457,18 +3460,27 @@ def _pool_score_page_stats(route_stats):
 
 def _sample_srw_selection_scores(params, input_ids, cfg, max_tokens):
     """Return host-side fresh-init selection score samples by SRW pool."""
-    _version, score_impl, score_params, score_kwargs = (
+    version, score_impl, score_params, score_kwargs = (
         _srw_selection_score_setup(params, cfg, max_tokens))
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
     score_out = score_fn(score_params, input_ids)
     sampled = jax.device_get(score_out)
     scores = {
         name: _score_route_values(sampled, name)
-        for name in ('q', 'k', 'v', 'rst')
+        for name in ('q', 'k', 'v')
     }
+    sampled_rst = np.asarray(sampled['rst'], dtype=np.float32)
+    if str(version) == V4173_MODEL_VERSION and sampled_rst.ndim == 3:
+        scores['rst'] = sampled_rst.reshape((sampled_rst.shape[0], -1))
+    else:
+        scores['rst'] = _score_route_values(sampled, 'rst')
     scores['qk'] = np.concatenate((scores['q'], scores['k']))
     route_stats = {
-        name: _score_route_meta(sampled, name, scores[name])
+        name: _score_route_meta(
+            sampled, name,
+            scores[name][0]
+            if name == 'rst' and scores[name].ndim == 2
+            else scores[name])
         for name in ('q', 'k', 'v', 'rst')
     }
     return scores, sampled, _pool_score_page_stats(route_stats)
@@ -3520,9 +3532,11 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
                                    tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
-    del version
     scores, sampled, page_stats = _sample_srw_selection_scores(
         params, input_ids, cfg, tau_init_cfg['calibration_tokens'])
+    per_space_rst = (
+        str(version) == V4173_MODEL_VERSION
+        and np.asarray(scores['rst']).ndim == 2)
 
     tau = {}
     estimated_active = {}
@@ -3533,6 +3547,37 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     for pool in ('qk', 'v', 'rst'):
         target = tau_init_cfg['targets'][pool]
         meta = page_stats[pool]
+        if pool == 'rst' and per_space_rst:
+            if bool(meta.get('pages_enabled', False)):
+                raise ValueError(
+                    "v4173 per-space RST tau calibration requires the full "
+                    "operator pool")
+            local_target = float(target)
+            space_scores = np.asarray(scores[pool], dtype=np.float32)
+            quantile_tau = [
+                float(np.clip(
+                    _array_quantile(values, 1.0 - local_target),
+                    tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+                for values in space_scores
+            ]
+            active_local = [
+                float(np.mean(values > space_tau))
+                for values, space_tau in zip(space_scores, quantile_tau)
+            ]
+            active_pool = list(active_local)
+            tau[pool] = quantile_tau
+            target_local[pool] = local_target
+            estimated_active_local[pool] = active_local
+            estimated_active_pool[pool] = active_pool
+            estimated_active[pool] = active_pool
+            tau_calibration[pool] = [
+                _tau_calibration_diag(
+                    f'{pool}[{space_id}]', values, meta, target,
+                    local_target, space_tau)
+                for space_id, (values, space_tau) in enumerate(
+                    zip(space_scores, quantile_tau))
+            ]
+            continue
         local_target = _local_target_from_pool_target(
             target, meta.get('candidate_frac', 1.0),
             bool(meta.get('pages_enabled', False)))
@@ -4589,7 +4634,7 @@ def _selection_calibration_summary_lines(summary):
         if diag:
             lines.append(
                 "tau_calib: "
-                f"pool={pool} "
+                f"pool={diag['pool']} "
                 f"target_pool={diag['target_pool']:.6f} "
                 f"candidate_frac={diag['candidate_frac']:.6f} "
                 f"target_local={diag['target_local']:.6f} "
@@ -4621,6 +4666,12 @@ def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MOD
         if keys[-3:] == ('router', 'raw_tau_attn', 'bias'):
             return jnp.stack([raw_qk, raw_qk, raw_v]).astype(value.dtype)
         if keys[-3:] == ('router', 'raw_tau_rst', 'bias'):
+            if jnp.ndim(raw_rst) == 1:
+                if value.ndim != 2 or value.shape != (raw_rst.shape[0], 1):
+                    raise ValueError(
+                        "per-space RST tau shape mismatch: "
+                        f"tau={raw_rst.shape}, bias={value.shape}")
+                return raw_rst[:, None].astype(value.dtype)
             return jnp.full_like(value, raw_rst)
         return value
 
@@ -4651,6 +4702,14 @@ def _v4164_tau_init_summary_lines(summary):
     active = summary['tau_init_est_active']
     active_local = summary.get('tau_init_est_active_local', active)
     sample = summary['tau_init_calibration']
+
+    def _fmt(value, precision=6):
+        values = np.asarray(value).reshape(-1)
+        if values.size == 1:
+            return f"{float(values[0]):.{precision}f}"
+        return '[' + ','.join(
+            f"{float(item):.{precision}f}" for item in values) + ']'
+
     lines = [
         "tau_init_mode=quantile_frac",
         "tau_init_target_frac["
@@ -4661,14 +4720,15 @@ def _v4164_tau_init_summary_lines(summary):
         f"v={local_targets['v']:.6f} "
         f"rst={local_targets['rst']:.6f}]",
         "tau_init_quantile_tau["
-        f"qk={tau['qk']:.6f} v={tau['v']:.6f} rst={tau['rst']:.6f}]",
+        f"qk={_fmt(tau['qk'])} v={_fmt(tau['v'])} "
+        f"rst={_fmt(tau['rst'])}]",
         "tau_init_est_active_pool["
-        f"qk={active['qk']:.6f} v={active['v']:.6f} "
-        f"rst={active['rst']:.6f}]",
+        f"qk={_fmt(active['qk'])} v={_fmt(active['v'])} "
+        f"rst={_fmt(active['rst'])}]",
         "tau_init_est_active_local["
-        f"qk={active_local['qk']:.6f} "
-        f"v={active_local['v']:.6f} "
-        f"rst={active_local['rst']:.6f}]",
+        f"qk={_fmt(active_local['qk'])} "
+        f"v={_fmt(active_local['v'])} "
+        f"rst={_fmt(active_local['rst'])}]",
         "tau_init_est_active_qk_split["
         f"q={summary['tau_init_est_active_q']:.6f} "
         f"k={summary['tau_init_est_active_k']:.6f}]",
@@ -4683,11 +4743,14 @@ def _v4164_tau_init_summary_lines(summary):
         f"neurons_rst={sample['neurons_rst']}]",
     ]
     for pool in ('qk', 'v', 'rst'):
-        diag = summary.get('tau_calibration', {}).get(pool)
-        if diag:
+        diag_value = summary.get('tau_calibration', {}).get(pool)
+        diagnostics = diag_value if isinstance(diag_value, list) else [diag_value]
+        for diag in diagnostics:
+            if not diag:
+                continue
             lines.append(
                 "tau_calib: "
-                f"pool={pool} "
+                f"pool={diag['pool']} "
                 f"target_pool={diag['target_pool']:.6f} "
                 f"candidate_frac={diag['candidate_frac']:.6f} "
                 f"target_local={diag['target_local']:.6f} "
@@ -7065,7 +7128,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                         or (str(_model_version) == V4173_MODEL_VERSION
                             and (('router/up_qk' in ps)
                                  or ('router/up_v' in ps)
-                                 or ('router/up_rst' in ps))))
+                                 or ('router/up_rst' in ps)
+                                 or _is_v4173_space_selector_router_path(ps))))
             return (('router/proj_attn' in ps)
                     or ('router/proj_rst' in ps)
                     or ('router/q_op_write_query_proj' in ps)
@@ -7115,7 +7179,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 return (('router/proj_rst' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
-                            and 'router/up_rst' in ps))
+                            and (('router/up_rst' in ps)
+                                 or _is_v4173_space_selector_router_path(ps))))
             return (('router/proj_rst' in ps)
                     or ('router/rst_op_write_query_proj' in ps))
 
@@ -15181,16 +15246,16 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
     if version == V4173_MODEL_VERSION and n_operation_spaces > 1:
-        request_factory = getattr(
-            module, 'make_sharded_rst_request_minimal', None)
-        if request_factory is None:
+        dense_factory = getattr(
+            module, 'make_sharded_rst_multispace_dense_minimal', None)
+        if dense_factory is None:
             raise RuntimeError(
                 "v4173 multi-space config requires "
-                "make_sharded_rst_request_minimal")
-        sharded['rst_request_minimal'] = request_factory(
+                "make_sharded_rst_multispace_dense_minimal")
+        sharded['rst_multispace_dense_minimal'] = dense_factory(
             max_chunk_size=chunks['rst'],
             **_factory_supported_kwargs(
-                request_factory, pool_kwargs('rst')))
+                dense_factory, pool_kwargs('rst')))
     if (version == V4173_MODEL_VERSION
             and kernel_profile == 'trajectory'):
         sharded['attn_qk_paired_trajectory_minimal'] = sharded[

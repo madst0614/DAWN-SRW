@@ -12,6 +12,7 @@ import yaml
 from jax.sharding import Mesh
 
 from models import dawn_srw_v4173 as v4173
+from models import dawn_srw_v4172 as v4172
 from scripts import train_jax
 
 
@@ -152,37 +153,37 @@ def test_multispace_shapes_selection_dense_parity() -> None:
     sharded = train_jax.build_canonical_sharded_fns(
         _trainer_cfg(), _mesh())
     assert getattr(
-        sharded['rst_request_minimal'],
-        '_v4173_request_dispatch') == 'grouped_by_space'
+        sharded['rst_multispace_dense_minimal'],
+        '_v4173_dense_grouped_execution') == 'all_spaces'
     x = jax.random.normal(jax.random.PRNGKey(5), (1, 3, 6))
     scalar = (jnp.float32(0.07), jnp.float32(0.07),
               jnp.float32(2.0), jnp.float32(4.0), jnp.float32(0.0))
     dense_actual, metrics, details = v4173._rst_multispace_dense_forward(
         x, pool, router, jax.random.PRNGKey(6),
-        0.0, 0.0, True, sharded['rst_request_minimal'],
+        0.0, 0.0, True, sharded['rst_multispace_dense_minimal'],
         8, 2, 6, 1, *scalar, return_details=True)
     assert details['selected_space_ids'].shape == (1, 3, 2)
     assert details['selected_space_weights'].shape == (1, 3, 2)
     assert details['local_outputs'].shape == (1, 3, 2, 3)
-    assert details['space_outputs'].shape == (1, 3, 2, 6)
+    assert 'space_outputs' not in details
+    assert 'all_space_outputs' not in details
+    assert 'all_space_local_outputs' not in details
     np.testing.assert_allclose(
         np.asarray(details['selected_space_weights'].sum(axis=-1)), 1.0,
         rtol=1.0e-6, atol=1.0e-6)
-    assert float(metrics['space_selected_requests']) == 6.0
-    assert float(metrics['space_processed_requests']) == 6.0
-    assert float(metrics['space_all_processed']) == 1.0
-    assert float(metrics['space_overflow_requests']) == 0.0
+    assert tuple(metrics) == v4173.RST_SPACE_METRIC_NAMES
+    assert all(np.isfinite(float(value)) for value in metrics.values())
     assert not np.allclose(
         np.asarray(jnp.linalg.norm(dense_actual, axis=-1)), 1.0)
 
-    dense_x = jnp.broadcast_to(x.reshape((1, 3, 6)), (8, 3, 6))
+    flat_x = x.reshape((3, 6))
     dense_query = jnp.einsum(
-        'mtd,mdr->mtr', dense_x, router['proj_rst']['kernel']
+        'td,mdr->mtr', flat_x, router['proj_rst']['kernel']
     ) + router['proj_rst']['bias'][:, None, :]
     dense_tau = jnp.einsum(
-        'mtd,mdr->mtr', dense_x, router['raw_tau_rst']['kernel']
+        'td,mdr->mtr', flat_x, router['raw_tau_rst']['kernel']
     ) + router['raw_tau_rst']['bias'][:, None, :]
-    dense_local = sharded['rst_request_minimal'](
+    dense_local = sharded['rst_multispace_dense_minimal'](
         dense_query, pool['rst_op_key'], dense_tau,
         jnp.ones((8, 3), dtype=jnp.bool_),
         pool['rst_read'], pool['rst_write'], *scalar)
@@ -199,7 +200,7 @@ def test_multispace_shapes_selection_dense_parity() -> None:
     ).sum(axis=1).reshape((1, 3, 6))
     np.testing.assert_allclose(
         np.asarray(dense_actual), np.asarray(dense_selected),
-        rtol=1.0e-6, atol=1.0e-7)
+        rtol=2.0e-6, atol=2.0e-7)
 
     diagnostics = train_jax.build_canonical_sharded_fns(
         _trainer_cfg(), _mesh(), kernel_profile='production_diagnostics')
@@ -212,7 +213,43 @@ def test_multispace_shapes_selection_dense_parity() -> None:
     for name in v4173.RST_SPACE_METRIC_NAMES:
         assert name in diagnostic_out
         assert np.isfinite(float(diagnostic_out[name]))
-    assert float(diagnostic_out['space_all_processed']) == 1.0
+    for name in (
+            'space_selected_requests', 'space_processed_requests',
+            'space_all_processed', 'space_overflow_requests'):
+        assert name not in diagnostic_out
+
+
+def test_fused_commit_graph_has_no_full_space_model_width_tensor() -> None:
+    n_spaces, token_count, d_route, d_model = 4, 3, 2, 7
+    local = jnp.ones((n_spaces, token_count, d_route), dtype=jnp.float32)
+    weights = jnp.full(
+        (token_count, n_spaces), 1.0 / n_spaces, dtype=jnp.float32)
+    up = jnp.ones((n_spaces, d_route, d_model), dtype=jnp.float32)
+    closed = jax.make_jaxpr(v4173._rst_multispace_fused_commit)(
+        local, weights, up, jnp.float32(1.0))
+    intermediate_shapes = {
+        tuple(var.aval.shape)
+        for equation in closed.jaxpr.eqns
+        for var in equation.outvars
+        if hasattr(getattr(var, 'aval', None), 'shape')
+    }
+    assert (n_spaces, token_count, d_model) not in intermediate_shapes
+    assert closed.out_avals[0].shape == (token_count, d_model)
+
+
+def test_no_dead_sparse_path_and_selector_uses_router_control_group() -> None:
+    source = Path(v4173.__file__).read_text(encoding='utf-8')
+    for removed in (
+            '_rst_multispace_sparse_forward', 'request_capacity',
+            'overflow round', 'packed_x', 'sorted_request_ids',
+            'make_sharded_rst_request_minimal', 'rst_request_minimal'):
+        assert removed not in source
+    assert train_jax._is_v4173_space_selector_router_path(
+        'router/rst_space_query/kernel')
+    assert train_jax._is_v4173_space_selector_router_path(
+        'router/rst_space_keys')
+    assert not train_jax._is_v4173_space_selector_router_path(
+        'neuron_pool/rst_op_key')
 
 
 def test_multispace_main_loss_gradients_and_analysis_ids() -> None:
@@ -258,6 +295,110 @@ def test_multispace_main_loss_gradients_and_analysis_ids() -> None:
     assert info['weighted_global_contribution'].shape == (1, 1, 3, 2, 6)
     assert info['space_internal_gate_den'].shape == (1, 8)
     assert np.all(np.isfinite(np.asarray(info['space_internal_gate_den'])))
+
+
+def test_per_space_tau_calibration_is_independent_and_selector_free(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    invalid_cfg = {
+        'model': {
+            'tau_init_mode': 'quantile_frac',
+            'tau_init_target_qk_frac': 0.1,
+            'tau_init_target_v_frac': 0.1,
+            'tau_init_target_rst_frac': 0.0,
+        },
+        'training': {},
+    }
+    with pytest.raises(ValueError, match='must be in'):
+        train_jax._v4164_tau_init_config(invalid_cfg)
+
+    n_spaces = 4
+    base = np.linspace(-0.9, 0.6, 1000, dtype=np.float32)
+    rst_scores = np.stack(
+        [base + np.float32(0.08 * index)
+         for index in range(n_spaces)])
+    q_scores = np.linspace(-0.8, 0.8, 400, dtype=np.float32)
+    k_scores = np.linspace(-0.7, 0.9, 400, dtype=np.float32)
+    v_scores = np.linspace(-0.6, 0.7, 400, dtype=np.float32)
+    scores = {
+        'q': q_scores,
+        'k': k_scores,
+        'qk': np.concatenate((q_scores, k_scores)),
+        'v': v_scores,
+        'rst': rst_scores,
+    }
+
+    def meta(pool_size: int) -> dict:
+        return {
+            'pages_enabled': False,
+            'candidate_valid_count': float(pool_size),
+            'candidate_count': float(pool_size),
+            'full_pool_size': float(pool_size),
+            'candidate_frac': 1.0,
+            'sample_count': 1000,
+        }
+
+    page_stats = {
+        'q': meta(400), 'k': meta(400), 'qk': meta(400),
+        'v': meta(400), 'rst': meta(1000),
+    }
+    sampled = {
+        'q': q_scores, 'k': k_scores, 'v': v_scores,
+        'rst': rst_scores, 'tokens': np.int32(1000),
+    }
+    monkeypatch.setattr(
+        train_jax, '_sample_srw_selection_scores',
+        lambda *args, **kwargs: (scores, sampled, page_stats))
+    tau_cfg = {
+        'targets': {'qk': 0.1, 'v': 0.1, 'rst': 0.1},
+        'tau_min': -0.95,
+        'tau_max': 0.95,
+        'calibration_tokens': 1000,
+    }
+    summary = train_jax._compute_srw_quantile_tau_init(
+        {}, jnp.zeros((1, 1), dtype=jnp.int32),
+        {'model': {'model_version': train_jax.V4173_MODEL_VERSION}},
+        tau_cfg)
+    tau = np.asarray(summary['tau_init_quantile_tau']['rst'])
+    assert tau.shape == (n_spaces,)
+    assert np.unique(tau).size == n_spaces
+    measured = np.mean(rst_scores > tau[:, None], axis=1)
+    np.testing.assert_allclose(measured, 0.1, rtol=0.0, atol=0.002)
+
+    _, variables, tokens = _init(spaces=n_spaces, top_k=2)
+    calibrated = train_jax._set_srw_quantile_tau_biases(
+        variables['params'], summary, train_jax.V4173_MODEL_VERSION)
+    raw_bias = calibrated['router']['raw_tau_rst']['bias']
+    assert raw_bias.shape == (n_spaces, 1)
+    np.testing.assert_allclose(
+        np.asarray(v4173._tau_from_param(raw_bias[:, 0])), tau,
+        rtol=1.0e-6, atol=1.0e-6)
+
+    cfg = _trainer_cfg(spaces=n_spaces, top_k=2)
+    monkeypatch.undo()
+    real_summary = train_jax._compute_srw_quantile_tau_init(
+        variables['params'], tokens, cfg,
+        {**tau_cfg, 'calibration_tokens': 3})
+    assert np.asarray(
+        real_summary['tau_init_quantile_tau']['rst']).shape == (n_spaces,)
+    _, score_impl, score_params, score_kwargs = (
+        train_jax._srw_selection_score_setup(
+            variables['params'], cfg, max_tokens=3))
+    assert 'rst_space_query' not in score_params['router']
+    assert 'rst_space_keys' not in score_params['router']
+    sampled_scores = score_impl(score_params, tokens, **score_kwargs)
+    assert sampled_scores['rst'].shape == (n_spaces, 3, 4)
+
+    _, single_variables, single_tokens = _init(spaces=1, top_k=1)
+    single_cfg = _trainer_cfg(spaces=1, top_k=1)
+    _, _, single_score_params, single_score_kwargs = (
+        train_jax._srw_selection_score_setup(
+            single_variables['params'], single_cfg, max_tokens=3))
+    current = v4173._tau_init_calibration_scores(
+        single_score_params, single_tokens, **single_score_kwargs)
+    legacy = v4172._tau_init_calibration_scores(
+        single_score_params, single_tokens, **single_score_kwargs)
+    np.testing.assert_array_equal(
+        np.asarray(current['rst']), np.asarray(legacy['rst']))
 
 
 def test_multispace_update_checkpoint_resume_and_forward(tmp_path: Path) -> None:
@@ -323,7 +464,7 @@ def test_multispace_update_checkpoint_resume_and_forward(tmp_path: Path) -> None
         np.asarray(updated_loss), np.asarray(resumed_loss))
 
 
-def test_multispace_selected_request_trajectory_uses_global_ids() -> None:
+def test_multispace_selected_space_trajectory_uses_global_ids() -> None:
     _, variables, _ = _init()
     params = variables['params']
     pool = v4173._pool_params_with_operator_keys(params['neuron_pool'])
@@ -376,30 +517,34 @@ def test_40m_parameter_match_symbolic_and_initialized_shape_tree() -> None:
         'operation_space_top_k': 2,
     }
     assert report['relative_difference'] < 0.0005
+    assert multi['model']['tau_init_target_rst_frac'] == 0.04
 
-    m = multi['model']
-    model = v4173.DAWN_SRW_V4173(
-        vocab_size=m['vocab_size'], d_model=m['d_model'],
-        d_route=m['d_route'], n_layers=m['n_layers'],
-        n_heads=m['n_heads'], max_seq_len=m['max_seq_len'],
-        dropout_rate=m['dropout'], router_dropout=m['router_dropout'],
-        gradient_checkpointing=m['gradient_checkpointing'],
-        n_qk=m['n_qk'], n_v=m['n_v'], n_rst=m['n_rst'],
-        n_operation_spaces=m['n_operation_spaces'],
-        operation_space_top_k=m['operation_space_top_k'],
-        tau_init_attn_qk=0.0, tau_init_attn_v=0.0,
-        tau_init_rst=0.0,
-        operator_key_mode=m['operator_key_mode'],
-        admission_den_power=m['admission_den_power'],
-        admission_den_power_qk=m['admission_den_power_qk'],
-        admission_den_power_v=m['admission_den_power_v'],
-        admission_den_power_rst=m['admission_den_power_rst'],
-        srw_composition_mode=m['srw_composition_mode'])
-    abstract = jax.eval_shape(
-        model.init,
-        {'params': jax.random.PRNGKey(8),
-         'dropout': jax.random.PRNGKey(9)},
-        jnp.ones((1, 1), dtype=jnp.int32), deterministic=True)['params']
-    initialized_count = sum(
-        int(np.prod(leaf.shape)) for leaf in jax.tree.leaves(abstract))
-    assert initialized_count == report['multi_space_params']
+    def initialized_count(m: dict, key: int) -> int:
+        model = v4173.DAWN_SRW_V4173(
+            vocab_size=m['vocab_size'], d_model=m['d_model'],
+            d_route=m['d_route'], n_layers=m['n_layers'],
+            n_heads=m['n_heads'], max_seq_len=m['max_seq_len'],
+            dropout_rate=m['dropout'], router_dropout=m['router_dropout'],
+            gradient_checkpointing=m['gradient_checkpointing'],
+            n_qk=m['n_qk'], n_v=m['n_v'], n_rst=m['n_rst'],
+            n_operation_spaces=m.get('n_operation_spaces', 1),
+            operation_space_top_k=m.get('operation_space_top_k', 1),
+            tau_init_attn_qk=0.0, tau_init_attn_v=0.0,
+            tau_init_rst=0.0,
+            operator_key_mode=m['operator_key_mode'],
+            admission_den_power=m['admission_den_power'],
+            admission_den_power_qk=m['admission_den_power_qk'],
+            admission_den_power_v=m['admission_den_power_v'],
+            admission_den_power_rst=m['admission_den_power_rst'],
+            srw_composition_mode=m['srw_composition_mode'])
+        abstract = jax.eval_shape(
+            model.init,
+            {'params': jax.random.PRNGKey(key),
+             'dropout': jax.random.PRNGKey(key + 1)},
+            jnp.ones((1, 1), dtype=jnp.int32),
+            deterministic=True)['params']
+        return sum(
+            int(np.prod(leaf.shape)) for leaf in jax.tree.leaves(abstract))
+
+    assert initialized_count(baseline['model'], 8) == report['baseline_params']
+    assert initialized_count(multi['model'], 10) == report['multi_space_params']

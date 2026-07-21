@@ -2,8 +2,9 @@
 
 This version has a dedicated parameter tree and execution kernels.  Operator
 selection uses normalized operation-space queries while execution reads use
-the corresponding raw Q, K, V, or RST query.  Reads are d_route-wide and
-writes remain d_model-wide.
+the corresponding raw Q, K, V, or RST query.  Reads and writes are
+d_route-wide; the aggregate local packet is lifted to d_model by the route up
+projection.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
@@ -246,10 +247,6 @@ RST_SPACE_METRIC_NAMES = (
     'space_usage_max',
     'space_usage_std',
     'space_dead_frac',
-    'space_selected_requests',
-    'space_processed_requests',
-    'space_all_processed',
-    'space_overflow_requests',
 )
 
 def _gate_eps_values_from_suffixes(suffixes):
@@ -480,7 +477,7 @@ def _validate_v4173_sharded_fns(
         'rst_single_retention_minimal': ('rst', rst_power),
         'rst_single_suppression_minimal': ('rst', rst_power),
         'rst_single_trajectory_minimal': ('rst', rst_power),
-        'rst_request_minimal': ('rst', rst_power),
+        'rst_multispace_dense_minimal': ('rst', rst_power),
         'paired': ('qk', qk_power),
         'attn_qk_paired': ('qk', qk_power),
         'qk_paired': ('qk', qk_power),
@@ -4497,35 +4494,35 @@ def make_sharded_srw_trajectory_minimal(
     return kernel
 
 
-def make_sharded_rst_request_minimal(
+def make_sharded_rst_multispace_dense_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Create the selected token-space request kernel for multi-space RST."""
+    """Create the grouped all-space dense execution kernel for RST."""
     srw_composition_mode, admission_den_power, heat_kernel_beta = (
         _validate_v4173_composition_settings(
             srw_composition_mode, admission_den_power, heat_kernel_beta,
-            context="make_sharded_rst_request_minimal"))
+            context="make_sharded_rst_multispace_dense_minimal"))
     _validate_v4173_admission_den_grad_scale(
         admission_den_grad_scale,
-        context="make_sharded_rst_request_minimal")
+        context="make_sharded_rst_multispace_dense_minimal")
     del dead_exposure_target
     den_power = jnp.float32(admission_den_power)
     effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
     composition_mode = srw_composition_mode
     beta = jnp.float32(heat_kernel_beta)
 
-    def request_core(
-            operator_query, operator_keys_local, raw_tau, request_valid,
+    def dense_core(
+            operator_query, operator_keys_local, raw_tau, token_valid,
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps):
         del soft_gate_t_final, soft_gate_boundary_power_final
-        n_spaces, request_capacity = operator_query.shape[:2]
+        n_spaces, token_capacity = operator_query.shape[:2]
         n_local = operator_keys_local.shape[1]
         chunk_size = min(int(max_chunk_size), int(n_local))
         n_chunks = (int(n_local) + chunk_size - 1) // chunk_size
@@ -4537,11 +4534,11 @@ def make_sharded_rst_request_minimal(
         read_padded = jnp.pad(read_vectors_local, pad_spec)
         write_padded = jnp.pad(write_vectors_local, pad_spec)
         valid_padded = jnp.arange(n_padded) < n_local
-        request_valid = jnp.asarray(request_valid, dtype=jnp.bool_)
+        token_valid = jnp.asarray(token_valid, dtype=jnp.bool_)
         safe_query = jnp.where(
-            request_valid[:, :, None], operator_query,
+            token_valid[:, :, None], operator_query,
             jax.nn.one_hot(
-                jnp.zeros(request_valid.shape, dtype=jnp.int32),
+                jnp.zeros(token_valid.shape, dtype=jnp.int32),
                 operator_query.shape[-1], dtype=operator_query.dtype))
         query_unit_bf = _forward_unit_direction(
             safe_query.astype(jnp.bfloat16).astype(jnp.float32)
@@ -4558,7 +4555,7 @@ def make_sharded_rst_request_minimal(
         tau = _tau_from_param(raw_tau)
 
         @jax.checkpoint
-        def request_step(carry, chunk_index):
+        def dense_step(carry, chunk_index):
             raw_out, total_gate_mass = carry
             start = chunk_index * chunk_size
             keys = jax.lax.dynamic_slice_in_dim(
@@ -4571,9 +4568,9 @@ def make_sharded_rst_request_minimal(
                 valid_padded, start, chunk_size, axis=0)
             rho_raw = jnp.einsum(
                 'mcr,mlr->mcl', query_unit_bf, keys).astype(jnp.float32)
-            valid_request_operator = (
-                request_valid[:, :, None] & valid[None, None, :])
-            rho_compute = jnp.where(valid_request_operator, rho_raw, tau)
+            valid_token_operator = (
+                token_valid[:, :, None] & valid[None, None, :])
+            rho_compute = jnp.where(valid_token_operator, rho_raw, tau)
             _, unpruned_operator_gate, _, execution_weight, _ = (
                 _compute_admission_drive(
                 rho_compute, tau, soft_gate_temperature,
@@ -4583,9 +4580,9 @@ def make_sharded_rst_request_minimal(
                 srw_composition_mode=composition_mode,
                 heat_kernel_beta=beta))
             unpruned_operator_gate = jnp.where(
-                valid_request_operator, unpruned_operator_gate, 0.0)
+                valid_token_operator, unpruned_operator_gate, 0.0)
             execution_weight = jnp.where(
-                valid_request_operator, execution_weight, 0.0)
+                valid_token_operator, execution_weight, 0.0)
             read_value = jnp.einsum(
                 'mcr,mlr->mcl',
                 operator_query.astype(jnp.bfloat16), read
@@ -4601,11 +4598,11 @@ def make_sharded_rst_request_minimal(
             ), None
 
         (raw_out, gate_mass), _ = jax.lax.scan(
-            request_step,
+            dense_step,
             (jnp.zeros(
-                (n_spaces, request_capacity, d_local), dtype=jnp.float32),
+                (n_spaces, token_capacity, d_local), dtype=jnp.float32),
              jnp.zeros(
-                (n_spaces, request_capacity, 1), dtype=jnp.float32)),
+                (n_spaces, token_capacity, 1), dtype=jnp.float32)),
             jnp.arange(n_chunks))
         global_gate_mass = jax.lax.psum(gate_mass, 'model')
         gate_den = _composition_den(
@@ -4614,8 +4611,8 @@ def make_sharded_rst_request_minimal(
         return jax.lax.psum(
             out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
 
-    request_kernel = shard_map(
-        request_core, mesh=mesh,
+    dense_kernel = shard_map(
+        dense_core, mesh=mesh,
         in_specs=(
             P(None, 'data', None), P(None, 'model', None),
             P(None, 'data', None), P(None, 'data'),
@@ -4623,13 +4620,13 @@ def make_sharded_rst_request_minimal(
             P(), P(), P(), P(), P()),
         out_specs=P(None, 'data', None), check_rep=False)
     _mark_v4173_srw_factory_output(
-        request_kernel, admission_den_power, composition_mode,
+        dense_kernel, admission_den_power, composition_mode,
         heat_kernel_beta)
-    request_kernel._v4173_kernel_profile = 'production'
-    request_kernel._v4173_request_dispatch = 'grouped_by_space'
-    request_kernel._v4173_request_capacity_multiple = int(
+    dense_kernel._v4173_kernel_profile = 'production'
+    dense_kernel._v4173_dense_grouped_execution = 'all_spaces'
+    dense_kernel._v4173_dense_token_multiple = int(
         mesh.shape['data'])
-    return request_kernel
+    return dense_kernel
 
 
 def _make_sharded_srw_paired_training_fast_minimal_impl(
@@ -6875,16 +6872,15 @@ def _rst_space_selection(x, router_params, operation_space_top_k):
     return top_ids.astype(jnp.int32), top_weights, space_scores
 
 
-def _rst_space_metrics(top_ids, top_weights, n_operation_spaces,
-                       processed_requests, overflow_requests=0.0):
-    """Cheap aggregate metrics for the selected token-space requests."""
+def _rst_space_metrics(top_ids, top_weights, n_operation_spaces):
+    """Cheap aggregate metrics for dense execution's top-k selection."""
     flat_ids = top_ids.reshape(-1)
-    selected_requests = jnp.float32(flat_ids.shape[0])
+    selected_pairs = jnp.float32(flat_ids.shape[0])
     token_count = jnp.float32(top_ids.reshape((-1, top_ids.shape[-1])).shape[0])
     usage_count = jnp.zeros(
         (int(n_operation_spaces),), dtype=jnp.float32
     ).at[flat_ids].add(jnp.float32(1.0))
-    usage = usage_count / jnp.maximum(selected_requests, 1.0)
+    usage = usage_count / jnp.maximum(selected_pairs, 1.0)
     top1_ids = top_ids[..., 0].reshape(-1)
     top1_usage = jnp.zeros(
         (int(n_operation_spaces),), dtype=jnp.float32
@@ -6894,8 +6890,6 @@ def _rst_space_metrics(top_ids, top_weights, n_operation_spaces,
         top_weights.astype(jnp.float32)
         * jnp.log(jnp.maximum(top_weights.astype(jnp.float32), 1.0e-30)),
         axis=-1)
-    processed = jnp.asarray(processed_requests, dtype=jnp.float32)
-    overflow = jnp.asarray(overflow_requests, dtype=jnp.float32)
     return {
         'space_selected_top1_frac': top1_frac,
         'space_weight_top1_mean': top_weights[..., 0].mean(),
@@ -6904,213 +6898,65 @@ def _rst_space_metrics(top_ids, top_weights, n_operation_spaces,
         'space_usage_max': usage.max(),
         'space_usage_std': usage.std(),
         'space_dead_frac': (usage_count == 0.0).astype(jnp.float32).mean(),
-        'space_selected_requests': selected_requests,
-        'space_processed_requests': processed,
-        'space_all_processed': (processed == selected_requests).astype(
-            jnp.float32),
-        'space_overflow_requests': overflow,
     }
 
 
-def _rst_multispace_sparse_forward(
-        x, pool_params, router_params, rng,
-        router_dropout, dropout_rate, deterministic, request_kernel,
-        n_operation_spaces, operation_space_top_k,
-        d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
-        soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps, return_details=False,
-        request_capacity=None):
-    """Dispatch exactly B*S*K selected requests and scatter-add results."""
-    if request_kernel is None or not getattr(
-            request_kernel, '_v4173_request_dispatch', False):
-        raise ValueError(
-            "multi-space RST requires the canonical request dispatch kernel")
-    top_ids, top_weights, space_scores = _rst_space_selection(
-        x, router_params, operation_space_top_k)
-    batch_size, sequence_length = x.shape[:2]
-    token_count = int(batch_size) * int(sequence_length)
-    top_k = int(operation_space_top_k)
-    request_count = token_count * top_k
-    flat_x = x.reshape((token_count, x.shape[-1]))
-    flat_space_ids = top_ids.reshape((request_count,))
-    flat_weights = top_weights.reshape((request_count,))
-    flat_token_ids = jnp.repeat(
-        jnp.arange(token_count, dtype=jnp.int32), top_k)
-    request_ids = jnp.arange(request_count, dtype=jnp.int32)
-    (sorted_space_ids, sorted_request_ids, sorted_token_ids,
-     sorted_weights) = jax.lax.sort(
-        (flat_space_ids, request_ids, flat_token_ids, flat_weights),
-        dimension=0, num_keys=1)
-    request_x = flat_x[sorted_token_ids]
-
-    space_counts = jnp.zeros(
-        (int(n_operation_spaces),), dtype=jnp.int32
-    ).at[sorted_space_ids].add(jnp.int32(1))
-    space_starts = jnp.cumsum(space_counts) - space_counts
-    rank_in_space = (
-        jnp.arange(request_count, dtype=jnp.int32)
-        - space_starts[sorted_space_ids])
-    base_capacity = (
-        math.ceil(request_count / int(n_operation_spaces))
-        if request_capacity is None else int(request_capacity))
-    if base_capacity <= 0:
-        raise ValueError("request_capacity must be positive")
-    capacity_multiple = max(1, int(getattr(
-        request_kernel, '_v4173_request_capacity_multiple', 1)))
-    capacity = (
-        math.ceil(base_capacity / capacity_multiple) * capacity_multiple)
-    max_rounds = math.ceil(request_count / capacity)
-    overflow_count = (rank_in_space >= capacity).astype(jnp.float32).sum()
-    local_out_sorted = jnp.zeros(
-        (request_count, pool_params['rst_write'].shape[-1]),
-        dtype=jnp.float32)
-    processed_requests = jnp.float32(0.0)
-    proj = router_params['proj_rst']
-    tau_params = router_params['raw_tau_rst']
-
-    for round_index in range(max_rounds):
-        round_start = round_index * capacity
-        round_valid = (
-            (rank_in_space >= round_start)
-            & (rank_in_space < round_start + capacity))
-        round_slot = jnp.clip(
-            rank_in_space - round_start, 0, capacity - 1)
-        packed_x = jnp.zeros(
-            (int(n_operation_spaces), capacity, x.shape[-1]),
-            dtype=x.dtype
-        ).at[sorted_space_ids, round_slot].add(
-            jnp.where(round_valid[:, None], request_x, 0.0))
-        packed_valid = (
-            jnp.zeros(
-                (int(n_operation_spaces), capacity), dtype=jnp.int32)
-            .at[sorted_space_ids, round_slot]
-            .add(round_valid.astype(jnp.int32)) > 0)
-        operator_query = jnp.einsum(
-            'mcd,mdr->mcr', packed_x, proj['kernel']) + proj['bias'][:, None, :]
-        rng, rng_query_drop = jax.random.split(rng)
-        operator_query = safe_dropout(
-            operator_query, router_dropout, deterministic, rng_query_drop)
-        raw_tau = jnp.einsum(
-            'mcd,mdr->mcr', packed_x, tau_params['kernel']
-        ) + tau_params['bias'][:, None, :]
-
-        def execute_group(_):
-            return request_kernel(
-                operator_query, pool_params['rst_op_key'], raw_tau,
-                packed_valid, pool_params['rst_read'],
-                pool_params['rst_write'], soft_gate_T_rst,
-                soft_gate_t_final, soft_gate_boundary_power,
-                soft_gate_boundary_power_final, execution_prune_eps)
-
-        grouped_out = jax.lax.cond(
-            jnp.any(round_valid), execute_group,
-            lambda _: jnp.zeros(
-                (int(n_operation_spaces), capacity,
-                 pool_params['rst_write'].shape[-1]),
-                dtype=jnp.float32),
-            operand=None)
-        request_out = grouped_out[sorted_space_ids, round_slot]
-        local_out_sorted = local_out_sorted + jnp.where(
-            round_valid[:, None], request_out, 0.0)
-        processed_requests = (
-            processed_requests
-            + round_valid.astype(jnp.float32).sum())
-    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
-    up_kernel = router_params['up_rst']['kernel'][sorted_space_ids]
-    space_out_sorted = jnp.einsum(
-        'qr,qrd->qd', local_out_sorted * rst_scale, up_kernel)
-    weighted_sorted = space_out_sorted * sorted_weights[:, None]
-    flat_update = jnp.zeros(
-        (token_count, d_model), dtype=weighted_sorted.dtype
-    ).at[sorted_token_ids].add(weighted_sorted)
-    update = flat_update.reshape(
-        (batch_size, sequence_length, d_model))
-    rng, rng_out = jax.random.split(rng)
-    update = safe_dropout(
-        update, dropout_rate, deterministic, rng_out)
-    all_processed = (
-        processed_requests == jnp.float32(request_count))
-    update = jnp.where(
-        all_processed, update,
-        jnp.full_like(update, jnp.float32(jnp.nan)))
-    metrics = _rst_space_metrics(
-        top_ids, top_weights, n_operation_spaces,
-        processed_requests=processed_requests,
-        overflow_requests=jnp.float32(overflow_count))
-    if not return_details:
-        return update, metrics
-    local_out = jnp.zeros_like(local_out_sorted).at[sorted_request_ids].set(
-        local_out_sorted)
-    space_out = jnp.zeros_like(space_out_sorted).at[sorted_request_ids].set(
-        space_out_sorted)
-    details = {
-        'selected_space_ids': top_ids,
-        'selected_space_weights': top_weights,
-        'space_scores': space_scores,
-        'local_outputs': local_out.reshape(
-            (batch_size, sequence_length, top_k, local_out.shape[-1])),
-        'space_outputs': space_out.reshape(
-            (batch_size, sequence_length, top_k, d_model)),
-        'request_space_ids': sorted_space_ids,
-        'request_token_ids': sorted_token_ids,
-        'request_weights': sorted_weights,
-    }
-    return update, metrics, details
+def _rst_multispace_fused_commit(
+        local_all, dense_space_weights, up_rst_kernel, rst_scale):
+    """Lift and sum weighted local packets without an [M,T,D] tensor."""
+    weights_mt = dense_space_weights.T
+    weighted_local = local_all * weights_mt[..., None]
+    return jnp.einsum(
+        'mtr,mrd->td', weighted_local * rst_scale, up_rst_kernel)
 
 
 def _rst_multispace_dense_forward(
         x, pool_params, router_params, rng,
-        router_dropout, dropout_rate, deterministic, request_kernel,
+        router_dropout, dropout_rate, deterministic, dense_kernel,
         n_operation_spaces, operation_space_top_k,
         d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
         execution_prune_eps, return_details=False):
     """Execute every RST space without gathering per-token parameters."""
-    if request_kernel is None or not getattr(
-            request_kernel, '_v4173_request_dispatch', False):
+    if dense_kernel is None or not getattr(
+            dense_kernel, '_v4173_dense_grouped_execution', False):
         raise ValueError(
-            "multi-space RST requires the canonical grouped kernel")
+            "multi-space RST requires the canonical dense grouped kernel")
     top_ids, top_weights, space_scores = _rst_space_selection(
         x, router_params, operation_space_top_k)
     batch_size, sequence_length = x.shape[:2]
     token_count = int(batch_size) * int(sequence_length)
     n_spaces = int(n_operation_spaces)
     top_k = int(operation_space_top_k)
-    capacity_multiple = max(1, int(getattr(
-        request_kernel, '_v4173_request_capacity_multiple', 1)))
+    token_multiple = max(1, int(getattr(
+        dense_kernel, '_v4173_dense_token_multiple', 1)))
     dense_capacity = (
-        math.ceil(token_count / capacity_multiple) * capacity_multiple)
+        math.ceil(token_count / token_multiple) * token_multiple)
     pad_tokens = dense_capacity - token_count
     flat_x = x.reshape((token_count, x.shape[-1]))
     padded_x = jnp.pad(flat_x, ((0, pad_tokens), (0, 0)))
-    dense_x = jnp.broadcast_to(
-        padded_x[None, :, :], (n_spaces, dense_capacity, x.shape[-1]))
     dense_valid = jnp.broadcast_to(
         (jnp.arange(dense_capacity) < token_count)[None, :],
         (n_spaces, dense_capacity))
 
     proj = router_params['proj_rst']
     operator_query = jnp.einsum(
-        'mtd,mdr->mtr', dense_x, proj['kernel']
+        'td,mdr->mtr', padded_x, proj['kernel']
     ) + proj['bias'][:, None, :]
     rng, rng_query_drop = jax.random.split(rng)
     operator_query = safe_dropout(
         operator_query, router_dropout, deterministic, rng_query_drop)
     tau_params = router_params['raw_tau_rst']
     raw_tau = jnp.einsum(
-        'mtd,mdr->mtr', dense_x, tau_params['kernel']
+        'td,mdr->mtr', padded_x, tau_params['kernel']
     ) + tau_params['bias'][:, None, :]
-    local_all = request_kernel(
+    local_all = dense_kernel(
         operator_query, pool_params['rst_op_key'], raw_tau,
         dense_valid, pool_params['rst_read'], pool_params['rst_write'],
         soft_gate_T_rst, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
         execution_prune_eps)[:, :token_count, :]
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
-    space_out_all = jnp.einsum(
-        'mtr,mrd->mtd', local_all * rst_scale,
-        router_params['up_rst']['kernel'])
-    space_out_tokens = space_out_all.transpose((1, 0, 2))
     flat_top_ids = top_ids.reshape((token_count, top_k))
     flat_top_weights = top_weights.reshape((token_count, top_k))
     dense_space_weights = jnp.zeros(
@@ -7118,22 +6964,17 @@ def _rst_multispace_dense_forward(
     dense_space_weights = dense_space_weights.at[
         jnp.arange(token_count, dtype=jnp.int32)[:, None],
         flat_top_ids].add(flat_top_weights)
-    update = jnp.einsum(
-        'tm,tmd->td', dense_space_weights, space_out_tokens
+    update = _rst_multispace_fused_commit(
+        local_all, dense_space_weights,
+        router_params['up_rst']['kernel'], rst_scale
     ).reshape((batch_size, sequence_length, d_model))
     rng, rng_out = jax.random.split(rng)
     update = safe_dropout(
         update, dropout_rate, deterministic, rng_out)
-    selected_requests = jnp.float32(token_count * top_k)
-    metrics = _rst_space_metrics(
-        top_ids, top_weights, n_spaces,
-        processed_requests=selected_requests,
-        overflow_requests=jnp.float32(0.0))
+    metrics = _rst_space_metrics(top_ids, top_weights, n_spaces)
     if not return_details:
         return update, metrics
     selected_local = local_all.transpose((1, 0, 2))[
-        jnp.arange(token_count, dtype=jnp.int32)[:, None], flat_top_ids]
-    selected_space_out = space_out_tokens[
         jnp.arange(token_count, dtype=jnp.int32)[:, None], flat_top_ids]
     details = {
         'selected_space_ids': top_ids,
@@ -7141,12 +6982,6 @@ def _rst_multispace_dense_forward(
         'space_scores': space_scores,
         'local_outputs': selected_local.reshape(
             (batch_size, sequence_length, top_k, local_all.shape[-1])),
-        'space_outputs': selected_space_out.reshape(
-            (batch_size, sequence_length, top_k, d_model)),
-        'all_space_local_outputs': local_all.reshape(
-            (n_spaces, batch_size, sequence_length, local_all.shape[-1])),
-        'all_space_outputs': space_out_all.reshape(
-            (n_spaces, batch_size, sequence_length, d_model)),
     }
     return update, metrics, details
 
@@ -7172,10 +7007,10 @@ def _rst_forward_training_fast(
     if not isinstance(sharded_fns, dict):
         raise ValueError("training fast RST requires dict sharded_fns")
     if int(n_operation_spaces) > 1:
-        request_kernel = sharded_fns.get('rst_request_minimal')
+        dense_kernel = sharded_fns.get('rst_multispace_dense_minimal')
         return _rst_multispace_dense_forward(
             x, pool_params, router_params, rng,
-            router_dropout, dropout_rate, deterministic, request_kernel,
+            router_dropout, dropout_rate, deterministic, dense_kernel,
             int(n_operation_spaces), int(operation_space_top_k),
             d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
@@ -7226,12 +7061,12 @@ def _rst_forward_production_diagnostics(
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
     if int(n_operation_spaces) > 1:
-        request_kernel = (
-            sharded_fns.get('rst_request_minimal')
+        dense_kernel = (
+            sharded_fns.get('rst_multispace_dense_minimal')
             if isinstance(sharded_fns, dict) else None)
         out, space_metrics, details = _rst_multispace_dense_forward(
             x, pool_params, router_params, rng,
-            router_dropout, dropout_rate, deterministic, request_kernel,
+            router_dropout, dropout_rate, deterministic, dense_kernel,
             int(n_operation_spaces), int(operation_space_top_k),
             d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
@@ -7368,38 +7203,38 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
     if int(n_operation_spaces) > 1:
-        request_kernel = (
-            sharded_fns.get('rst_request_minimal')
+        dense_kernel = (
+            sharded_fns.get('rst_multispace_dense_minimal')
             if isinstance(sharded_fns, dict) else None)
         out, _, details = _rst_multispace_dense_forward(
             x, pool_params, router_params, rng,
-            router_dropout, dropout_rate, deterministic, request_kernel,
+            router_dropout, dropout_rate, deterministic, dense_kernel,
             int(n_operation_spaces), int(operation_space_top_k),
             d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps, return_details=True)
         rst_trajectory_trace = None
         if analysis_trajectory_enabled:
-            if request_kernel is None:
+            if dense_kernel is None:
                 raise ValueError(
-                    "multi-space trajectory requires the selected request "
-                    "kernel metadata")
+                    "multi-space trajectory requires dense grouped kernel "
+                    "metadata")
             angular_kwargs = {
                 'soft_gate_temperature': soft_gate_T_rst,
                 'soft_gate_boundary_power': soft_gate_boundary_power,
                 'execution_prune_eps': execution_prune_eps,
                 'soft_gate_effective_active_eps': 1.0e-6,
                 'admission_den_power': float(getattr(
-                    request_kernel, '_v4173_admission_den_power',
+                    dense_kernel, '_v4173_admission_den_power',
                     admission_den_power)),
                 'admission_den_power_rst': float(getattr(
-                    request_kernel, '_v4173_admission_den_power',
+                    dense_kernel, '_v4173_admission_den_power',
                     admission_den_power)),
                 'srw_composition_mode': getattr(
-                    request_kernel, '_v4173_srw_composition_mode',
+                    dense_kernel, '_v4173_srw_composition_mode',
                     DEFAULT_SRW_COMPOSITION_MODE),
                 'heat_kernel_beta': float(getattr(
-                    request_kernel, '_v4173_heat_kernel_beta',
+                    dense_kernel, '_v4173_heat_kernel_beta',
                     DEFAULT_HEAT_KERNEL_BETA)),
             }
             _, trace_details = _rst_multispace_inference(
@@ -12035,21 +11870,9 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
     multi_space = router['proj_rst']['kernel'].ndim == 3
     if multi_space:
-        top_k = min(
-            int(router['proj_rst']['kernel'].shape[0]),
-            int(params.get('operation_space_top_k', 1))
-            if hasattr(params, 'get') else 1)
-        # Calibration params do not carry config metadata. Use all selected
-        # spaces only when a caller materialized the canonical top-k value;
-        # otherwise one differentiable top space is sufficient for tau init.
-        top_ids, _, _ = _rst_space_selection(
-            rst_x, router, top_k)
-        request_x = jnp.repeat(rst_x, top_k, axis=0)
-        flat_ids = top_ids.reshape(-1)
         rst_operator_query = jnp.einsum(
-            'qd,qdr->qr', request_x,
-            router['proj_rst']['kernel'][flat_ids]
-        ) + router['proj_rst']['bias'][flat_ids]
+            'td,mdr->mtr', rst_x, router['proj_rst']['kernel']
+        ) + router['proj_rst']['bias'][:, None, :]
     else:
         rst_operator_query = (
             rst_x @ router['proj_rst']['kernel']
@@ -12074,7 +11897,7 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         'rst': (
             jax.vmap(_selection_rho)(
                 rst_operator_query,
-                rst_operator_keys[flat_ids]).reshape((token_count, -1))
+                rst_operator_keys)
             if multi_space
             else _selection_rho(rst_operator_query, rst_operator_keys)),
     }
@@ -12261,15 +12084,13 @@ def _rst_multispace_inference(
     top_k = int(operation_space_top_k)
     flat_x = x.reshape((token_count, x.shape[-1]))
     n_spaces = int(router_params['proj_rst']['kernel'].shape[0])
-    dense_x = jnp.broadcast_to(
-        flat_x[None, :, :], (n_spaces, token_count, x.shape[-1]))
     proj = router_params['proj_rst']
     operator_query_all = jnp.einsum(
-        'mtd,mdr->mtr', dense_x, proj['kernel']
+        'td,mdr->mtr', flat_x, proj['kernel']
     ) + proj['bias'][:, None, :]
     tau_params = router_params['raw_tau_rst']
     raw_tau_all = jnp.einsum(
-        'mtd,mdr->mtr', dense_x, tau_params['kernel']
+        'td,mdr->mtr', flat_x, tau_params['kernel']
     ) + tau_params['bias'][:, None, :]
     keys = pool_params['rst_op_key']
     reads = pool_params['rst_read']
@@ -12316,19 +12137,17 @@ def _rst_multispace_inference(
         operator_query_all, keys, raw_tau_all, reads, writes,
         request_operator_multiplier)
     _, _, rst_scale = _pool_output_scales(d_model, n_layers)
-    space_out_all = jnp.einsum(
-        'mtr,mrd->mtd', local_all * rst_scale,
-        router_params['up_rst']['kernel'])
-    if space_multiplier is not None:
-        space_out_all = space_out_all * jnp.asarray(
-            space_multiplier, dtype=jnp.float32)[:, None, None]
     flat_top_ids = top_ids.reshape((token_count, top_k))
     dense_space_weights = jnp.zeros(
         (token_count, n_spaces), dtype=jnp.float32).at[
             jnp.arange(token_count, dtype=jnp.int32)[:, None],
             flat_top_ids].add(top_weights.reshape((token_count, top_k)))
-    update = jnp.einsum(
-        'tm,mtd->td', dense_space_weights, space_out_all
+    if space_multiplier is not None:
+        dense_space_weights = dense_space_weights * jnp.asarray(
+            space_multiplier, dtype=jnp.float32)[None, :]
+    update = _rst_multispace_fused_commit(
+        local_all, dense_space_weights,
+        router_params['up_rst']['kernel'], rst_scale
     ).reshape((batch_size, sequence_length, d_model))
     if not return_details:
         return update
@@ -12340,7 +12159,6 @@ def _rst_multispace_inference(
         return value_by_token[token_index, flat_top_ids]
 
     local = select_spaces(local_all)
-    space_out = select_spaces(space_out_all)
     operator_query = select_spaces(operator_query_all)
     raw_tau = select_spaces(raw_tau_all)
     request_gate = select_spaces(gate_all)
@@ -12349,6 +12167,13 @@ def _rst_multispace_inference(
     margin = select_spaces(margin_all)
     read_value = select_spaces(read_value_all)
     request_den = select_spaces(request_den_all)
+    selected_up = router_params['up_rst']['kernel'][flat_top_ids]
+    space_out = jnp.einsum(
+        'tkr,tkrd->tkd', local * rst_scale, selected_up)
+    if space_multiplier is not None:
+        selected_multiplier = jnp.asarray(
+            space_multiplier, dtype=jnp.float32)[flat_top_ids]
+        space_out = space_out * selected_multiplier[..., None]
     request_gate_den = request_gate.sum(axis=-1) / jnp.maximum(
         request_gate_normalized.sum(axis=-1), jnp.float32(1e-8))
     return update, {
