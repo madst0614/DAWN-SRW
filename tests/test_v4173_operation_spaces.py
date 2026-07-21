@@ -187,6 +187,8 @@ def test_multispace_shapes_selection_dense_parity() -> None:
         dense_query, pool['rst_op_key'], dense_tau,
         jnp.ones((8, 3), dtype=jnp.bool_),
         pool['rst_read'], pool['rst_write'], *scalar)
+    assert not isinstance(dense_local, tuple)
+    assert dense_local.shape == (8, 3, 3)
     _, _, rst_scale = v4173._pool_output_scales(6, 1)
     dense_space_outputs = jnp.einsum(
         'mtr,mrd->mtd', dense_local * rst_scale,
@@ -204,6 +206,20 @@ def test_multispace_shapes_selection_dense_parity() -> None:
 
     diagnostics = train_jax.build_canonical_sharded_fns(
         _trainer_cfg(), _mesh(), kernel_profile='production_diagnostics')
+    assert 'rst_multispace_dense_minimal' not in diagnostics
+    assert getattr(
+        diagnostics['rst_multispace_dense_diagnostics'],
+        '_v4173_dense_grouped_diagnostics') == 'all_spaces'
+    diagnostic_kernel_out = diagnostics[
+        'rst_multispace_dense_diagnostics'](
+            dense_query, pool['rst_op_key'], dense_tau,
+            jnp.ones((8, 3), dtype=jnp.bool_),
+            pool['rst_read'], pool['rst_write'], *scalar)
+    assert isinstance(diagnostic_kernel_out, tuple)
+    assert len(diagnostic_kernel_out) == 8
+    assert diagnostic_kernel_out[0].shape == (8, 3, 3)
+    assert all(value.shape == (8, 3, 1)
+               for value in diagnostic_kernel_out[1:])
     diagnostic_out = model.apply(
         variables, tokens, labels=tokens, deterministic=True,
         rngs={'dropout': jax.random.PRNGKey(16)},
@@ -213,6 +229,16 @@ def test_multispace_shapes_selection_dense_parity() -> None:
     for name in v4173.RST_SPACE_METRIC_NAMES:
         assert name in diagnostic_out
         assert np.isfinite(float(diagnostic_out[name]))
+    for name in (
+            'rst_active_tau_frac', 'rst_active_tau_count', 'rst_gate_mass',
+            'rst_gate_den', 'rst_tau_mean'):
+        assert np.isfinite(float(diagnostic_out[name]))
+        assert float(diagnostic_out[name]) != 0.0
+    assert not any(
+        name.startswith(('per_space_', 'all_space_'))
+        for name in diagnostic_out)
+    for name in ('operator_gate', 'operator_rho', 'space_outputs'):
+        assert name not in diagnostic_out
     for name in (
             'space_selected_requests', 'space_processed_requests',
             'space_all_processed', 'space_overflow_requests'):
@@ -235,6 +261,142 @@ def test_fused_commit_graph_has_no_full_space_model_width_tensor() -> None:
     }
     assert (n_spaces, token_count, d_model) not in intermediate_shapes
     assert closed.out_avals[0].shape == (token_count, d_model)
+
+
+def test_multispace_production_diagnostics_update_parity() -> None:
+    _, variables, _ = _init()
+    pool = v4173._pool_params_with_operator_keys(
+        variables['params']['neuron_pool'])
+    router = variables['params']['router']
+    production = train_jax.build_canonical_sharded_fns(
+        _trainer_cfg(), _mesh())
+    diagnostics = train_jax.build_canonical_sharded_fns(
+        _trainer_cfg(), _mesh(), kernel_profile='production_diagnostics')
+    x = jax.random.normal(jax.random.PRNGKey(101), (1, 3, 6))
+    kwargs = dict(
+        d_model=6, n_layers=1, n_operation_spaces=8,
+        operation_space_top_k=2, soft_gate_T_rst=jnp.float32(0.07),
+        soft_gate_t_final=jnp.float32(0.07),
+        soft_gate_boundary_power=jnp.float32(2.0),
+        soft_gate_boundary_power_final=jnp.float32(4.0),
+        execution_prune_eps=jnp.float32(0.0))
+    production_out, _ = v4173._rst_forward_training_fast(
+        x, pool, router, jax.random.PRNGKey(102),
+        0.0, 0.0, True, production, **kwargs)
+    diagnostics_result = v4173._rst_forward_production_diagnostics(
+        x, pool, router, jax.random.PRNGKey(102),
+        0.0, 0.0, True, diagnostics, **kwargs)
+    np.testing.assert_allclose(
+        np.asarray(production_out), np.asarray(diagnostics_result[0]),
+        rtol=1.0e-5, atol=1.0e-5)
+
+
+def test_multispace_diagnostic_aggregate_manual_reference() -> None:
+    top_ids = jnp.asarray([[[0, 1], [1, 2]]], dtype=jnp.int32)
+    top_weights = jnp.asarray(
+        [[[0.25, 0.75], [0.60, 0.40]]], dtype=jnp.float32)
+
+    def aggregate(values) -> jax.Array:
+        return jnp.asarray(values, dtype=jnp.float32)[..., None]
+
+    active_count = aggregate([[2, 4], [6, 8], [10, 12]])
+    gate_mass = aggregate([[0.5, 2.0], [1.5, 0.25], [3.0, 0.75]])
+    gate_sq = aggregate([[0.2, 1.5], [0.7, 0.1], [2.0, 0.3]])
+    gate_max = aggregate([[0.3, 1.0], [0.8, 0.2], [1.2, 0.4]])
+    angular_sum = aggregate([[1, 2], [3, 4], [5, 6]])
+    tau = aggregate([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+    gate_den = aggregate([[1.0, 2.0], [1.5, 1.0], [3.0, 1.0]])
+    actual = v4173._rst_multispace_diagnostic_aggregates(
+        top_ids, top_weights, active_count, gate_mass, gate_sq, gate_max,
+        angular_sum, tau, gate_den, n_rst_per_space=20,
+        composition_floor_mass=1.0, composition_mode='linear_angular')
+
+    ids = np.asarray(top_ids).reshape((2, 2))
+    weights = np.asarray(top_weights).reshape((2, 2))
+
+    def select(values: jax.Array) -> np.ndarray:
+        values_np = np.asarray(values)[..., 0]
+        return np.stack(
+            [values_np[ids[token], token] for token in range(2)])
+
+    active_np = np.asarray(active_count)
+    mass_np = np.asarray(gate_mass)
+    depth = np.asarray(angular_sum) / np.maximum(active_np, 1.0)
+    eff_n = np.square(mass_np) / np.maximum(np.asarray(gate_sq), 1.0e-8)
+    top1 = np.asarray(gate_max) / np.maximum(mass_np, 1.0e-8)
+    floor = (mass_np < 1.0).astype(np.float32)
+
+    expected = {
+        'rst_active_tau_frac': select(active_count / 20.0).mean(),
+        'rst_active_tau_count': select(active_count).sum(axis=-1).mean(),
+        'rst_gate_mass': (select(gate_mass) * weights).sum(axis=-1).mean(),
+        'rst_gate_den': (select(gate_den) * weights).sum(axis=-1).mean(),
+        'rst_depth_active': (
+            select(jnp.asarray(depth)) * weights).sum(axis=-1).mean(),
+        'rst_gate_eff_n': (
+            select(jnp.asarray(eff_n)) * weights).sum(axis=-1).mean(),
+        'rst_top1_gate_frac': (
+            select(jnp.asarray(top1)) * weights).sum(axis=-1).mean(),
+        'rst_den_floor_frac': (
+            select(jnp.asarray(floor)) * weights).sum(axis=-1).mean(),
+        'rst_tau_mean': select(tau).mean(),
+    }
+    for name, value in expected.items():
+        np.testing.assert_allclose(
+            np.asarray(actual[name]), value, rtol=1.0e-6, atol=1.0e-6)
+    weighted_tau = (select(tau) * weights).sum(axis=-1).mean()
+    assert not np.isclose(float(actual['rst_tau_mean']), weighted_tau)
+
+
+def test_grouped_diagnostics_m1_matches_single_space_definitions() -> None:
+    mesh = _mesh()
+    common = dict(
+        max_chunk_size=2, admission_den_power=1.2,
+        srw_composition_mode='linear_angular')
+    single_kernel = v4173.make_sharded_srw_diagnostics_minimal(
+        mesh, **common)
+    grouped_kernel = v4173.make_sharded_rst_multispace_dense_diagnostics(
+        mesh, **common)
+    x = jax.random.normal(jax.random.PRNGKey(111), (1, 3, 6))
+    query = jax.random.normal(jax.random.PRNGKey(112), (1, 3, 3))
+    keys = jax.random.normal(jax.random.PRNGKey(113), (4, 3))
+    read = jax.random.normal(jax.random.PRNGKey(114), (4, 3))
+    write = jax.random.normal(jax.random.PRNGKey(115), (4, 3))
+    raw_tau = jnp.full((1, 3, 1), -0.4, dtype=jnp.float32)
+    scalar = (jnp.float32(0.07), jnp.float32(0.07),
+              jnp.float32(2.0), jnp.float32(4.0), jnp.float32(0.0))
+    single = single_kernel(
+        x, query, keys, raw_tau, read, write, *scalar)
+    grouped = grouped_kernel(
+        query.reshape((1, 3, 3)), keys[None, ...],
+        raw_tau.reshape((1, 3, 1)),
+        jnp.ones((1, 3), dtype=jnp.bool_),
+        read[None, ...], write[None, ...], *scalar)
+    np.testing.assert_allclose(
+        np.asarray(grouped[0][0]).reshape((1, 3, 3)),
+        np.asarray(single[0]), rtol=1.0e-6, atol=1.0e-6)
+    aggregate = v4173._rst_multispace_diagnostic_aggregates(
+        jnp.zeros((1, 3, 1), dtype=jnp.int32),
+        jnp.ones((1, 3, 1), dtype=jnp.float32),
+        *grouped[1:7], grouped[7], n_rst_per_space=4,
+        composition_floor_mass=getattr(
+            grouped_kernel, '_v4173_composition_floor_mass'),
+        composition_mode='linear_angular')
+    metric_indices = {
+        'rst_active_tau_frac': 1,
+        'rst_active_tau_count': 2,
+        'rst_gate_mass': 3,
+        'rst_gate_den': 4,
+        'rst_depth_active': 5,
+        'rst_gate_eff_n': 6,
+        'rst_top1_gate_frac': 7,
+        'rst_den_floor_frac': 8,
+        'rst_tau_mean': 9,
+    }
+    for name, index in metric_indices.items():
+        np.testing.assert_allclose(
+            np.asarray(aggregate[name]), np.asarray(single[index]),
+            rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_no_dead_sparse_path_and_selector_uses_router_control_group() -> None:
@@ -295,6 +457,14 @@ def test_multispace_main_loss_gradients_and_analysis_ids() -> None:
     assert info['weighted_global_contribution'].shape == (1, 1, 3, 2, 6)
     assert info['space_internal_gate_den'].shape == (1, 8)
     assert np.all(np.isfinite(np.asarray(info['space_internal_gate_den'])))
+    for name in (
+            'per_space_selection_frac', 'per_space_mean_selected_weight',
+            'per_space_active_frac', 'per_space_active_count',
+            'per_space_tau_mean', 'per_space_gate_mass',
+            'per_space_gate_den', 'per_space_output_norm',
+            'per_space_weighted_contribution_norm'):
+        assert info[name].shape == (1, 8)
+        assert np.all(np.isfinite(np.asarray(info[name])))
 
 
 def test_per_space_tau_calibration_is_independent_and_selector_free(

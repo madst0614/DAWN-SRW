@@ -13517,6 +13517,18 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
         f"       v={_required_linear_direct_tau_metric(rec, 'attn_v_tau_mean'):+.6f}"
         f" rst={_required_linear_direct_tau_metric(rec, 'rst_tau_mean'):+.6f}"
     )
+    if (str(ctx.get('model_version')) == V4173_MODEL_VERSION
+            and all(name in rec for name in V4173_OPERATION_SPACE_METRIC_NAMES)):
+        log_message(
+            "  space: "
+            f"top1={float(rec['space_selected_top1_frac']):.3f} "
+            f"w1={float(rec['space_weight_top1_mean']):.3f} "
+            f"H={float(rec['space_weight_entropy_mean']):.3f} "
+            "usage["
+            f"min={float(rec['space_usage_min']):.3f} "
+            f"max={float(rec['space_usage_max']):.3f} "
+            f"std={float(rec['space_usage_std']):.3f}] "
+            f"dead={float(rec['space_dead_frac']):.3f}")
     if str(ctx.get('model_version')) in (
             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
         log_message(
@@ -15246,13 +15258,19 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
     if version == V4173_MODEL_VERSION and n_operation_spaces > 1:
-        dense_factory = getattr(
-            module, 'make_sharded_rst_multispace_dense_minimal', None)
+        if kernel_profile == 'production_diagnostics':
+            dense_factory_name = (
+                'make_sharded_rst_multispace_dense_diagnostics')
+            dense_kernel_name = 'rst_multispace_dense_diagnostics'
+        else:
+            dense_factory_name = 'make_sharded_rst_multispace_dense_minimal'
+            dense_kernel_name = 'rst_multispace_dense_minimal'
+        dense_factory = getattr(module, dense_factory_name, None)
         if dense_factory is None:
             raise RuntimeError(
                 "v4173 multi-space config requires "
-                "make_sharded_rst_multispace_dense_minimal")
-        sharded['rst_multispace_dense_minimal'] = dense_factory(
+                f"{dense_factory_name}")
+        sharded[dense_kernel_name] = dense_factory(
             max_chunk_size=chunks['rst'],
             **_factory_supported_kwargs(
                 dense_factory, pool_kwargs('rst')))

@@ -478,6 +478,7 @@ def _validate_v4173_sharded_fns(
         'rst_single_suppression_minimal': ('rst', rst_power),
         'rst_single_trajectory_minimal': ('rst', rst_power),
         'rst_multispace_dense_minimal': ('rst', rst_power),
+        'rst_multispace_dense_diagnostics': ('rst', rst_power),
         'paired': ('qk', qk_power),
         'attn_qk_paired': ('qk', qk_power),
         'qk_paired': ('qk', qk_power),
@@ -4629,6 +4630,175 @@ def make_sharded_rst_multispace_dense_minimal(
     return dense_kernel
 
 
+def make_sharded_rst_multispace_dense_diagnostics(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Create the observational grouped all-space dense RST kernel."""
+    srw_composition_mode, admission_den_power, heat_kernel_beta = (
+        _validate_v4173_composition_settings(
+            srw_composition_mode, admission_den_power, heat_kernel_beta,
+            context="make_sharded_rst_multispace_dense_diagnostics"))
+    _validate_v4173_admission_den_grad_scale(
+        admission_den_grad_scale,
+        context="make_sharded_rst_multispace_dense_diagnostics")
+    del dead_exposure_target
+    den_power = jnp.float32(admission_den_power)
+    effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
+    composition_mode = srw_composition_mode
+    beta = jnp.float32(heat_kernel_beta)
+
+    def diagnostics_core(
+            operator_query, operator_keys_local, raw_tau, token_valid,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        n_spaces, token_capacity = operator_query.shape[:2]
+        n_local = operator_keys_local.shape[1]
+        chunk_size = min(int(max_chunk_size), int(n_local))
+        n_chunks = (int(n_local) + chunk_size - 1) // chunk_size
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - int(n_local)
+        d_local = write_vectors_local.shape[-1]
+        pad_spec = ((0, 0), (0, pad_n), (0, 0))
+        operator_keys_padded = jnp.pad(operator_keys_local, pad_spec)
+        read_padded = jnp.pad(read_vectors_local, pad_spec)
+        write_padded = jnp.pad(write_vectors_local, pad_spec)
+        valid_padded = jnp.arange(n_padded) < n_local
+        token_valid = jnp.asarray(token_valid, dtype=jnp.bool_)
+        safe_query = jnp.where(
+            token_valid[:, :, None], operator_query,
+            jax.nn.one_hot(
+                jnp.zeros(token_valid.shape, dtype=jnp.int32),
+                operator_query.shape[-1], dtype=operator_query.dtype))
+        query_unit_bf = _forward_unit_direction(
+            safe_query.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        key_unit_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_unit_bf = _forward_unit_direction(
+            read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_unit_bf = _forward_unit_direction(
+            write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau)
+
+        @jax.checkpoint
+        def diagnostics_step(carry, chunk_index):
+            (raw_out, total_gate_mass, total_gate_sq, total_gate_max,
+             total_active_count, total_angular_depth) = carry
+            start = chunk_index * chunk_size
+            keys = jax.lax.dynamic_slice_in_dim(
+                key_unit_bf, start, chunk_size, axis=1)
+            read = jax.lax.dynamic_slice_in_dim(
+                read_unit_bf, start, chunk_size, axis=1)
+            write = jax.lax.dynamic_slice_in_dim(
+                write_unit_bf, start, chunk_size, axis=1)
+            valid = jax.lax.dynamic_slice_in_dim(
+                valid_padded, start, chunk_size, axis=0)
+            rho_raw = jnp.einsum(
+                'mcr,mlr->mcl', query_unit_bf, keys).astype(jnp.float32)
+            valid_token_operator = (
+                token_valid[:, :, None] & valid[None, None, :])
+            rho_compute = jnp.where(valid_token_operator, rho_raw, tau)
+            (margin, operator_gate, angular_depth, execution_weight,
+             _) = _compute_admission_drive(
+                rho_compute, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=effective_active_eps,
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=composition_mode,
+                heat_kernel_beta=beta)
+            operator_gate = jnp.where(
+                valid_token_operator, operator_gate, 0.0)
+            angular_depth = jnp.where(
+                valid_token_operator, angular_depth, 0.0)
+            execution_weight = jnp.where(
+                valid_token_operator, execution_weight, 0.0)
+            active_count = (
+                ((margin > jnp.float32(0.0)) & valid_token_operator)
+                .astype(jnp.float32).sum(axis=-1, keepdims=True))
+            read_value = jnp.einsum(
+                'mcr,mlr->mcl',
+                operator_query.astype(jnp.bfloat16), read
+            ).astype(jnp.float32)
+            amplitude = execution_weight * read_value
+            chunk_out = jnp.einsum(
+                'mcl,mlr->mcr', amplitude.astype(jnp.bfloat16), write
+            ).astype(jnp.float32)
+            return (
+                raw_out + chunk_out,
+                total_gate_mass + operator_gate.sum(
+                    axis=-1, keepdims=True),
+                total_gate_sq + jnp.square(operator_gate).sum(
+                    axis=-1, keepdims=True),
+                jnp.maximum(
+                    total_gate_max,
+                    operator_gate.max(axis=-1, keepdims=True)),
+                total_active_count + active_count,
+                total_angular_depth + angular_depth.sum(
+                    axis=-1, keepdims=True),
+            ), None
+
+        aggregate_shape = (n_spaces, token_capacity, 1)
+        (raw_out, gate_mass, gate_sq, gate_max, active_count,
+         angular_depth_sum), _ = jax.lax.scan(
+            diagnostics_step,
+            (
+                jnp.zeros(
+                    (n_spaces, token_capacity, d_local), dtype=jnp.float32),
+                jnp.zeros(aggregate_shape, dtype=jnp.float32),
+                jnp.zeros(aggregate_shape, dtype=jnp.float32),
+                jnp.zeros(aggregate_shape, dtype=jnp.float32),
+                jnp.zeros(aggregate_shape, dtype=jnp.float32),
+                jnp.zeros(aggregate_shape, dtype=jnp.float32),
+            ),
+            jnp.arange(n_chunks))
+        global_gate_mass = jax.lax.psum(gate_mass, 'model')
+        global_gate_sq = jax.lax.psum(gate_sq, 'model')
+        global_gate_max = jax.lax.pmax(
+            jax.lax.stop_gradient(gate_max), 'model')
+        global_active_count = jax.lax.stop_gradient(
+            jax.lax.psum(active_count, 'model'))
+        global_angular_depth = jax.lax.stop_gradient(
+            jax.lax.psum(angular_depth_sum, 'model'))
+        gate_den = _composition_den(
+            global_gate_mass, den_power, composition_mode)
+        out = raw_out / gate_den
+        out = jax.lax.psum(
+            out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
+        return tuple(jax.lax.stop_gradient(value) for value in (
+            out, global_active_count, global_gate_mass, global_gate_sq,
+            global_gate_max, global_angular_depth, tau, gate_den))
+
+    aggregate_spec = P(None, 'data', None)
+    diagnostics_kernel = shard_map(
+        diagnostics_core, mesh=mesh,
+        in_specs=(
+            P(None, 'data', None), P(None, 'model', None),
+            P(None, 'data', None), P(None, 'data'),
+            P(None, 'model', None), P(None, 'model', None),
+            P(), P(), P(), P(), P()),
+        out_specs=(aggregate_spec,) * 8, check_rep=False)
+    _mark_v4173_srw_factory_output(
+        diagnostics_kernel, admission_den_power, composition_mode,
+        heat_kernel_beta)
+    diagnostics_kernel._v4173_kernel_profile = 'production_diagnostics'
+    diagnostics_kernel._v4173_dense_grouped_diagnostics = 'all_spaces'
+    diagnostics_kernel._v4173_dense_token_multiple = int(
+        mesh.shape['data'])
+    diagnostics_kernel._v4173_composition_floor_mass = float(
+        _composition_den_floor_mass(composition_mode))
+    return diagnostics_kernel
+
+
 def _make_sharded_srw_paired_training_fast_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
@@ -6890,7 +7060,7 @@ def _rst_space_metrics(top_ids, top_weights, n_operation_spaces):
         top_weights.astype(jnp.float32)
         * jnp.log(jnp.maximum(top_weights.astype(jnp.float32), 1.0e-30)),
         axis=-1)
-    return {
+    metrics = {
         'space_selected_top1_frac': top1_frac,
         'space_weight_top1_mean': top_weights[..., 0].mean(),
         'space_weight_entropy_mean': entropy.mean(),
@@ -6898,6 +7068,10 @@ def _rst_space_metrics(top_ids, top_weights, n_operation_spaces):
         'space_usage_max': usage.max(),
         'space_usage_std': usage.std(),
         'space_dead_frac': (usage_count == 0.0).astype(jnp.float32).mean(),
+    }
+    return {
+        name: jax.lax.stop_gradient(value.astype(jnp.float32))
+        for name, value in metrics.items()
     }
 
 
@@ -6908,6 +7082,76 @@ def _rst_multispace_fused_commit(
     weighted_local = local_all * weights_mt[..., None]
     return jnp.einsum(
         'mtr,mrd->td', weighted_local * rst_scale, up_rst_kernel)
+
+
+def _rst_multispace_diagnostic_aggregates(
+        top_ids, top_weights, active_count, gate_mass, gate_sq, gate_max,
+        angular_depth_sum, tau, gate_den, n_rst_per_space,
+        composition_floor_mass, composition_mode):
+    """Reduce per-space/token scan aggregates to regular RST scalars."""
+    aggregate_values = (
+        active_count, gate_mass, gate_sq, gate_max, angular_depth_sum,
+        tau, gate_den)
+    if any(value.ndim != 3 or value.shape[-1] != 1
+           for value in aggregate_values):
+        raise ValueError(
+            "multi-space diagnostics require [M,T,1] aggregate tensors")
+    n_rst_per_space = int(n_rst_per_space)
+    if n_rst_per_space <= 0:
+        raise ValueError("n_rst_per_space must be positive")
+    if composition_floor_mass is None:
+        raise ValueError(
+            "multi-space diagnostics require composition floor metadata")
+    flat_ids = top_ids.reshape((-1, top_ids.shape[-1]))
+    flat_weights = top_weights.reshape((-1, top_weights.shape[-1]))
+    token_index = jnp.arange(flat_ids.shape[0], dtype=jnp.int32)[:, None]
+
+    def select(value):
+        by_token = jnp.swapaxes(value[..., 0], 0, 1)
+        return by_token[token_index, flat_ids]
+
+    active_frac = active_count / jnp.float32(n_rst_per_space)
+    depth_active = jnp.where(
+        active_count > 0.0,
+        angular_depth_sum / jnp.maximum(active_count, 1.0), 0.0)
+    gate_eff_n = jnp.where(
+        gate_mass > 0.0,
+        jnp.square(gate_mass) / jnp.maximum(gate_sq, 1.0e-8), 0.0)
+    top1_gate_frac = jnp.where(
+        gate_mass > 0.0,
+        gate_max / jnp.maximum(gate_mass, 1.0e-8), 0.0)
+    if composition_mode == 'linear_angular':
+        den_floor = gate_mass < jnp.float32(composition_floor_mass)
+    else:
+        den_floor = gate_mass <= jnp.float32(composition_floor_mass)
+    den_floor = den_floor.astype(jnp.float32)
+
+    def selected_mean(value):
+        return select(value).mean()
+
+    def selected_sum_then_mean(value):
+        return select(value).sum(axis=-1).mean()
+
+    def selected_weighted_mean(value):
+        return (select(value) * flat_weights).sum(axis=-1).mean()
+
+    # Each space retains its own denominator. This is only the selected-space
+    # weighted mean of those internal denominators, never a shared commit den.
+    metrics = {
+        'rst_active_tau_frac': selected_mean(active_frac),
+        'rst_active_tau_count': selected_sum_then_mean(active_count),
+        'rst_gate_mass': selected_weighted_mean(gate_mass),
+        'rst_gate_den': selected_weighted_mean(gate_den),
+        'rst_depth_active': selected_weighted_mean(depth_active),
+        'rst_gate_eff_n': selected_weighted_mean(gate_eff_n),
+        'rst_top1_gate_frac': selected_weighted_mean(top1_gate_frac),
+        'rst_den_floor_frac': selected_weighted_mean(den_floor),
+        'rst_tau_mean': selected_mean(tau),
+    }
+    return {
+        name: jax.lax.stop_gradient(value.astype(jnp.float32))
+        for name, value in metrics.items()
+    }
 
 
 def _rst_multispace_dense_forward(
@@ -6986,6 +7230,114 @@ def _rst_multispace_dense_forward(
     return update, metrics, details
 
 
+def _rst_multispace_dense_diagnostics_forward(
+        x, pool_params, router_params, rng,
+        router_dropout, dropout_rate, deterministic, diagnostics_kernel,
+        n_operation_spaces, operation_space_top_k,
+        d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps):
+    """Run the diagnostics-only grouped dense kernel and scalar reductions."""
+    if diagnostics_kernel is None or not getattr(
+            diagnostics_kernel, '_v4173_dense_grouped_diagnostics', False):
+        raise ValueError(
+            "multi-space RST diagnostics require the canonical grouped "
+            "diagnostics kernel")
+    top_ids, top_weights, _ = _rst_space_selection(
+        x, router_params, operation_space_top_k)
+    batch_size, sequence_length = x.shape[:2]
+    token_count = int(batch_size) * int(sequence_length)
+    n_spaces = int(n_operation_spaces)
+    top_k = int(operation_space_top_k)
+    token_multiple = max(1, int(getattr(
+        diagnostics_kernel, '_v4173_dense_token_multiple', 1)))
+    dense_capacity = (
+        math.ceil(token_count / token_multiple) * token_multiple)
+    pad_tokens = dense_capacity - token_count
+    flat_x = x.reshape((token_count, x.shape[-1]))
+    padded_x = jnp.pad(flat_x, ((0, pad_tokens), (0, 0)))
+    dense_valid = jnp.broadcast_to(
+        (jnp.arange(dense_capacity) < token_count)[None, :],
+        (n_spaces, dense_capacity))
+
+    proj = router_params['proj_rst']
+    operator_query = jnp.einsum(
+        'td,mdr->mtr', padded_x, proj['kernel']
+    ) + proj['bias'][:, None, :]
+    rng, rng_query_drop = jax.random.split(rng)
+    operator_query = safe_dropout(
+        operator_query, router_dropout, deterministic, rng_query_drop)
+    tau_params = router_params['raw_tau_rst']
+    raw_tau = jnp.einsum(
+        'td,mdr->mtr', padded_x, tau_params['kernel']
+    ) + tau_params['bias'][:, None, :]
+    diagnostics = diagnostics_kernel(
+        operator_query, pool_params['rst_op_key'], raw_tau,
+        dense_valid, pool_params['rst_read'], pool_params['rst_write'],
+        soft_gate_T_rst, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps)
+    if not isinstance(diagnostics, tuple) or len(diagnostics) != 8:
+        raise ValueError(
+            "multi-space diagnostics kernel must return local output plus "
+            "seven [M,T,1] aggregates")
+    (local_all, active_count, gate_mass, gate_sq, gate_max,
+     angular_depth_sum, tau, gate_den) = tuple(
+        value[:, :token_count, :] for value in diagnostics)
+
+    flat_top_ids = top_ids.reshape((token_count, top_k))
+    flat_top_weights = top_weights.reshape((token_count, top_k))
+    dense_space_weights = jnp.zeros(
+        (token_count, n_spaces), dtype=jnp.float32).at[
+            jnp.arange(token_count, dtype=jnp.int32)[:, None],
+            flat_top_ids].add(flat_top_weights)
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    update = _rst_multispace_fused_commit(
+        local_all, dense_space_weights,
+        router_params['up_rst']['kernel'], rst_scale
+    ).reshape((batch_size, sequence_length, d_model))
+    rng, rng_out = jax.random.split(rng)
+    update = safe_dropout(
+        update, dropout_rate, deterministic, rng_out)
+
+    composition_mode = getattr(
+        diagnostics_kernel, '_v4173_srw_composition_mode', None)
+    if composition_mode is None:
+        raise ValueError(
+            "multi-space diagnostics kernel is missing composition metadata")
+    n_rst_per_space = int(pool_params['rst_op_key'].shape[1])
+    rst_metrics = _rst_multispace_diagnostic_aggregates(
+        top_ids, top_weights, active_count, gate_mass, gate_sq, gate_max,
+        angular_depth_sum, tau, gate_den, n_rst_per_space,
+        getattr(
+            diagnostics_kernel, '_v4173_composition_floor_mass', None),
+        composition_mode)
+    space_metrics = _rst_space_metrics(top_ids, top_weights, n_spaces)
+    token_index = jnp.arange(token_count, dtype=jnp.int32)[:, None]
+    selected_local = jnp.swapaxes(local_all, 0, 1)[
+        token_index, flat_top_ids]
+    selected_den = jnp.swapaxes(gate_den, 0, 1)[
+        token_index, flat_top_ids]
+    raw_local = selected_local * selected_den
+    diagnostic_scalars = {
+        'admission_mass_max': jax.lax.stop_gradient(gate_mass.max()),
+        'composition_den_min': jax.lax.stop_gradient(gate_den.min()),
+        'composition_den_max': jax.lax.stop_gradient(gate_den.max()),
+        'raw_srw_out_norm': jax.lax.stop_gradient(
+            jnp.linalg.norm(raw_local.astype(jnp.float32), axis=-1).mean()),
+        'normalized_srw_out_norm': jax.lax.stop_gradient(
+            jnp.linalg.norm(
+                selected_local.astype(jnp.float32), axis=-1).mean()),
+    }
+    debug_details = {
+        'local_outputs': selected_local.reshape(
+            (batch_size, sequence_length, top_k, local_all.shape[-1])),
+        'selected_space_weights': top_weights,
+    }
+    return (update, rst_metrics, space_metrics, diagnostic_scalars,
+            debug_details)
+
+
 def _rst_forward_training_fast(
         x, pool_params, router_params, rng,
         router_dropout, dropout_rate, deterministic, sharded_fns,
@@ -7061,38 +7413,47 @@ def _rst_forward_production_diagnostics(
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
     if int(n_operation_spaces) > 1:
-        dense_kernel = (
-            sharded_fns.get('rst_multispace_dense_minimal')
+        diagnostics_kernel = (
+            sharded_fns.get('rst_multispace_dense_diagnostics')
             if isinstance(sharded_fns, dict) else None)
-        out, space_metrics, details = _rst_multispace_dense_forward(
+        (out, rst_metrics, space_metrics, diagnostic_scalars,
+         debug_details) = _rst_multispace_dense_diagnostics_forward(
             x, pool_params, router_params, rng,
-            router_dropout, dropout_rate, deterministic, dense_kernel,
+            router_dropout, dropout_rate, deterministic, diagnostics_kernel,
             int(n_operation_spaces), int(operation_space_top_k),
             d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, return_details=True)
+            execution_prune_eps)
         out_norm = jnp.linalg.norm(
             out.astype(jnp.float32), axis=-1).mean()
-        local_norm = jnp.linalg.norm(
-            details['local_outputs'].astype(jnp.float32), axis=-1).mean()
-        zero = jnp.float32(0.0)
         zero_contribution = jnp.zeros(
             (x.shape[0], x.shape[-1]), dtype=jnp.float32)
         output = (
             out,
-            zero, zero, zero, zero, zero, zero, zero, zero, zero,
+            rst_metrics['rst_active_tau_frac'],
+            rst_metrics['rst_active_tau_count'],
+            rst_metrics['rst_gate_mass'],
+            rst_metrics['rst_gate_den'],
+            rst_metrics['rst_depth_active'],
+            rst_metrics['rst_gate_eff_n'],
+            rst_metrics['rst_top1_gate_frac'],
+            rst_metrics['rst_den_floor_frac'],
+            rst_metrics['rst_tau_mean'],
             jax.lax.stop_gradient(out_norm),
-            zero, zero, zero,
-            jax.lax.stop_gradient(local_norm),
-            jax.lax.stop_gradient(local_norm),
+            diagnostic_scalars['admission_mass_max'],
+            diagnostic_scalars['composition_den_min'],
+            diagnostic_scalars['composition_den_max'],
+            diagnostic_scalars['raw_srw_out_norm'],
+            diagnostic_scalars['normalized_srw_out_norm'],
             out_norm,
             zero_contribution, zero_contribution,
         )
         output += tuple(
             space_metrics[name] for name in RST_SPACE_METRIC_NAMES)
         if parity_debug:
-            return output + ((out, x, details['local_outputs'],
-                              details['selected_space_weights']),)
+            return output + ((
+                out, x, debug_details['local_outputs'],
+                debug_details['selected_space_weights']),)
         return output
     rst_operator_keys = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
@@ -13013,10 +13374,43 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
             space_commit_unit = _forward_unit_direction(space_commit)
             local_operator_id = jnp.argmax(
                 space_details['operator_gate'], axis=-1).astype(jnp.int32)
+            selected_active_count = (
+                space_details['operator_margin'] > 0.0
+            ).astype(jnp.float32).sum(axis=-1)
+            selected_gate_mass = space_details[
+                'operator_gate_unpruned'].sum(axis=-1)
+            selected_tau = _tau_from_param(
+                space_details['raw_tau'])[..., 0]
             gate_den_sum = (
                 selection_one_hot
                 * space_details['operator_gate_den'][..., None]).sum(
                     axis=(0, 1, 2))
+            active_count_sum = (
+                selection_one_hot
+                * selected_active_count[..., None]).sum(axis=(0, 1, 2))
+            gate_mass_sum = (
+                selection_one_hot
+                * selected_gate_mass[..., None]).sum(axis=(0, 1, 2))
+            tau_sum = (
+                selection_one_hot
+                * selected_tau[..., None]).sum(axis=(0, 1, 2))
+            per_space_selection_frac = selection_count / jnp.maximum(
+                selection_count.sum(), 1.0)
+            per_space_mean_selected_weight = selected_weight_sum / safe_count
+            per_space_active_count = active_count_sum / safe_count
+            per_space_active_frac = (
+                per_space_active_count / jnp.float32(local_operator_count))
+            per_space_tau_mean = tau_sum / safe_count
+            per_space_gate_mass = gate_mass_sum / safe_count
+            per_space_gate_den = gate_den_sum / safe_count
+            per_space_output_norm = (
+                selection_one_hot
+                * local_output_norm[..., None]).sum(
+                    axis=(0, 1, 2)) / safe_count
+            per_space_weighted_contribution_norm = (
+                selection_one_hot
+                * weighted_output_norm[..., None]).sum(
+                    axis=(0, 1, 2)) / safe_count
             info.update({
                 'selected_space_id': selected_ids,
                 'selected_space_weight': selected_weights,
@@ -13026,23 +13420,28 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
                     + local_operator_id),
                 'space_local_contribution': space_details['space_outputs'],
                 'weighted_global_contribution': weighted_output,
-                'space_selection_frequency': selection_count / jnp.maximum(
-                    selection_count.sum(), 1.0),
-                'space_mean_selected_weight': selected_weight_sum / safe_count,
-                'space_output_norm': (
-                    selection_one_hot
-                    * local_output_norm[..., None]).sum(
-                        axis=(0, 1, 2)) / safe_count,
+                'per_space_selection_frac': per_space_selection_frac,
+                'per_space_mean_selected_weight': (
+                    per_space_mean_selected_weight),
+                'per_space_active_frac': per_space_active_frac,
+                'per_space_active_count': per_space_active_count,
+                'per_space_tau_mean': per_space_tau_mean,
+                'per_space_gate_mass': per_space_gate_mass,
+                'per_space_gate_den': per_space_gate_den,
+                'per_space_output_norm': per_space_output_norm,
+                'per_space_weighted_contribution_norm': (
+                    per_space_weighted_contribution_norm),
+                'space_selection_frequency': per_space_selection_frac,
+                'space_mean_selected_weight': (
+                    per_space_mean_selected_weight),
+                'space_output_norm': per_space_output_norm,
                 'space_weighted_contribution_norm': (
-                    selection_one_hot
-                    * weighted_output_norm[..., None]).sum(
-                        axis=(0, 1, 2)) / safe_count,
+                    per_space_weighted_contribution_norm),
                 'space_operator_active_count': (
                     gate_RST_raw_space > 0.0).astype(jnp.float32).sum(
                         axis=(0, 1, 3)),
-                'space_internal_gate_mass': gate_RST_raw_space.sum(
-                    axis=(0, 1, 3)),
-                'space_internal_gate_den': gate_den_sum / safe_count,
+                'space_internal_gate_mass': per_space_gate_mass,
+                'space_internal_gate_den': per_space_gate_den,
                 'space_commit_cosine': (
                     space_commit_unit @ space_commit_unit.T),
             })
