@@ -13190,6 +13190,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in V4173_OPERATION_SPACE_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    for _key in V4174_ADDRESS_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
         _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
         if _key not in m)

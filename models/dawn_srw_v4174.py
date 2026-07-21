@@ -808,6 +808,68 @@ def _aggregate_operator_diagnostics(
     )
 
 
+def _canonical_regular_operator_metrics(
+        metrics: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
+    """Map v4174 address diagnostics to the shared DirectTau log contract."""
+    route_prefixes = {
+        "q": "attn_q", "k": "attn_k", "v": "attn_v", "rst": "rst"}
+    suffixes = {
+        "active_tau_frac": "active_tau_frac",
+        "active_tau_count": "active_tau_count",
+        "tau_mean": "tau_mean",
+        "gate_mass_mean": "gate_mass",
+        "gate_den_mean": "gate_den",
+        "depth_active_mean": "depth_active",
+        "gate_eff_n_mean": "gate_eff_n",
+        "top1_gate_frac_mean": "top1_gate_frac",
+        "den_floor_frac": "den_floor_frac",
+    }
+    required = {
+        f"{route}_operator_{source_suffix}"
+        for route in route_prefixes for source_suffix in suffixes}
+    required.update({
+        "q_route_output_norm", "k_route_output_norm",
+        "v_route_output_norm", "rst_route_output_norm",
+        "attn_out_norm", "rst_out_norm", "residual_norm",
+    })
+    missing = tuple(sorted(required.difference(metrics)))
+    if missing:
+        raise KeyError(
+            "v4174 canonical regular diagnostics are incomplete: "
+            + ", ".join(missing))
+
+    out: dict[str, jax.Array] = {}
+    for route, prefix in route_prefixes.items():
+        for source_suffix, canonical_suffix in suffixes.items():
+            out[f"{prefix}_{canonical_suffix}"] = metrics[
+                f"{route}_operator_{source_suffix}"]
+    for canonical_suffix in suffixes.values():
+        out[f"attn_qk_{canonical_suffix}"] = jnp.float32(0.5) * (
+            out[f"attn_q_{canonical_suffix}"]
+            + out[f"attn_k_{canonical_suffix}"])
+
+    out.update({
+        "attn_qk_admission_mass_mean": out["attn_qk_gate_mass"],
+        "attn_v_admission_mass_mean": out["attn_v_gate_mass"],
+        "rst_admission_mass_mean": out["rst_gate_mass"],
+        "attn_qk_composition_den_mean": out["attn_qk_gate_den"],
+        "attn_v_composition_den_mean": out["attn_v_gate_den"],
+        "rst_composition_den_mean": out["rst_gate_den"],
+        "attn_qk_composition_den_floor_frac": out[
+            "attn_qk_den_floor_frac"],
+        "attn_v_composition_den_floor_frac": out[
+            "attn_v_den_floor_frac"],
+        "rst_composition_den_floor_frac": out["rst_den_floor_frac"],
+        "attn_qk_pool_scaled_srw_out_norm": jnp.float32(0.5) * (
+            metrics["q_route_output_norm"]
+            + metrics["k_route_output_norm"]),
+        "attn_v_pool_scaled_srw_out_norm": metrics["v_route_output_norm"],
+        "rst_pool_scaled_srw_out_norm": metrics["rst_route_output_norm"],
+    })
+    return {
+        key: jax.lax.stop_gradient(value) for key, value in out.items()}
+
+
 class DAWN_SRW_V4174(nn.Module):
     """Transformer whose four routes share one operation-address codebook."""
     __version__ = MODEL_VERSION
@@ -1204,6 +1266,15 @@ class DAWN_SRW_V4174(nn.Module):
             state = state + _v4173.safe_dropout(
                 rst_route_update, self.dropout_rate, deterministic, rng_rst)
             if diagnostics_enabled:
+                operator_metrics.setdefault("attn_out_norm", []).append(
+                    jax.lax.stop_gradient(jnp.linalg.norm(
+                        attention_output.astype(jnp.float32), axis=-1).mean()))
+                operator_metrics.setdefault("rst_out_norm", []).append(
+                    jax.lax.stop_gradient(jnp.linalg.norm(
+                        rst_route_update.astype(jnp.float32), axis=-1).mean()))
+                operator_metrics.setdefault("residual_norm", []).append(
+                    jax.lax.stop_gradient(jnp.linalg.norm(
+                        state.astype(jnp.float32), axis=-1).mean()))
                 operator_metrics.setdefault("q_route_output_norm", []).append(
                     jnp.linalg.norm(q_route_output.astype(jnp.float32), axis=-1).mean())
                 operator_metrics.setdefault("k_route_output_norm", []).append(
@@ -1254,6 +1325,8 @@ class DAWN_SRW_V4174(nn.Module):
         if diagnostics_enabled:
             for key, values in operator_metrics.items():
                 result[key] = jnp.stack(values).mean()
+            result.update(_canonical_regular_operator_metrics(result))
+            result["heat_kernel_beta"] = jnp.float32(self.heat_kernel_beta)
         if analysis:
             for key, values in analysis_arrays.items():
                 result[key] = jnp.stack(values).mean(axis=0)
