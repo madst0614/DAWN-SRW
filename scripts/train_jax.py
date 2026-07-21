@@ -18754,7 +18754,7 @@ def main():
                 params, calibration_input_ids, cfg, tau_init_cfg)
             _tau_init_summary_json = json.dumps(tau_init_summary)
         _tau_init_summary_json = _broadcast_str_from_host0(
-            _tau_init_summary_json, max_len=16384)
+            _tau_init_summary_json, max_len=65536)
         if not _tau_init_summary_json:
             raise RuntimeError(
                 "Failed to broadcast quantile tau initialization summary.")
