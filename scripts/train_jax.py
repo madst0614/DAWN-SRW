@@ -1308,6 +1308,31 @@ V4174_ADDRESS_METRIC_NAMES = tuple(
         'address_top1_usage_max',
     ))
 
+V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
+    'heat_kernel_beta',
+    *tuple(
+        f'{pool}_{name}'
+        for pool in ('attn_qk', 'attn_v', 'rst')
+        for name in (
+            'admission_mass_mean',
+            'composition_den_mean',
+            'composition_den_floor_frac',
+            'pool_scaled_srw_out_norm',
+        )),
+)
+
+V4174_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+    *V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES,
+    *V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES,
+    *V4174_ADDRESS_METRIC_NAMES,
+)
+V4174_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4174_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
+
 V4173_RESUME_REQUIRED_FIELDS = (
     *V4171_RESUME_REQUIRED_FIELDS,
 )
@@ -13293,7 +13318,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 def _v4170_compact_regular_jsonl_record(rec, ctx):
     """Whitelist the low-cost v4170 regular record without fake fallbacks."""
     model_version = str(ctx.get('model_version'))
-    if (model_version == V4173_MODEL_VERSION
+    if model_version == V4174_MODEL_VERSION:
+        rec_keys = V4174_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4174_COMPACT_REGULAR_JSONL_KEYS
+    elif (model_version == V4173_MODEL_VERSION
             and all(key in rec for key in
                     V4173_OPERATION_SPACE_METRIC_NAMES)):
         rec_keys = V4173_COMPACT_REGULAR_JSONL_REC_KEYS
