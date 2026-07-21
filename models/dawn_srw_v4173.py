@@ -23,7 +23,7 @@ import flax.linen as nn
 import math
 import numbers
 import numpy as np
-from typing import Optional, Dict
+from typing import Callable, Optional, Dict
 from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
@@ -237,6 +237,20 @@ GATE_EPS_SUFFIX_TO_VALUE = {
     '1e_2': 1.0e-2,
     '1e_1': 1.0e-1,
 }
+
+RST_SPACE_METRIC_NAMES = (
+    'space_selected_top1_frac',
+    'space_weight_top1_mean',
+    'space_weight_entropy_mean',
+    'space_usage_min',
+    'space_usage_max',
+    'space_usage_std',
+    'space_dead_frac',
+    'space_selected_requests',
+    'space_processed_requests',
+    'space_all_processed',
+    'space_overflow_requests',
+)
 
 def _gate_eps_values_from_suffixes(suffixes):
     return tuple(float(GATE_EPS_SUFFIX_TO_VALUE[s]) for s in suffixes)
@@ -466,6 +480,7 @@ def _validate_v4173_sharded_fns(
         'rst_single_retention_minimal': ('rst', rst_power),
         'rst_single_suppression_minimal': ('rst', rst_power),
         'rst_single_trajectory_minimal': ('rst', rst_power),
+        'rst_request_minimal': ('rst', rst_power),
         'paired': ('qk', qk_power),
         'attn_qk_paired': ('qk', qk_power),
         'qk_paired': ('qk', qk_power),
@@ -696,6 +711,20 @@ def symbolic_parameter_count(model_cfg):
     n_qk = _positive_int('n_qk')
     n_v = _positive_int('n_v')
     n_rst = _positive_int('n_rst', model_cfg.get('n_know'))
+    n_operation_spaces = _positive_int(
+        'n_operation_spaces', model_cfg.get('n_operation_spaces', 1))
+    operation_space_top_k = _positive_int(
+        'operation_space_top_k',
+        model_cfg.get('operation_space_top_k', 1))
+    if operation_space_top_k > n_operation_spaces:
+        raise ValueError(
+            "model.operation_space_top_k must be <= "
+            f"model.n_operation_spaces, got {operation_space_top_k} > "
+            f"{n_operation_spaces}")
+    if n_rst % n_operation_spaces != 0:
+        raise ValueError(
+            "model.n_rst must be divisible by model.n_operation_spaces, "
+            f"got {n_rst} % {n_operation_spaces}")
     operator_count = n_qk + n_v + n_rst
     mode = _validate_operator_key_mode(
         model_cfg.get('operator_key_mode', OPERATOR_KEY_MODE),
@@ -706,19 +735,79 @@ def symbolic_parameter_count(model_cfg):
             "operator_key_mode='generalized_bilinear_rw'")
     learned_keys = 0
     bilinear_probes = 2 * d_route * d_route
+    attention_router = 5 * d_model * d_route + 3 * d_route + 3 * d_model + 3
+    single_rst_router = 2 * d_model * d_route + d_route + d_model + 1
+    if n_operation_spaces == 1:
+        rst_router = single_rst_router
+        operation_space_router = 0
+    else:
+        rst_router = n_operation_spaces * single_rst_router
+        operation_space_router = (
+            d_model * d_route + d_route
+            + n_operation_spaces * d_route)
     counts = {
         'token_embedding': vocab_size * d_model,
         'position_embedding': max_seq_len * d_model,
         'layer_stack': n_layers * (d_model * d_model + 4 * d_model),
-        'router': (
-            7 * d_model * d_route + 4 * d_route + 4 * d_model + 4),
+        'router': attention_router + rst_router + operation_space_router,
+        'operation_space_router': operation_space_router,
         'read_write_pools': operator_count * (2 * d_route),
         'learned_key_tables': learned_keys,
         'bilinear_probe_matrices': bilinear_probes,
         'final_norm': 2 * d_model,
     }
-    counts['total'] = sum(counts.values())
+    counts['total'] = sum(
+        value for key, value in counts.items()
+        if key != 'operation_space_router')
     return counts
+
+
+def search_parameter_matched_n_rst(baseline_model_cfg, multi_model_cfg):
+    """Search divisible n_rst candidates with the exact symbolic counter."""
+    baseline = (
+        baseline_model_cfg['model']
+        if isinstance(baseline_model_cfg, dict)
+        and isinstance(baseline_model_cfg.get('model'), dict)
+        else baseline_model_cfg)
+    multi = (
+        multi_model_cfg['model']
+        if isinstance(multi_model_cfg, dict)
+        and isinstance(multi_model_cfg.get('model'), dict)
+        else multi_model_cfg)
+    baseline_total = int(symbolic_parameter_count(baseline)['total'])
+    baseline_n_rst = int(baseline.get('n_rst', baseline.get('n_know')))
+    n_operation_spaces = int(multi.get('n_operation_spaces', 1))
+    if n_operation_spaces <= 1:
+        raise ValueError(
+            "parameter-match search requires n_operation_spaces > 1")
+    candidates = []
+    upper = max(baseline_n_rst * 2, n_operation_spaces)
+    for candidate in range(n_operation_spaces, upper + 1,
+                           n_operation_spaces):
+        candidate_cfg = dict(multi)
+        candidate_cfg['n_rst'] = candidate
+        candidate_cfg.pop('n_know', None)
+        candidate_total = int(
+            symbolic_parameter_count(candidate_cfg)['total'])
+        candidates.append((
+            abs(candidate_total - baseline_total),
+            candidate_total > baseline_total,
+            candidate,
+            candidate_total))
+    absolute_difference, _, n_rst, multi_total = min(candidates)
+    return {
+        'baseline_params': baseline_total,
+        'multi_space_params': multi_total,
+        'absolute_difference': absolute_difference,
+        'relative_difference': (
+            absolute_difference / float(baseline_total)),
+        'baseline_n_rst': baseline_n_rst,
+        'n_rst': n_rst,
+        'n_rst_per_space': n_rst // n_operation_spaces,
+        'n_operation_spaces': n_operation_spaces,
+        'operation_space_top_k': int(
+            multi.get('operation_space_top_k', 1)),
+    }
 
 
 _LEARNED_OPERATOR_KEY_NAMES = (
@@ -799,40 +888,51 @@ def _pool_operator_keys(pool_params, operator_key_mode=None):
                     "parameters: " + ", ".join(missing_rw))
             read_shape = tuple(pool_params[read_name].shape)
             write_shape = tuple(pool_params[write_name].shape)
-            if (len(read_shape) != 2 or len(write_shape) != 2
+            expected_rank = 3 if prefix == 'rst' and len(read_shape) == 3 else 2
+            if (len(read_shape) != expected_rank
+                    or len(write_shape) != expected_rank
                     or read_shape != write_shape
-                    or int(read_shape[1]) != int(read_probe.shape[0])):
+                    or int(read_shape[-1]) != int(read_probe.shape[0])):
                 raise ValueError(
                     "legacy v4173 full-write checkpoint is incompatible "
                     "with native v4173 local-write architecture; start a "
                     "fresh run")
-            keys[f'{prefix}_op_key'] = (
-                materialize_generalized_bilinear_operator_keys(
-                pool_params[read_name], pool_params[write_name],
-                read_probe, write_probe))
+            if expected_rank == 2:
+                keys[f'{prefix}_op_key'] = (
+                    materialize_generalized_bilinear_operator_keys(
+                        pool_params[read_name], pool_params[write_name],
+                        read_probe, write_probe))
+            else:
+                keys[f'{prefix}_op_key'] = jax.vmap(
+                    materialize_generalized_bilinear_operator_keys,
+                    in_axes=(0, 0, None, None))(
+                        pool_params[read_name], pool_params[write_name],
+                        read_probe, write_probe)
     d_route = None
     for prefix, read_key in (
             ('attn_qk', 'attn_qk_read'),
             ('attn_v', 'attn_v_read'),
             ('rst', 'rst_read')):
         operator_keys = keys[f'{prefix}_op_key']
-        if operator_keys.ndim != 2:
+        expected_rank = 3 if prefix == 'rst' and operator_keys.ndim == 3 else 2
+        if operator_keys.ndim != expected_rank:
             raise ValueError(
-                f"v417x {prefix}_op_key must have rank 2 [N, d_route], "
+                f"v417x {prefix}_op_key has an invalid rank, "
                 f"got {operator_keys.shape}")
         if read_key in pool_params:
-            expected_rows = int(pool_params[read_key].shape[0])
-            if int(operator_keys.shape[0]) != expected_rows:
+            expected_prefix = tuple(pool_params[read_key].shape[:-1])
+            if tuple(operator_keys.shape[:-1]) != expected_prefix:
                 raise ValueError(
                     f"v417x {prefix}_op_key shape mismatch: expected "
-                    f"[{expected_rows}, d_route], got {operator_keys.shape}")
+                    f"{expected_prefix} + (d_route,), got "
+                    f"{operator_keys.shape}")
         if d_route is None:
-            d_route = int(operator_keys.shape[1])
+            d_route = int(operator_keys.shape[-1])
             if d_route <= 0:
                 raise ValueError(
                     f"v417x {prefix}_op_key must have d_route > 0, got "
                     f"{operator_keys.shape}")
-        elif int(operator_keys.shape[1]) != d_route:
+        elif int(operator_keys.shape[-1]) != d_route:
             raise ValueError(
                 f"v417x {prefix}_op_key route width mismatch: expected "
                 f"d_route={d_route}, got {operator_keys.shape}")
@@ -4397,6 +4497,141 @@ def make_sharded_srw_trajectory_minimal(
     return kernel
 
 
+def make_sharded_rst_request_minimal(
+        mesh, max_chunk_size=2048, dead_exposure_target=0.1,
+        soft_gate_effective_active_eps=1.0e-6,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_grad_scale=1.0,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Create the selected token-space request kernel for multi-space RST."""
+    srw_composition_mode, admission_den_power, heat_kernel_beta = (
+        _validate_v4173_composition_settings(
+            srw_composition_mode, admission_den_power, heat_kernel_beta,
+            context="make_sharded_rst_request_minimal"))
+    _validate_v4173_admission_den_grad_scale(
+        admission_den_grad_scale,
+        context="make_sharded_rst_request_minimal")
+    del dead_exposure_target
+    den_power = jnp.float32(admission_den_power)
+    effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
+    composition_mode = srw_composition_mode
+    beta = jnp.float32(heat_kernel_beta)
+
+    def request_core(
+            operator_query, operator_keys_local, raw_tau, request_valid,
+            read_vectors_local, write_vectors_local,
+            soft_gate_temperature, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps):
+        del soft_gate_t_final, soft_gate_boundary_power_final
+        n_spaces, request_capacity = operator_query.shape[:2]
+        n_local = operator_keys_local.shape[1]
+        chunk_size = min(int(max_chunk_size), int(n_local))
+        n_chunks = (int(n_local) + chunk_size - 1) // chunk_size
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - int(n_local)
+        d_local = write_vectors_local.shape[-1]
+        pad_spec = ((0, 0), (0, pad_n), (0, 0))
+        operator_keys_padded = jnp.pad(operator_keys_local, pad_spec)
+        read_padded = jnp.pad(read_vectors_local, pad_spec)
+        write_padded = jnp.pad(write_vectors_local, pad_spec)
+        valid_padded = jnp.arange(n_padded) < n_local
+        request_valid = jnp.asarray(request_valid, dtype=jnp.bool_)
+        safe_query = jnp.where(
+            request_valid[:, :, None], operator_query,
+            jax.nn.one_hot(
+                jnp.zeros(request_valid.shape, dtype=jnp.int32),
+                operator_query.shape[-1], dtype=operator_query.dtype))
+        query_unit_bf = _forward_unit_direction(
+            safe_query.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        key_unit_bf = _forward_unit_direction(
+            operator_keys_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        read_unit_bf = _forward_unit_direction(
+            read_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        write_unit_bf = _forward_unit_direction(
+            write_padded.astype(jnp.bfloat16).astype(jnp.float32)
+        ).astype(jnp.bfloat16)
+        tau = _tau_from_param(raw_tau)
+
+        @jax.checkpoint
+        def request_step(carry, chunk_index):
+            raw_out, total_gate_mass = carry
+            start = chunk_index * chunk_size
+            keys = jax.lax.dynamic_slice_in_dim(
+                key_unit_bf, start, chunk_size, axis=1)
+            read = jax.lax.dynamic_slice_in_dim(
+                read_unit_bf, start, chunk_size, axis=1)
+            write = jax.lax.dynamic_slice_in_dim(
+                write_unit_bf, start, chunk_size, axis=1)
+            valid = jax.lax.dynamic_slice_in_dim(
+                valid_padded, start, chunk_size, axis=0)
+            rho_raw = jnp.einsum(
+                'mcr,mlr->mcl', query_unit_bf, keys).astype(jnp.float32)
+            valid_request_operator = (
+                request_valid[:, :, None] & valid[None, None, :])
+            rho_compute = jnp.where(valid_request_operator, rho_raw, tau)
+            _, unpruned_operator_gate, _, execution_weight, _ = (
+                _compute_admission_drive(
+                rho_compute, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=effective_active_eps,
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=composition_mode,
+                heat_kernel_beta=beta))
+            unpruned_operator_gate = jnp.where(
+                valid_request_operator, unpruned_operator_gate, 0.0)
+            execution_weight = jnp.where(
+                valid_request_operator, execution_weight, 0.0)
+            read_value = jnp.einsum(
+                'mcr,mlr->mcl',
+                operator_query.astype(jnp.bfloat16), read
+            ).astype(jnp.float32)
+            amplitude = execution_weight * read_value
+            chunk_out = jnp.einsum(
+                'mcl,mlr->mcr', amplitude.astype(jnp.bfloat16), write
+            ).astype(jnp.float32)
+            return (
+                raw_out + chunk_out,
+                total_gate_mass + unpruned_operator_gate.sum(
+                    axis=-1, keepdims=True),
+            ), None
+
+        (raw_out, gate_mass), _ = jax.lax.scan(
+            request_step,
+            (jnp.zeros(
+                (n_spaces, request_capacity, d_local), dtype=jnp.float32),
+             jnp.zeros(
+                (n_spaces, request_capacity, 1), dtype=jnp.float32)),
+            jnp.arange(n_chunks))
+        global_gate_mass = jax.lax.psum(gate_mass, 'model')
+        gate_den = _composition_den(
+            global_gate_mass, den_power, composition_mode)
+        out = raw_out / gate_den
+        return jax.lax.psum(
+            out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
+
+    request_kernel = shard_map(
+        request_core, mesh=mesh,
+        in_specs=(
+            P(None, 'data', None), P(None, 'model', None),
+            P(None, 'data', None), P(None, 'data'),
+            P(None, 'model', None), P(None, 'model', None),
+            P(), P(), P(), P(), P()),
+        out_specs=P(None, 'data', None), check_rep=False)
+    _mark_v4173_srw_factory_output(
+        request_kernel, admission_den_power, composition_mode,
+        heat_kernel_beta)
+    request_kernel._v4173_kernel_profile = 'production'
+    request_kernel._v4173_request_dispatch = 'grouped_by_space'
+    request_kernel._v4173_request_capacity_multiple = int(
+        mesh.shape['data'])
+    return request_kernel
+
+
 def _make_sharded_srw_paired_training_fast_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
@@ -5556,6 +5791,39 @@ def make_sharded_srw_paired_trajectory_minimal(
 # 4. NeuronPool -- RW execution directions + static address parameterization
 # ================================================================
 
+def _stacked_initializer(initializer):
+    """Apply an existing rank-2 initializer independently per space."""
+    def init(key, shape, dtype=jnp.float32):
+        if len(shape) < 2:
+            raise ValueError(
+                f"operation-space initializer requires a leading axis: {shape}")
+        keys = jax.random.split(key, int(shape[0]))
+        return jax.vmap(
+            lambda subkey: initializer(subkey, shape[1:], dtype))(keys)
+    return init
+
+
+class OperationSpaceDense(nn.Module):
+    """Dense projection with one independent kernel per operation space."""
+    n_operation_spaces: int
+    features: int
+    use_bias: bool = True
+    kernel_init: Callable = nn.initializers.lecun_normal()
+    bias_init: Callable = nn.initializers.zeros
+
+    @nn.compact
+    def __call__(self, inputs):
+        kernel = self.param(
+            'kernel', _stacked_initializer(self.kernel_init),
+            (self.n_operation_spaces, inputs.shape[-1], self.features))
+        output = jnp.einsum('...d,mdr->...mr', inputs, kernel)
+        if self.use_bias:
+            bias = self.param(
+                'bias', _stacked_initializer(self.bias_init),
+                (self.n_operation_spaces, self.features))
+            output = output + bias
+        return output
+
 class NeuronPool(nn.Module):
     n_qk: int
     n_v: int
@@ -5564,6 +5832,7 @@ class NeuronPool(nn.Module):
     operator_key_mode: str = OPERATOR_KEY_MODE
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
+    n_operation_spaces: int = 1
 
     def setup(self):
         d_route = int(self.d_route)
@@ -5579,14 +5848,25 @@ class NeuronPool(nn.Module):
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
             raise ValueError("NeuronPool requires n_rst or n_know checkpoint alias.")
+        n_operation_spaces = int(self.n_operation_spaces)
+        if n_operation_spaces <= 0 or int(n_rst_eff) % n_operation_spaces != 0:
+            raise ValueError(
+                "NeuronPool requires positive n_operation_spaces dividing "
+                f"n_rst, got n_rst={n_rst_eff}, "
+                f"n_operation_spaces={n_operation_spaces}")
+        n_rst_per_space = int(n_rst_eff) // n_operation_spaces
 
         # Read vectors extract amplitudes from raw operation projections.
         self.attn_qk_read = self.param(
             'attn_qk_read', unit_norm_init(), (self.n_qk, d_route))
         self.attn_v_read = self.param(
             'attn_v_read', unit_norm_init(), (self.n_v, d_route))
+        rst_shape = (
+            (int(n_rst_eff), d_route)
+            if n_operation_spaces == 1
+            else (n_operation_spaces, n_rst_per_space, d_route))
         self.rst_read = self.param(
-            'rst_read', unit_norm_init(), (n_rst_eff, d_route))
+            'rst_read', unit_norm_init(), rst_shape)
 
         # Write vectors define native route-local output directions.  A
         # route-shared Router projection lifts only the aggregate packet.
@@ -5595,7 +5875,7 @@ class NeuronPool(nn.Module):
         self.attn_v_write = self.param(
             'attn_v_write', unit_norm_init(), (self.n_v, d_route))
         self.rst_write = self.param(
-            'rst_write', unit_norm_init(), (n_rst_eff, d_route))
+            'rst_write', unit_norm_init(), rst_shape)
 
         probe_init = nn.initializers.orthogonal(scale=1.0)
         self.rw_key_read_probe = self.param(
@@ -5618,6 +5898,7 @@ class Router(nn.Module):
     n_v: int
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
+    n_operation_spaces: int = 1
     router_dropout: float = 0.1
     # Constructor receives cosine-space tau values. The train driver may use
     # safe placeholders before one-time quantile calibration.
@@ -5630,6 +5911,12 @@ class Router(nn.Module):
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
             raise ValueError("Router requires n_rst or n_know checkpoint alias.")
+        n_operation_spaces = int(self.n_operation_spaces)
+        if n_operation_spaces <= 0 or int(n_rst_eff) % n_operation_spaces != 0:
+            raise ValueError(
+                "Router requires positive n_operation_spaces dividing n_rst, "
+                f"got n_rst={n_rst_eff}, "
+                f"n_operation_spaces={n_operation_spaces}")
 
         missing_tau = [
             name for name, value in (
@@ -5660,17 +5947,32 @@ class Router(nn.Module):
             name='proj_attn',
             kernel_init=query_proj_init,
             bias_init=nn.initializers.zeros)
-        self.proj_rst = nn.Dense(
-            db,
-            name='proj_rst',
-            kernel_init=query_proj_init,
-            bias_init=nn.initializers.zeros)
+        if n_operation_spaces == 1:
+            self.proj_rst = nn.Dense(
+                db,
+                name='proj_rst',
+                kernel_init=query_proj_init,
+                bias_init=nn.initializers.zeros)
+        else:
+            self.proj_rst = OperationSpaceDense(
+                n_operation_spaces, db, name='proj_rst',
+                kernel_init=query_proj_init,
+                bias_init=nn.initializers.zeros)
         self.raw_tau_attn = nn.Dense(3, name='raw_tau_attn',
             kernel_init=nn.initializers.zeros,
             bias_init=lambda k, s, d: raw_tau_attn_bias_init.astype(d))
-        self.raw_tau_rst = nn.Dense(1, name='raw_tau_rst',
-            kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, raw_tau_rst_bias_init, d))
+        raw_tau_bias_init = (
+            lambda k, s, d: jnp.full(s, raw_tau_rst_bias_init, d))
+        if n_operation_spaces == 1:
+            self.raw_tau_rst = nn.Dense(
+                1, name='raw_tau_rst',
+                kernel_init=nn.initializers.zeros,
+                bias_init=raw_tau_bias_init)
+        else:
+            self.raw_tau_rst = OperationSpaceDense(
+                n_operation_spaces, 1, name='raw_tau_rst',
+                kernel_init=nn.initializers.zeros,
+                bias_init=raw_tau_bias_init)
         up_init = nn.initializers.orthogonal(scale=1.0)
         self.up_qk = nn.Dense(
             self.d_model, use_bias=False, name='up_qk',
@@ -5678,9 +5980,21 @@ class Router(nn.Module):
         self.up_v = nn.Dense(
             self.d_model, use_bias=False, name='up_v',
             kernel_init=up_init)
-        self.up_rst = nn.Dense(
-            self.d_model, use_bias=False, name='up_rst',
-            kernel_init=up_init)
+        if n_operation_spaces == 1:
+            self.up_rst = nn.Dense(
+                self.d_model, use_bias=False, name='up_rst',
+                kernel_init=up_init)
+        else:
+            self.up_rst = OperationSpaceDense(
+                n_operation_spaces, self.d_model, use_bias=False,
+                name='up_rst', kernel_init=up_init)
+            self.rst_space_query = nn.Dense(
+                db, name='rst_space_query',
+                kernel_init=query_proj_init,
+                bias_init=nn.initializers.zeros)
+            self.rst_space_keys = self.param(
+                'rst_space_keys', unit_norm_init(),
+                (n_operation_spaces, db))
 
 
 # ================================================================
@@ -6543,10 +6857,305 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
     return result
 
 
+def _rst_space_selection(x, router_params, operation_space_top_k):
+    """Select operation spaces from the shared cosine address system."""
+    query_params = router_params.get('rst_space_query')
+    space_keys = router_params.get('rst_space_keys')
+    if query_params is None or space_keys is None:
+        raise ValueError(
+            "multi-space RST requires rst_space_query and rst_space_keys")
+    space_query = (
+        x @ query_params['kernel'] + query_params['bias'])
+    query_unit = _forward_unit_direction(space_query.astype(jnp.float32))
+    key_unit = _forward_unit_direction(space_keys.astype(jnp.float32))
+    space_scores = jnp.einsum('...r,mr->...m', query_unit, key_unit)
+    top_scores, top_ids = jax.lax.top_k(
+        space_scores, int(operation_space_top_k))
+    top_weights = jax.nn.softmax(top_scores.astype(jnp.float32), axis=-1)
+    return top_ids.astype(jnp.int32), top_weights, space_scores
+
+
+def _rst_space_metrics(top_ids, top_weights, n_operation_spaces,
+                       processed_requests, overflow_requests=0.0):
+    """Cheap aggregate metrics for the selected token-space requests."""
+    flat_ids = top_ids.reshape(-1)
+    selected_requests = jnp.float32(flat_ids.shape[0])
+    token_count = jnp.float32(top_ids.reshape((-1, top_ids.shape[-1])).shape[0])
+    usage_count = jnp.zeros(
+        (int(n_operation_spaces),), dtype=jnp.float32
+    ).at[flat_ids].add(jnp.float32(1.0))
+    usage = usage_count / jnp.maximum(selected_requests, 1.0)
+    top1_ids = top_ids[..., 0].reshape(-1)
+    top1_usage = jnp.zeros(
+        (int(n_operation_spaces),), dtype=jnp.float32
+    ).at[top1_ids].add(jnp.float32(1.0))
+    top1_frac = top1_usage.max() / jnp.maximum(token_count, 1.0)
+    entropy = -jnp.sum(
+        top_weights.astype(jnp.float32)
+        * jnp.log(jnp.maximum(top_weights.astype(jnp.float32), 1.0e-30)),
+        axis=-1)
+    processed = jnp.asarray(processed_requests, dtype=jnp.float32)
+    overflow = jnp.asarray(overflow_requests, dtype=jnp.float32)
+    return {
+        'space_selected_top1_frac': top1_frac,
+        'space_weight_top1_mean': top_weights[..., 0].mean(),
+        'space_weight_entropy_mean': entropy.mean(),
+        'space_usage_min': usage.min(),
+        'space_usage_max': usage.max(),
+        'space_usage_std': usage.std(),
+        'space_dead_frac': (usage_count == 0.0).astype(jnp.float32).mean(),
+        'space_selected_requests': selected_requests,
+        'space_processed_requests': processed,
+        'space_all_processed': (processed == selected_requests).astype(
+            jnp.float32),
+        'space_overflow_requests': overflow,
+    }
+
+
+def _rst_multispace_sparse_forward(
+        x, pool_params, router_params, rng,
+        router_dropout, dropout_rate, deterministic, request_kernel,
+        n_operation_spaces, operation_space_top_k,
+        d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps, return_details=False,
+        request_capacity=None):
+    """Dispatch exactly B*S*K selected requests and scatter-add results."""
+    if request_kernel is None or not getattr(
+            request_kernel, '_v4173_request_dispatch', False):
+        raise ValueError(
+            "multi-space RST requires the canonical request dispatch kernel")
+    top_ids, top_weights, space_scores = _rst_space_selection(
+        x, router_params, operation_space_top_k)
+    batch_size, sequence_length = x.shape[:2]
+    token_count = int(batch_size) * int(sequence_length)
+    top_k = int(operation_space_top_k)
+    request_count = token_count * top_k
+    flat_x = x.reshape((token_count, x.shape[-1]))
+    flat_space_ids = top_ids.reshape((request_count,))
+    flat_weights = top_weights.reshape((request_count,))
+    flat_token_ids = jnp.repeat(
+        jnp.arange(token_count, dtype=jnp.int32), top_k)
+    request_ids = jnp.arange(request_count, dtype=jnp.int32)
+    (sorted_space_ids, sorted_request_ids, sorted_token_ids,
+     sorted_weights) = jax.lax.sort(
+        (flat_space_ids, request_ids, flat_token_ids, flat_weights),
+        dimension=0, num_keys=1)
+    request_x = flat_x[sorted_token_ids]
+
+    space_counts = jnp.zeros(
+        (int(n_operation_spaces),), dtype=jnp.int32
+    ).at[sorted_space_ids].add(jnp.int32(1))
+    space_starts = jnp.cumsum(space_counts) - space_counts
+    rank_in_space = (
+        jnp.arange(request_count, dtype=jnp.int32)
+        - space_starts[sorted_space_ids])
+    base_capacity = (
+        math.ceil(request_count / int(n_operation_spaces))
+        if request_capacity is None else int(request_capacity))
+    if base_capacity <= 0:
+        raise ValueError("request_capacity must be positive")
+    capacity_multiple = max(1, int(getattr(
+        request_kernel, '_v4173_request_capacity_multiple', 1)))
+    capacity = (
+        math.ceil(base_capacity / capacity_multiple) * capacity_multiple)
+    max_rounds = math.ceil(request_count / capacity)
+    overflow_count = (rank_in_space >= capacity).astype(jnp.float32).sum()
+    local_out_sorted = jnp.zeros(
+        (request_count, pool_params['rst_write'].shape[-1]),
+        dtype=jnp.float32)
+    processed_requests = jnp.float32(0.0)
+    proj = router_params['proj_rst']
+    tau_params = router_params['raw_tau_rst']
+
+    for round_index in range(max_rounds):
+        round_start = round_index * capacity
+        round_valid = (
+            (rank_in_space >= round_start)
+            & (rank_in_space < round_start + capacity))
+        round_slot = jnp.clip(
+            rank_in_space - round_start, 0, capacity - 1)
+        packed_x = jnp.zeros(
+            (int(n_operation_spaces), capacity, x.shape[-1]),
+            dtype=x.dtype
+        ).at[sorted_space_ids, round_slot].add(
+            jnp.where(round_valid[:, None], request_x, 0.0))
+        packed_valid = (
+            jnp.zeros(
+                (int(n_operation_spaces), capacity), dtype=jnp.int32)
+            .at[sorted_space_ids, round_slot]
+            .add(round_valid.astype(jnp.int32)) > 0)
+        operator_query = jnp.einsum(
+            'mcd,mdr->mcr', packed_x, proj['kernel']) + proj['bias'][:, None, :]
+        rng, rng_query_drop = jax.random.split(rng)
+        operator_query = safe_dropout(
+            operator_query, router_dropout, deterministic, rng_query_drop)
+        raw_tau = jnp.einsum(
+            'mcd,mdr->mcr', packed_x, tau_params['kernel']
+        ) + tau_params['bias'][:, None, :]
+
+        def execute_group(_):
+            return request_kernel(
+                operator_query, pool_params['rst_op_key'], raw_tau,
+                packed_valid, pool_params['rst_read'],
+                pool_params['rst_write'], soft_gate_T_rst,
+                soft_gate_t_final, soft_gate_boundary_power,
+                soft_gate_boundary_power_final, execution_prune_eps)
+
+        grouped_out = jax.lax.cond(
+            jnp.any(round_valid), execute_group,
+            lambda _: jnp.zeros(
+                (int(n_operation_spaces), capacity,
+                 pool_params['rst_write'].shape[-1]),
+                dtype=jnp.float32),
+            operand=None)
+        request_out = grouped_out[sorted_space_ids, round_slot]
+        local_out_sorted = local_out_sorted + jnp.where(
+            round_valid[:, None], request_out, 0.0)
+        processed_requests = (
+            processed_requests
+            + round_valid.astype(jnp.float32).sum())
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    up_kernel = router_params['up_rst']['kernel'][sorted_space_ids]
+    space_out_sorted = jnp.einsum(
+        'qr,qrd->qd', local_out_sorted * rst_scale, up_kernel)
+    weighted_sorted = space_out_sorted * sorted_weights[:, None]
+    flat_update = jnp.zeros(
+        (token_count, d_model), dtype=weighted_sorted.dtype
+    ).at[sorted_token_ids].add(weighted_sorted)
+    update = flat_update.reshape(
+        (batch_size, sequence_length, d_model))
+    rng, rng_out = jax.random.split(rng)
+    update = safe_dropout(
+        update, dropout_rate, deterministic, rng_out)
+    all_processed = (
+        processed_requests == jnp.float32(request_count))
+    update = jnp.where(
+        all_processed, update,
+        jnp.full_like(update, jnp.float32(jnp.nan)))
+    metrics = _rst_space_metrics(
+        top_ids, top_weights, n_operation_spaces,
+        processed_requests=processed_requests,
+        overflow_requests=jnp.float32(overflow_count))
+    if not return_details:
+        return update, metrics
+    local_out = jnp.zeros_like(local_out_sorted).at[sorted_request_ids].set(
+        local_out_sorted)
+    space_out = jnp.zeros_like(space_out_sorted).at[sorted_request_ids].set(
+        space_out_sorted)
+    details = {
+        'selected_space_ids': top_ids,
+        'selected_space_weights': top_weights,
+        'space_scores': space_scores,
+        'local_outputs': local_out.reshape(
+            (batch_size, sequence_length, top_k, local_out.shape[-1])),
+        'space_outputs': space_out.reshape(
+            (batch_size, sequence_length, top_k, d_model)),
+        'request_space_ids': sorted_space_ids,
+        'request_token_ids': sorted_token_ids,
+        'request_weights': sorted_weights,
+    }
+    return update, metrics, details
+
+
+def _rst_multispace_dense_forward(
+        x, pool_params, router_params, rng,
+        router_dropout, dropout_rate, deterministic, request_kernel,
+        n_operation_spaces, operation_space_top_k,
+        d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps, return_details=False):
+    """Execute every RST space without gathering per-token parameters."""
+    if request_kernel is None or not getattr(
+            request_kernel, '_v4173_request_dispatch', False):
+        raise ValueError(
+            "multi-space RST requires the canonical grouped kernel")
+    top_ids, top_weights, space_scores = _rst_space_selection(
+        x, router_params, operation_space_top_k)
+    batch_size, sequence_length = x.shape[:2]
+    token_count = int(batch_size) * int(sequence_length)
+    n_spaces = int(n_operation_spaces)
+    top_k = int(operation_space_top_k)
+    capacity_multiple = max(1, int(getattr(
+        request_kernel, '_v4173_request_capacity_multiple', 1)))
+    dense_capacity = (
+        math.ceil(token_count / capacity_multiple) * capacity_multiple)
+    pad_tokens = dense_capacity - token_count
+    flat_x = x.reshape((token_count, x.shape[-1]))
+    padded_x = jnp.pad(flat_x, ((0, pad_tokens), (0, 0)))
+    dense_x = jnp.broadcast_to(
+        padded_x[None, :, :], (n_spaces, dense_capacity, x.shape[-1]))
+    dense_valid = jnp.broadcast_to(
+        (jnp.arange(dense_capacity) < token_count)[None, :],
+        (n_spaces, dense_capacity))
+
+    proj = router_params['proj_rst']
+    operator_query = jnp.einsum(
+        'mtd,mdr->mtr', dense_x, proj['kernel']
+    ) + proj['bias'][:, None, :]
+    rng, rng_query_drop = jax.random.split(rng)
+    operator_query = safe_dropout(
+        operator_query, router_dropout, deterministic, rng_query_drop)
+    tau_params = router_params['raw_tau_rst']
+    raw_tau = jnp.einsum(
+        'mtd,mdr->mtr', dense_x, tau_params['kernel']
+    ) + tau_params['bias'][:, None, :]
+    local_all = request_kernel(
+        operator_query, pool_params['rst_op_key'], raw_tau,
+        dense_valid, pool_params['rst_read'], pool_params['rst_write'],
+        soft_gate_T_rst, soft_gate_t_final,
+        soft_gate_boundary_power, soft_gate_boundary_power_final,
+        execution_prune_eps)[:, :token_count, :]
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    space_out_all = jnp.einsum(
+        'mtr,mrd->mtd', local_all * rst_scale,
+        router_params['up_rst']['kernel'])
+    space_out_tokens = space_out_all.transpose((1, 0, 2))
+    flat_top_ids = top_ids.reshape((token_count, top_k))
+    flat_top_weights = top_weights.reshape((token_count, top_k))
+    dense_space_weights = jnp.zeros(
+        (token_count, n_spaces), dtype=jnp.float32)
+    dense_space_weights = dense_space_weights.at[
+        jnp.arange(token_count, dtype=jnp.int32)[:, None],
+        flat_top_ids].add(flat_top_weights)
+    update = jnp.einsum(
+        'tm,tmd->td', dense_space_weights, space_out_tokens
+    ).reshape((batch_size, sequence_length, d_model))
+    rng, rng_out = jax.random.split(rng)
+    update = safe_dropout(
+        update, dropout_rate, deterministic, rng_out)
+    selected_requests = jnp.float32(token_count * top_k)
+    metrics = _rst_space_metrics(
+        top_ids, top_weights, n_spaces,
+        processed_requests=selected_requests,
+        overflow_requests=jnp.float32(0.0))
+    if not return_details:
+        return update, metrics
+    selected_local = local_all.transpose((1, 0, 2))[
+        jnp.arange(token_count, dtype=jnp.int32)[:, None], flat_top_ids]
+    selected_space_out = space_out_tokens[
+        jnp.arange(token_count, dtype=jnp.int32)[:, None], flat_top_ids]
+    details = {
+        'selected_space_ids': top_ids,
+        'selected_space_weights': top_weights,
+        'space_scores': space_scores,
+        'local_outputs': selected_local.reshape(
+            (batch_size, sequence_length, top_k, local_all.shape[-1])),
+        'space_outputs': selected_space_out.reshape(
+            (batch_size, sequence_length, top_k, d_model)),
+        'all_space_local_outputs': local_all.reshape(
+            (n_spaces, batch_size, sequence_length, local_all.shape[-1])),
+        'all_space_outputs': space_out_all.reshape(
+            (n_spaces, batch_size, sequence_length, d_model)),
+    }
+    return update, metrics, details
+
+
 def _rst_forward_training_fast(
         x, pool_params, router_params, rng,
         router_dropout, dropout_rate, deterministic, sharded_fns,
         d_model=None, n_layers=None,
+        n_operation_spaces=1, operation_space_top_k=1,
         soft_gate_temperature=0.07, soft_gate_t_final=0.07,
         soft_gate_T_rst=None, soft_gate_boundary_power=2.0,
         soft_gate_boundary_power_final=4.0,
@@ -6562,6 +7171,15 @@ def _rst_forward_training_fast(
     pool_params = _ensure_pool_operator_keys(pool_params)
     if not isinstance(sharded_fns, dict):
         raise ValueError("training fast RST requires dict sharded_fns")
+    if int(n_operation_spaces) > 1:
+        request_kernel = sharded_fns.get('rst_request_minimal')
+        return _rst_multispace_dense_forward(
+            x, pool_params, router_params, rng,
+            router_dropout, dropout_rate, deterministic, request_kernel,
+            int(n_operation_spaces), int(operation_space_top_k),
+            d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps)
     fused_single = sharded_fns.get('rst_single_minimal')
     if fused_single is None:
         raise ValueError("training fast RST requires the production kernel")
@@ -6592,6 +7210,7 @@ def _rst_forward_production_diagnostics(
         x, pool_params, router_params, rng,
         router_dropout, dropout_rate, deterministic, sharded_fns,
         d_model=None, n_layers=None,
+        n_operation_spaces=1, operation_space_top_k=1,
         soft_gate_temperature=0.07, soft_gate_t_final=0.07,
         soft_gate_T_rst=None, soft_gate_boundary_power=2.0,
         soft_gate_boundary_power_final=4.0,
@@ -6606,6 +7225,40 @@ def _rst_forward_production_diagnostics(
     soft_gate_T_rst = (
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
+    if int(n_operation_spaces) > 1:
+        request_kernel = (
+            sharded_fns.get('rst_request_minimal')
+            if isinstance(sharded_fns, dict) else None)
+        out, space_metrics, details = _rst_multispace_dense_forward(
+            x, pool_params, router_params, rng,
+            router_dropout, dropout_rate, deterministic, request_kernel,
+            int(n_operation_spaces), int(operation_space_top_k),
+            d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, return_details=True)
+        out_norm = jnp.linalg.norm(
+            out.astype(jnp.float32), axis=-1).mean()
+        local_norm = jnp.linalg.norm(
+            details['local_outputs'].astype(jnp.float32), axis=-1).mean()
+        zero = jnp.float32(0.0)
+        zero_contribution = jnp.zeros(
+            (x.shape[0], x.shape[-1]), dtype=jnp.float32)
+        output = (
+            out,
+            zero, zero, zero, zero, zero, zero, zero, zero, zero,
+            jax.lax.stop_gradient(out_norm),
+            zero, zero, zero,
+            jax.lax.stop_gradient(local_norm),
+            jax.lax.stop_gradient(local_norm),
+            out_norm,
+            zero_contribution, zero_contribution,
+        )
+        output += tuple(
+            space_metrics[name] for name in RST_SPACE_METRIC_NAMES)
+        if parity_debug:
+            return output + ((out, x, details['local_outputs'],
+                              details['selected_space_weights']),)
+        return output
     rst_operator_keys = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
@@ -6669,6 +7322,7 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
                          router_dropout, dropout_rate, deterministic,
                          sharded_fns,
                          d_model=None, n_layers=None,
+                         n_operation_spaces=1, operation_space_top_k=1,
                          soft_gate_temperature=0.07,
                          soft_gate_t_final=0.07,
                          soft_gate_T_rst=None,
@@ -6713,6 +7367,96 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
     soft_gate_T_rst = (
         soft_gate_temperature if soft_gate_T_rst is None else soft_gate_T_rst)
     pool_params = _ensure_pool_operator_keys(pool_params)
+    if int(n_operation_spaces) > 1:
+        request_kernel = (
+            sharded_fns.get('rst_request_minimal')
+            if isinstance(sharded_fns, dict) else None)
+        out, _, details = _rst_multispace_dense_forward(
+            x, pool_params, router_params, rng,
+            router_dropout, dropout_rate, deterministic, request_kernel,
+            int(n_operation_spaces), int(operation_space_top_k),
+            d_model, n_layers, soft_gate_T_rst, soft_gate_t_final,
+            soft_gate_boundary_power, soft_gate_boundary_power_final,
+            execution_prune_eps, return_details=True)
+        rst_trajectory_trace = None
+        if analysis_trajectory_enabled:
+            if request_kernel is None:
+                raise ValueError(
+                    "multi-space trajectory requires the selected request "
+                    "kernel metadata")
+            angular_kwargs = {
+                'soft_gate_temperature': soft_gate_T_rst,
+                'soft_gate_boundary_power': soft_gate_boundary_power,
+                'execution_prune_eps': execution_prune_eps,
+                'soft_gate_effective_active_eps': 1.0e-6,
+                'admission_den_power': float(getattr(
+                    request_kernel, '_v4173_admission_den_power',
+                    admission_den_power)),
+                'admission_den_power_rst': float(getattr(
+                    request_kernel, '_v4173_admission_den_power',
+                    admission_den_power)),
+                'srw_composition_mode': getattr(
+                    request_kernel, '_v4173_srw_composition_mode',
+                    DEFAULT_SRW_COMPOSITION_MODE),
+                'heat_kernel_beta': float(getattr(
+                    request_kernel, '_v4173_heat_kernel_beta',
+                    DEFAULT_HEAT_KERNEL_BETA)),
+            }
+            _, trace_details = _rst_multispace_inference(
+                x, pool_params, router_params, d_model, n_layers,
+                int(operation_space_top_k), angular_kwargs,
+                return_details=True)
+            rst_trajectory_trace = _rst_multispace_trajectory_trace(
+                trace_details, pool_params, router_params,
+                analysis_trajectory_positions,
+                analysis_trajectory_position_valid,
+                analysis_trajectory_ids_rst,
+                analysis_trajectory_valid_rst,
+                d_model, n_layers)
+            replayed = _analysis_replace_trajectory_positions(
+                out, rst_trajectory_trace[1],
+                analysis_trajectory_positions,
+                analysis_trajectory_position_valid)
+            out = jnp.where(
+                jnp.asarray(
+                    analysis_trajectory_replay_enabled, dtype=jnp.bool_),
+                replayed, out)
+        if analysis_trajectory_patch_schedule_enabled:
+            out = _analysis_apply_trajectory_patch(
+                out, layer_index=analysis_layer_index,
+                stage_code=TRAJECTORY_PATCH_STAGES['rst'],
+                patch_layers=analysis_trajectory_patch_layers,
+                patch_positions=analysis_trajectory_patch_positions,
+                patch_stages=analysis_trajectory_patch_stages,
+                patch_enabled=analysis_trajectory_patch_enabled,
+                patch_values=analysis_trajectory_patch_values)
+        out_norm = jnp.linalg.norm(
+            out.astype(jnp.float32), axis=-1).mean()
+        local_norm = jnp.linalg.norm(
+            details['local_outputs'].astype(jnp.float32), axis=-1).mean()
+        zero = jnp.float32(0.0)
+        zero_contribution = jnp.zeros(
+            (x.shape[0], x.shape[-1]), dtype=jnp.float32)
+        output = (
+            out,
+            zero, zero, zero, zero, zero, zero, zero, zero, zero,
+            jax.lax.stop_gradient(out_norm),
+            zero, zero, zero,
+            jax.lax.stop_gradient(local_norm),
+            jax.lax.stop_gradient(local_norm),
+            out_norm,
+            zero_contribution, zero_contribution,
+        )
+        if analysis_trajectory_enabled:
+            output += ((
+                rst_trajectory_trace,
+                jnp.float32(1.0),
+            ),)
+        if parity_debug:
+            local_sum = details['local_outputs'].sum(axis=2)
+            return output + ((out, x, local_sum,
+                              details['selected_space_weights'][..., :1]),)
+        return output
     rst_operator_keys = pool_params['rst_op_key']
     rst_read = pool_params['rst_read']
     rst_write = pool_params['rst_write']
@@ -7605,6 +8349,8 @@ class DAWN_SRW_V4173(nn.Module):
     n_v: int = 2600
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias; n_rst is canonical.
+    n_operation_spaces: int = 1
+    operation_space_top_k: int = 1
     router_dropout: float = 0.1
     n_chunks_rst: Optional[int] = None
     n_chunks_know: int = 1    # Config alias; n_chunks_rst is canonical.
@@ -7671,13 +8417,31 @@ class DAWN_SRW_V4173(nn.Module):
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
+        n_operation_spaces = int(self.n_operation_spaces)
+        operation_space_top_k = int(self.operation_space_top_k)
+        if n_operation_spaces <= 0:
+            raise ValueError(
+                "model.n_operation_spaces must be a positive integer, got "
+                f"{self.n_operation_spaces!r}")
+        if not 1 <= operation_space_top_k <= n_operation_spaces:
+            raise ValueError(
+                "model.operation_space_top_k must satisfy "
+                "1 <= top_k <= n_operation_spaces, got "
+                f"top_k={operation_space_top_k}, "
+                f"n_operation_spaces={n_operation_spaces}")
+        if int(n_rst_eff) % n_operation_spaces != 0:
+            raise ValueError(
+                "model.n_rst must be divisible by model.n_operation_spaces, "
+                f"got {n_rst_eff} % {n_operation_spaces}")
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
             d_model=self.d_model, d_route=self.d_route,
-            operator_key_mode=operator_key_mode)
+            operator_key_mode=operator_key_mode,
+            n_operation_spaces=n_operation_spaces)
         self.router = Router(
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
+            n_operation_spaces=n_operation_spaces,
             router_dropout=self.router_dropout,
             tau_init_attn_qk=self.tau_init_attn_qk,
             tau_init_attn_v=self.tau_init_attn_v,
@@ -8480,6 +9244,7 @@ class DAWN_SRW_V4173(nn.Module):
                 per_token_correct,
             )
 
+        space_metrics_all = ()
         if self.is_initializing():
             _z = jnp.float32(0.0)
             total_aux = _z
@@ -8625,6 +9390,9 @@ class DAWN_SRW_V4173(nn.Module):
             _ = self.router.proj_rst(x)
             _ = self.router.raw_tau_attn(x)
             _ = self.router.raw_tau_rst(x)
+            if int(self.n_operation_spaces) > 1:
+                _ = self.router.rst_space_query(x)
+                _ = self.router.rst_space_keys
             route_local_zeros = jnp.zeros(
                 (*x.shape[:-1], self.d_route), dtype=x.dtype)
             _ = self.router.up_qk(route_local_zeros)
@@ -8683,6 +9451,8 @@ class DAWN_SRW_V4173(nn.Module):
                         deterministic, _sharded,
                         d_model=self.d_model,
                         n_layers=self.n_layers,
+                        n_operation_spaces=self.n_operation_spaces,
+                        operation_space_top_k=self.operation_space_top_k,
                         soft_gate_temperature=soft_gate_temperature,
                         soft_gate_t_final=soft_gate_t_final,
                         soft_gate_T_rst=soft_gate_T_rst,
@@ -8691,12 +9461,19 @@ class DAWN_SRW_V4173(nn.Module):
                             soft_gate_boundary_power_final),
                         admission_den_power=admission_den_power_rst,
                         execution_prune_eps=execution_prune_eps)
-                    return x + rst_update, ()
+                    if int(self.n_operation_spaces) > 1:
+                        rst_update, space_metrics = rst_update
+                        scan_metrics = tuple(
+                            space_metrics[name]
+                            for name in RST_SPACE_METRIC_NAMES)
+                    else:
+                        scan_metrics = ()
+                    return x + rst_update, scan_metrics
 
                 if self.gradient_checkpointing:
                     scan_body_training_fast = jax.checkpoint(
                         scan_body_training_fast)
-                x, _ = jax.lax.scan(
+                x, space_metrics_all = jax.lax.scan(
                     scan_body_training_fast,
                     x,
                     {'params': stacked, 'rng': layer_rngs})
@@ -8706,8 +9483,15 @@ class DAWN_SRW_V4173(nn.Module):
                         sharded_fns.get("vocab_argmax")
                         if isinstance(sharded_fns, dict) else None)
                     if vocab_argmax is not None:
-                        return {'argmax_token_ids': vocab_argmax(
+                        result = {'argmax_token_ids': vocab_argmax(
                             x, self.token_emb.embedding)}
+                        if int(self.n_operation_spaces) > 1:
+                            result.update({
+                                name: values.mean()
+                                for name, values in zip(
+                                    RST_SPACE_METRIC_NAMES,
+                                    space_metrics_all)})
+                        return result
                     if vp_embed is not None:
                         raise NotImplementedError(
                             "Full logits are disabled on the vocab-parallel "
@@ -8717,16 +9501,28 @@ class DAWN_SRW_V4173(nn.Module):
                     logits = self.token_emb.attend(x)
                     if embedding_vocab_size != logical_vocab_size:
                         logits = logits[..., :logical_vocab_size]
-                    return {'logits': logits}
+                    result = {'logits': logits}
+                    if int(self.n_operation_spaces) > 1:
+                        result.update({
+                            name: values.mean()
+                            for name, values in zip(
+                                RST_SPACE_METRIC_NAMES, space_metrics_all)})
+                    return result
                 loss = _compute_vocab_ce_loss(x)
                 valid_count = (labels[:, 1:] != -100).astype(
                     jnp.int32).sum()
-                return {
+                result = {
                     'loss': loss,
                     'aux_loss': jnp.float32(0.0),
                     'correct': jnp.int32(0),
                     'valid_count': valid_count,
                 }
+                if int(self.n_operation_spaces) > 1:
+                    result.update({
+                        name: values.mean()
+                        for name, values in zip(
+                            RST_SPACE_METRIC_NAMES, space_metrics_all)})
+                return result
 
             if minimal_train:
                 trace_minimal_layers = bool(
@@ -8917,6 +9713,8 @@ class DAWN_SRW_V4173(nn.Module):
                         sharded_fns=_sharded,
                         d_model=self.d_model,
                         n_layers=self.n_layers,
+                        n_operation_spaces=self.n_operation_spaces,
+                        operation_space_top_k=self.operation_space_top_k,
                         soft_gate_temperature=soft_gate_temperature,
                         soft_gate_t_final=soft_gate_t_final,
                         soft_gate_T_rst=soft_gate_T_rst,
@@ -8978,6 +9776,15 @@ class DAWN_SRW_V4173(nn.Module):
                     if analysis_trajectory_enabled:
                         rst_trajectory = rst_values[-1]
                         rst_values = rst_values[:-1]
+                    if (int(self.n_operation_spaces) > 1
+                            and minimal_kernel_profile
+                            == 'production_diagnostics'):
+                        rst_space_metric_values = rst_values[
+                            -len(RST_SPACE_METRIC_NAMES):]
+                        rst_values = rst_values[
+                            :-len(RST_SPACE_METRIC_NAMES)]
+                    else:
+                        rst_space_metric_values = ()
                     (rst_out, rst_active_frac, rst_active_n_mean,
                      rst_gate_mass_mean, rst_gate_den_mean,
                      rst_depth_active_mean, rst_gate_eff_n_mean,
@@ -9131,6 +9938,8 @@ class DAWN_SRW_V4173(nn.Module):
                             trace_values = tuple(
                                 target_debug(value) for value in trace_values)
                         layer_stats += trace_values
+                    if rst_space_metric_values:
+                        layer_stats += tuple(rst_space_metric_values)
                     return x_next, layer_stats
 
                 if self.gradient_checkpointing:
@@ -9169,6 +9978,15 @@ class DAWN_SRW_V4173(nn.Module):
                     })
                 x, minimal_stats = jax.lax.scan(
                     scan_body_minimal, x, xs_minimal)
+                if (int(self.n_operation_spaces) > 1
+                        and minimal_kernel_profile
+                        == 'production_diagnostics'):
+                    space_metrics_all = minimal_stats[
+                        -len(RST_SPACE_METRIC_NAMES):]
+                    minimal_stats = minimal_stats[
+                        :-len(RST_SPACE_METRIC_NAMES)]
+                else:
+                    space_metrics_all = ()
                 if trace_minimal_layers:
                     minimal_values = minimal_stats[:-18]
                     (parity_pre_layer_residual_all,
@@ -9407,6 +10225,12 @@ class DAWN_SRW_V4173(nn.Module):
                         if analysis_program_capture_contribution:
                             output['operator_program_contributions'] = (
                                 program_route_contributions)
+                        if space_metrics_all:
+                            output.update({
+                                name: values.mean()
+                                for name, values in zip(
+                                    RST_SPACE_METRIC_NAMES,
+                                    space_metrics_all)})
                         return output
                     if vp_embed is not None:
                         raise NotImplementedError(
@@ -9445,6 +10269,12 @@ class DAWN_SRW_V4173(nn.Module):
                     if analysis_program_capture_contribution:
                         output['operator_program_contributions'] = (
                             program_route_contributions)
+                    if space_metrics_all:
+                        output.update({
+                            name: values.mean()
+                            for name, values in zip(
+                                RST_SPACE_METRIC_NAMES,
+                                space_metrics_all)})
                     return output
 
                 (loss, per_token_ce, correct, valid_count,
@@ -9639,6 +10469,11 @@ class DAWN_SRW_V4173(nn.Module):
                 if analysis_program_capture_contribution:
                     output['operator_program_contributions'] = (
                         program_route_contributions)
+                if space_metrics_all:
+                    output.update({
+                        name: values.mean()
+                        for name, values in zip(
+                            RST_SPACE_METRIC_NAMES, space_metrics_all)})
                 return output
 
             def scan_body(carry, xs):
@@ -10363,6 +11198,11 @@ class DAWN_SRW_V4173(nn.Module):
             'token_emb_norm': jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean(),
             'token_emb_norm_max': jnp.linalg.norm(self.token_emb.embedding, axis=-1).max(),
         }
+        if space_metrics_all:
+            result.update({
+                name: values.mean()
+                for name, values in zip(
+                    RST_SPACE_METRIC_NAMES, space_metrics_all)})
         for _prefix, _diag_all in (
                 ('attn_qk', attn_qk_sparsity_diag_all),
                 ('attn_v', attn_v_sparsity_diag_all),
@@ -10967,6 +11807,8 @@ class DAWN_SRW_V4173(nn.Module):
             'heat_kernel_beta': self.heat_kernel_beta,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
+            'n_operation_spaces': int(self.n_operation_spaces),
+            'operation_space_top_k': int(self.operation_space_top_k),
         }
         return cfg
 
@@ -11041,6 +11883,10 @@ class DAWN_SRW_V4173(nn.Module):
             f"  execution_write_width={self.d_route}",
             f"  vocab logical/padded={logical_vocab_size}/{embedding_vocab_size}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
+            ("  RST operation spaces: "
+             f"count={int(self.n_operation_spaces)}, "
+             f"top_k={int(self.operation_space_top_k)}, "
+             f"operators_per_space={n_rst_eff // int(self.n_operation_spaces)}"),
             "  Selection: cosine(direct state query, live bilinear RW key)",
             "Execution:",
             "  native local read/write with route-shared aggregate up-projection",
@@ -11187,9 +12033,27 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'])
     q_operator_query, k_operator_query, v_operator_query = jnp.split(attn_operator_queries, 3, axis=-1)
-    rst_operator_query = (
-        rst_x @ router['proj_rst']['kernel']
-        + router['proj_rst']['bias'])
+    multi_space = router['proj_rst']['kernel'].ndim == 3
+    if multi_space:
+        top_k = min(
+            int(router['proj_rst']['kernel'].shape[0]),
+            int(params.get('operation_space_top_k', 1))
+            if hasattr(params, 'get') else 1)
+        # Calibration params do not carry config metadata. Use all selected
+        # spaces only when a caller materialized the canonical top-k value;
+        # otherwise one differentiable top space is sufficient for tau init.
+        top_ids, _, _ = _rst_space_selection(
+            rst_x, router, top_k)
+        request_x = jnp.repeat(rst_x, top_k, axis=0)
+        flat_ids = top_ids.reshape(-1)
+        rst_operator_query = jnp.einsum(
+            'qd,qdr->qr', request_x,
+            router['proj_rst']['kernel'][flat_ids]
+        ) + router['proj_rst']['bias'][flat_ids]
+    else:
+        rst_operator_query = (
+            rst_x @ router['proj_rst']['kernel']
+            + router['proj_rst']['bias'])
 
     def _selection_rho(operator_query, operator_keys):
         q_unit = _forward_unit_direction(
@@ -11207,7 +12071,12 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         'q': _selection_rho(q_operator_query, qk_operator_keys),
         'k': _selection_rho(k_operator_query, qk_operator_keys),
         'v': _selection_rho(v_operator_query, v_operator_keys),
-        'rst': _selection_rho(rst_operator_query, rst_operator_keys),
+        'rst': (
+            jax.vmap(_selection_rho)(
+                rst_operator_query,
+                rst_operator_keys[flat_ids]).reshape((token_count, -1))
+            if multi_space
+            else _selection_rho(rst_operator_query, rst_operator_keys)),
     }
 
 
@@ -11240,9 +12109,17 @@ def _query_geometry_diagnostics(params, input_ids, max_tokens=4096):
     q_operator_query, k_operator_query, v_operator_query = jnp.split(
         attn_x @ router['proj_attn']['kernel']
         + router['proj_attn']['bias'], 3, axis=-1)
-    rst_operator_query = (
-        rst_x @ router['proj_rst']['kernel']
-        + router['proj_rst']['bias'])
+    if router['proj_rst']['kernel'].ndim == 3:
+        top_ids, _, _ = _rst_space_selection(rst_x, router, 1)
+        flat_ids = top_ids.reshape(-1)
+        rst_operator_query = jnp.einsum(
+            'qd,qdr->qr', rst_x,
+            router['proj_rst']['kernel'][flat_ids]
+        ) + router['proj_rst']['bias'][flat_ids]
+    else:
+        rst_operator_query = (
+            rst_x @ router['proj_rst']['kernel']
+            + router['proj_rst']['bias'])
     out = {}
     out.update(_query_geometry_stats(q_operator_query, 'q', max_tokens))
     out.update(_query_geometry_stats(k_operator_query, 'k', max_tokens))
@@ -11371,6 +12248,303 @@ def _srw_inference_with_gates(
             execution_weight_norm)
 
 
+def _rst_multispace_inference(
+        x, pool_params, router_params, d_model, n_layers,
+        operation_space_top_k, angular_execution_kwargs,
+        return_details=False, space_multiplier=None,
+        operator_multiplier=None):
+    """All-space dense inference without per-token parameter gathers."""
+    top_ids, top_weights, space_scores = _rst_space_selection(
+        x, router_params, operation_space_top_k)
+    batch_size, sequence_length = x.shape[:2]
+    token_count = int(batch_size) * int(sequence_length)
+    top_k = int(operation_space_top_k)
+    flat_x = x.reshape((token_count, x.shape[-1]))
+    n_spaces = int(router_params['proj_rst']['kernel'].shape[0])
+    dense_x = jnp.broadcast_to(
+        flat_x[None, :, :], (n_spaces, token_count, x.shape[-1]))
+    proj = router_params['proj_rst']
+    operator_query_all = jnp.einsum(
+        'mtd,mdr->mtr', dense_x, proj['kernel']
+    ) + proj['bias'][:, None, :]
+    tau_params = router_params['raw_tau_rst']
+    raw_tau_all = jnp.einsum(
+        'mtd,mdr->mtr', dense_x, tau_params['kernel']
+    ) + tau_params['bias'][:, None, :]
+    keys = pool_params['rst_op_key']
+    reads = pool_params['rst_read']
+    writes = pool_params['rst_write']
+
+    if operator_multiplier is None:
+        request_operator_multiplier = jnp.ones(
+            keys.shape[:2], dtype=jnp.float32)
+    else:
+        request_operator_multiplier = jnp.asarray(
+            operator_multiplier, dtype=jnp.float32).reshape(
+                (n_spaces, keys.shape[1]))
+
+    def one_space(query, request_keys, request_tau, read, write,
+                  operator_mult):
+        query = query[None, :, :]
+        request_tau = request_tau[None, :, :]
+        offset = jnp.zeros_like(request_tau)
+        read_directions = _forward_unit_direction(read.astype(jnp.float32))
+        write_directions = _forward_unit_direction(write.astype(jnp.float32))
+        execution_kwargs, den_power = _split_admission_den_kwargs(
+            angular_execution_kwargs, 'rst')
+        margin, unpruned_operator_gate, _, execution_weight, _ = (
+            _angular_execution(
+                query, request_keys, request_tau, offset,
+                **execution_kwargs))
+        multiplier = operator_mult[None, :]
+        unpruned_operator_gate = unpruned_operator_gate * multiplier
+        execution_weight = execution_weight * multiplier
+        den = _composition_den(
+            unpruned_operator_gate.sum(axis=-1, keepdims=True), den_power,
+            execution_kwargs.get(
+                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
+        read_value = _operation_projection_read(query, read_directions)
+        raw = (execution_weight * read_value) @ write_directions
+        local = raw.astype(jnp.float32) / den
+        return (
+            local[0], execution_weight[0],
+            (execution_weight / jnp.maximum(den, 1.0e-8))[0],
+            unpruned_operator_gate[0], margin[0], read_value[0], den[0])
+
+    (local_all, gate_all, normalized_gate_all, unpruned_gate_all,
+     margin_all, read_value_all, request_den_all) = jax.vmap(one_space)(
+        operator_query_all, keys, raw_tau_all, reads, writes,
+        request_operator_multiplier)
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    space_out_all = jnp.einsum(
+        'mtr,mrd->mtd', local_all * rst_scale,
+        router_params['up_rst']['kernel'])
+    if space_multiplier is not None:
+        space_out_all = space_out_all * jnp.asarray(
+            space_multiplier, dtype=jnp.float32)[:, None, None]
+    flat_top_ids = top_ids.reshape((token_count, top_k))
+    dense_space_weights = jnp.zeros(
+        (token_count, n_spaces), dtype=jnp.float32).at[
+            jnp.arange(token_count, dtype=jnp.int32)[:, None],
+            flat_top_ids].add(top_weights.reshape((token_count, top_k)))
+    update = jnp.einsum(
+        'tm,mtd->td', dense_space_weights, space_out_all
+    ).reshape((batch_size, sequence_length, d_model))
+    if not return_details:
+        return update
+
+    token_index = jnp.arange(token_count, dtype=jnp.int32)[:, None]
+
+    def select_spaces(value):
+        value_by_token = jnp.swapaxes(value, 0, 1)
+        return value_by_token[token_index, flat_top_ids]
+
+    local = select_spaces(local_all)
+    space_out = select_spaces(space_out_all)
+    operator_query = select_spaces(operator_query_all)
+    raw_tau = select_spaces(raw_tau_all)
+    request_gate = select_spaces(gate_all)
+    request_gate_normalized = select_spaces(normalized_gate_all)
+    unpruned_operator_gate = select_spaces(unpruned_gate_all)
+    margin = select_spaces(margin_all)
+    read_value = select_spaces(read_value_all)
+    request_den = select_spaces(request_den_all)
+    request_gate_den = request_gate.sum(axis=-1) / jnp.maximum(
+        request_gate_normalized.sum(axis=-1), jnp.float32(1e-8))
+    return update, {
+        'selected_space_ids': top_ids,
+        'selected_space_weights': top_weights,
+        'space_scores': space_scores,
+        'local_outputs': local.reshape(
+            (batch_size, sequence_length, top_k, local.shape[-1])),
+        'space_outputs': space_out.reshape(
+            (batch_size, sequence_length, top_k, d_model)),
+        'operator_query': operator_query.reshape(
+            (batch_size, sequence_length, top_k, operator_query.shape[-1])),
+        'raw_tau': raw_tau.reshape(
+            (batch_size, sequence_length, top_k, 1)),
+        'operator_gate': request_gate.reshape(
+            (batch_size, sequence_length, top_k, request_gate.shape[-1])),
+        'operator_gate_normalized': request_gate_normalized.reshape(
+            (batch_size, sequence_length, top_k,
+             request_gate_normalized.shape[-1])),
+        'operator_gate_den': request_gate_den.reshape(
+            (batch_size, sequence_length, top_k)),
+        'operator_gate_unpruned': unpruned_operator_gate.reshape(
+            (batch_size, sequence_length, top_k,
+             unpruned_operator_gate.shape[-1])),
+        'operator_margin': margin.reshape(
+            (batch_size, sequence_length, top_k, margin.shape[-1])),
+        'operator_rho': (
+            margin + _tau_from_param(raw_tau)
+        ).reshape((batch_size, sequence_length, top_k, margin.shape[-1])),
+        'operator_read_scalar': read_value.reshape(
+            (batch_size, sequence_length, top_k, read_value.shape[-1])),
+        'request_denominator': request_den.reshape(
+            (batch_size, sequence_length, top_k, 1)),
+    }
+
+
+def _rst_multispace_trajectory_trace(
+        details, pool_params, router_params, positions, position_valid,
+        replay_operator_ids, replay_operator_valid, d_model, n_layers):
+    """Build a global-ID trace from only the selected space requests."""
+    positions = jnp.asarray(positions, dtype=jnp.int32)
+    position_valid = jnp.asarray(position_valid, dtype=jnp.bool_)
+    replay_operator_ids = jnp.asarray(
+        replay_operator_ids, dtype=jnp.int32)
+    replay_operator_valid = jnp.asarray(
+        replay_operator_valid, dtype=jnp.bool_)
+    batch_size, capture_positions = positions.shape
+    batch_index = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
+    clipped_positions = jnp.clip(
+        positions, 0, details['selected_space_ids'].shape[1] - 1)
+
+    def at_positions(value):
+        return value[batch_index, clipped_positions]
+
+    selected_spaces = at_positions(details['selected_space_ids'])
+    selected_weights = at_positions(details['selected_space_weights'])
+    execution = at_positions(details['operator_gate'])
+    internal_gate = at_positions(details['operator_gate_unpruned'])
+    margin = at_positions(details['operator_margin'])
+    rho = at_positions(details['operator_rho'])
+    read_scalar = at_positions(details['operator_read_scalar'])
+    denominator = at_positions(details['request_denominator'])
+    query = at_positions(details['operator_query'])
+    raw_tau = at_positions(details['raw_tau'])
+    space_outputs = at_positions(details['space_outputs'])
+    local_operator_count = int(execution.shape[-1])
+    top_k = int(execution.shape[-2])
+    capture_width = int(replay_operator_ids.shape[-1])
+    candidate_count = top_k * local_operator_count
+    actual_width = min(capture_width, candidate_count)
+
+    global_ids = (
+        selected_spaces[..., :, None] * jnp.int32(local_operator_count)
+        + jnp.arange(local_operator_count, dtype=jnp.int32)
+    ).reshape((batch_size, capture_positions, candidate_count))
+    amplitude = execution * read_scalar.astype(jnp.float32)
+    score = jnp.abs(amplitude).reshape(
+        (batch_size, capture_positions, candidate_count))
+    top_score, top_index = jax.lax.top_k(score, actual_width)
+
+    def top_field(value):
+        flat = value.reshape(
+            (batch_size, capture_positions, candidate_count))
+        return jnp.take_along_axis(flat, top_index, axis=-1)
+
+    top_ids = jnp.take_along_axis(global_ids, top_index, axis=-1)
+    top_read = top_field(read_scalar)
+    top_amplitude = top_field(amplitude)
+    top_execution = top_field(execution)
+    top_internal_gate = top_field(internal_gate)
+    top_margin = top_field(margin)
+    top_rho = top_field(rho)
+    if actual_width < capture_width:
+        pad_width = capture_width - actual_width
+
+        def pad(value, fill):
+            return jnp.pad(
+                value, ((0, 0), (0, 0), (0, pad_width)),
+                constant_values=fill)
+
+        top_score = pad(top_score, -jnp.inf)
+        top_ids = pad(top_ids, -1)
+        top_read = pad(top_read, 0.0)
+        top_amplitude = pad(top_amplitude, 0.0)
+        top_execution = pad(top_execution, 0.0)
+        top_internal_gate = pad(top_internal_gate, 0.0)
+        top_margin = pad(top_margin, 0.0)
+        top_rho = pad(top_rho, 0.0)
+
+    local_count_i32 = jnp.int32(local_operator_count)
+    total_operators = jnp.int32(
+        pool_params['rst_read'].shape[0] * local_operator_count)
+    replay_valid = (
+        replay_operator_valid
+        & (replay_operator_ids >= 0)
+        & (replay_operator_ids < total_operators))
+    safe_replay_ids = jnp.clip(
+        replay_operator_ids, 0, total_operators - 1)
+    replay_spaces = safe_replay_ids // local_count_i32
+    replay_local = safe_replay_ids % local_count_i32
+    gather_local = jnp.broadcast_to(
+        replay_local[..., None, :],
+        (*replay_local.shape[:2], top_k, capture_width))
+    replay_execution = jnp.take_along_axis(
+        execution, gather_local, axis=-1)
+    replay_read = jnp.take_along_axis(
+        read_scalar, gather_local, axis=-1)
+    selected_match = (
+        selected_spaces[..., :, None] == replay_spaces[..., None, :])
+    selected_match &= replay_valid[..., None, :]
+    replay_amplitude = replay_execution * replay_read.astype(jnp.float32)
+    replay_amplitude = jnp.where(selected_match, replay_amplitude, 0.0)
+
+    write = _forward_unit_direction(
+        pool_params['rst_write'].astype(jnp.float32)).reshape(
+            (-1, pool_params['rst_write'].shape[-1]))[safe_replay_ids]
+    up = router_params['up_rst']['kernel'][replay_spaces]
+    local_replay = jnp.einsum(
+        'bpkt,bptr->bpktr',
+        replay_amplitude / jnp.maximum(denominator, 1.0e-8), write)
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
+    replay_by_request = jnp.einsum(
+        'bpktr,bptrd->bpktd', local_replay * rst_scale, up)
+    replay_output = (
+        replay_by_request
+        * selected_weights[..., :, None, None]
+        * selected_match[..., None].astype(jnp.float32)
+    ).sum(axis=(2, 3))
+
+    production_output = (
+        space_outputs * selected_weights[..., None]).sum(axis=2)
+    valid_vector = position_valid[..., None]
+    trace_valid = jnp.isfinite(top_score) & position_valid[..., None]
+    weighted_query = (query * selected_weights[..., None]).sum(axis=2)
+    weighted_tau = (
+        _tau_from_param(raw_tau) * selected_weights[..., None]).sum(axis=2)
+    internal_gate_mass = (
+        internal_gate.sum(axis=-1, keepdims=True)
+        * selected_weights[..., None]).sum(axis=2)
+    weighted_denominator = (
+        denominator * selected_weights[..., None]).sum(axis=2)
+    numerator_count = (execution != 0.0).astype(jnp.int32).sum(axis=(2, 3))
+    denominator_count = (
+        internal_gate != 0.0).astype(jnp.int32).sum(axis=(2, 3))
+    trace = (
+        jnp.where(valid_vector, production_output, 0.0),
+        jnp.where(valid_vector, replay_output, 0.0),
+        jnp.where(valid_vector, production_output, 0.0),
+        jnp.where(valid_vector, replay_output, 0.0),
+        jnp.where(valid_vector, weighted_query, 0.0),
+        jnp.where(valid_vector, weighted_tau, 0.0),
+        jnp.where(valid_vector, internal_gate_mass, 0.0),
+        jnp.where(valid_vector, weighted_denominator, 0.0),
+        jnp.where(position_valid, numerator_count, 0),
+        jnp.where(position_valid, denominator_count, 0),
+        jnp.where(trace_valid, top_ids, jnp.int32(-1)),
+        trace_valid,
+        jnp.where(
+            trace_valid,
+            jax.lax.bitcast_convert_type(
+                top_read.astype(jnp.bfloat16), jnp.uint16),
+            jnp.uint16(0)),
+        jnp.where(
+            trace_valid,
+            jax.lax.bitcast_convert_type(
+                top_amplitude.astype(jnp.bfloat16), jnp.uint16),
+            jnp.uint16(0)),
+        jnp.where(trace_valid, top_execution, 0.0),
+        jnp.where(trace_valid, top_internal_gate, 0.0),
+        jnp.where(trace_valid, top_margin, 0.0),
+        jnp.where(trace_valid, top_rho, 0.0),
+        position_valid,
+    )
+    return tuple(jax.lax.stop_gradient(value) for value in trace)
+
+
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                          n_heads, d_model, n_layers,
@@ -11433,11 +12607,20 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _rst_forward_inference(x, pool_params, router_params,
                            d_model=None, n_layers=None,
+                           n_operation_spaces=1,
+                           operation_space_top_k=1,
                            angular_execution_kwargs=None):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
     if angular_execution_kwargs is None:
         angular_execution_kwargs = {}
     pool_params = _ensure_pool_operator_keys(pool_params)
+    if int(n_operation_spaces) > 1:
+        if d_model is None or n_layers is None:
+            raise ValueError(
+                "depth-scaled pool outputs require d_model and n_layers.")
+        return _rst_multispace_inference(
+            x, pool_params, router_params, d_model, n_layers,
+            operation_space_top_k, angular_execution_kwargs)
     rst_operator_keys = pool_params['rst_op_key']
     operator_query = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
     tau = x @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
@@ -11545,6 +12728,10 @@ def prefill(params, model_cfg, input_ids):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
+            n_operation_spaces=int(model_cfg.get(
+                'n_operation_spaces', 1)),
+            operation_space_top_k=int(model_cfg.get(
+                'operation_space_top_k', 1)),
             angular_execution_kwargs=angular_execution_kwargs)
         x = x + rst_out
         return (x, cK, cV), None
@@ -11598,6 +12785,10 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
+            n_operation_spaces=int(model_cfg.get(
+                'n_operation_spaces', 1)),
+            operation_space_top_k=int(model_cfg.get(
+                'operation_space_top_k', 1)),
             angular_execution_kwargs=angular_execution_kwargs)
         x = x + rst_out
         return (x, cK, cV, pos), None
@@ -11761,6 +12952,11 @@ def vectorized_neuron_health(params):
         operator_keys = pool[op_key_key]
         read = pool[read_key]
         write = pool[write_key]
+        if operator_keys.ndim == 3:
+            operator_keys = operator_keys.reshape(
+                (-1, operator_keys.shape[-1]))
+            read = read.reshape((-1, read.shape[-1]))
+            write = write.reshape((-1, write.shape[-1]))
         op_key_n = jnp.linalg.norm(operator_keys, axis=-1)
         read_n = jnp.linalg.norm(read, axis=-1)
         write_n = jnp.linalg.norm(write, axis=-1)
@@ -11789,6 +12985,9 @@ def vectorized_weight_analysis(params, max_sample=2048):
             ('Attention-V', 'attn_v_op_key'),
             ('RST', 'rst_op_key')]:
         operator_keys = pool[op_key_key]
+        if operator_keys.ndim == 3:
+            operator_keys = operator_keys.reshape(
+                (-1, operator_keys.shape[-1]))
         N, d = operator_keys.shape
         if N > max_sample:
             idx = jnp.linspace(0, N - 1, max_sample, dtype=jnp.int32)
@@ -11916,16 +13115,41 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         x = x + attn_out
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-        rst_operator_query = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
-        tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
-        raw_scan_offset_k = jnp.zeros_like(tau_k)
-        rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
-            normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
-            pool_params['rst_read'], pool_params['rst_write'],
-            admission_den_pool='rst',
-            **angular_execution_kwargs)
-        rst_out = (
-            rst_out * rst_scale_eff) @ router_params['up_rst']['kernel']
+        n_operation_spaces = int(model_cfg.get('n_operation_spaces', 1))
+        operation_space_top_k = int(model_cfg.get(
+            'operation_space_top_k', 1))
+        if n_operation_spaces > 1:
+            rst_out, space_details = _rst_multispace_inference(
+                normed, pool_params, router_params, d_model, n_layers,
+                operation_space_top_k, angular_execution_kwargs,
+                return_details=True)
+            rst_operator_query = space_details['operator_query']
+            local_operator_count = int(rst_operator_keys.shape[1])
+            gate_shape = (B, S, n_operation_spaces, local_operator_count)
+            gate_RST_raw_space = jnp.zeros(gate_shape, dtype=jnp.float32)
+            gate_RST_space = jnp.zeros(gate_shape, dtype=jnp.float32)
+            batch_index = jnp.arange(B)[:, None, None]
+            token_index = jnp.arange(S)[None, :, None]
+            selected_spaces = space_details['selected_space_ids']
+            gate_RST_raw_space = gate_RST_raw_space.at[
+                batch_index, token_index, selected_spaces, :].add(
+                    space_details['operator_gate'])
+            gate_RST_space = gate_RST_space.at[
+                batch_index, token_index, selected_spaces, :].add(
+                    space_details['operator_gate_normalized'])
+            gate_RST_raw = gate_RST_raw_space.reshape((B, S, -1))
+            gate_RST = gate_RST_space.reshape((B, S, -1))
+        else:
+            rst_operator_query = normed @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
+            tau_k = normed @ router_params['raw_tau_rst']['kernel'] + router_params['raw_tau_rst']['bias']
+            raw_scan_offset_k = jnp.zeros_like(tau_k)
+            rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
+                normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
+                pool_params['rst_read'], pool_params['rst_write'],
+                admission_den_pool='rst',
+                **angular_execution_kwargs)
+            rst_out = (
+                rst_out * rst_scale_eff) @ router_params['up_rst']['kernel']
         rst_out_norm = jnp.linalg.norm(rst_out, axis=-1).mean()
         x = x + rst_out
 
@@ -11939,6 +13163,64 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         info.update(_query_geometry_stats(k_operator_query, 'k'))
         info.update(_query_geometry_stats(v_operator_query, 'v'))
         info.update(_query_geometry_stats(rst_operator_query, 'rst'))
+        if n_operation_spaces > 1:
+            selected_ids = space_details['selected_space_ids']
+            selected_weights = space_details['selected_space_weights']
+            selection_one_hot = jax.nn.one_hot(
+                selected_ids, n_operation_spaces, dtype=jnp.float32)
+            selection_count = selection_one_hot.sum(axis=(0, 1, 2))
+            selected_weight_sum = (
+                selection_one_hot
+                * selected_weights[..., None]).sum(axis=(0, 1, 2))
+            safe_count = jnp.maximum(selection_count, 1.0)
+            local_output_norm = jnp.linalg.norm(
+                space_details['space_outputs'].astype(jnp.float32), axis=-1)
+            weighted_output = (
+                space_details['space_outputs']
+                * selected_weights[..., None])
+            weighted_output_norm = jnp.linalg.norm(
+                weighted_output.astype(jnp.float32), axis=-1)
+            flat_selected_ids = selected_ids.reshape(-1)
+            space_commit = jnp.zeros(
+                (n_operation_spaces, d_model), dtype=jnp.float32
+            ).at[flat_selected_ids].add(
+                weighted_output.reshape((-1, d_model)).astype(jnp.float32))
+            space_commit_unit = _forward_unit_direction(space_commit)
+            local_operator_id = jnp.argmax(
+                space_details['operator_gate'], axis=-1).astype(jnp.int32)
+            gate_den_sum = (
+                selection_one_hot
+                * space_details['operator_gate_den'][..., None]).sum(
+                    axis=(0, 1, 2))
+            info.update({
+                'selected_space_id': selected_ids,
+                'selected_space_weight': selected_weights,
+                'local_operator_id': local_operator_id,
+                'global_rst_operator_id': (
+                    selected_ids * jnp.int32(local_operator_count)
+                    + local_operator_id),
+                'space_local_contribution': space_details['space_outputs'],
+                'weighted_global_contribution': weighted_output,
+                'space_selection_frequency': selection_count / jnp.maximum(
+                    selection_count.sum(), 1.0),
+                'space_mean_selected_weight': selected_weight_sum / safe_count,
+                'space_output_norm': (
+                    selection_one_hot
+                    * local_output_norm[..., None]).sum(
+                        axis=(0, 1, 2)) / safe_count,
+                'space_weighted_contribution_norm': (
+                    selection_one_hot
+                    * weighted_output_norm[..., None]).sum(
+                        axis=(0, 1, 2)) / safe_count,
+                'space_operator_active_count': (
+                    gate_RST_raw_space > 0.0).astype(jnp.float32).sum(
+                        axis=(0, 1, 3)),
+                'space_internal_gate_mass': gate_RST_raw_space.sum(
+                    axis=(0, 1, 3)),
+                'space_internal_gate_den': gate_den_sum / safe_count,
+                'space_commit_cosine': (
+                    space_commit_unit @ space_commit_unit.T),
+            })
         if _return_raw:
             info['gate_Q_raw'] = gate_Q_raw
             info['gate_K_raw'] = gate_K_raw
@@ -11977,6 +13259,10 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if 'v' in suppress_masks else None
     rst_mask = suppress_masks.get('rst', suppress_masks.get('know', None))
     rst_mult = jnp.where(rst_mask, 0.0, 1.0) if rst_mask is not None else None
+    space_mask = suppress_masks.get('space', None)
+    space_mult = (
+        jnp.where(space_mask, 0.0, 1.0)
+        if space_mask is not None else None)
 
     def _srw_sup(
             state, operator_query, operator_keys, tau_off, raw_scan_offset,
@@ -12061,14 +13347,25 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             x = x + attn_out
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-            rst_operator_query = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
-            tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
-            raw_scan_offset_k = jnp.zeros_like(tau_k)
-            rst_local = _srw_sup(
-                normed, rst_operator_query, rst_operator_keys, tau_k,
-                raw_scan_offset_k, pp['rst_read'], pp['rst_write'],
-                rst_mult, 'rst')
-            x = x + (rst_local * rst_scale_eff) @ rp['up_rst']['kernel']
+            n_operation_spaces = int(model_cfg.get(
+                'n_operation_spaces', 1))
+            if n_operation_spaces > 1:
+                rst_update = _rst_multispace_inference(
+                    normed, pp, rp, d_model, n_layers,
+                    int(model_cfg.get('operation_space_top_k', 1)),
+                    angular_execution_kwargs,
+                    space_multiplier=space_mult,
+                    operator_multiplier=rst_mult)
+                x = x + rst_update
+            else:
+                rst_operator_query = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
+                tau_k = normed @ rp['raw_tau_rst']['kernel'] + rp['raw_tau_rst']['bias']
+                raw_scan_offset_k = jnp.zeros_like(tau_k)
+                rst_local = _srw_sup(
+                    normed, rst_operator_query, rst_operator_keys, tau_k,
+                    raw_scan_offset_k, pp['rst_read'], pp['rst_write'],
+                    rst_mult, 'rst')
+                x = x + (rst_local * rst_scale_eff) @ rp['up_rst']['kernel']
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])

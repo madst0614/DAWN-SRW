@@ -462,7 +462,7 @@ def test_v4173_config_registry_resume_and_fail_loud_contracts(
     poc_path = "configs/train_config_v4173_40M_c4_5B.yaml"
     with open(poc_path, "r", encoding="utf-8") as handle:
         poc_cfg = yaml.safe_load(handle)
-    assert v4173.symbolic_parameter_count(poc_cfg)["total"] == 27_271_428
+    assert v4173.symbolic_parameter_count(poc_cfg)["total"] == 40_343_044
     assert poc_cfg["training"]["mesh_data"] == 4
     auto_mesh_cfg = deepcopy(poc_cfg)
     auto_mesh_cfg["training"].pop("mesh_data")

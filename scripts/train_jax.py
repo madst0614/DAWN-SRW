@@ -134,6 +134,7 @@ from models.dawn_srw_v4173 import (
     _tau_init_calibration_scores as _v4173_tau_init_calibration_scores,
     _validate_v4173_sharded_fns,
     generalized_bilinear_operator_key_diagnostics as _v4173_operator_key_diagnostics,
+    search_parameter_matched_n_rst as _v4173_search_parameter_matched_n_rst,
     symbolic_parameter_count as _v4173_symbolic_parameter_count,
 )
 from models.baseline_transformer_jax import (
@@ -782,6 +783,20 @@ V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES = (
     'grad_pool_rst_op_key',
 )
 
+V4173_OPERATION_SPACE_METRIC_NAMES = (
+    'space_selected_top1_frac',
+    'space_weight_top1_mean',
+    'space_weight_entropy_mean',
+    'space_usage_min',
+    'space_usage_max',
+    'space_usage_std',
+    'space_dead_frac',
+    'space_selected_requests',
+    'space_processed_requests',
+    'space_all_processed',
+    'space_overflow_requests',
+)
+
 V4170_COMPACT_TRAIN_METRIC_NAMES = (
     'total_loss',
     'ce_loss',
@@ -829,6 +844,15 @@ V4172_COMPACT_REGULAR_JSONL_REC_KEYS = (
 )
 V4172_COMPACT_REGULAR_JSONL_KEYS = (
     *V4172_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
+
+V4173_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    *V4172_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4173_OPERATION_SPACE_METRIC_NAMES,
+)
+V4173_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4173_COMPACT_REGULAR_JSONL_REC_KEYS,
     'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
 )
 
@@ -1426,6 +1450,18 @@ def _validate_v4171_resume_compatibility(
             "parameter conversion, and operator-key fallback are "
             "disabled. "
             f"requested={requested_version}, checkpoint={checkpoint_version}")
+    if requested_version == V4173_MODEL_VERSION:
+        _materialize_v4173_operation_space_config(requested_model_cfg)
+        _materialize_v4173_operation_space_config(checkpoint_model_cfg)
+        for field in ('n_operation_spaces', 'operation_space_top_k'):
+            requested_value = requested_model_cfg[field]
+            checkpoint_value = checkpoint_model_cfg[field]
+            if requested_value != checkpoint_value:
+                raise RuntimeError(
+                    "v4173 checkpoint operation-space schema mismatch: "
+                    f"model.{field} requested={requested_value}, "
+                    f"checkpoint={checkpoint_value}. Automatic space "
+                    "replication or migration is disabled.")
     requested_den_powers = _v4171_checkpoint_den_powers(
         requested_model_cfg,
         missing_message=(
@@ -1653,6 +1689,8 @@ def _require_resume_materialized_fields(full_config):
             + ", ".join(model_version_missing)
         )
     model_version = full_config['model']['model_version']
+    if str(model_version) == V4173_MODEL_VERSION:
+        _materialize_v4173_operation_space_config(full_config['model'])
     if not _is_active_srw_version(model_version):
         return
     if _is_v417x_version(model_version):
@@ -2859,6 +2897,8 @@ def _validate_v4171_model_config(model_cfg):
     if version not in V417X_MODEL_VERSIONS:
         raise ValueError(
             f"v417x config validator does not support model_version={version!r}")
+    if version == V4173_MODEL_VERSION:
+        _materialize_v4173_operation_space_config(model_cfg)
     d_route = model_cfg.get('d_route')
     (den_power, den_power_qk, den_power_v, den_power_rst) = (
         _resolve_v417x_admission_den_powers(
@@ -2913,6 +2953,39 @@ def _validate_v4171_model_config(model_cfg):
     model_cfg['admission_den_power_rst'] = den_power_rst
     model_cfg['srw_composition_mode'] = composition_mode
     model_cfg['heat_kernel_beta'] = heat_kernel_beta
+
+
+def _materialize_v4173_operation_space_config(model_cfg):
+    """Materialize the only two v4173 operation-space config fields."""
+    if not isinstance(model_cfg, dict):
+        raise TypeError("v4173 model config must be a mapping")
+    n_operation_spaces = model_cfg.get('n_operation_spaces', 1)
+    operation_space_top_k = model_cfg.get('operation_space_top_k', 1)
+    for name, value in (
+            ('n_operation_spaces', n_operation_spaces),
+            ('operation_space_top_k', operation_space_top_k)):
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value <= 0):
+            raise ValueError(
+                f"model.{name} must be a positive integer, got {value!r}")
+    if operation_space_top_k > n_operation_spaces:
+        raise ValueError(
+            "model.operation_space_top_k must satisfy "
+            "1 <= top_k <= n_operation_spaces, got "
+            f"top_k={operation_space_top_k}, "
+            f"n_operation_spaces={n_operation_spaces}")
+    n_rst = model_cfg.get('n_rst', model_cfg.get('n_know'))
+    if (not isinstance(n_rst, int) or isinstance(n_rst, bool)
+            or n_rst <= 0):
+        raise ValueError(
+            f"model.n_rst must be a positive integer, got {n_rst!r}")
+    if n_rst % n_operation_spaces != 0:
+        raise ValueError(
+            "model.n_rst must be divisible by model.n_operation_spaces, "
+            f"got {n_rst} % {n_operation_spaces}")
+    model_cfg['n_operation_spaces'] = int(n_operation_spaces)
+    model_cfg['operation_space_top_k'] = int(operation_space_top_k)
+    return model_cfg
 
 
 def _tau_lr_mult_for_model(training_cfg, model_version):
@@ -3025,6 +3098,15 @@ def _v4170_compact_train_metrics(
             metrics.update({
                 key: operator_key_gradient_metrics[key]
                 for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
+            present_space_metrics = tuple(
+                key for key in V4173_OPERATION_SPACE_METRIC_NAMES
+                if key in result)
+            if present_space_metrics and len(present_space_metrics) != len(
+                    V4173_OPERATION_SPACE_METRIC_NAMES):
+                raise RuntimeError(
+                    "v4173 operation-space train metrics are incomplete")
+            metrics.update({
+                key: result[key] for key in present_space_metrics})
         return metrics
     metrics.update({
         key: result[key]
@@ -3155,6 +3237,11 @@ def _dawn_srw_kwargs(cfg):
             'srw_composition_mode': m['srw_composition_mode'],
             'heat_kernel_beta': m.get(
                 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
+        })
+    if str(version) == V4173_MODEL_VERSION:
+        kw.update({
+            'n_operation_spaces': m['n_operation_spaces'],
+            'operation_space_top_k': m['operation_space_top_k'],
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -9619,6 +9706,8 @@ def get_param_shardings(params, mesh, model_version=None,
     row_sharded = NamedSharding(mesh, P('model', None))
     n_sharded = NamedSharding(mesh, P('model', None))
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
+    space_operator_sharded_3d = NamedSharding(
+        mesh, P(None, 'model', None))
     stage_n_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
     router_input_sharded_3d = NamedSharding(mesh, P(None, 'model', None))
     version = str(model_version) if model_version is not None else None
@@ -9701,6 +9790,10 @@ def get_param_shardings(params, mesh, model_version=None,
                     and (leaf.endswith('_op_read_proj')
                          or leaf.endswith('_op_write_proj'))):
                 return replicated
+            if (version == V4173_MODEL_VERSION
+                    and leaf in ('rst_read', 'rst_write')
+                    and value.ndim == 3):
+                return space_operator_sharded_3d
             if value.ndim == 2:
                 return n_sharded       # [N, d_bn] or [N, D]
             elif value.ndim == 3:
@@ -12755,6 +12848,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in V4171_COMPOSITION_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    for _key in V4173_OPERATION_SPACE_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
         _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
         if _key not in m)
@@ -12855,7 +12951,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 def _v4170_compact_regular_jsonl_record(rec, ctx):
     """Whitelist the low-cost v4170 regular record without fake fallbacks."""
     model_version = str(ctx.get('model_version'))
-    if model_version in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
+    if (model_version == V4173_MODEL_VERSION
+            and all(key in rec for key in
+                    V4173_OPERATION_SPACE_METRIC_NAMES)):
+        rec_keys = V4173_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4173_COMPACT_REGULAR_JSONL_KEYS
+    elif model_version in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         rec_keys = V4172_COMPACT_REGULAR_JSONL_REC_KEYS
         output_keys = V4172_COMPACT_REGULAR_JSONL_KEYS
     elif _is_v417x_version(model_version):
@@ -14988,17 +15089,24 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
     if paired_factory is None:
         raise RuntimeError(
             f"{version} module is missing make_sharded_srw_paired")
+    n_operation_spaces = int(model_cfg.get('n_operation_spaces', 1))
     for key in ('n_qk', 'n_v', 'n_rst'):
         value = int(model_cfg.get(key, model_cfg.get('n_know', 0)))
-        if value <= 0 or value % mesh_model != 0:
+        divisor = (
+            mesh_model * n_operation_spaces
+            if key == 'n_rst' and n_operation_spaces > 1
+            else mesh_model)
+        if value <= 0 or value % divisor != 0:
             raise ValueError(
                 f"model.{key}={value} must be positive and divisible by "
-                f"mesh_model={mesh_model}")
+                f"{divisor} (mesh_model={mesh_model}, "
+                f"n_operation_spaces={n_operation_spaces})")
     local_counts = {
         'qk': int(model_cfg['n_qk']) // mesh_model,
         'v': int(model_cfg['n_v']) // mesh_model,
         'rst': int(model_cfg.get(
-            'n_rst', model_cfg.get('n_know'))) // mesh_model,
+            'n_rst', model_cfg.get('n_know'))) // (
+                mesh_model * n_operation_spaces),
     }
     chunks = {
         pool: max(1, math.ceil(
@@ -15072,6 +15180,17 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         sharded['attn_qk_paired_minimal'] = paired_min(
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(paired_min, pool_kwargs('qk')))
+    if version == V4173_MODEL_VERSION and n_operation_spaces > 1:
+        request_factory = getattr(
+            module, 'make_sharded_rst_request_minimal', None)
+        if request_factory is None:
+            raise RuntimeError(
+                "v4173 multi-space config requires "
+                "make_sharded_rst_request_minimal")
+        sharded['rst_request_minimal'] = request_factory(
+            max_chunk_size=chunks['rst'],
+            **_factory_supported_kwargs(
+                request_factory, pool_kwargs('rst')))
     if (version == V4173_MODEL_VERSION
             and kernel_profile == 'trajectory'):
         sharded['attn_qk_paired_trajectory_minimal'] = sharded[
@@ -17555,6 +17674,46 @@ def main():
                     "Parameter reference: v4172=393800708 "
                     f"current={symbolic_counts['total']} "
                     f"delta={int(symbolic_counts['total']) - 393_800_708}")
+                if (int(cfg['model'].get('n_operation_spaces', 1)) == 8
+                        and int(cfg['model'].get(
+                            'operation_space_top_k', 1)) == 2
+                        and int(cfg['model'].get('d_model', 0)) == 384
+                        and int(cfg['model'].get('d_route', 0)) == 128
+                        and int(cfg['model'].get('n_layers', 0)) == 12
+                        and int(cfg['model'].get('n_qk', 0)) == 9748
+                        and int(cfg['model'].get('n_v', 0)) == 30730):
+                    baseline_path = Path(PROJECT_ROOT) / (
+                        'configs/train_config_v4173_40M_c4_5B.yaml')
+                    baseline_cfg = load_config(baseline_path)
+                    match_report = _v4173_search_parameter_matched_n_rst(
+                        baseline_cfg['model'], cfg['model'])
+                    if int(cfg['model']['n_rst']) != int(match_report['n_rst']):
+                        raise RuntimeError(
+                            "v4173 40M operation-space parameter match is "
+                            "not the symbolic-search optimum: "
+                            f"configured={cfg['model']['n_rst']} "
+                            f"searched={match_report['n_rst']}")
+                    if match_report['relative_difference'] > 0.0005:
+                        raise RuntimeError(
+                            "v4173 40M operation-space parameter match "
+                            "exceeds 0.05%: "
+                            f"{match_report['relative_difference']:.8%}")
+                    print("Operation-space parameter match:")
+                    for label, key in (
+                            ('baseline params', 'baseline_params'),
+                            ('multi-space params', 'multi_space_params'),
+                            ('absolute difference', 'absolute_difference'),
+                            ('relative difference', 'relative_difference'),
+                            ('baseline n_rst', 'baseline_n_rst'),
+                            ('new total n_rst', 'n_rst'),
+                            ('n_rst_per_space', 'n_rst_per_space'),
+                            ('n_operation_spaces', 'n_operation_spaces'),
+                            ('operation_space_top_k',
+                             'operation_space_top_k')):
+                        value = match_report[key]
+                        if key == 'relative_difference':
+                            value = f"{value:.8%}"
+                        print(f"  {label}: {value}")
         for line in model.get_model_info():
             print(line)
         if str(model_version_cfg) == V4167_MODEL_VERSION:
