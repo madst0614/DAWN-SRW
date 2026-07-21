@@ -61,6 +61,7 @@ DAWN_SRW_VERSIONS = {
     "dawn_srw",
     "spatial-r1-v4.1.5.5",
     "spatial-r1-v4.1.5.2",
+    "spatial-r1-v4.1.7.4",
 }
 
 README_NOTE = (

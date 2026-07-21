@@ -13,6 +13,7 @@ SUPPORTED_MODEL_VERSIONS = (
     "spatial-r1-v4.1.7.1",
     "spatial-r1-v4.1.7.2",
     "spatial-r1-v4.1.7.3",
+    "spatial-r1-v4.1.7.4",
 )
 PHASES = ("discovery", "validation", "test")
 UNIT_LEVELS = (
