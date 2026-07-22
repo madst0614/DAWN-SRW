@@ -1,41 +1,33 @@
-"""DAWN-SRW v4.1.7.4: route execution over shared operation spaces.
+"""DAWN-SRW v4.1.7.4: operator fields over shared local state spaces.
 
-The model starts from a shared state representation ``x`` in
-``[B, S, d_model]``.  It defines one shared operation-coordinate system and
-``M`` operation spaces.  Each operation space is represented by one learned
-space key ``k_m`` in that coordinate system.  Q, K, V, and RST independently
-select from the same ``M`` spaces and execute their route-specific components
-within the selected spaces.  The same space index aligns the Q/K/V/RST
-execution components belonging to that operation space.
+An operation space is an independent local state space.  Given a shared state
+``x``, space ``m`` owns exactly one encoder ``P_m`` and decoder ``U_m``::
 
-For route ``r`` and operation-space index ``m`` the canonical computation is
+    z_m = P_m x
+    y_r = sum_m alpha[r, m] U_m F[r, m](z_m, c_r)
 
-``c_r(x) = C_r x``
-``alpha_{r,m}(x) = TopKSoftmax_m(cos(c_r(x), k_m))``
-``z_{r,m} = P_{r,m} x``
-``u_{r,m} = RWCompose_{r,m}(z_{r,m})``
-``y_r = sum_m alpha_{r,m}(x) U_{r,m} u_{r,m}``
+Q, K, V, and RST consume the same ``z_m``.  They differ in their global
+operator query, RW bank/gate/tau, composition, and downstream use.  A space is
+selected from the distribution of its live generalized-bilinear RW operator
+keys, never from a learned representative key.  Production routing uses a
+deterministic FAVOR+-style positive orthogonal sketch; exact log-mean-exp is
+kept as the analysis reference.
 
-The operation-space keys are shared.  Space queries, operation projections, tau
-projections, and execution are route-specific.  Q and K alone share their RW
-read/write rows and state writeback.  V and RST have independent banks.
-Semantic selection is sparse top-k, while physical execution is deliberately
-all-space dense.  Production activations stop at ``[M,T,R]`` (or paired
-``[M,T,2,R]``); writeback contracts directly to ``[T,D]`` and never creates
-``[M,T,D]``.  Native v4174 with ``M=1`` uses implicit space weight one.
+Semantic routing is hard top-k.  Physical execution remains all-space dense.
+The fused decoder contracts ``[M,T,R]`` directly into ``[T,D]`` and never
+materializes ``[M,T,D]``.  The canonical 400M-equivalent geometry is
+``D=2048, M=8, R=256``.  The stacked encoder is initialized orthogonally and
+the independent trainable decoder starts as its transpose.
 
-The five historical ``operation_address_*`` serialized names are retained
-solely for exact params/optimizer-state resume compatibility with native
-v4174 checkpoints already in training.  They are not v4173 migration aliases
-and never trigger cross-version conversion.  A space key may be described as
-the learned address of its operation space in the shared coordinate system.
+This is the sole v4.1.7.4 architecture.  Earlier checkpoint, optimizer,
+parameter-path, and config schemas are intentionally unsupported.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import Any, Callable, Optional
 
 import flax.linen as nn
@@ -95,25 +87,20 @@ from models.dawn_srw_v4173 import (
 
 
 MODEL_VERSION = "spatial-r1-v4.1.7.4"
-
-V4174_SERIALIZED_SPACE_PARAM_NAMES = {
-    "operation_space_keys": "operation_address_keys",
-    "q_space_query_proj": "q_address_query_proj",
-    "k_space_query_proj": "k_address_query_proj",
-    "v_space_query_proj": "v_address_query_proj",
-    "rst_space_query_proj": "rst_address_query_proj",
-}
-
+ROUTES = ("q", "k", "v", "rst")
+SPACE_KERNEL_FEATURE_MULTIPLIER = 2
+SPACE_KERNEL_SEED = 4174
+SPACE_KERNEL_EPS = 1.0e-20
 SPACE_METRIC_SUFFIXES = (
-    "space_weight_top1_mean",
-    "space_weight_entropy_mean",
+    "dominant_space_id",
+    "space_top1_rate",
     "space_usage_min",
     "space_usage_max",
     "space_usage_std",
+    "space_selected_weight_top1",
+    "space_selected_entropy",
     "space_dead_frac",
-    "space_top1_usage_max",
 )
-ROUTES = ("q", "k", "v", "rst")
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -123,69 +110,48 @@ def _positive_int(name: str, value: Any) -> int:
 
 
 def resolve_operation_space_config(model_cfg: Mapping[str, Any]) -> tuple[int, int]:
-    """Resolve canonical and native-v4174 compatibility config fields.
-
-    ``n_operation_addresses`` and ``operation_address_top_k`` are accepted
-    only because native v4174 runs created before the terminology correction
-    serialized those config fields.  They do not imply v4173 compatibility.
-    """
-    canonical_n = model_cfg.get("n_operation_spaces")
-    canonical_k = model_cfg.get("operation_space_top_k")
-    serialized_n = model_cfg.get("n_operation_addresses")
-    serialized_k = model_cfg.get("operation_address_top_k")
-
-    def resolve_pair(canonical_name, canonical_value,
-                     serialized_name, serialized_value, default):
-        canonical = (None if canonical_value is None else
-                     _positive_int(canonical_name, canonical_value))
-        serialized = (None if serialized_value is None else
-                      _positive_int(serialized_name, serialized_value))
-        if canonical is not None and serialized is not None and canonical != serialized:
-            raise ValueError(
-                f"model.{canonical_name}={canonical} conflicts with native-v4174 "
-                f"compatibility field model.{serialized_name}={serialized}")
-        return canonical if canonical is not None else (
-            serialized if serialized is not None else default)
-
-    n_spaces = resolve_pair(
-        "n_operation_spaces", canonical_n,
-        "n_operation_addresses", serialized_n, 1)
-    top_k = resolve_pair(
-        "operation_space_top_k", canonical_k,
-        "operation_address_top_k", serialized_k, 1)
+    """Validate the only supported v4174 operation-space schema."""
+    n_spaces = _positive_int(
+        "n_operation_spaces", model_cfg.get("n_operation_spaces"))
+    top_k = _positive_int(
+        "operation_space_top_k", model_cfg.get("operation_space_top_k"))
     if top_k > n_spaces:
         raise ValueError(
-            "model.operation_space_top_k must be <= "
-            f"model.n_operation_spaces, got {top_k} > {n_spaces}"
-        )
+            "model.operation_space_top_k must be <= model.n_operation_spaces, "
+            f"got {top_k} > {n_spaces}")
     return n_spaces, top_k
 
 
 def materialize_operation_space_config(model_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Validate and add canonical fields while preserving raw v4174 aliases."""
+    """Validate and materialize the canonical fresh-run schema in-place."""
     n_spaces, top_k = resolve_operation_space_config(model_cfg)
     model_cfg["n_operation_spaces"] = n_spaces
     model_cfg["operation_space_top_k"] = top_k
+    d_model = _positive_int("d_model", model_cfg.get("d_model"))
+    d_route = _positive_int("d_route", model_cfg.get("d_route"))
+    if d_model != n_spaces * d_route:
+        raise ValueError(
+            "v4174 requires model.d_model == model.n_operation_spaces * "
+            f"model.d_route, got {d_model} != {n_spaces} * {d_route}")
     for pool_name in ("n_qk", "n_v", "n_rst"):
         value = _positive_int(pool_name, model_cfg.get(
             pool_name, model_cfg.get("n_know") if pool_name == "n_rst" else None))
         if value % n_spaces:
             raise ValueError(
                 f"model.{pool_name} must be divisible by "
-                f"model.n_operation_spaces, got {value} % {n_spaces}"
-            )
+                f"model.n_operation_spaces, got {value} % {n_spaces}")
+    for name in (
+            "space_kernel_beta_qk", "space_kernel_beta_v",
+            "space_kernel_beta_rst"):
+        value = model_cfg.get(name)
+        if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"model.{name} must be a materialized positive float")
+        model_cfg[name] = float(value)
     return model_cfg
 
 
-def _serialized_space_param(params: Mapping[str, Any], canonical_name: str):
-    """Read a native-v4174 parameter through the centralized ABI mapping."""
-    serialized_name = V4174_SERIALIZED_SPACE_PARAM_NAMES.get(
-        canonical_name, canonical_name)
-    return params[serialized_name]
-
-
 def symbolic_parameter_count(model_cfg: Mapping[str, Any]) -> dict[str, int]:
-    """Count the exact v4174 tree, including the shared space codebook."""
+    """Count the exact canonical v4174 parameter tree."""
     if "model" in model_cfg and isinstance(model_cfg["model"], Mapping):
         model_cfg = model_cfg["model"]
     cfg = dict(model_cfg)
@@ -196,77 +162,81 @@ def symbolic_parameter_count(model_cfg: Mapping[str, Any]) -> dict[str, int]:
     d_model = _positive_int("d_model", cfg.get("d_model"))
     d_route = _positive_int("d_route", cfg.get("d_route"))
     n_layers = _positive_int("n_layers", cfg.get("n_layers"))
-    counts_by_route = {
-        name: _positive_int(name, cfg.get(name, cfg.get("n_know")
-                                          if name == "n_rst" else None))
-        for name in ("n_qk", "n_v", "n_rst")
-    }
-    for name, value in counts_by_route.items():
+    if d_model != n_spaces * d_route:
+        raise ValueError("v4174 parameter count requires D == M * R")
+    counts_by_pool = {
+        name: _positive_int(name, cfg.get(
+            name, cfg.get("n_know") if name == "n_rst" else None))
+        for name in ("n_qk", "n_v", "n_rst")}
+    for name, value in counts_by_pool.items():
         if value % n_spaces:
-            raise ValueError(
-                f"model.{name}={value} must be divisible by "
-                f"n_operation_spaces={n_spaces}")
-    operator_count = sum(counts_by_route.values())
-    if n_spaces == 1:
-        router = 7 * d_model * d_route + 4 * d_model + 4 * d_route + 4
-        space_lookup = 0
-    else:
-        route_local = (
-            7 * n_spaces * d_model * d_route
-            + 4 * n_spaces * d_model
-            + 4 * n_spaces * d_route
-            + 4 * n_spaces
-        )
-        space_lookup = 4 * (d_model * d_route + d_route) + n_spaces * d_route
-        router = route_local + space_lookup
+            raise ValueError(f"model.{name} must be divisible by M")
+    shared_space_state = 2 * n_spaces * d_model * d_route
+    global_route_queries = 4 * d_model * d_route
+    route_tau = 4 * (d_route + 1)
     counts = {
         "token_embedding": vocab * d_model,
         "position_embedding": max_seq * d_model,
         "layer_stack": n_layers * (d_model * d_model + 4 * d_model),
-        "router": router,
-        "operation_space_lookup": space_lookup,
-        "read_write_pools": operator_count * 2 * d_route,
+        "router": shared_space_state + global_route_queries + route_tau,
+        "shared_space_state": shared_space_state,
+        "global_route_queries": global_route_queries,
+        "read_write_pools": sum(counts_by_pool.values()) * 2 * d_route,
         "learned_key_tables": 0,
         "bilinear_probe_matrices": 2 * d_route * d_route,
         "final_norm": 2 * d_model,
     }
     counts["total"] = sum(
         value for key, value in counts.items()
-        if key != "operation_space_lookup")
+        if key not in ("shared_space_state", "global_route_queries"))
     return counts
 
 
-def _stacked_initializer(initializer: Callable) -> Callable:
-    def init(key, shape, dtype=jnp.float32):
-        keys = jax.random.split(key, int(shape[0]))
-        return jax.vmap(lambda k: initializer(k, shape[1:], dtype))(keys)
-    return init
+def _orthogonal_space_projection_init(
+        key: jax.Array, shape: tuple[int, ...], dtype=jnp.float32) -> jax.Array:
+    """Initialize ``[M,D,R]`` from row blocks of one orthogonal ``[D,D]``."""
+    m, d_model, d_route = map(int, shape)
+    if m * d_route != d_model:
+        raise ValueError("orthogonal block initialization requires M * R == D")
+    orthogonal = nn.initializers.orthogonal(scale=1.0)(
+        key, (d_model, d_model), jnp.float32)
+    blocks = orthogonal.T.reshape((m, d_route, d_model))
+    return jnp.swapaxes(blocks, -1, -2).astype(dtype)
 
 
-class SpaceDense(nn.Module):
-    """Route-local ``P_{r,m}`` or tau projection with replicated space axis."""
-    n_operation_spaces: int
-    features: int
-    use_bias: bool = True
-    kernel_init: Callable = nn.initializers.lecun_normal()
-    bias_init: Callable = nn.initializers.zeros
+def _space_operator_read_init(
+        key: jax.Array, shape: tuple[int, ...], dtype=jnp.float32) -> jax.Array:
+    """Initialize each space's live RW field around a distinct ORF direction."""
+    m, n_operator, d_route = map(int, shape)
+    centers = _positive_orthogonal_projection(d_route)[:m]
+    centers = _shared_forward_unit_direction(centers)
+    noise = (jnp.float32(0.005) / math.sqrt(d_route)) * jax.random.normal(
+        key, (m, n_operator, d_route), dtype=jnp.float32)
+    return _shared_forward_unit_direction(
+        centers[:, None, :] + noise).astype(dtype)
 
-    @nn.compact
-    def __call__(self, state):
-        kernel = self.param(
-            "kernel", _stacked_initializer(self.kernel_init),
-            (self.n_operation_spaces, state.shape[-1], self.features))
-        result = jnp.einsum("...d,mdr->m...r", state, kernel)
-        if self.use_bias:
-            bias = self.param(
-                "bias", _stacked_initializer(self.bias_init),
-                (self.n_operation_spaces, self.features))
-            result = result + bias[(slice(None),) + (None,) * (state.ndim - 1)]
-        return result
+
+def _space_operator_write_init(
+        key: jax.Array, shape: tuple[int, ...], dtype=jnp.float32) -> jax.Array:
+    """Use a positive carrier so bilinear keys retain the space field center."""
+    m, n_operator, d_route = map(int, shape)
+    carrier = jnp.full(
+        (m, n_operator, d_route), 1.0 / math.sqrt(d_route), jnp.float32)
+    noise = (jnp.float32(0.0005) / math.sqrt(d_route)) * jax.random.normal(
+        key, (m, n_operator, d_route), dtype=jnp.float32)
+    return _shared_forward_unit_direction(carrier + noise).astype(dtype)
+
+
+def _identity_probe_init(
+        key: jax.Array, shape: tuple[int, ...], dtype=jnp.float32) -> jax.Array:
+    del key
+    if len(shape) != 2 or shape[0] != shape[1]:
+        raise ValueError("operator-key probes must be square")
+    return jnp.eye(shape[0], dtype=dtype)
 
 
 class OperationSpaceNeuronPool(nn.Module):
-    """Space-indexed RW banks; only the operation-row axis is sharded."""
+    """Space-indexed RW banks; only the per-space operator axis is sharded."""
     n_qk: int
     n_v: int
     n_rst: int
@@ -274,27 +244,22 @@ class OperationSpaceNeuronPool(nn.Module):
     n_operation_spaces: int
 
     def setup(self):
-        m = int(self.n_operation_spaces)
-        r = int(self.d_route)
-        shapes = {
-            "qk": (self.n_qk, r) if m == 1 else (m, self.n_qk // m, r),
-            "v": (self.n_v, r) if m == 1 else (m, self.n_v // m, r),
-            "rst": (self.n_rst, r) if m == 1 else (m, self.n_rst // m, r),
-        }
-        for name in ("qk", "v", "rst"):
+        m, r = int(self.n_operation_spaces), int(self.d_route)
+        for name, count in (
+                ("qk", self.n_qk), ("v", self.n_v), ("rst", self.n_rst)):
+            shape = (m, int(count) // m, r)
             setattr(self, f"{name}_read_vectors", self.param(
-                f"{name}_read_vectors", _shared_unit_norm_init(), shapes[name]))
+                f"{name}_read_vectors", _space_operator_read_init, shape))
             setattr(self, f"{name}_write_vectors", self.param(
-                f"{name}_write_vectors", _shared_unit_norm_init(), shapes[name]))
-        probe_init = nn.initializers.orthogonal(scale=1.0)
+                f"{name}_write_vectors", _space_operator_write_init, shape))
         self.operator_key_read_probe = self.param(
-            "operator_key_read_probe", probe_init, (r, r))
+            "operator_key_read_probe", _identity_probe_init, (r, r))
         self.operator_key_write_probe = self.param(
-            "operator_key_write_probe", probe_init, (r, r))
+            "operator_key_write_probe", _identity_probe_init, (r, r))
 
 
 class OperationSpaceRouter(nn.Module):
-    """Shared space codebook plus route-specific projections and tau."""
+    """Shared local-state basis plus global route queries and route tau."""
     d_model: int
     d_route: int
     n_operation_spaces: int
@@ -303,184 +268,217 @@ class OperationSpaceRouter(nn.Module):
     tau_init_rst: float
 
     def setup(self):
-        m, r = int(self.n_operation_spaces), int(self.d_route)
-        projection_init = nn.initializers.orthogonal(scale=1.0)
+        m, d, r = (int(self.n_operation_spaces), int(self.d_model),
+                   int(self.d_route))
+        self.space_state_proj = self.param(
+            "space_state_proj", _orthogonal_space_projection_init, (m, d, r))
+        self.space_state_writeback = self.param(
+            "space_state_writeback",
+            lambda key, shape, dtype=jnp.float32: jnp.swapaxes(
+                self.space_state_proj, -1, -2).astype(dtype),
+            (m, r, d))
         tau_values = {
             "q": self.tau_init_attn_qk,
             "k": self.tau_init_attn_qk,
             "v": self.tau_init_attn_v,
             "rst": self.tau_init_rst,
         }
-        projection_cls = nn.Dense if m == 1 else SpaceDense
-        projection_args = ({"features": r} if m == 1 else {
-            "n_operation_spaces": m, "features": r})
-        tau_args = ({"features": 1} if m == 1 else {
-            "n_operation_spaces": m, "features": 1})
         for route in ROUTES:
-            setattr(self, f"{route}_operation_proj", projection_cls(
-                name=f"{route}_operation_proj", kernel_init=projection_init,
-                bias_init=nn.initializers.zeros, **projection_args))
+            setattr(self, f"{route}_operator_query_proj", nn.Dense(
+                r, use_bias=False, name=f"{route}_operator_query_proj",
+                kernel_init=nn.initializers.orthogonal(scale=1.0)))
             tau_value = min(max(float(tau_values[route]), -0.9998), 0.9998)
             probability = (tau_value + 1.0) * 0.5
             raw_tau = math.log(probability) - math.log1p(-probability)
-            setattr(self, f"{route}_operator_tau_proj", projection_cls(
-                name=f"{route}_operator_tau_proj",
+            setattr(self, f"{route}_operator_tau_proj", nn.Dense(
+                1, name=f"{route}_operator_tau_proj",
                 kernel_init=nn.initializers.zeros,
-                bias_init=lambda k, s, d, value=raw_tau: jnp.full(s, value, d),
-                **tau_args))
-        writeback_args = ({"features": self.d_model, "use_bias": False}
-                          if m == 1 else {
-                              "n_operation_spaces": m,
-                              "features": self.d_model, "use_bias": False})
-        for name in ("qk", "v", "rst"):
-            setattr(self, f"{name}_state_writeback", projection_cls(
-                name=f"{name}_state_writeback", kernel_init=projection_init,
-                **writeback_args))
-        if m > 1:
-            # Native v4174 checkpoints already in training serialize these
-            # tensors under operation_address_* names.  Python attributes use
-            # corrected operation-space terminology while the serialized ABI
-            # remains byte-for-byte compatible for params and optimizer slots.
-            self.operation_space_keys = self.param(
-                V4174_SERIALIZED_SPACE_PARAM_NAMES["operation_space_keys"],
-                _shared_unit_norm_init(), (m, r))
-            for route in ROUTES:
-                setattr(self, f"{route}_space_query_proj", nn.Dense(
-                    r, name=V4174_SERIALIZED_SPACE_PARAM_NAMES[
-                        f"{route}_space_query_proj"],
-                    kernel_init=projection_init,
-                    bias_init=nn.initializers.zeros))
+                bias_init=lambda key, shape, dtype, value=raw_tau: jnp.full(
+                    shape, value, dtype)))
 
 
 def _linear(params: Mapping[str, jax.Array], state: jax.Array) -> jax.Array:
     return state @ params["kernel"] + params.get("bias", 0.0)
 
 
-def _select_operation_spaces(
-        state: jax.Array,
-        space_query_params: Mapping[str, jax.Array],
-        operation_space_keys: jax.Array,
-        operation_space_top_k: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Select semantic spaces without changing physical dense execution.
+def _unit_normalize(value: jax.Array, eps: float = 1.0e-8) -> jax.Array:
+    value = jnp.asarray(value, dtype=jnp.float32)
+    return value / jnp.maximum(
+        jnp.linalg.norm(value, axis=-1, keepdims=True), jnp.float32(eps))
 
-    ``state`` is ``[B,S,D]``; the route-specific query projection maps it to
-    ``[B,S,R]``.  Shared keys are ``[M,R]``.  Returned IDs and selected
-    weights are ``[B,S,K]`` and scores are ``[B,S,M]``.  The dense execution
-    path later scatters these K weights into ``[T,M]``; it never dispatches or
-    gathers tokens by space.
-    """
-    query = _linear(space_query_params, state)
-    query = _shared_forward_unit_direction(query.astype(jnp.float32))
-    keys = _shared_forward_unit_direction(
-        jnp.asarray(operation_space_keys, dtype=jnp.float32))
-    scores = jnp.einsum("bsr,mr->bsm", query, keys)
+
+def _project_space_local_states(
+        state: jax.Array, space_state_proj: jax.Array) -> jax.Array:
+    """Project shared ``[T,D]`` state once into canonical ``[M,T,R]``."""
+    if state.ndim != 2 or space_state_proj.ndim != 3:
+        raise ValueError("state/projection must have shapes [T,D] and [M,D,R]")
+    return jnp.einsum("td,mdr->mtr", state, space_state_proj)
+
+
+@lru_cache(maxsize=None)
+def _positive_orthogonal_projection(
+        d_route: int, seed: int = SPACE_KERNEL_SEED) -> jax.Array:
+    """Return deterministic paired orthogonal Gaussian directions ``[2R,R]``."""
+    d_route = int(d_route)
+    rng = np.random.default_rng(int(seed))
+    matrix = rng.standard_normal((d_route, d_route), dtype=np.float64)
+    q, r = np.linalg.qr(matrix)
+    q = q * np.where(np.diag(r) < 0.0, -1.0, 1.0)[None, :]
+    rows = np.concatenate((q.T, -q.T), axis=0) * math.sqrt(d_route)
+    return jnp.asarray(rows, dtype=jnp.float32)
+
+
+def _build_positive_kernel_features(
+        vectors: jax.Array, beta: float,
+        projection: Optional[jax.Array] = None) -> jax.Array:
+    """Positive orthogonal features approximating ``exp(beta q^T k)``."""
+    vectors = jnp.asarray(vectors, dtype=jnp.float32)
+    if projection is None:
+        projection = _positive_orthogonal_projection(int(vectors.shape[-1]))
+    projection = jnp.asarray(projection, dtype=jnp.float32)
+    beta_array = jnp.asarray(beta, dtype=jnp.float32)
+    log_features = (
+        jnp.sqrt(beta_array) * jnp.einsum(
+            "...r,hr->...h", vectors, projection)
+        - 0.5 * beta_array * jnp.sum(
+            jnp.square(vectors), axis=-1, keepdims=True)
+        - 0.5 * jnp.log(jnp.float32(projection.shape[0])))
+    return jnp.exp(jnp.clip(log_features, -80.0, 80.0))
+
+
+def _build_space_kernel_sketches(
+        operator_keys: Mapping[str, jax.Array],
+        betas: Mapping[str, float]) -> dict[str, jax.Array]:
+    """Materialize one live positive operator-field sketch per pool and space."""
+    result = {}
+    for pool_name in ("qk", "v", "rst"):
+        keys = _unit_normalize(
+            operator_keys[f"{pool_name}_operator_keys"])
+        features = _build_positive_kernel_features(
+            keys, float(betas[pool_name]))
+        result[f"{pool_name}_space_kernel_sketch"] = features.mean(axis=-2)
+    return result
+
+
+def _exact_space_log_field(
+        operator_query: jax.Array, operator_keys: jax.Array, beta: float,
+        valid_operator_mask: Optional[jax.Array] = None) -> jax.Array:
+    """Reference log-mean-exp field over each space's valid operators."""
+    query = _unit_normalize(operator_query)
+    keys = _unit_normalize(operator_keys)
+    cosine = jnp.einsum("...tr,mnr->...tmn", query, keys)
+    if valid_operator_mask is None:
+        valid_operator_mask = jnp.ones(keys.shape[:-1], dtype=jnp.bool_)
+    mask = jnp.asarray(valid_operator_mask, dtype=jnp.bool_)
+    valid_count = jnp.maximum(mask.sum(axis=-1), 1)
+    values = jnp.where(
+        mask, jnp.float32(beta) * (cosine - 1.0), -jnp.inf)
+    return (jax.scipy.special.logsumexp(values, axis=-1)
+            - jnp.log(valid_count.astype(jnp.float32)))
+
+
+def _sketch_space_log_field(
+        operator_query: jax.Array, space_kernel_sketch: jax.Array,
+        beta: float, eps: float = SPACE_KERNEL_EPS) -> jax.Array:
+    """Production positive-sketch log field, returned as ``[...,T,M]``."""
+    query = _unit_normalize(operator_query)
+    query_features = _build_positive_kernel_features(query, float(beta))
+    density = jnp.einsum(
+        "...th,mh->...tm", query_features,
+        jnp.asarray(space_kernel_sketch, dtype=jnp.float32))
+    return jnp.log(jnp.maximum(density, jnp.float32(eps))) - jnp.float32(beta)
+
+
+def _select_operation_spaces(
+        space_log_scores: jax.Array,
+        operation_space_top_k: int) -> tuple[jax.Array, jax.Array]:
+    """Hard top-k IDs with differentiable selected-score softmax weights."""
     selected_scores, selected_ids = jax.lax.top_k(
-        scores, int(operation_space_top_k))
-    selected_weights = jax.nn.softmax(selected_scores, axis=-1)
-    return selected_ids, selected_weights, scores
+        space_log_scores, int(operation_space_top_k))
+    return selected_ids, jax.nn.softmax(selected_scores, axis=-1)
 
 
 def _dense_space_weights(
-        selected_space_ids: jax.Array,
-        selected_space_weights: jax.Array,
-        n_operation_spaces: int,
-) -> jax.Array:
-    """Return exact-zero unselected weights as a flattened ``[T,M]`` matrix."""
-    dense = jnp.sum(
+        selected_space_ids: jax.Array, selected_space_weights: jax.Array,
+        n_operation_spaces: int) -> jax.Array:
+    """Scatter selected semantic weights into exact-zero dense ``[T,M]``."""
+    return jnp.sum(
         jax.nn.one_hot(
             selected_space_ids, int(n_operation_spaces),
             dtype=selected_space_weights.dtype)
-        * selected_space_weights[..., None],
-        axis=-2)
-    return dense.reshape((-1, int(n_operation_spaces)))
+        * selected_space_weights[..., None], axis=-2).reshape(
+            (-1, int(n_operation_spaces)))
 
 
-def _space_weighted_state_writeback(
-        space_results: jax.Array,
-        dense_space_weights: jax.Array,
-        state_writeback_kernel: jax.Array,
-        route_scale: jax.Array | float,
-) -> jax.Array:
-    """Fuse semantic space weighting, space sum, and ``R -> D`` writeback.
-
-    Inputs are ``space_results[M,T,R]``, weights ``[T,M]``, and the
-    route-specific kernel ``[M,R,D]``.  The only weighted intermediate is
-    ``[M,T,R]``.  The einsum contracts directly to ``[T,D]``; a forbidden
-    ``[M,T,D]`` tensor is never materialized.
-    """
-    space_results = jnp.asarray(space_results)
+def _space_weighted_writeback(
+        space_results: jax.Array, dense_space_weights: jax.Array,
+        space_state_writeback: jax.Array,
+        route_scale: jax.Array | float) -> jax.Array:
+    """Fuse semantic weighting and shared decoder without ``[M,T,D]``."""
     if space_results.ndim != 3:
-        raise ValueError(
-            "space_results must have shape [M,T,R], got "
-            f"{space_results.shape}")
-    weighted_results = (
+        raise ValueError("space_results must have shape [M,T,R]")
+    weighted_local = (
         space_results
-        * jnp.swapaxes(dense_space_weights, 0, 1)[..., None])
+        * jnp.swapaxes(dense_space_weights, 0, 1)[..., None]
+        * jnp.asarray(route_scale))
     return jnp.einsum(
-        "mtr,mrd->td", weighted_results * jnp.asarray(route_scale),
-        state_writeback_kernel)
+        "mtr,mrd->td", weighted_local, space_state_writeback)
 
 
-def _materialize_space_operator_keys(
+def _materialize_operator_keys(
         read_vectors: jax.Array, write_vectors: jax.Array,
         read_probe: jax.Array, write_probe: jax.Array) -> jax.Array:
-    """Generate live-gradient operator keys independently inside each space."""
-    if read_vectors.ndim == 2:
-        return _shared_materialize_operator_keys(
-            read_vectors, write_vectors, read_probe, write_probe)
+    """Generate unit operator keys with live gradients to both RW vectors."""
     if read_vectors.ndim != 3:
-        raise ValueError(
-            "space-indexed read/write vectors must be [M,N,R], got "
-            f"{read_vectors.shape}")
-    return jax.vmap(
-        lambda read, write: _shared_materialize_operator_keys(
-            read, write, read_probe, write_probe))(read_vectors, write_vectors)
+        raise ValueError("space-indexed RW vectors must have shape [M,N,R]")
+    return jax.vmap(lambda read, write: _shared_materialize_operator_keys(
+        read, write, read_probe, write_probe))(read_vectors, write_vectors)
+
+
+def _space_read_scalar(
+        space_local_states: jax.Array, read_vectors: jax.Array) -> jax.Array:
+    """Compute ``r_i^T z_m`` for all spaces and operators."""
+    read_unit = _shared_forward_unit_direction(
+        read_vectors.astype(jnp.float32)).astype(jnp.bfloat16)
+    return jnp.einsum(
+        "mtr,mnr->mtn", space_local_states.astype(jnp.bfloat16), read_unit
+    ).astype(jnp.float32)
 
 
 def _rw_compose_space_dense(
         operator_query: jax.Array, operator_keys: jax.Array,
-        raw_operator_tau: jax.Array, read_vectors: jax.Array,
-        write_vectors: jax.Array, *, soft_gate_temperature: float,
-        soft_gate_boundary_power: float, admission_den_power: float,
-        srw_composition_mode: str, heat_kernel_beta: float,
-        execution_prune_eps: float = 0.0, max_chunk_size: int = 2048,
-        diagnostics: bool = False):
-    """Execute every space densely while chunking only the operator axis.
-
-    The physical input/output is ``[M,T,R]`` and each space owns
-    ``[N_per_space,R]`` operator rows.  Operator gates are transient
-    ``[M,T,chunk]`` values.  Production returns only local results;
-    diagnostics additionally returns seven ``[M,T,1]`` aggregates.
-    """
-    if operator_query.ndim == 2:
-        operator_query = operator_query[None, ...]
-    if operator_keys.ndim == 2:
-        operator_keys = operator_keys[None, ...]
-    if raw_operator_tau.ndim == 2:
-        raw_operator_tau = raw_operator_tau[None, ...]
-    if read_vectors.ndim == 2:
-        read_vectors = read_vectors[None, ...]
-    if write_vectors.ndim == 2:
-        write_vectors = write_vectors[None, ...]
-    m, token_count, d_route = operator_query.shape
+        raw_operator_tau: jax.Array, space_local_states: jax.Array,
+        read_vectors: jax.Array, write_vectors: jax.Array, *,
+        shared_read_scalar: Optional[jax.Array] = None,
+        soft_gate_temperature: float, soft_gate_boundary_power: float,
+        admission_den_power: float, srw_composition_mode: str,
+        heat_kernel_beta: float, execution_prune_eps: float = 0.0,
+        max_chunk_size: int = 2048, diagnostics: bool = False):
+    """Execute one route across every space while chunking only operators."""
+    if operator_query.ndim != 2:
+        raise ValueError("operator_query must have shape [T,R]")
+    if space_local_states.ndim != 3 or operator_keys.ndim != 3:
+        raise ValueError("local states/keys must have shapes [M,T,R]/[M,N,R]")
+    m, token_count, d_route = space_local_states.shape
     n_operator = int(operator_keys.shape[1])
-    chunk = min(int(max_chunk_size), n_operator)
+    chunk = min(max(1, int(max_chunk_size)), n_operator)
     n_chunks = math.ceil(n_operator / chunk)
     padded = n_chunks * chunk
     padding = ((0, 0), (0, padded - n_operator), (0, 0))
     keys = jnp.pad(operator_keys, padding)
     reads = jnp.pad(read_vectors, padding)
     writes = jnp.pad(write_vectors, padding)
+    read_scalars = (None if shared_read_scalar is None else jnp.pad(
+        shared_read_scalar, ((0, 0), (0, 0), (0, padded - n_operator))))
     valid = jnp.arange(padded) < n_operator
     query_unit = _shared_forward_unit_direction(
-        operator_query.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        operator_query.astype(jnp.float32)).astype(jnp.bfloat16)
     key_unit = _shared_forward_unit_direction(
-        keys.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        keys.astype(jnp.float32)).astype(jnp.bfloat16)
     read_unit = _shared_forward_unit_direction(
-        reads.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        reads.astype(jnp.float32)).astype(jnp.bfloat16)
     write_unit = _shared_forward_unit_direction(
-        writes.astype(jnp.bfloat16).astype(jnp.float32)).astype(jnp.bfloat16)
+        writes.astype(jnp.float32)).astype(jnp.bfloat16)
     tau = _shared_tau_from_param(raw_operator_tau)
     aggregate_shape = (m, token_count, 1)
     carry = (
@@ -500,7 +498,7 @@ def _rw_compose_space_dense(
         write = jax.lax.dynamic_slice_in_dim(write_unit, start, chunk, axis=1)
         row_valid = jax.lax.dynamic_slice_in_dim(valid, start, chunk, axis=0)
         valid_mask = row_valid[None, None, :]
-        rho = jnp.einsum("mtr,mnr->mtn", query_unit, key).astype(jnp.float32)
+        rho = jnp.einsum("tr,mnr->mtn", query_unit, key).astype(jnp.float32)
         rho = jnp.where(valid_mask, rho, tau)
         margin, gate, depth, execution_weight, _ = _shared_compute_admission_drive(
             rho, tau, soft_gate_temperature,
@@ -512,9 +510,13 @@ def _rw_compose_space_dense(
         gate = jnp.where(valid_mask, gate, 0.0)
         depth = jnp.where(valid_mask, depth, 0.0)
         execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
-        read_value = jnp.einsum(
-            "mtr,mnr->mtn", operator_query.astype(jnp.bfloat16), read
-        ).astype(jnp.float32)
+        if read_scalars is None:
+            read_value = jnp.einsum(
+                "mtr,mnr->mtn", space_local_states.astype(jnp.bfloat16), read
+            ).astype(jnp.float32)
+        else:
+            read_value = jax.lax.dynamic_slice_in_dim(
+                read_scalars, start, chunk, axis=2).astype(jnp.float32)
         chunk_out = jnp.einsum(
             "mtn,mnr->mtr",
             (execution_weight * read_value).astype(jnp.bfloat16), write
@@ -533,8 +535,6 @@ def _rw_compose_space_dense(
      depth_sum), _ = jax.lax.scan(step, carry, jnp.arange(n_chunks))
     gate_den = _shared_composition_den(
         gate_mass, jnp.float32(admission_den_power), srw_composition_mode)
-    # Match the canonical shard-map boundary: model shards contribute BF16
-    # local results before the replicated FP32 route-local output is formed.
     space_results = (raw_out / gate_den).astype(jnp.bfloat16).astype(jnp.float32)
     if not diagnostics:
         return space_results
@@ -542,151 +542,97 @@ def _rw_compose_space_dense(
             depth_sum, tau, gate_den)
 
 
-def _paired_qk_space_execution(
-        stacked_qk_operator_query: jax.Array,
-        qk_operator_keys: jax.Array,
-        stacked_qk_raw_tau: jax.Array,
-        qk_read_vectors: jax.Array,
-        qk_write_vectors: jax.Array,
-        **execution_kwargs) -> jax.Array:
-    """Execute independent Q/K gates against one shared space-indexed bank.
-
-    Q and K arrive as ``[M,T,2,R]`` and return the same shape.  The route axis
-    is paired before attention; it is never retained by the attention core.
-    Selection, operation projection, and tau remain independent.
-    """
+def _qk_shared_read_compose(
+        q_operator_query: jax.Array, k_operator_query: jax.Array,
+        qk_operator_keys: jax.Array, q_raw_tau: jax.Array,
+        k_raw_tau: jax.Array, space_local_states: jax.Array,
+        qk_read_vectors: jax.Array, qk_write_vectors: jax.Array,
+        **execution_kwargs):
+    """Execute Q/K independent gates using one shared read-scalar tensor."""
+    qk_read_scalar = _space_read_scalar(space_local_states, qk_read_vectors)
     q_result = _rw_compose_space_dense(
-        stacked_qk_operator_query[:, :, 0, :], qk_operator_keys,
-        stacked_qk_raw_tau[:, :, 0, :], qk_read_vectors, qk_write_vectors,
-        **execution_kwargs)
+        q_operator_query, qk_operator_keys, q_raw_tau, space_local_states,
+        qk_read_vectors, qk_write_vectors,
+        shared_read_scalar=qk_read_scalar, **execution_kwargs)
     k_result = _rw_compose_space_dense(
-        stacked_qk_operator_query[:, :, 1, :], qk_operator_keys,
-        stacked_qk_raw_tau[:, :, 1, :], qk_read_vectors, qk_write_vectors,
-        **execution_kwargs)
-    return jnp.stack((q_result, k_result), axis=2)
+        k_operator_query, qk_operator_keys, k_raw_tau, space_local_states,
+        qk_read_vectors, qk_write_vectors,
+        shared_read_scalar=qk_read_scalar, **execution_kwargs)
+    return q_result, k_result
 
 
 def _space_selector_metrics(
         selected_ids: jax.Array, selected_weights: jax.Array,
         n_operation_spaces: int, route: str) -> dict[str, jax.Array]:
-    """Small regular metrics computed only from already-selected IDs/weights."""
     m = int(n_operation_spaces)
-    flat_ids = selected_ids.reshape((-1, selected_ids.shape[-1]))
-    flat_weights = selected_weights.reshape((-1, selected_weights.shape[-1]))
-    top1 = flat_ids[:, 0]
-    top1_usage = jax.nn.one_hot(top1, m, dtype=jnp.float32).mean(axis=0)
-    usage = jax.nn.one_hot(flat_ids, m, dtype=jnp.float32).sum(axis=1).mean(axis=0)
-    entropy = -(flat_weights * jnp.log(jnp.maximum(flat_weights, 1e-8))).sum(axis=-1)
-    suffix_values = {
-        "weight_top1_mean": flat_weights[:, 0].mean(),
-        "weight_entropy_mean": entropy.mean(),
-        "usage_min": usage.min(),
-        "usage_max": usage.max(),
-        "usage_std": usage.std(),
-        "dead_frac": (usage == 0).astype(jnp.float32).mean(),
-        "top1_usage_max": top1_usage.max(),
+    ids = selected_ids.reshape((-1, selected_ids.shape[-1]))
+    weights = selected_weights.reshape((-1, selected_weights.shape[-1]))
+    top1_usage = jax.nn.one_hot(
+        ids[:, 0], m, dtype=jnp.float32).mean(axis=0)
+    inclusion = jax.nn.one_hot(
+        ids, m, dtype=jnp.float32).sum(axis=1).mean(axis=0)
+    entropy = -(weights * jnp.log(jnp.maximum(weights, 1.0e-8))).sum(axis=-1)
+    dominant = jnp.argmax(top1_usage)
+    values = {
+        "dominant_space_id": dominant.astype(jnp.float32),
+        "space_top1_rate": top1_usage[dominant],
+        "space_usage_min": inclusion.min(),
+        "space_usage_max": inclusion.max(),
+        "space_usage_std": inclusion.std(),
+        "space_selected_weight_top1": weights[:, 0].mean(),
+        "space_selected_entropy": entropy.mean(),
+        "space_dead_frac": (inclusion == 0).astype(jnp.float32).mean(),
     }
-    values = {}
-    for suffix, value in suffix_values.items():
-        value = jax.lax.stop_gradient(value)
-        values[f"{route}_space_{suffix}"] = value
-        # Deprecated compatibility alias for native v4174 run log consumers.
-        values[f"{route}_address_{suffix}"] = value
-    return values
+    return {f"{route}_{name}": jax.lax.stop_gradient(value)
+            for name, value in values.items()}
 
 
-def operation_space_initialization_diagnostics(
-        operation_space_keys: jax.Array,
-        route_assignments: Mapping[str, tuple[jax.Array, jax.Array, jax.Array]],
-) -> dict[str, float]:
-    """Host-side, one-shot key and initial token-assignment diagnostics."""
-    keys = jax.device_get(jnp.asarray(operation_space_keys, dtype=jnp.float32))
-    norms = jnp.linalg.norm(keys, axis=-1)
-    if (not bool(jnp.all(jnp.isfinite(keys)))
-            or bool(jnp.any(norms <= 0))):
-        raise ValueError("operation_space_keys contain non-finite or zero-norm rows")
-    unit = keys / norms[:, None]
-    cosine = unit @ unit.T
-    offdiag = cosine[~jnp.eye(cosine.shape[0], dtype=jnp.bool_)]
-    if bool(jnp.any(offdiag > 0.95)):
-        raise ValueError("operation_space_keys contain duplicate or near-identical rows")
-    nearest = jnp.max(jnp.where(
-        jnp.eye(cosine.shape[0], dtype=jnp.bool_), -jnp.inf, cosine), axis=-1)
-    out = {
-        "operation_space_pair_cosine_mean": float(offdiag.mean()),
-        "operation_space_pair_cosine_abs_mean": float(jnp.abs(offdiag).mean()),
-        "operation_space_pair_cosine_max": float(offdiag.max()),
-        "operation_space_nearest_neighbor_cosine_mean": float(nearest.mean()),
-        "operation_space_nearest_neighbor_cosine_max": float(nearest.max()),
-    }
-    m = int(keys.shape[0])
-    for route, (ids, weights, scores) in route_assignments.items():
-        ids = jnp.asarray(ids)
-        weights = jnp.asarray(weights)
-        scores = jnp.asarray(scores)
-        top1_usage = jax.nn.one_hot(ids[..., 0], m).reshape((-1, m)).mean(axis=0)
-        topk_usage = jax.nn.one_hot(ids, m).sum(axis=-2).reshape((-1, m)).mean(axis=0)
-        sorted_scores = jnp.sort(scores, axis=-1)
-        gap = sorted_scores[..., -1] - sorted_scores[..., -2]
-        for label, values in (("top1_usage", top1_usage),
-                              ("topk_usage", topk_usage)):
-            out[f"{route}_{label}_min"] = float(values.min())
-            out[f"{route}_{label}_max"] = float(values.max())
-            out[f"{route}_{label}_std"] = float(values.std())
-        out[f"{route}_dead_space_frac"] = float((topk_usage == 0).mean())
-        out[f"{route}_top1_weight_mean"] = float(weights[..., 0].mean())
-        out[f"{route}_weight_entropy"] = float(
-            (-(weights * jnp.log(jnp.maximum(weights, 1e-8))).sum(axis=-1)).mean())
-        out[f"{route}_top1_top2_score_gap"] = float(gap.mean())
+def _space_router_metrics(
+        route_assignments: Mapping[str, tuple[jax.Array, jax.Array]],
+        n_operation_spaces: int) -> dict[str, jax.Array]:
+    """Regular selector diagnostics from already materialized top-k tensors."""
+    out = {}
+    for route, (ids, weights) in route_assignments.items():
+        out.update(_space_selector_metrics(
+            ids, weights, n_operation_spaces, route))
+
+    def agreement(left: str, right: str, name: str):
+        left_ids, right_ids = (
+            route_assignments[left][0], route_assignments[right][0])
+        out[f"{name}_dominant_space_agreement"] = jax.lax.stop_gradient(
+            (left_ids[..., 0] == right_ids[..., 0]).astype(jnp.float32).mean())
+        matches = (left_ids[..., :, None] == right_ids[..., None, :]).sum(
+            axis=(-2, -1)).astype(jnp.float32)
+        out[f"{name}_topk_set_agreement"] = jax.lax.stop_gradient(
+            (matches / float(left_ids.shape[-1])).mean())
+
+    agreement("q", "k", "qk")
+    agreement("q", "v", "qv")
+    agreement("v", "rst", "v_rst")
+    qk_pair = (
+        route_assignments["q"][0][..., 0] * int(n_operation_spaces)
+        + route_assignments["k"][0][..., 0])
+    pair_hist = jax.nn.one_hot(
+        qk_pair, int(n_operation_spaces) ** 2, dtype=jnp.float32
+    ).reshape((-1, int(n_operation_spaces) ** 2)).mean(axis=0)
+    out["topk_pair_concentration"] = jax.lax.stop_gradient(pair_hist.max())
+    all_top1 = jnp.concatenate(tuple(
+        route_assignments[route][0][..., 0].reshape(-1)
+        for route in ROUTES))
+    dominant = jnp.argmax(jax.nn.one_hot(
+        all_top1, int(n_operation_spaces), dtype=jnp.float32).sum(axis=0))
+    second_index = min(1, int(route_assignments["q"][0].shape[-1]) - 1)
+    all_second = jnp.concatenate(tuple(
+        route_assignments[route][0][..., second_index].reshape(-1)
+        for route in ROUTES))
+    second_counts = jax.nn.one_hot(
+        all_second, int(n_operation_spaces), dtype=jnp.float32).sum(axis=0)
+    second_counts = second_counts.at[dominant].set(0.0)
+    second_probability = second_counts / jnp.maximum(second_counts.sum(), 1.0)
+    out["hub_excluded_second_slot_entropy"] = jax.lax.stop_gradient(
+        -jnp.sum(second_probability * jnp.log(jnp.maximum(
+            second_probability, 1.0e-8))))
     return out
-
-
-def initialization_diagnostics_from_params(
-        params: Mapping[str, Any], input_ids: jax.Array,
-        operation_space_top_k: int) -> dict[str, float]:
-    """Build the one-shot host diagnostic outside the training-step graph."""
-    router = params["router"]
-    serialized_key_name = V4174_SERIALIZED_SPACE_PARAM_NAMES[
-        "operation_space_keys"]
-    if serialized_key_name not in router:
-        return {}
-    input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
-    positions = jnp.arange(input_ids.shape[1])[None, :]
-    state = (params["token_emb"]["embedding"][input_ids]
-             + params["pos_emb"]["embedding"][positions])
-    block = params["block_0"]
-    attention_state = _shared_layer_norm(
-        state, block["norm1"]["scale"], block["norm1"]["bias"])
-    rst_state = _shared_layer_norm(
-        state, block["norm2"]["scale"], block["norm2"]["bias"])
-    assignments = {}
-    operation_space_keys = _serialized_space_param(
-        router, "operation_space_keys")
-    for route in ROUTES:
-        route_state = rst_state if route == "rst" else attention_state
-        assignments[route] = _select_operation_spaces(
-            route_state, _serialized_space_param(
-                router, f"{route}_space_query_proj"),
-            operation_space_keys, operation_space_top_k)
-    return operation_space_initialization_diagnostics(
-        operation_space_keys, assignments)
-
-
-def _space_projection(
-        state: jax.Array, params: Mapping[str, jax.Array]) -> jax.Array:
-    """Apply a canonical projection and normalize its space-leading shape."""
-    kernel = params["kernel"]
-    if kernel.ndim == 2:
-        return (_linear(params, state))[None, ...]
-    result = jnp.einsum("...d,mdr->m...r", state, kernel)
-    bias = params.get("bias", 0.0)
-    return result + bias.reshape(
-        (bias.shape[0],) + (1,) * (result.ndim - 2) + (bias.shape[-1],))
-
-
-def _canonical_writeback_kernel(params: Mapping[str, jax.Array]) -> jax.Array:
-    kernel = params["kernel"]
-    return kernel[None, ...] if kernel.ndim == 2 else kernel
 
 
 def _aggregate_operator_diagnostics(
@@ -695,26 +641,23 @@ def _aggregate_operator_diagnostics(
         n_operators_per_space: int, route: str,
         srw_composition_mode: str,
 ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-    """Reduce space-local aggregates according to the reporting contract."""
+    """Reduce space-local gate aggregates on the selected semantic spaces."""
     (space_results, active_count, gate_mass, gate_sq, gate_max,
      depth_sum, tau, gate_den) = diagnostics_values
     ids = selected_ids.reshape((-1, selected_ids.shape[-1]))
     weights = selected_weights.reshape((-1, selected_weights.shape[-1]))
 
     def selected(value):
-        token_major = jnp.swapaxes(value[..., 0], 0, 1)
-        return jnp.take_along_axis(token_major, ids, axis=1)
+        return jnp.take_along_axis(
+            jnp.swapaxes(value[..., 0], 0, 1), ids, axis=1)
 
-    active = selected(active_count)
-    mass = selected(gate_mass)
-    square = selected(gate_sq)
-    maximum = selected(gate_max)
-    depth = selected(depth_sum)
-    tau_selected = selected(tau)
-    den = selected(gate_den)
+    active, mass, square, maximum, depth, tau_selected, den = tuple(
+        selected(value) for value in (
+            active_count, gate_mass, gate_sq, gate_max, depth_sum, tau, gate_den))
     weighted_mean = lambda value: (value * weights).sum(axis=-1).mean()
     floor_mass = _shared_composition_den_floor_mass(srw_composition_mode)
-    floor_compare = jnp.less if srw_composition_mode == "linear_angular" else jnp.less_equal
+    floor_compare = (jnp.less if srw_composition_mode == "linear_angular"
+                     else jnp.less_equal)
     metrics = {
         f"{route}_operator_active_tau_frac": (
             active / float(n_operators_per_space)).mean(),
@@ -731,16 +674,7 @@ def _aggregate_operator_diagnostics(
         f"{route}_operator_den_floor_frac": weighted_mean(
             floor_compare(mass, floor_mass).astype(jnp.float32)),
     }
-    m = int(space_results.shape[0])
-    flat_ids = ids.reshape(-1)
-    flat_weights = weights.reshape(-1)
-    selected_counts = jax.nn.one_hot(flat_ids, m).sum(axis=0)
-    selected_weight_sum = (
-        jax.nn.one_hot(flat_ids, m) * flat_weights[:, None]).sum(axis=0)
     per_space = {
-        f"{route}_per_space_selection_frac": selected_counts / ids.shape[0],
-        f"{route}_per_space_mean_selected_weight": (
-            selected_weight_sum / jnp.maximum(selected_counts, 1.0)),
         f"{route}_per_space_active_frac": (
             active_count[..., 0] / float(n_operators_per_space)).mean(axis=1),
         f"{route}_per_space_active_count": active_count[..., 0].mean(axis=1),
@@ -752,74 +686,170 @@ def _aggregate_operator_diagnostics(
     }
     return (
         {key: jax.lax.stop_gradient(value) for key, value in metrics.items()},
-        {key: jax.lax.stop_gradient(value) for key, value in per_space.items()},
-    )
+        {key: jax.lax.stop_gradient(value) for key, value in per_space.items()})
 
 
 def _canonical_regular_operator_metrics(
         metrics: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
-    """Map v4174 space diagnostics to the shared DirectTau log contract."""
-    route_prefixes = {
-        "q": "attn_q", "k": "attn_k", "v": "attn_v", "rst": "rst"}
-    suffixes = {
-        "active_tau_frac": "active_tau_frac",
-        "active_tau_count": "active_tau_count",
-        "tau_mean": "tau_mean",
-        "gate_mass_mean": "gate_mass",
-        "gate_den_mean": "gate_den",
-        "depth_active_mean": "depth_active",
-        "gate_eff_n_mean": "gate_eff_n",
-        "top1_gate_frac_mean": "top1_gate_frac",
-        "den_floor_frac": "den_floor_frac",
-    }
-    required = {
-        f"{route}_operator_{source_suffix}"
-        for route in route_prefixes for source_suffix in suffixes}
-    required.update({
-        "q_route_output_norm", "k_route_output_norm",
-        "v_route_output_norm", "rst_route_update_norm",
-        "attn_out_norm", "rst_out_norm", "residual_norm",
-    })
-    missing = tuple(sorted(required.difference(metrics)))
-    if missing:
-        raise KeyError(
-            "v4174 canonical regular diagnostics are incomplete: "
-            + ", ".join(missing))
-
-    out: dict[str, jax.Array] = {}
-    for route, prefix in route_prefixes.items():
-        for source_suffix, canonical_suffix in suffixes.items():
-            out[f"{prefix}_{canonical_suffix}"] = metrics[
-                f"{route}_operator_{source_suffix}"]
-    for canonical_suffix in suffixes.values():
-        out[f"attn_qk_{canonical_suffix}"] = jnp.float32(0.5) * (
-            out[f"attn_q_{canonical_suffix}"]
-            + out[f"attn_k_{canonical_suffix}"])
-
-    out.update({
-        "attn_qk_admission_mass_mean": out["attn_qk_gate_mass"],
-        "attn_v_admission_mass_mean": out["attn_v_gate_mass"],
-        "rst_admission_mass_mean": out["rst_gate_mass"],
-        "attn_qk_composition_den_mean": out["attn_qk_gate_den"],
-        "attn_v_composition_den_mean": out["attn_v_gate_den"],
-        "rst_composition_den_mean": out["rst_gate_den"],
-        "attn_qk_composition_den_floor_frac": out[
-            "attn_qk_den_floor_frac"],
-        "attn_v_composition_den_floor_frac": out[
-            "attn_v_den_floor_frac"],
-        "rst_composition_den_floor_frac": out["rst_den_floor_frac"],
+    """Map route-local observations into the trainer's pool-level schema."""
+    qk = lambda suffix: jnp.float32(0.5) * (
+        metrics[f"q_operator_{suffix}"] + metrics[f"k_operator_{suffix}"])
+    out = {
+        "attn_qk_admission_mass_mean": qk("gate_mass_mean"),
+        "attn_v_admission_mass_mean": metrics["v_operator_gate_mass_mean"],
+        "rst_admission_mass_mean": metrics["rst_operator_gate_mass_mean"],
+        "attn_qk_composition_den_mean": qk("gate_den_mean"),
+        "attn_v_composition_den_mean": metrics["v_operator_gate_den_mean"],
+        "rst_composition_den_mean": metrics["rst_operator_gate_den_mean"],
+        "attn_qk_composition_den_floor_frac": qk("den_floor_frac"),
+        "attn_v_composition_den_floor_frac": metrics[
+            "v_operator_den_floor_frac"],
+        "rst_composition_den_floor_frac": metrics[
+            "rst_operator_den_floor_frac"],
         "attn_qk_pool_scaled_srw_out_norm": jnp.float32(0.5) * (
-            metrics["q_route_output_norm"]
-            + metrics["k_route_output_norm"]),
+            metrics["q_route_output_norm"] + metrics["k_route_output_norm"]),
         "attn_v_pool_scaled_srw_out_norm": metrics["v_route_output_norm"],
         "rst_pool_scaled_srw_out_norm": metrics["rst_route_update_norm"],
-    })
+    }
+    return {key: jax.lax.stop_gradient(value) for key, value in out.items()}
+
+
+def _rank_values(value: jax.Array) -> jax.Array:
+    order = jnp.argsort(value, axis=-1)
+    return jnp.argsort(order, axis=-1).astype(jnp.float32)
+
+
+def _correlation(left: jax.Array, right: jax.Array) -> jax.Array:
+    left = left.reshape(-1).astype(jnp.float32)
+    right = right.reshape(-1).astype(jnp.float32)
+    left = left - left.mean()
+    right = right - right.mean()
+    return jnp.sum(left * right) / jnp.maximum(
+        jnp.linalg.norm(left) * jnp.linalg.norm(right), 1.0e-8)
+
+
+def _kernel_sketch_reference_metrics(
+        operator_query: jax.Array, operator_keys: jax.Array,
+        space_kernel_sketch: jax.Array, beta: float,
+        operation_space_top_k: int) -> dict[str, jax.Array]:
+    """Compare production sketch scores against the exact operator field."""
+    exact = _exact_space_log_field(operator_query, operator_keys, beta)
+    sketch = _sketch_space_log_field(
+        operator_query, space_kernel_sketch, beta)
+    exact_ids, exact_weights = _select_operation_spaces(
+        exact, operation_space_top_k)
+    sketch_ids, sketch_weights = _select_operation_spaces(
+        sketch, operation_space_top_k)
+    topk_matches = (exact_ids[..., :, None] == sketch_ids[..., None, :]).sum(
+        axis=(-2, -1)).astype(jnp.float32) / float(operation_space_top_k)
+    error = jnp.abs(sketch - exact)
     return {
-        key: jax.lax.stop_gradient(value) for key, value in out.items()}
+        "pearson": _correlation(sketch, exact),
+        "rank_correlation": _correlation(
+            _rank_values(sketch), _rank_values(exact)),
+        "top1_agreement": (
+            sketch_ids[..., 0] == exact_ids[..., 0]).astype(jnp.float32).mean(),
+        "topk_set_agreement": topk_matches.mean(),
+        "selected_weight_abs_difference": jnp.abs(
+            sketch_weights - exact_weights).mean(),
+        "maximum_log_score_error": error.max(),
+        "mean_log_score_error": error.mean(),
+        "all_scores_finite": jnp.all(jnp.isfinite(sketch)).astype(jnp.float32),
+    }
+
+
+def _space_geometry_diagnostics(
+        space_state_proj: jax.Array,
+        space_state_writeback: jax.Array,
+        state: Optional[jax.Array] = None) -> dict[str, jax.Array]:
+    """Rare-cadence projection rank, overlap, and local-state geometry."""
+    projection = jnp.asarray(space_state_proj, dtype=jnp.float32)
+    stacked = jnp.swapaxes(projection, -1, -2).reshape(
+        (-1, projection.shape[1]))
+    singular = jnp.linalg.svd(stacked, compute_uv=False)
+    probability = singular / jnp.maximum(singular.sum(), 1.0e-8)
+    effective_rank = jnp.exp(-jnp.sum(
+        probability * jnp.log(jnp.maximum(probability, 1.0e-8))))
+    basis_overlap = jnp.einsum("mdr,nds->mnrs", projection, projection)
+    principal_cosines = jax.vmap(lambda row: jax.vmap(
+        lambda cross: jnp.linalg.svd(cross, compute_uv=False))(row))(
+            basis_overlap)
+    principal_angles = jnp.arccos(jnp.clip(principal_cosines, -1.0, 1.0))
+    frobenius = jnp.einsum("mdr,ndr->mn", projection, projection)
+    diagonal = jnp.sqrt(jnp.maximum(jnp.diag(frobenius), 1.0e-8))
+    overlap = frobenius / (diagonal[:, None] * diagonal[None, :])
+    mask = ~jnp.eye(projection.shape[0], dtype=jnp.bool_)
+    out = {
+        "stacked_projection_singular_values": singular,
+        "stacked_projection_rank": jnp.linalg.matrix_rank(stacked),
+        "stacked_projection_effective_rank": effective_rank,
+        "space_projection_pairwise_overlap": overlap[mask],
+        "space_subspace_principal_angles": principal_angles[mask],
+        "encoder_writeback_init_error": jnp.max(jnp.abs(
+            jnp.swapaxes(projection, -1, -2) - space_state_writeback)),
+    }
+    if state is not None:
+        local = _project_space_local_states(state, projection)
+        covariance = jnp.einsum("mtr,nts->mnrs", local, local) / jnp.maximum(
+            state.shape[0], 1)
+        covariance_norm = jnp.linalg.norm(covariance, axis=(-2, -1))
+        covariance_diag = jnp.sqrt(jnp.maximum(
+            jnp.diag(covariance_norm), 1.0e-8))
+        covariance_overlap = covariance_norm / (
+            covariance_diag[:, None] * covariance_diag[None, :])
+        variance = jnp.var(local, axis=1).sum(axis=-1)
+        out.update({
+            "space_local_state_covariance_overlap": covariance_overlap[mask],
+            "space_local_state_norm": jnp.linalg.norm(
+                local, axis=-1).mean(axis=-1),
+            "space_explained_variance": variance / jnp.maximum(
+                variance.sum(), 1.0e-8),
+        })
+    return out
+
+
+def _operator_field_geometry_diagnostics(
+        operator_keys: Mapping[str, jax.Array],
+        sketches: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
+    """Rare-cadence live operator-field geometry by pool and space."""
+    out = {}
+    for pool in ("qk", "v", "rst"):
+        keys = operator_keys[f"{pool}_operator_keys"].astype(jnp.float32)
+        covariance = jnp.einsum("mnr,mns->mrs", keys, keys) / keys.shape[1]
+        eigenvalues = jnp.linalg.eigvalsh(covariance)
+        probability = eigenvalues / jnp.maximum(
+            eigenvalues.sum(axis=-1, keepdims=True), 1.0e-8)
+        effective_rank = jnp.exp(-jnp.sum(
+            probability * jnp.log(jnp.maximum(probability, 1.0e-8)), axis=-1))
+        sketch = sketches[f"{pool}_space_kernel_sketch"]
+        sketch_similarity = jnp.einsum("mh,nh->mn", sketch, sketch)
+        sketch_norm = jnp.linalg.norm(sketch, axis=-1)
+        sketch_similarity = sketch_similarity / jnp.maximum(
+            sketch_norm[:, None] * sketch_norm[None, :], 1.0e-8)
+        sample_count = min(256, int(keys.shape[1]))
+        sample_index = jnp.linspace(
+            0, int(keys.shape[1]) - 1, sample_count).astype(jnp.int32)
+        sampled_keys = keys[:, sample_index]
+        cross_similarity = jnp.einsum(
+            "mir,njr->mnij", sampled_keys, sampled_keys)
+        cross_nearest = cross_similarity.max(axis=(-2, -1))
+        cross_mask = ~jnp.eye(keys.shape[0], dtype=jnp.bool_)
+        out.update({
+            f"{pool}_operator_key_covariance_effective_rank": effective_rank,
+            f"{pool}_space_kernel_field_mass": sketch.sum(axis=-1),
+            f"{pool}_space_field_pairwise_similarity": sketch_similarity,
+            f"{pool}_cross_space_nearest_operator_similarity": cross_nearest[
+                cross_mask],
+            f"{pool}_operator_key_mean_norm": jnp.linalg.norm(
+                keys, axis=-1).mean(axis=-1),
+            f"{pool}_operator_key_angular_spread": jnp.std(
+                jnp.einsum("mnr,mr->mn", keys, keys.mean(axis=1)), axis=-1),
+        })
+    return out
 
 
 class DAWN_SRW_V4174(nn.Module):
-    """Transformer whose four routes share one operation-space codebook."""
+    """Canonical shared-local-state, operator-field-routed DAWN-SRW."""
     __version__ = MODEL_VERSION
 
     vocab_size: int = 30000
@@ -839,12 +869,15 @@ class DAWN_SRW_V4174(nn.Module):
     admission_den_power_rst: Optional[float] = None
     srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE
     heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA
-    n_qk: int = 1580
-    n_v: int = 2600
+    n_qk: int = 1581
+    n_v: int = 2601
     n_rst: Optional[int] = None
     n_know: Optional[int] = None
-    n_operation_spaces: int = 1
-    operation_space_top_k: int = 1
+    n_operation_spaces: int = 3
+    operation_space_top_k: int = 2
+    space_kernel_beta_qk: float = 1.0
+    space_kernel_beta_v: float = 1.0
+    space_kernel_beta_rst: float = 1.0
     router_dropout: float = 0.1
     n_chunks_rst: Optional[int] = None
     n_chunks_know: int = 1
@@ -864,24 +897,29 @@ class DAWN_SRW_V4174(nn.Module):
 
     def setup(self):
         if self.operator_key_mode != OPERATOR_KEY_MODE:
-            raise ValueError(
-                f"v4174 requires operator_key_mode={OPERATOR_KEY_MODE!r}")
+            raise ValueError(f"v4174 requires operator_key_mode={OPERATOR_KEY_MODE!r}")
         if self.d_model % self.n_heads:
             raise ValueError("d_model must be divisible by n_heads")
         m = _positive_int("n_operation_spaces", self.n_operation_spaces)
         k = _positive_int("operation_space_top_k", self.operation_space_top_k)
-        if k > m:
-            raise ValueError("operation_space_top_k exceeds n_operation_spaces")
+        if k > m or self.d_model != m * self.d_route:
+            raise ValueError("v4174 requires K <= M and D == M * R")
         n_rst = int(self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200))
-        for name, value in (("n_qk", self.n_qk), ("n_v", self.n_v),
-                            ("n_rst", n_rst)):
+        for name, value in (
+                ("n_qk", self.n_qk), ("n_v", self.n_v), ("n_rst", n_rst)):
             if int(value) % m:
                 raise ValueError(f"{name} must be divisible by n_operation_spaces")
         if any(value is None for value in (
                 self.tau_init_attn_qk, self.tau_init_attn_v,
                 self.tau_init_rst)):
             raise ValueError("v4174 requires explicit initial operator tau values")
+        for name, value in (
+                ("qk", self.space_kernel_beta_qk),
+                ("v", self.space_kernel_beta_v),
+                ("rst", self.space_kernel_beta_rst)):
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"space kernel beta {name} must be positive")
         _, embedding_vocab = self._vocab_sizes()
         self.token_emb = nn.Embed(
             embedding_vocab, self.d_model,
@@ -906,18 +944,13 @@ class DAWN_SRW_V4174(nn.Module):
         self.norm = nn.LayerNorm()
 
     def _realize_parameters(self, state: jax.Array) -> None:
-        """Create every canonical parameter during ``init`` without a heavy RW run."""
         _ = self.neuron_pool.qk_read_vectors
+        local = jnp.einsum(
+            "bsd,mdr->mbsr", state, self.router.space_state_proj)
         for route in ROUTES:
-            _ = getattr(self.router, f"{route}_operation_proj")(state)
-            _ = getattr(self.router, f"{route}_operator_tau_proj")(state)
-        if int(self.n_operation_spaces) > 1:
-            _ = self.router.operation_space_keys
-            for route in ROUTES:
-                _ = getattr(self.router, f"{route}_space_query_proj")(state)
-        local_zero = jnp.zeros((*state.shape[:-1], self.d_route), state.dtype)
-        for name in ("qk", "v", "rst"):
-            _ = getattr(self.router, f"{name}_state_writeback")(local_zero)
+            _ = getattr(self.router, f"{route}_operator_query_proj")(state)
+            _ = getattr(self.router, f"{route}_operator_tau_proj")(local)
+        _ = self.router.space_state_writeback
         for layer in self.layers:
             _ = layer.norm1(state)
             _ = layer.norm2(state)
@@ -936,33 +969,36 @@ class DAWN_SRW_V4174(nn.Module):
             minimal_train=False, minimal_runtime_profile="training",
             ce_token_chunk_size=32768, compute_accuracy=True,
             **analysis_kwargs):
-        """Run all-space dense routing; heavy arrays require analysis cadence."""
+        """Run the single canonical all-space dense architecture."""
         del (attention_mask, soft_gate_t_final,
              soft_gate_boundary_power_final, admission_den_power,
              heat_kernel_beta, minimal_train, ce_token_chunk_size,
              analysis_kwargs)
-        m = int(self.n_operation_spaces)
-        top_k = int(self.operation_space_top_k)
-        n_rst_effective = int(self.n_rst if self.n_rst is not None else (
+        m, top_k = int(self.n_operation_spaces), int(self.operation_space_top_k)
+        n_rst = int(self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200))
         if input_ids.shape[1] > self.max_seq_len:
             raise ValueError("sequence length exceeds max_seq_len")
         composition_mode = str(srw_composition_mode or self.srw_composition_mode)
-        qk_power = float(self.admission_den_power_qk
-                         if self.admission_den_power_qk is not None
-                         else self.admission_den_power)
-        v_power = float(self.admission_den_power_v
-                        if self.admission_den_power_v is not None
-                        else self.admission_den_power)
-        rst_power = float(self.admission_den_power_rst
-                          if self.admission_den_power_rst is not None
-                          else self.admission_den_power)
-        soft_gate_T_qk = float(soft_gate_temperature if soft_gate_T_qk is None
-                               else soft_gate_T_qk)
-        soft_gate_T_v = float(soft_gate_temperature if soft_gate_T_v is None
-                              else soft_gate_T_v)
-        soft_gate_T_rst = float(soft_gate_temperature if soft_gate_T_rst is None
-                                else soft_gate_T_rst)
+        den_powers = {
+            "qk": float(self.admission_den_power_qk
+                        if self.admission_den_power_qk is not None
+                        else self.admission_den_power),
+            "v": float(self.admission_den_power_v
+                       if self.admission_den_power_v is not None
+                       else self.admission_den_power),
+            "rst": float(self.admission_den_power_rst
+                         if self.admission_den_power_rst is not None
+                         else self.admission_den_power),
+        }
+        temperatures = {
+            "qk": float(soft_gate_temperature if soft_gate_T_qk is None
+                        else soft_gate_T_qk),
+            "v": float(soft_gate_temperature if soft_gate_T_v is None
+                       else soft_gate_T_v),
+            "rst": float(soft_gate_temperature if soft_gate_T_rst is None
+                         else soft_gate_T_rst),
+        }
         positions = jnp.arange(input_ids.shape[1])[None, :]
         vocab_embed = (sharded_fns.get("vocab_parallel_embedding")
                        if isinstance(sharded_fns, dict) else None)
@@ -980,190 +1016,142 @@ class DAWN_SRW_V4174(nn.Module):
                     if embedding != logical else logits}
 
         params = self.variables["params"]
-        pool = params["neuron_pool"]
-        router = params["router"]
-        read_probe = pool["operator_key_read_probe"]
-        write_probe = pool["operator_key_write_probe"]
-        bank_values: dict[str, tuple[jax.Array, jax.Array, jax.Array]] = {}
-        for name in ("qk", "v", "rst"):
-            read = pool[f"{name}_read_vectors"]
-            write = pool[f"{name}_write_vectors"]
-            bank_values[name] = (
-                read, write, _materialize_space_operator_keys(
-                    read, write, read_probe, write_probe))
+        pool, router = params["neuron_pool"], params["router"]
+        operator_keys = _pool_operator_keys(pool)
+        betas = {
+            "qk": float(self.space_kernel_beta_qk),
+            "v": float(self.space_kernel_beta_v),
+            "rst": float(self.space_kernel_beta_rst),
+        }
+        sketches = _build_space_kernel_sketches(operator_keys, betas)
+        bank_values = {
+            name: (pool[f"{name}_read_vectors"],
+                   pool[f"{name}_write_vectors"],
+                   operator_keys[f"{name}_operator_keys"])
+            for name in ("qk", "v", "rst")}
         qk_scale, v_scale, rst_scale = _shared_pool_output_scales(
             self.d_model, self.n_layers)
-        base_rng = self.make_rng("dropout")
-        layer_rngs = jax.random.split(base_rng, self.n_layers)
-        selector_metrics: dict[str, list[jax.Array]] = {}
-        operator_metrics: dict[str, list[jax.Array]] = {}
-        analysis_arrays: dict[str, list[jax.Array]] = {}
+        layer_rngs = jax.random.split(self.make_rng("dropout"), self.n_layers)
         diagnostics_enabled = (
             minimal_runtime_profile == "diagnostics" or analysis)
+        regular_lists: dict[str, list[jax.Array]] = {}
+        analysis_lists: dict[str, list[jax.Array]] = {}
+        last_local_input = None
 
-        def execute_space_route(
-                route_key, operator_query, operator_keys, raw_tau,
-                read_vectors, write_vectors, *, temperature, den_power):
-            kernel = (sharded_fns.get(route_key)
-                      if isinstance(sharded_fns, dict) else None)
-            if kernel is not None and m > 1:
-                token_valid = jnp.ones(
-                    operator_query.shape[:2], dtype=jnp.bool_)
-                return kernel(
-                    operator_query, operator_keys, raw_tau, token_valid,
-                    read_vectors, write_vectors,
-                    temperature, temperature,
-                    soft_gate_boundary_power, soft_gate_boundary_power,
-                    execution_prune_eps)
+        def append(target, values):
+            for key, value in values.items():
+                target.setdefault(key, []).append(value)
+
+        def execute(route, query, raw_tau, local_states):
+            pool_name = "qk" if route in ("q", "k") else route
+            read, write, keys = bank_values[pool_name]
             return _rw_compose_space_dense(
-                operator_query, operator_keys, raw_tau,
-                read_vectors, write_vectors,
-                soft_gate_temperature=temperature,
+                query, keys, raw_tau, local_states, read, write,
+                soft_gate_temperature=temperatures[pool_name],
                 soft_gate_boundary_power=soft_gate_boundary_power,
-                admission_den_power=den_power,
+                admission_den_power=den_powers[pool_name],
                 srw_composition_mode=composition_mode,
                 heat_kernel_beta=self.heat_kernel_beta,
                 execution_prune_eps=execution_prune_eps,
                 diagnostics=diagnostics_enabled)
 
         for layer_index, layer in enumerate(self.layers):
-            rng, rng_attn, rng_rst = jax.random.split(layer_rngs[layer_index], 3)
+            rng, rng_attn, rng_rst = jax.random.split(
+                layer_rngs[layer_index], 3)
             normalized = layer.norm1(state)
-            route_ids: dict[str, jax.Array] = {}
-            route_weights: dict[str, jax.Array] = {}
-            dense_weights: dict[str, jax.Array] = {}
-            if m == 1:
-                shape = (*normalized.shape[:2], 1)
-                for route in ROUTES:
-                    route_ids[route] = jnp.zeros(shape, dtype=jnp.int32)
-                    route_weights[route] = jnp.ones(shape, dtype=jnp.float32)
-                    dense_weights[route] = jnp.ones(
-                        (normalized.shape[0] * normalized.shape[1], 1),
-                        dtype=jnp.float32)
-            else:
-                operation_space_keys = _serialized_space_param(
-                    router, "operation_space_keys")
-                for route in ("q", "k", "v"):
-                    ids, weights, _ = _select_operation_spaces(
-                        normalized, _serialized_space_param(
-                            router, f"{route}_space_query_proj"),
-                        operation_space_keys, top_k)
-                    route_ids[route], route_weights[route] = ids, weights
-                    dense_weights[route] = _dense_space_weights(ids, weights, m)
+            batch_size, sequence_length = normalized.shape[:2]
+            flat_state = normalized.reshape((-1, self.d_model))
+            last_local_input = flat_state
+            space_local_states = _project_space_local_states(
+                flat_state, router["space_state_proj"])
+            queries = {
+                route: _shared_forward_unit_direction(_linear(
+                    router[f"{route}_operator_query_proj"], flat_state
+                ).astype(jnp.float32))
+                for route in ("q", "k", "v")}
+            tau = {
+                route: _linear(
+                    router[f"{route}_operator_tau_proj"], space_local_states)
+                for route in ROUTES}
+            assignments = {}
+            dense_weights = {}
+            score_values = {}
             for route in ("q", "k", "v"):
-                for key, value in _space_selector_metrics(
-                        route_ids[route], route_weights[route], m, route).items():
-                    selector_metrics.setdefault(key, []).append(value)
-            flat_attention_state = normalized.reshape((-1, self.d_model))
-            query_values = {
-                route: _space_projection(
-                    normalized, router[f"{route}_operation_proj"]
-                ).reshape((m, -1, self.d_route))
-                for route in ("q", "k", "v")}
-            tau_values = {
-                route: _space_projection(
-                    normalized, router[f"{route}_operator_tau_proj"]
-                ).reshape((m, -1, 1))
-                for route in ("q", "k", "v")}
-            qk_execution_kwargs = dict(
-                soft_gate_temperature=soft_gate_T_qk,
+                pool_name = "qk" if route in ("q", "k") else route
+                scores = _sketch_space_log_field(
+                    queries[route],
+                    sketches[f"{pool_name}_space_kernel_sketch"],
+                    betas[pool_name])
+                ids, weights = _select_operation_spaces(scores, top_k)
+                assignments[route] = (
+                    ids.reshape((batch_size, sequence_length, top_k)),
+                    weights.reshape((batch_size, sequence_length, top_k)))
+                dense_weights[route] = _dense_space_weights(ids, weights, m)
+                score_values[route] = scores
+
+            qk_kwargs = dict(
+                soft_gate_temperature=temperatures["qk"],
                 soft_gate_boundary_power=soft_gate_boundary_power,
-                admission_den_power=qk_power,
+                admission_den_power=den_powers["qk"],
                 srw_composition_mode=composition_mode,
                 heat_kernel_beta=self.heat_kernel_beta,
                 execution_prune_eps=execution_prune_eps,
                 diagnostics=diagnostics_enabled)
-            qk_paired = jnp.stack((query_values["q"], query_values["k"]), axis=2)
-            qk_tau = jnp.stack((tau_values["q"], tau_values["k"]), axis=2)
-            qk_read, qk_write, qk_keys = bank_values["qk"]
-            paired_space_kernel = (
-                sharded_fns.get("qk_space_dense")
-                if isinstance(sharded_fns, dict) and m > 1 else None)
-            if paired_space_kernel is not None:
-                paired_result = paired_space_kernel(
-                    qk_paired, qk_keys, qk_tau,
-                    jnp.ones(qk_paired.shape[:2], dtype=jnp.bool_),
-                    qk_read, qk_write,
-                    soft_gate_T_qk, soft_gate_T_qk,
-                    soft_gate_boundary_power, soft_gate_boundary_power,
-                    execution_prune_eps)
-                if diagnostics_enabled:
-                    q_diag, k_diag = paired_result
-                else:
-                    q_space_outputs = paired_result[:, :, 0]
-                    k_space_outputs = paired_result[:, :, 1]
-            elif diagnostics_enabled:
-                q_diag = execute_space_route(
-                    "q_space_dense", qk_paired[:, :, 0], qk_keys,
-                    qk_tau[:, :, 0], qk_read, qk_write,
-                    temperature=soft_gate_T_qk, den_power=qk_power)
-                k_diag = execute_space_route(
-                    "k_space_dense", qk_paired[:, :, 1], qk_keys,
-                    qk_tau[:, :, 1], qk_read, qk_write,
-                    temperature=soft_gate_T_qk, den_power=qk_power)
+            q_result, k_result = _qk_shared_read_compose(
+                queries["q"], queries["k"], bank_values["qk"][2],
+                tau["q"], tau["k"], space_local_states,
+                bank_values["qk"][0], bank_values["qk"][1], **qk_kwargs)
             if diagnostics_enabled:
-                q_space_outputs, k_space_outputs = q_diag[0], k_diag[0]
-                for route, diag in (("q", q_diag), ("k", k_diag)):
+                q_space_outputs, k_space_outputs = q_result[0], k_result[0]
+                for route, diag in (("q", q_result), ("k", k_result)):
                     scalar, arrays = _aggregate_operator_diagnostics(
-                        diag, route_ids[route], route_weights[route],
-                        self.n_qk // m, route, composition_mode)
-                    for key, value in scalar.items():
-                        operator_metrics.setdefault(key, []).append(value)
+                        diag, *assignments[route], self.n_qk // m,
+                        route, composition_mode)
+                    append(regular_lists, scalar)
                     if analysis:
-                        for key, value in arrays.items():
-                            analysis_arrays.setdefault(key, []).append(value)
-            elif paired_space_kernel is None:
-                paired_result = _paired_qk_space_execution(
-                    qk_paired, qk_keys, qk_tau, qk_read, qk_write,
-                    **qk_execution_kwargs)
-                q_space_outputs = paired_result[:, :, 0]
-                k_space_outputs = paired_result[:, :, 1]
-            q_route_output = _space_weighted_state_writeback(
-                q_space_outputs, dense_weights["q"],
-                _canonical_writeback_kernel(router["qk_state_writeback"]),
+                        append(analysis_lists, arrays)
+            else:
+                q_space_outputs, k_space_outputs = q_result, k_result
+            shared_writeback = router["space_state_writeback"]
+            q_route_output = _space_weighted_writeback(
+                q_space_outputs, dense_weights["q"], shared_writeback,
                 qk_scale).reshape(normalized.shape)
-            k_route_output = _space_weighted_state_writeback(
-                k_space_outputs, dense_weights["k"],
-                _canonical_writeback_kernel(router["qk_state_writeback"]),
+            k_route_output = _space_weighted_writeback(
+                k_space_outputs, dense_weights["k"], shared_writeback,
                 qk_scale).reshape(normalized.shape)
-            v_read, v_write, v_keys = bank_values["v"]
-            v_execution_kwargs = dict(qk_execution_kwargs)
-            v_execution_kwargs["soft_gate_temperature"] = soft_gate_T_v
-            v_execution_kwargs["admission_den_power"] = v_power
-            v_result = execute_space_route(
-                "v_space_dense", query_values["v"], v_keys,
-                tau_values["v"], v_read, v_write,
-                temperature=soft_gate_T_v, den_power=v_power)
+
+            v_result = execute("v", queries["v"], tau["v"], space_local_states)
             if diagnostics_enabled:
                 v_space_outputs = v_result[0]
                 scalar, arrays = _aggregate_operator_diagnostics(
-                    v_result, route_ids["v"], route_weights["v"],
-                    self.n_v // m, "v", composition_mode)
-                for key, value in scalar.items():
-                    operator_metrics.setdefault(key, []).append(value)
+                    v_result, *assignments["v"], self.n_v // m,
+                    "v", composition_mode)
+                append(regular_lists, scalar)
                 if analysis:
-                    for key, value in arrays.items():
-                        analysis_arrays.setdefault(key, []).append(value)
+                    append(analysis_lists, arrays)
             else:
                 v_space_outputs = v_result
-            v_route_output = _space_weighted_state_writeback(
-                v_space_outputs, dense_weights["v"],
-                _canonical_writeback_kernel(router["v_state_writeback"]),
+            v_route_output = _space_weighted_writeback(
+                v_space_outputs, dense_weights["v"], shared_writeback,
                 v_scale).reshape(normalized.shape)
-            batch_size, sequence_length = normalized.shape[:2]
+
             d_head = self.d_model // self.n_heads
             query = q_route_output.reshape(
-                batch_size, sequence_length, self.n_heads, d_head).transpose(0, 2, 1, 3)
+                batch_size, sequence_length, self.n_heads, d_head).transpose(
+                    0, 2, 1, 3)
             key = k_route_output.reshape(
-                batch_size, sequence_length, self.n_heads, d_head).transpose(0, 2, 1, 3)
+                batch_size, sequence_length, self.n_heads, d_head).transpose(
+                    0, 2, 1, 3)
             value = v_route_output.reshape(
-                batch_size, sequence_length, self.n_heads, d_head).transpose(0, 2, 1, 3)
+                batch_size, sequence_length, self.n_heads, d_head).transpose(
+                    0, 2, 1, 3)
             attention_scores = jnp.einsum(
                 "bhsd,bhtd->bhst", query, key) / jnp.sqrt(jnp.float32(d_head))
             causal = jnp.tril(jnp.ones(
                 (sequence_length, sequence_length), dtype=jnp.bool_))
             attention_scores = jnp.where(
-                causal, attention_scores, jnp.finfo(attention_scores.dtype).min)
+                causal, attention_scores,
+                jnp.finfo(attention_scores.dtype).min)
             attention_weights = jax.nn.softmax(attention_scores, axis=-1)
             attention_weights = _shared_safe_dropout(
                 attention_weights, self.dropout_rate, deterministic, rng_attn)
@@ -1175,68 +1163,65 @@ class DAWN_SRW_V4174(nn.Module):
             state = state + _shared_safe_dropout(
                 attention_output, self.dropout_rate, deterministic, rng)
 
-            normalized = layer.norm2(state)
-            if m > 1:
-                ids, weights, _ = _select_operation_spaces(
-                    normalized, _serialized_space_param(
-                        router, "rst_space_query_proj"),
-                    operation_space_keys, top_k)
-                route_ids["rst"], route_weights["rst"] = ids, weights
-                dense_weights["rst"] = _dense_space_weights(ids, weights, m)
-            for key, value in _space_selector_metrics(
-                    route_ids["rst"], route_weights["rst"], m, "rst").items():
-                selector_metrics.setdefault(key, []).append(value)
-            rst_query = _space_projection(
-                normalized, router["rst_operation_proj"]).reshape(
-                    (m, -1, self.d_route))
-            rst_tau = _space_projection(
-                normalized, router["rst_operator_tau_proj"]).reshape((m, -1, 1))
-            rst_read_vectors, rst_write_vectors, rst_keys = bank_values["rst"]
-            rst_result = execute_space_route(
-                "rst_space_dense", rst_query, rst_keys, rst_tau,
-                rst_read_vectors, rst_write_vectors,
-                temperature=soft_gate_T_rst, den_power=rst_power)
+            rst_state = layer.norm2(state).reshape((-1, self.d_model))
+            rst_query = _shared_forward_unit_direction(_linear(
+                router["rst_operator_query_proj"], rst_state).astype(jnp.float32))
+            queries["rst"] = rst_query
+            rst_scores = _sketch_space_log_field(
+                rst_query, sketches["rst_space_kernel_sketch"], betas["rst"])
+            rst_ids, rst_weights = _select_operation_spaces(rst_scores, top_k)
+            assignments["rst"] = (
+                rst_ids.reshape((batch_size, sequence_length, top_k)),
+                rst_weights.reshape((batch_size, sequence_length, top_k)))
+            dense_weights["rst"] = _dense_space_weights(
+                rst_ids, rst_weights, m)
+            score_values["rst"] = rst_scores
+            rst_result = execute(
+                "rst", rst_query, tau["rst"], space_local_states)
             if diagnostics_enabled:
                 rst_space_updates = rst_result[0]
                 scalar, arrays = _aggregate_operator_diagnostics(
-                    rst_result, route_ids["rst"], route_weights["rst"],
-                    n_rst_effective // m, "rst", composition_mode)
-                for key, value in scalar.items():
-                    operator_metrics.setdefault(key, []).append(value)
+                    rst_result, *assignments["rst"], n_rst // m,
+                    "rst", composition_mode)
+                append(regular_lists, scalar)
                 if analysis:
-                    for key, value in arrays.items():
-                        analysis_arrays.setdefault(key, []).append(value)
+                    append(analysis_lists, arrays)
             else:
                 rst_space_updates = rst_result
-            rst_route_update = _space_weighted_state_writeback(
-                rst_space_updates, dense_weights["rst"],
-                _canonical_writeback_kernel(router["rst_state_writeback"]),
+            rst_route_update = _space_weighted_writeback(
+                rst_space_updates, dense_weights["rst"], shared_writeback,
                 rst_scale).reshape(normalized.shape)
             state = state + _shared_safe_dropout(
                 rst_route_update, self.dropout_rate, deterministic, rng_rst)
+
+            append(regular_lists, _space_router_metrics(assignments, m))
             if diagnostics_enabled:
-                operator_metrics.setdefault("attn_out_norm", []).append(
-                    jax.lax.stop_gradient(jnp.linalg.norm(
-                        attention_output.astype(jnp.float32), axis=-1).mean()))
-                operator_metrics.setdefault("rst_out_norm", []).append(
-                    jax.lax.stop_gradient(jnp.linalg.norm(
-                        rst_route_update.astype(jnp.float32), axis=-1).mean()))
-                operator_metrics.setdefault("residual_norm", []).append(
-                    jax.lax.stop_gradient(jnp.linalg.norm(
-                        state.astype(jnp.float32), axis=-1).mean()))
-                operator_metrics.setdefault("q_route_output_norm", []).append(
-                    jnp.linalg.norm(q_route_output.astype(jnp.float32), axis=-1).mean())
-                operator_metrics.setdefault("k_route_output_norm", []).append(
-                    jnp.linalg.norm(k_route_output.astype(jnp.float32), axis=-1).mean())
-                operator_metrics.setdefault("v_route_output_norm", []).append(
-                    jnp.linalg.norm(v_route_output.astype(jnp.float32), axis=-1).mean())
-                rst_route_update_norm = jnp.linalg.norm(
-                    rst_route_update.astype(jnp.float32), axis=-1).mean()
-                operator_metrics.setdefault("rst_route_update_norm", []).append(
-                    rst_route_update_norm)
-                # Deprecated native-v4174 log compatibility alias.
-                operator_metrics.setdefault("rst_route_output_norm", []).append(
-                    rst_route_update_norm)
+                append(regular_lists, {
+                    "attn_out_norm": jnp.linalg.norm(
+                        attention_output.astype(jnp.float32), axis=-1).mean(),
+                    "rst_out_norm": jnp.linalg.norm(
+                        rst_route_update.astype(jnp.float32), axis=-1).mean(),
+                    "residual_norm": jnp.linalg.norm(
+                        state.astype(jnp.float32), axis=-1).mean(),
+                    "q_route_output_norm": jnp.linalg.norm(
+                        q_route_output.astype(jnp.float32), axis=-1).mean(),
+                    "k_route_output_norm": jnp.linalg.norm(
+                        k_route_output.astype(jnp.float32), axis=-1).mean(),
+                    "v_route_output_norm": jnp.linalg.norm(
+                        v_route_output.astype(jnp.float32), axis=-1).mean(),
+                    "rst_route_update_norm": jnp.linalg.norm(
+                        rst_route_update.astype(jnp.float32), axis=-1).mean(),
+                })
+            if analysis:
+                for route in ROUTES:
+                    pool_name = "qk" if route in ("q", "k") else route
+                    reference = _kernel_sketch_reference_metrics(
+                        queries[route], bank_values[pool_name][2],
+                        sketches[f"{pool_name}_space_kernel_sketch"],
+                        betas[pool_name], top_k)
+                    append(analysis_lists, {
+                        f"{route}_kernel_sketch_{name}": value
+                        for name, value in reference.items()})
 
         state = self.norm(state)
         result: dict[str, jax.Array] = {}
@@ -1249,7 +1234,8 @@ class DAWN_SRW_V4174(nn.Module):
             else:
                 logical, embedding = self._vocab_sizes()
                 logits = self.token_emb.attend(state)
-                result["logits"] = logits[..., :logical] if embedding != logical else logits
+                result["logits"] = (logits[..., :logical]
+                                    if embedding != logical else logits)
         else:
             shift_state = state[:, :-1]
             shift_labels = labels[:, 1:].astype(jnp.int32)
@@ -1265,29 +1251,36 @@ class DAWN_SRW_V4174(nn.Module):
                 logits = self.token_emb.attend(shift_state)[..., :logical]
                 safe_labels = jnp.where(valid, shift_labels, 0)
                 token_loss = -jax.nn.log_softmax(logits).reshape(
-                    (-1, logical))[jnp.arange(safe_labels.size), safe_labels.reshape(-1)]
-                loss = (token_loss.reshape(safe_labels.shape) * valid).sum() / jnp.maximum(valid.sum(), 1)
+                    (-1, logical))[jnp.arange(safe_labels.size),
+                                    safe_labels.reshape(-1)]
+                loss = (token_loss.reshape(safe_labels.shape) * valid).sum(
+                    ) / jnp.maximum(valid.sum(), 1)
                 predictions = jnp.argmax(logits, axis=-1)
-                correct = ((predictions == safe_labels) & valid).sum().astype(jnp.int32)
+                correct = ((predictions == safe_labels) & valid).sum().astype(
+                    jnp.int32)
             result.update({
                 "loss": loss, "aux_loss": jnp.float32(0.0),
                 "correct": correct if compute_accuracy else jnp.int32(0),
                 "valid_count": valid.sum().astype(jnp.int32),
             })
-        for key, values in selector_metrics.items():
+        for key, values in regular_lists.items():
             result[key] = jnp.stack(values).mean()
         if diagnostics_enabled:
-            for key, values in operator_metrics.items():
-                result[key] = jnp.stack(values).mean()
             result.update(_canonical_regular_operator_metrics(result))
-            result["heat_kernel_beta"] = jnp.float32(self.heat_kernel_beta)
+            result.update({
+                "heat_kernel_beta": jnp.float32(self.heat_kernel_beta),
+                "space_kernel_beta_qk": jnp.float32(self.space_kernel_beta_qk),
+                "space_kernel_beta_v": jnp.float32(self.space_kernel_beta_v),
+                "space_kernel_beta_rst": jnp.float32(self.space_kernel_beta_rst),
+            })
         if analysis:
-            for key, values in analysis_arrays.items():
-                value = jnp.stack(values).mean(axis=0)
-                result[key] = value
-                if "_per_space_" in key:
-                    # Deprecated native-v4174 analysis compatibility alias.
-                    result[key.replace("_per_space_", "_per_address_")] = value
+            for key, values in analysis_lists.items():
+                result[key] = jnp.stack(values).mean(axis=0)
+            result.update(_space_geometry_diagnostics(
+                router["space_state_proj"], router["space_state_writeback"],
+                last_local_input))
+            result.update(_operator_field_geometry_diagnostics(
+                operator_keys, sketches))
         return result
 
     def get_model_info(self) -> list[str]:
@@ -1296,64 +1289,55 @@ class DAWN_SRW_V4174(nn.Module):
         m = int(self.n_operation_spaces)
         return [
             f"DAWN-SRW v4.1.7.4 ({MODEL_VERSION})",
-            "architecture: shared state -> shared operation-space lookup -> "
-            "route-local RW execution -> space-weighted state writeback",
-            f"spaces: count={m}, top_k={int(self.operation_space_top_k)}, "
-            f"d_space=d_route={int(self.d_route)}",
-            "Q/K share qk_read_vectors, qk_write_vectors, generated keys, and "
-            "qk_state_writeback; routing/projection/tau remain independent",
+            "operation space: one shared local state projection and one shared "
+            "decoder basis consumed by Q/K/V/RST",
+            f"canonical geometry: D={self.d_model}, M={m}, R={self.d_route}; "
+            f"D=M*R, top_k={self.operation_space_top_k}",
+            "selection: live RW operator-distribution positive kernel field; "
+            "the same global route query selects spaces and exact operators",
+            "Q/K share RW read/write rows, live keys, local state, and one "
+            "read-scalar computation; query/gate/tau remain independent",
             f"operators per space: qk={int(self.n_qk)//m}, "
             f"v={int(self.n_v)//m}, rst={n_rst//m}",
-            "execution: semantic top-k with physical all-space dense kernels; "
-            "no [M,T,D] writeback intermediate",
+            "execution: semantic hard top-k, physical all-space dense, fused "
+            "shared writeback without an [M,T,D] intermediate",
         ]
 
 
-def _pool_operator_keys(pool_params: Mapping[str, jax.Array],
-                        operator_key_mode: Optional[str] = None) -> dict[str, jax.Array]:
-    """Materialize canonical live-gradient keys for QK, V, and RST banks."""
+def _pool_operator_keys(
+        pool_params: Mapping[str, jax.Array],
+        operator_key_mode: Optional[str] = None) -> dict[str, jax.Array]:
+    """Materialize canonical live-gradient QK, V, and RST operator keys."""
     if operator_key_mode not in (None, OPERATOR_KEY_MODE):
         raise ValueError(f"unsupported operator_key_mode={operator_key_mode!r}")
     read_probe = pool_params["operator_key_read_probe"]
     write_probe = pool_params["operator_key_write_probe"]
     return {
-        f"{name}_operator_keys": _materialize_space_operator_keys(
+        f"{name}_operator_keys": _materialize_operator_keys(
             pool_params[f"{name}_read_vectors"],
             pool_params[f"{name}_write_vectors"], read_probe, write_probe)
-        for name in ("qk", "v", "rst")
-    }
+        for name in ("qk", "v", "rst")}
 
 
 def generalized_bilinear_operator_key_diagnostics(
         read_vectors, write_vectors, read_probes, write_probes,
         eps=RW_FORWARD_NORM_EPS):
-    """Expose existing bilinear-key diagnostics for one space or bank."""
-    if read_vectors.ndim == 2:
-        return _shared_operator_key_diagnostics(
-            read_vectors, write_vectors, read_probes, write_probes, eps)
+    """Expose generalized-bilinear key diagnostics for a space-indexed bank."""
     flattened_read = read_vectors.reshape((-1, read_vectors.shape[-1]))
     flattened_write = write_vectors.reshape((-1, write_vectors.shape[-1]))
     return _shared_operator_key_diagnostics(
         flattened_read, flattened_write, read_probes, write_probes, eps)
 
 
-def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
-    """Return all-token × every-space score tables for independent tau fits.
-
-    Space selectors are deliberately absent: operator tau calibrates the
-    space-local RW bank, not the semantic space lookup.  Q and K share
-    operator rows but receive independent score tables and therefore
-    independent quantiles under the common QK target.
-    """
+def _sampled_layer_states(params, input_ids, max_tokens):
     max_tokens = _positive_int("max_tokens", int(max_tokens))
     input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
     if input_ids.ndim != 2:
         raise ValueError("input_ids must be [batch, sequence]")
-    seq_len = input_ids.shape[1]
     token_count = min(max_tokens, int(input_ids.size))
     token_index = jnp.arange(token_count) * int(input_ids.size) // token_count
+    positions = token_index % input_ids.shape[1]
     token_ids = input_ids.reshape(-1)[token_index]
-    positions = token_index % seq_len
     state = (params["token_emb"]["embedding"][token_ids]
              + params["pos_emb"]["embedding"][positions]).astype(jnp.float32)
     block = params["block_0"]
@@ -1361,78 +1345,125 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
         state, block["norm1"]["scale"], block["norm1"]["bias"])
     rst_state = _shared_layer_norm(
         state, block["norm2"]["scale"], block["norm2"]["bias"])
-    router = params["router"]
-    pool = params["neuron_pool"]
-    keys = _pool_operator_keys(pool)
+    return attention_state, rst_state
 
-    def score(route_state, projection, operator_keys):
-        query = _space_projection(route_state, projection)
-        if operator_keys.ndim == 2:
-            operator_keys = operator_keys[None, ...]
-        query = _shared_forward_unit_direction(query.astype(jnp.float32))
-        operator_keys = _shared_forward_unit_direction(
-            operator_keys.astype(jnp.float32))
-        return jnp.einsum("mtr,mnr->mtn", query, operator_keys)
+
+def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
+    """Return per-route ``[M,T,N]`` cosine tables for independent tau fits."""
+    attention_state, rst_state = _sampled_layer_states(
+        params, input_ids, max_tokens)
+    router, keys = params["router"], _pool_operator_keys(params["neuron_pool"])
+
+    def score(route, state, pool_name):
+        query = _shared_forward_unit_direction(_linear(
+            router[f"{route}_operator_query_proj"], state).astype(jnp.float32))
+        return jnp.einsum(
+            "tr,mnr->mtn", query, keys[f"{pool_name}_operator_keys"])
 
     return {
-        "q": score(attention_state, router["q_operation_proj"],
-                   keys["qk_operator_keys"]),
-        "k": score(attention_state, router["k_operation_proj"],
-                   keys["qk_operator_keys"]),
-        "v": score(attention_state, router["v_operation_proj"],
-                   keys["v_operator_keys"]),
-        "rst": score(rst_state, router["rst_operation_proj"],
-                     keys["rst_operator_keys"]),
+        "q": score("q", attention_state, "qk"),
+        "k": score("k", attention_state, "qk"),
+        "v": score("v", attention_state, "v"),
+        "rst": score("rst", rst_state, "rst"),
     }
 
 
 def calibrate_operator_tau_per_space(
-        scores_by_route: Mapping[str, jax.Array],
-        *, target_qk_frac: float, target_v_frac: float,
+        scores_by_route: Mapping[str, jax.Array], *,
+        target_qk_frac: float, target_v_frac: float,
         target_rst_frac: float) -> dict[str, jax.Array]:
-    """Compute one quantile per route/space from all calibration tokens."""
+    """Compute one exact cosine quantile per route and operation space."""
     targets = {
         "q": float(target_qk_frac), "k": float(target_qk_frac),
         "v": float(target_v_frac), "rst": float(target_rst_frac)}
     result = {}
     for route in ROUTES:
         scores = jnp.asarray(scores_by_route[route], dtype=jnp.float32)
-        if scores.ndim != 3:
-            raise ValueError(f"{route} scores must have shape [M,T,N]")
         target = targets[route]
-        if not 0.0 < target < 1.0:
-            raise ValueError("tau target fractions must be in (0,1)")
+        if scores.ndim != 3 or not 0.0 < target < 1.0:
+            raise ValueError("tau calibration requires [M,T,N] and target in (0,1)")
         result[route] = jnp.quantile(
             scores.reshape((scores.shape[0], -1)), 1.0 - target, axis=1)
     return result
 
 
+def calibrate_space_kernel_betas(
+        scores_by_route: Mapping[str, jax.Array], *,
+        target_qk_frac: float, target_v_frac: float,
+        target_rst_frac: float, eps: float = 1.0e-6) -> dict[str, float]:
+    """Calibrate fixed pool betas from near and four-times-broader quantiles."""
+    route_and_target = {
+        "qk": (("q", "k"), float(target_qk_frac)),
+        "v": (("v",), float(target_v_frac)),
+        "rst": (("rst",), float(target_rst_frac)),
+    }
+    result = {}
+    for pool, (routes, near_fraction) in route_and_target.items():
+        if not 0.0 < near_fraction < 1.0:
+            raise ValueError("kernel calibration targets must be in (0,1)")
+        values = jnp.concatenate(tuple(
+            jnp.asarray(scores_by_route[route], dtype=jnp.float32).reshape(-1)
+            for route in routes))
+        broad_fraction = min(4.0 * near_fraction, 1.0)
+        rho_near = jnp.quantile(values, 1.0 - near_fraction)
+        rho_broad = (values.min() if broad_fraction >= 1.0 else
+                     jnp.quantile(values, 1.0 - broad_fraction))
+        beta = math.log(2.0) / max(
+            float(rho_near - rho_broad), float(eps))
+        result[f"space_kernel_beta_{pool}"] = float(beta)
+    return result
+
+
 def _query_geometry_diagnostics(params, input_ids, max_tokens=4096):
-    """Rare-cadence route-query geometry with canonical space terminology."""
     scores = _tau_init_calibration_scores(params, input_ids, max_tokens)
+    return {
+        f"{route}_operator_score_{name}": value
+        for route, route_scores in scores.items()
+        for name, value in (
+            ("mean", route_scores.mean()), ("std", route_scores.std()),
+            ("max", route_scores.max()))}
+
+
+def initialization_diagnostics_from_params(
+        params: Mapping[str, Any], input_ids: jax.Array,
+        operation_space_top_k: int) -> dict[str, float]:
+    """Host-side one-shot orthogonal basis diagnostics."""
+    del operation_space_top_k
+    attention_state, _ = _sampled_layer_states(params, input_ids, 4096)
+    router = params["router"]
+    diagnostics = _space_geometry_diagnostics(
+        router["space_state_proj"], router["space_state_writeback"],
+        attention_state)
     out = {}
-    for route, value in scores.items():
-        out[f"{route}_operator_score_mean"] = value.mean()
-        out[f"{route}_operator_score_std"] = value.std()
-        out[f"{route}_operator_score_max"] = value.max()
+    for key, value in diagnostics.items():
+        value = jnp.asarray(value, dtype=jnp.float32)
+        if value.ndim == 0:
+            out[key] = float(value)
+        else:
+            out[f"{key}_min"] = float(value.min())
+            out[f"{key}_max"] = float(value.max())
+            out[f"{key}_mean"] = float(value.mean())
     return out
 
 
 def analysis_forward(params, model_cfg, input_ids, mode="full"):
-    """Run the canonical module in analysis cadence without full state outputs."""
+    """Run the canonical module with rare-cadence diagnostics enabled."""
     del mode
     cfg = dict(model_cfg)
     model = DAWN_SRW_V4174(
         vocab_size=cfg.get("vocab_size", 30000),
         logical_vocab_size=cfg.get("logical_vocab_size"),
         vocab_size_padded=cfg.get("vocab_size_padded"),
-        d_model=cfg.get("d_model", 384), n_layers=cfg.get("n_layers", 12),
-        n_heads=cfg.get("n_heads", 6), max_seq_len=cfg.get("max_seq_len", 512),
+        d_model=cfg["d_model"], n_layers=cfg["n_layers"],
+        n_heads=cfg["n_heads"], max_seq_len=cfg.get("max_seq_len", 512),
         dropout_rate=0.0, router_dropout=0.0,
-        d_route=cfg.get("d_route", 128), n_qk=cfg["n_qk"], n_v=cfg["n_v"],
+        d_route=cfg["d_route"], n_qk=cfg["n_qk"], n_v=cfg["n_v"],
         n_rst=cfg.get("n_rst", cfg.get("n_know")),
-        n_operation_spaces=cfg.get("n_operation_spaces", 1),
-        operation_space_top_k=cfg.get("operation_space_top_k", 1),
+        n_operation_spaces=cfg["n_operation_spaces"],
+        operation_space_top_k=cfg["operation_space_top_k"],
+        space_kernel_beta_qk=cfg["space_kernel_beta_qk"],
+        space_kernel_beta_v=cfg["space_kernel_beta_v"],
+        space_kernel_beta_rst=cfg["space_kernel_beta_rst"],
         admission_den_power=cfg.get("admission_den_power", 1.0),
         admission_den_power_qk=cfg.get("admission_den_power_qk"),
         admission_den_power_v=cfg.get("admission_den_power_v"),
@@ -1443,9 +1474,8 @@ def analysis_forward(params, model_cfg, input_ids, mode="full"):
         tau_init_attn_qk=cfg.get("tau_init_attn_qk", 0.0),
         tau_init_attn_v=cfg.get("tau_init_attn_v", 0.0),
         tau_init_rst=cfg.get("tau_init_rst", 0.0))
-    variables = {"params": params}
     return model.apply(
-        variables, input_ids, deterministic=True, analysis=True,
+        {"params": params}, input_ids, deterministic=True, analysis=True,
         minimal_runtime_profile="diagnostics",
         rngs={"dropout": jax.random.PRNGKey(0)})
 
@@ -1459,9 +1489,9 @@ def _factory_profile_wrapper(factory: Callable, profile: str) -> Callable:
     return wrapped
 
 
-# Native v4174 reuses the proven, numerically identical RW shard-map kernels.
-# M=1 and M>1 both keep the native v4174 parameter tree; the grouped wrappers
-# below add only the leading operation-space axis for M>1.
+# Vocab and generic analysis profiles retain the proven v4173 shard-map
+# factories.  Canonical all-space RW execution is expressed directly in the
+# model so GSPMD can shard only the per-space operator axis of live parameters.
 make_sharded_srw = _shared_make_sharded_srw
 make_sharded_srw_paired = _shared_make_sharded_srw_paired
 make_sharded_srw_minimal = _factory_profile_wrapper(
@@ -1489,7 +1519,6 @@ make_sharded_srw_paired_trajectory_minimal = _factory_profile_wrapper(
 
 @wraps(_shared_make_space_dense_minimal)
 def make_sharded_space_dense_minimal(*args, **kwargs):
-    """Create a production ``[M,T,R]`` grouped-dense space kernel."""
     kernel = _shared_make_space_dense_minimal(*args, **kwargs)
     kernel._v4174_kernel_profile = "production"
     kernel._v4174_dense_grouped_execution = "all_spaces"
@@ -1498,66 +1527,23 @@ def make_sharded_space_dense_minimal(*args, **kwargs):
 
 @wraps(_shared_make_space_dense_diagnostics)
 def make_sharded_space_dense_diagnostics(*args, **kwargs):
-    """Create the matching observational kernel with ``[M,T,1]`` aggregates."""
     kernel = _shared_make_space_dense_diagnostics(*args, **kwargs)
     kernel._v4174_kernel_profile = "production_diagnostics"
     kernel._v4174_dense_grouped_diagnostics = "all_spaces"
     return kernel
 
 
-@wraps(_shared_make_space_dense_minimal)
-def make_sharded_qk_space_dense_minimal(*args, **kwargs):
-    """Create the paired Q/K ``[M,T,2,R]`` production interface.
-
-    Both routes consume the same sharded QK bank closure.  Their query/tau
-    slices remain independent, and the paired route axis is eliminated before
-    causal attention.
-    """
-    single = make_sharded_space_dense_minimal(*args, **kwargs)
-
-    def paired(stacked_query, operator_keys, stacked_tau, token_valid,
-               read_vectors, write_vectors, *runtime_scalars):
-        q_output = single(
-            stacked_query[:, :, 0], operator_keys, stacked_tau[:, :, 0],
-            token_valid, read_vectors, write_vectors, *runtime_scalars)
-        k_output = single(
-            stacked_query[:, :, 1], operator_keys, stacked_tau[:, :, 1],
-            token_valid, read_vectors, write_vectors, *runtime_scalars)
-        return jnp.stack((q_output, k_output), axis=2)
-
-    paired._v4174_kernel_profile = "production"
-    paired._v4174_paired_qk_execution = "all_spaces"
-    return paired
-
-
-@wraps(_shared_make_space_dense_diagnostics)
-def make_sharded_qk_space_dense_diagnostics(*args, **kwargs):
-    """Create paired Q/K observational execution without full operator tensors."""
-    single = make_sharded_space_dense_diagnostics(*args, **kwargs)
-
-    def paired(stacked_query, operator_keys, stacked_tau, token_valid,
-               read_vectors, write_vectors, *runtime_scalars):
-        return (
-            single(stacked_query[:, :, 0], operator_keys,
-                   stacked_tau[:, :, 0], token_valid, read_vectors,
-                   write_vectors, *runtime_scalars),
-            single(stacked_query[:, :, 1], operator_keys,
-                   stacked_tau[:, :, 1], token_valid, read_vectors,
-                   write_vectors, *runtime_scalars),
-        )
-
-    paired._v4174_kernel_profile = "production_diagnostics"
-    paired._v4174_paired_qk_execution = "all_spaces"
-    return paired
+make_sharded_qk_space_dense_minimal = make_sharded_space_dense_minimal
+make_sharded_qk_space_dense_diagnostics = make_sharded_space_dense_diagnostics
 
 
 def _validate_v4174_sharded_fns(
         sharded_fns, admission_den_power, srw_composition_mode,
         heat_kernel_beta, **kwargs):
-    """Validate common RW metadata while allowing v4174 space wrappers."""
     return _validate_shared_rw_sharded_fns(
         sharded_fns, admission_den_power, srw_composition_mode,
         heat_kernel_beta, **kwargs)
+
 
 def get_model_version() -> str:
     return MODEL_VERSION

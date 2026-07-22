@@ -139,12 +139,12 @@ from models.dawn_srw_v4173 import (
 )
 from models.dawn_srw_v4174 import (
     DAWN_SRW_V4174,
-    V4174_SERIALIZED_SPACE_PARAM_NAMES,
     _pool_operator_keys as _v4174_pool_operator_keys,
     _query_geometry_diagnostics as _v4174_query_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4174_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4174_tau_init_calibration_scores,
     _validate_v4174_sharded_fns,
+    calibrate_space_kernel_betas as _v4174_calibrate_space_kernel_betas,
     generalized_bilinear_operator_key_diagnostics as _v4174_operator_key_diagnostics,
     initialization_diagnostics_from_params as _v4174_initialization_diagnostics,
     materialize_operation_space_config as _materialize_v4174_operation_space_config,
@@ -1309,19 +1309,23 @@ V4174_SPACE_METRIC_NAMES = tuple(
     f'{route}_{suffix}'
     for route in ('q', 'k', 'v', 'rst')
     for suffix in (
-        'space_weight_top1_mean',
-        'space_weight_entropy_mean',
+        'dominant_space_id',
+        'space_top1_rate',
         'space_usage_min',
         'space_usage_max',
         'space_usage_std',
+        'space_selected_weight_top1',
+        'space_selected_entropy',
         'space_dead_frac',
-        'space_top1_usage_max',
     ))
-V4174_ADDRESS_METRIC_ALIASES = tuple(
-    name.replace('_space_', '_address_')
-    for name in V4174_SPACE_METRIC_NAMES)
 V4174_SELECTOR_METRIC_NAMES = (
-    *V4174_SPACE_METRIC_NAMES, *V4174_ADDRESS_METRIC_ALIASES)
+    *V4174_SPACE_METRIC_NAMES,
+    'qk_dominant_space_agreement', 'qk_topk_set_agreement',
+    'qv_dominant_space_agreement', 'qv_topk_set_agreement',
+    'v_rst_dominant_space_agreement', 'v_rst_topk_set_agreement',
+    'topk_pair_concentration',
+    'hub_excluded_second_slot_entropy',
+)
 
 V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
     'heat_kernel_beta',
@@ -1567,6 +1571,16 @@ def _validate_v4171_resume_compatibility(
                 "v4174 checkpoint operation-space schema mismatch: "
                 f"requested={requested_spaces}, checkpoint={checkpoint_spaces}. "
                 "Automatic space replication or migration is disabled.")
+        for field in (
+                'space_kernel_beta_qk', 'space_kernel_beta_v',
+                'space_kernel_beta_rst'):
+            requested_value = requested_model_cfg.get(field)
+            checkpoint_value = checkpoint_model_cfg.get(field)
+            if requested_value != checkpoint_value:
+                raise RuntimeError(
+                    "v4174 checkpoint kernel-field calibration mismatch: "
+                    f"model.{field} requested={requested_value}, "
+                    f"checkpoint={checkpoint_value}")
     requested_den_powers = _v4171_checkpoint_den_powers(
         requested_model_cfg,
         missing_message=(
@@ -1804,16 +1818,13 @@ def _require_resume_materialized_fields(full_config):
         _materialize_v4173_operation_space_config(full_config['model'])
     elif str(model_version) == V4174_MODEL_VERSION:
         model_cfg = full_config['model']
-        if not any(name in model_cfg for name in (
-                'n_operation_spaces', 'n_operation_addresses')):
+        if 'n_operation_spaces' not in model_cfg:
             raise RuntimeError(
-                "Native v4174 checkpoint metadata is missing the operation-space count")
-        if not any(name in model_cfg for name in (
-                'operation_space_top_k', 'operation_address_top_k')):
+                "v4174 checkpoint metadata is missing model.n_operation_spaces")
+        if 'operation_space_top_k' not in model_cfg:
             raise RuntimeError(
-                "Native v4174 checkpoint metadata is missing operation-space top-k")
-        # Validate semantically without rewriting the raw checkpoint snapshot.
-        _resolve_v4174_operation_space_config(model_cfg)
+                "v4174 checkpoint metadata is missing model.operation_space_top_k")
+        _materialize_v4174_operation_space_config(model_cfg)
     if not _is_active_srw_version(model_version):
         return
     if _is_v417x_version(model_version):
@@ -2001,6 +2012,7 @@ def _maybe_materialize_vocab_parallel_config(cfg):
             V4171_MODEL_VERSION,
             V4172_MODEL_VERSION,
             V4173_MODEL_VERSION,
+            V4174_MODEL_VERSION,
             BASELINE_MODEL_VERSION,
             LEGACY_BASELINE_MODEL_VERSION):
         return
@@ -3397,6 +3409,9 @@ def _dawn_srw_kwargs(cfg):
         kw.update({
             'n_operation_spaces': m['n_operation_spaces'],
             'operation_space_top_k': m['operation_space_top_k'],
+            'space_kernel_beta_qk': m['space_kernel_beta_qk'],
+            'space_kernel_beta_v': m['space_kernel_beta_v'],
+            'space_kernel_beta_rst': m['space_kernel_beta_rst'],
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -3521,7 +3536,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
         },
         'router': ({
             name: value for name, value in params['router'].items()
-            if name.endswith('_operation_proj')
+            if name.endswith('_operator_query_proj')
         } if str(version) == V4174_MODEL_VERSION else {
             'proj_attn': params['router']['proj_attn'],
             'proj_rst': params['router']['proj_rst'],
@@ -4900,11 +4915,11 @@ def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MOD
             }
             if len(keys) >= 3 and keys[-1] == 'bias' and keys[-2] in route_raw:
                 raw_value = jnp.asarray(route_raw[keys[-2]], dtype=value.dtype)
-                if raw_value.size != value.size:
-                    raise ValueError(
-                        f"{keys[-2]} per-address tau shape mismatch: "
-                        f"tau={raw_value.shape}, bias={value.shape}")
-                return raw_value.reshape(value.shape)
+                # Canonical v4174 uses one route program over every shared
+                # local state.  Initial route bias is the pooled mean of the
+                # independently measured space quantiles; the shared R->1
+                # kernel subsequently makes tau state- and space-dependent.
+                return jnp.full_like(value, raw_value.mean())
         if keys[-3:] == ('router', 'raw_tau_attn', 'bias'):
             return jnp.stack([raw_qk, raw_qk, raw_v]).astype(value.dtype)
         if keys[-3:] == ('router', 'raw_tau_rst', 'bias'):
@@ -6193,6 +6208,14 @@ def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
             for entry in (
                 pool_schema['qk'], pool_schema['v'], pool_schema['rst'])
         }
+    if str(model_version) == V4174_MODEL_VERSION:
+        return {
+            entry['metric_prefix']: jnp.sqrt(
+                jnp.square(_norm(entry['read']))
+                + jnp.square(_norm(entry['write'])))
+            for entry in (
+                pool_schema['qk'], pool_schema['v'], pool_schema['rst'])
+        }
     if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         shared_probe_metrics = _shared_probe_gradient_diagnostics(
             {}, pool_grads, model_version)
@@ -7473,13 +7496,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
                     names = (
-                        'q_operation_proj', 'k_operation_proj',
-                        'v_operation_proj', 'qk_state_writeback',
-                        'v_state_writeback',
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['q_space_query_proj'],
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['k_space_query_proj'],
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['v_space_query_proj'],
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['operation_space_keys'])
+                        'q_operator_query_proj', 'k_operator_query_proj',
+                        'v_operator_query_proj', 'space_state_proj',
+                        'space_state_writeback')
                     return any(f'router/{name}' in ps for name in names)
                 return (('router/proj_attn' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
@@ -7494,9 +7513,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
                     names = (
-                        'rst_operation_proj', 'rst_state_writeback',
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['rst_space_query_proj'],
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['operation_space_keys'])
+                        'rst_operator_query_proj', 'space_state_proj',
+                        'space_state_writeback')
                     return any(f'router/{name}' in ps for name in names)
                 return (('router/proj_rst' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
@@ -7973,7 +7991,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_v': jnp.float32(0.0),
                 'rst': jnp.float32(0.0),
             }
-            if str(_model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
+            if (str(_model_version)
+                in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS
+                and str(_model_version) != V4174_MODEL_VERSION)
             else _canonical_pool_op_key_grad_norms(
                 _gpool, _model_version))
         if float(global_grad_clip) > 0.0:
@@ -7985,24 +8005,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
             grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
             if str(_model_version) == V4174_MODEL_VERSION:
-                serialized_space_key = V4174_SERIALIZED_SPACE_PARAM_NAMES[
-                    'operation_space_keys']
                 grad_router_proj_attn = jnp.sqrt(sum(
                     jnp.square(_child_norm(_grouter, name))
                     for name in (
-                        'q_operation_proj', 'k_operation_proj',
-                        'v_operation_proj',
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['q_space_query_proj'],
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['k_space_query_proj'],
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['v_space_query_proj'],
-                        'qk_state_writeback', 'v_state_writeback',
-                        serialized_space_key)))
+                        'q_operator_query_proj', 'k_operator_query_proj',
+                        'v_operator_query_proj', 'space_state_proj',
+                        'space_state_writeback')))
                 grad_router_proj_rst = jnp.sqrt(sum(
                     jnp.square(_child_norm(_grouter, name))
                     for name in (
-                        'rst_operation_proj',
-                        V4174_SERIALIZED_SPACE_PARAM_NAMES['rst_space_query_proj'],
-                        'rst_state_writeback', serialized_space_key)))
+                        'rst_operator_query_proj', 'space_state_proj',
+                        'space_state_writeback')))
             if str(_model_version) == V4173_MODEL_VERSION:
                 grad_router_proj_attn = jnp.sqrt(
                     jnp.square(grad_router_proj_attn)
@@ -8201,9 +8214,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             elif _is_v417x_version(_model_version):
                 _v417x_keys = _pool_operator_keys_for_version(
                     _model_version)(_pool)
-                _cur_qk = _v417x_keys['attn_qk_op_key']
-                _cur_v = _v417x_keys['attn_v_op_key']
-                _cur_rst = _v417x_keys['rst_op_key']
+                if str(_model_version) == V4174_MODEL_VERSION:
+                    _cur_qk = _v417x_keys['qk_operator_keys']
+                    _cur_v = _v417x_keys['v_operator_keys']
+                    _cur_rst = _v417x_keys['rst_operator_keys']
+                else:
+                    _cur_qk = _v417x_keys['attn_qk_op_key']
+                    _cur_v = _v417x_keys['attn_v_op_key']
+                    _cur_rst = _v417x_keys['rst_op_key']
             elif ('attn_qk_read_global' in _pool
                     or 'attn_qk_read_shared' in _pool):
                 def _flat_partitioned_op_key(prefix):
@@ -10058,6 +10076,26 @@ def create_geometry_step(max_sample=512, model_version=None):
         v417x_keys = (
             _pool_operator_keys_for_version(model_version)(pool)
             if _is_v417x_version(model_version) else None)
+        if str(model_version) == V4174_MODEL_VERSION:
+            pool_schema = _canonical_pool_schema(model_version)
+            for route, name in (('qk', 'attn_qk'), ('v', 'attn_v'),
+                                ('rst', 'rst')):
+                schema = pool_schema[route]
+                operator_keys = v417x_keys[schema['operator_keys']]
+                operator_rows = operator_keys.reshape(
+                    (-1, operator_keys.shape[-1]))
+                read_vectors = pool[schema['read']]
+                write_vectors = pool[schema['write']]
+                out.update(_v417x_operator_key_geometry(
+                    operator_rows, name, learned_embedding=False))
+                out.update(_geom_one(operator_rows, f'{name}_op_key'))
+                out.update(_geom_one(
+                    read_vectors.reshape((-1, read_vectors.shape[-1])),
+                    f'{name}_read'))
+                out.update(_geom_one(
+                    write_vectors.reshape((-1, write_vectors.shape[-1])),
+                    f'{name}_write'))
+            return out
         for name, emb_key, read_key, write_key, op_read_key, op_write_key in (
                 ('attn_qk', 'attn_qk_emb', 'attn_qk_read',
                  'attn_qk_write', 'attn_qk_op_read_proj',
@@ -15428,6 +15466,10 @@ def create_canonical_optimizer(params, training_cfg, total_optimizer_steps,
         'attn_qk_emb', 'attn_v_emb', 'rst_emb',
         'attn_qk_op_key', 'attn_v_op_key', 'rst_op_key',
         'rw_key_read_probe', 'rw_key_write_probe',
+        'qk_read_vectors', 'qk_write_vectors',
+        'v_read_vectors', 'v_write_vectors',
+        'rst_read_vectors', 'rst_write_vectors',
+        'operator_key_read_probe', 'operator_key_write_probe',
         'attn_qk_op_read_proj', 'attn_qk_op_write_proj',
         'attn_v_op_read_proj', 'attn_v_op_write_proj',
         'rst_op_read_proj', 'rst_op_write_proj',
@@ -18889,6 +18931,44 @@ def main():
             for _line in _v4164_tau_init_summary_lines(tau_init_summary):
                 print(_line, flush=True)
 
+    space_kernel_beta_summary = None
+    if (str(model_version_cfg) == V4174_MODEL_VERSION
+            and not _has_resume_checkpoint):
+        if len(train_loader) <= 0:
+            raise ValueError(
+                "v4174 space-kernel calibration requires one training batch")
+        _space_beta_json = None
+        if is_host0:
+            calibration_input_ids, _ = next(iter(train_loader))
+            score_tables = _v4174_tau_init_calibration_scores(
+                params, calibration_input_ids, max_tokens=128)
+            space_kernel_beta_summary = _v4174_calibrate_space_kernel_betas(
+                score_tables,
+                target_qk_frac=float(
+                    cfg['model']['tau_init_target_qk_frac']),
+                target_v_frac=float(
+                    cfg['model']['tau_init_target_v_frac']),
+                target_rst_frac=float(
+                    cfg['model']['tau_init_target_rst_frac']))
+            _space_beta_json = json.dumps(
+                space_kernel_beta_summary,
+                ensure_ascii=False, separators=(',', ':'))
+        _space_beta_json = _broadcast_str_from_host0(
+            _space_beta_json, max_len=4096)
+        if not _space_beta_json:
+            raise RuntimeError("Failed to broadcast v4174 kernel beta payload")
+        space_kernel_beta_summary = json.loads(_space_beta_json)
+        cfg['model'].update({
+            key: float(value)
+            for key, value in space_kernel_beta_summary.items()})
+        model = build_model_from_config(cfg)
+        if is_host0:
+            print("\n=== Operation-space kernel beta calibration ===", flush=True)
+            for key in sorted(space_kernel_beta_summary):
+                print(
+                    f"  {key}: {float(space_kernel_beta_summary[key]):.8g}",
+                    flush=True)
+
     raw_config_snapshot = _safe_config_snapshot(raw_cfg_snapshot)
     if _has_resume_checkpoint:
         full_config_snapshot = _safe_config_snapshot(saved_full_config)
@@ -20082,7 +20162,15 @@ def main():
 
         pool = p['neuron_pool']
         if _is_v417x_version(model_version_cfg):
-            return _pool_operator_keys_for_version(model_version_cfg)(pool)
+            operator_keys = _pool_operator_keys_for_version(
+                model_version_cfg)(pool)
+            if str(model_version_cfg) == V4174_MODEL_VERSION:
+                return {
+                    'attn_qk_op_key': operator_keys['qk_operator_keys'],
+                    'attn_v_op_key': operator_keys['v_operator_keys'],
+                    'rst_op_key': operator_keys['rst_operator_keys'],
+                }
+            return operator_keys
         if str(model_version_cfg) == V4170_MODEL_VERSION:
             return _v4170_pool_operator_keys(pool)
         if ('attn_qk_read_global' in pool
@@ -20257,6 +20345,9 @@ def main():
                 raise _SkipBreakdown("speed check disabled")
             if is_baseline:
                 raise _SkipBreakdown("baseline has no SRW layer breakdown")
+            if str(model_version) == V4174_MODEL_VERSION:
+                raise _SkipBreakdown(
+                    "v4.1.7.4 uses the canonical kernel-field execution graph")
             if operation_space_tau_free_enabled:
                 raise _SkipBreakdown(
                     "operation-space tau-free path disables legacy DirectTau "
