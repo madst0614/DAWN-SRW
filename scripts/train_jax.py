@@ -139,7 +139,7 @@ from models.dawn_srw_v4173 import (
 )
 from models.dawn_srw_v4174 import (
     DAWN_SRW_V4174,
-    _convert_v4173_single_address_params_to_v4174,
+    V4174_SERIALIZED_SPACE_PARAM_NAMES,
     _pool_operator_keys as _v4174_pool_operator_keys,
     _query_geometry_diagnostics as _v4174_query_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4174_raw_tau_init_from_cosine_tau,
@@ -147,8 +147,8 @@ from models.dawn_srw_v4174 import (
     _validate_v4174_sharded_fns,
     generalized_bilinear_operator_key_diagnostics as _v4174_operator_key_diagnostics,
     initialization_diagnostics_from_params as _v4174_initialization_diagnostics,
-    materialize_operation_address_config as _materialize_v4174_operation_address_config,
-    search_parameter_matched_operator_counts as _v4174_search_parameter_matched_operator_counts,
+    materialize_operation_space_config as _materialize_v4174_operation_space_config,
+    resolve_operation_space_config as _resolve_v4174_operation_space_config,
     symbolic_parameter_count as _v4174_symbolic_parameter_count,
 )
 from models.baseline_transformer_jax import (
@@ -224,6 +224,17 @@ def broadcast_str_from_host0(value, max_len=512):
     if value is None:
         value = ''
     encoded = value.encode('utf-8')
+    if max_len is None:
+        encoded_len = np.asarray(
+            [len(encoded) if jax.process_index() == 0 else 0],
+            dtype=np.uint64)
+        if _HAVE_BROADCAST:
+            received_len = np.asarray(_bcast_one_to_all(encoded_len))
+        else:
+            gathered_len = np.asarray(process_allgather(encoded_len))
+            received_len = (gathered_len[:1] if gathered_len.ndim == 1
+                            else gathered_len[0])
+        max_len = max(1, int(np.asarray(received_len).reshape(-1)[0]))
     if len(encoded) > max_len:
         raise ValueError(
             f"String too long for broadcast: {len(encoded)} > {max_len}")
@@ -479,7 +490,6 @@ MODEL_REGISTRY = {
         'query_geometry_diagnostics': _v4174_query_geometry_diagnostics,
         'operator_key_diagnostics': _v4174_operator_key_diagnostics,
         'symbolic_parameter_count': _v4174_symbolic_parameter_count,
-        'legacy_converter': _convert_v4173_single_address_params_to_v4174,
     },
 }
 
@@ -1295,18 +1305,23 @@ V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES = (
     'local_write_grad',
 )
 
-V4174_ADDRESS_METRIC_NAMES = tuple(
+V4174_SPACE_METRIC_NAMES = tuple(
     f'{route}_{suffix}'
     for route in ('q', 'k', 'v', 'rst')
     for suffix in (
-        'address_weight_top1_mean',
-        'address_weight_entropy_mean',
-        'address_usage_min',
-        'address_usage_max',
-        'address_usage_std',
-        'address_dead_frac',
-        'address_top1_usage_max',
+        'space_weight_top1_mean',
+        'space_weight_entropy_mean',
+        'space_usage_min',
+        'space_usage_max',
+        'space_usage_std',
+        'space_dead_frac',
+        'space_top1_usage_max',
     ))
+V4174_ADDRESS_METRIC_ALIASES = tuple(
+    name.replace('_space_', '_address_')
+    for name in V4174_SPACE_METRIC_NAMES)
+V4174_SELECTOR_METRIC_NAMES = (
+    *V4174_SPACE_METRIC_NAMES, *V4174_ADDRESS_METRIC_ALIASES)
 
 V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
     'heat_kernel_beta',
@@ -1326,7 +1341,7 @@ V4174_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES,
     *V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES,
-    *V4174_ADDRESS_METRIC_NAMES,
+    *V4174_SELECTOR_METRIC_NAMES,
 )
 V4174_COMPACT_REGULAR_JSONL_KEYS = (
     *V4174_COMPACT_REGULAR_JSONL_REC_KEYS,
@@ -1339,8 +1354,6 @@ V4173_RESUME_REQUIRED_FIELDS = (
 
 V4174_RESUME_REQUIRED_FIELDS = (
     *V4171_RESUME_REQUIRED_FIELDS,
-    ('model', 'n_operation_addresses'),
-    ('model', 'operation_address_top_k'),
 )
 
 V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
@@ -1514,42 +1527,6 @@ def _validate_v4170_resume_compatibility(
                 "migration/fallback is disabled.")
 
 
-def convert_v4173_single_address_checkpoint_for_v4174(
-        restored_params, checkpoint_metadata):
-    """Perform the only supported cross-version conversion at load boundary.
-
-    This is a params-only initialization path.  The caller must create a fresh
-    optimizer because slot trees use the historical parameter paths.  Native
-    v4174 checkpoint resume remains exact-version and restores optimizer state
-    normally.
-    """
-    metadata = deepcopy(dict(checkpoint_metadata or {}))
-    full_config = metadata.get('full_config')
-    if not isinstance(full_config, dict) or not isinstance(
-            full_config.get('model'), dict):
-        raise RuntimeError(
-            "legacy v4173 conversion requires checkpoint metadata.full_config.model")
-    source_model_cfg = full_config['model']
-    source_version = str(source_model_cfg.get('model_version', ''))
-    if source_version != V4173_MODEL_VERSION:
-        raise RuntimeError(
-            "v4174 legacy conversion requires a v4173 source checkpoint, "
-            f"got {source_version!r}")
-    converted, conversion = _convert_v4173_single_address_params_to_v4174(
-        restored_params, source_model_cfg=source_model_cfg,
-        return_metadata=True)
-    converted_model_cfg = deepcopy(source_model_cfg)
-    converted_model_cfg['model_version'] = V4174_MODEL_VERSION
-    converted_model_cfg.pop('n_operation_spaces', None)
-    converted_model_cfg.pop('operation_space_top_k', None)
-    converted_model_cfg['n_operation_addresses'] = 1
-    converted_model_cfg['operation_address_top_k'] = 1
-    metadata['full_config']['model'] = converted_model_cfg
-    metadata.update(conversion)
-    metadata['optimizer_restore_policy'] = 'fresh_optimizer'
-    return converted, metadata
-
-
 def _validate_v4171_resume_compatibility(
         requested_model_cfg, checkpoint_model_cfg):
     requested_version = str(requested_model_cfg.get('model_version', ''))
@@ -1557,6 +1534,11 @@ def _validate_v4171_resume_compatibility(
         return
     checkpoint_version = str(checkpoint_model_cfg.get('model_version', ''))
     if checkpoint_version != requested_version:
+        if requested_version == V4174_MODEL_VERSION:
+            raise RuntimeError(
+                "v4174 accepts only native v4174 checkpoints. Cross-version "
+                "v4173 parameter conversion is not supported. "
+                f"requested={requested_version}, checkpoint={checkpoint_version!r}")
         raise RuntimeError(
             f"{requested_version} resume requires the exact same model "
             "version checkpoint; automatic migration, random initialization, "
@@ -1576,15 +1558,15 @@ def _validate_v4171_resume_compatibility(
                     f"checkpoint={checkpoint_value}. Automatic space "
                     "replication or migration is disabled.")
     if requested_version == V4174_MODEL_VERSION:
-        _materialize_v4174_operation_address_config(requested_model_cfg)
-        _materialize_v4174_operation_address_config(checkpoint_model_cfg)
-        for field in ('n_operation_addresses', 'operation_address_top_k'):
-            if requested_model_cfg[field] != checkpoint_model_cfg[field]:
-                raise RuntimeError(
-                    "v4174 checkpoint operation-address schema mismatch: "
-                    f"model.{field} requested={requested_model_cfg[field]}, "
-                    f"checkpoint={checkpoint_model_cfg[field]}. Automatic "
-                    "address replication or migration is disabled.")
+        requested_spaces = _resolve_v4174_operation_space_config(
+            requested_model_cfg)
+        checkpoint_spaces = _resolve_v4174_operation_space_config(
+            checkpoint_model_cfg)
+        if requested_spaces != checkpoint_spaces:
+            raise RuntimeError(
+                "v4174 checkpoint operation-space schema mismatch: "
+                f"requested={requested_spaces}, checkpoint={checkpoint_spaces}. "
+                "Automatic space replication or migration is disabled.")
     requested_den_powers = _v4171_checkpoint_den_powers(
         requested_model_cfg,
         missing_message=(
@@ -1821,7 +1803,17 @@ def _require_resume_materialized_fields(full_config):
     if str(model_version) == V4173_MODEL_VERSION:
         _materialize_v4173_operation_space_config(full_config['model'])
     elif str(model_version) == V4174_MODEL_VERSION:
-        _materialize_v4174_operation_address_config(full_config['model'])
+        model_cfg = full_config['model']
+        if not any(name in model_cfg for name in (
+                'n_operation_spaces', 'n_operation_addresses')):
+            raise RuntimeError(
+                "Native v4174 checkpoint metadata is missing the operation-space count")
+        if not any(name in model_cfg for name in (
+                'operation_space_top_k', 'operation_address_top_k')):
+            raise RuntimeError(
+                "Native v4174 checkpoint metadata is missing operation-space top-k")
+        # Validate semantically without rewriting the raw checkpoint snapshot.
+        _resolve_v4174_operation_space_config(model_cfg)
     if not _is_active_srw_version(model_version):
         return
     if _is_v417x_version(model_version):
@@ -3034,7 +3026,7 @@ def _validate_v4171_model_config(model_cfg):
     if version == V4173_MODEL_VERSION:
         _materialize_v4173_operation_space_config(model_cfg)
     elif version == V4174_MODEL_VERSION:
-        _materialize_v4174_operation_address_config(model_cfg)
+        _materialize_v4174_operation_space_config(model_cfg)
     d_route = model_cfg.get('d_route')
     (den_power, den_power_qk, den_power_v, den_power_rst) = (
         _resolve_v417x_admission_den_powers(
@@ -3257,14 +3249,14 @@ def _v4170_compact_train_metrics(
             metrics.update({
                 key: result[key] for key in present_space_metrics})
         if str(model_version) == V4174_MODEL_VERSION:
-            present_address_metrics = tuple(
-                key for key in V4174_ADDRESS_METRIC_NAMES if key in result)
-            if present_address_metrics and len(present_address_metrics) != len(
-                    V4174_ADDRESS_METRIC_NAMES):
+            present_space_metrics = tuple(
+                key for key in V4174_SELECTOR_METRIC_NAMES if key in result)
+            if present_space_metrics and len(present_space_metrics) != len(
+                    V4174_SELECTOR_METRIC_NAMES):
                 raise RuntimeError(
-                    "v4174 operation-address train metrics are incomplete")
+                    "v4174 operation-space train metrics are incomplete")
             metrics.update({
-                key: result[key] for key in present_address_metrics})
+                key: result[key] for key in present_space_metrics})
         return metrics
     metrics.update({
         key: result[key]
@@ -3403,8 +3395,8 @@ def _dawn_srw_kwargs(cfg):
         })
     if str(version) == V4174_MODEL_VERSION:
         kw.update({
-            'n_operation_addresses': m['n_operation_addresses'],
-            'operation_address_top_k': m['operation_address_top_k'],
+            'n_operation_spaces': m['n_operation_spaces'],
+            'operation_space_top_k': m['operation_space_top_k'],
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -3529,9 +3521,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
         },
         'router': ({
             name: value for name, value in params['router'].items()
-            if (name.endswith('_operation_proj')
-                or name.endswith('_address_query_proj')
-                or name == 'operation_address_keys')
+            if name.endswith('_operation_proj')
         } if str(version) == V4174_MODEL_VERSION else {
             'proj_attn': params['router']['proj_attn'],
             'proj_rst': params['router']['proj_rst'],
@@ -3711,7 +3701,7 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     scores, sampled, page_stats = _sample_srw_selection_scores(
         params, input_ids, cfg, tau_init_cfg['calibration_tokens'])
-    per_address_v4174 = str(version) == V4174_MODEL_VERSION
+    per_space_v4174 = str(version) == V4174_MODEL_VERSION
     per_space_rst = (
         str(version) == V4173_MODEL_VERSION
         and np.asarray(scores['rst']).ndim == 2)
@@ -3726,11 +3716,11 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         target = tau_init_cfg['targets'][pool]
         meta = page_stats[pool]
         if ((pool == 'rst' and per_space_rst)
-                or (per_address_v4174
+                or (per_space_v4174
                     and np.asarray(scores[pool]).ndim == 2)):
             if bool(meta.get('pages_enabled', False)):
                 raise ValueError(
-                    "per-address operator tau calibration requires the full "
+                    "per-space operator tau calibration requires the full "
                     "operator pool")
             local_target = float(target)
             space_scores = np.asarray(scores[pool], dtype=np.float32)
@@ -3774,7 +3764,7 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         tau_calibration[pool] = _tau_calibration_diag(
             pool, scores[pool], meta, target, local_target, quantile_tau)
 
-    if per_address_v4174:
+    if per_space_v4174:
         # Q and K use the same target but their independent projection score
         # distributions produce independent per-address quantiles.
         qk_target = float(tau_init_cfg['targets']['qk'])
@@ -3793,10 +3783,10 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
             estimated_active_pool[route] = route_active
             tau_calibration[route] = [
                 _tau_calibration_diag(
-                    f'{route}[{address_id}]', values,
+                    f'{route}[{space_id}]', values,
                     page_stats[route], qk_target, qk_target,
-                    float(route_tau[address_id]))
-                for address_id, values in enumerate(route_scores)]
+                    float(route_tau[space_id]))
+                for space_id, values in enumerate(route_scores)]
         tau['qk'] = (
             0.5 * (np.asarray(tau['q']) + np.asarray(tau['k']))).tolist()
 
@@ -3826,21 +3816,21 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         'tau_init_est_active_local_rst': estimated_active_local['rst'],
         'tau_init_est_active_q': (
             float(np.mean(scores['q'] > (
-                np.asarray(tau['q'])[:, None] if per_address_v4174
+                np.asarray(tau['q'])[:, None] if per_space_v4174
                 else tau['qk'])))
             * float(page_stats['q'].get('candidate_frac', 1.0))),
         'tau_init_est_active_k': (
             float(np.mean(scores['k'] > (
-                np.asarray(tau['k'])[:, None] if per_address_v4174
+                np.asarray(tau['k'])[:, None] if per_space_v4174
                 else tau['qk'])))
             * float(page_stats['k'].get('candidate_frac', 1.0))),
         'tau_init_est_active_local_q': float(
             np.mean(scores['q'] > (
-                np.asarray(tau['q'])[:, None] if per_address_v4174
+                np.asarray(tau['q'])[:, None] if per_space_v4174
                 else tau['qk']))),
         'tau_init_est_active_local_k': float(
             np.mean(scores['k'] > (
-                np.asarray(tau['k'])[:, None] if per_address_v4174
+                np.asarray(tau['k'])[:, None] if per_space_v4174
                 else tau['qk']))),
         'tau_calibration': tau_calibration,
         'tau_init_calibration': {
@@ -3853,6 +3843,28 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
             'neurons_rst': int(page_stats['rst']['full_pool_size']),
         },
     }
+
+
+_TAU_INIT_APPLY_PAYLOAD_FIELDS = (
+    'tau_init_quantile_tau',
+    'tau_init_target_frac',
+    'tau_init_target_local_frac',
+    'tau_init_est_active',
+    'tau_init_est_active_local',
+    'tau_init_est_active_pool',
+)
+
+
+def _tau_init_apply_payload(summary):
+    """Return only deterministic cross-host fields needed to apply tau."""
+    missing = tuple(
+        field for field in _TAU_INIT_APPLY_PAYLOAD_FIELDS
+        if field not in summary)
+    if missing:
+        raise KeyError(
+            "tau initialization summary is missing apply fields: "
+            + ", ".join(missing))
+    return {field: summary[field] for field in _TAU_INIT_APPLY_PAYLOAD_FIELDS}
 
 
 def _dict_without_private_keys(src):
@@ -5957,6 +5969,55 @@ def _depth_pool_scales_for(model=None, model_cfg=None):
     )
 
 
+def _canonical_pool_schema(model_version):
+    """Return version-specific parameter keys under canonical pool identities."""
+    if str(model_version) == V4174_MODEL_VERSION:
+        return {
+            'qk': {
+                'metric_prefix': 'attn_qk',
+                'read': 'qk_read_vectors',
+                'write': 'qk_write_vectors',
+                'operator_keys': 'qk_operator_keys',
+            },
+            'v': {
+                'metric_prefix': 'attn_v',
+                'read': 'v_read_vectors',
+                'write': 'v_write_vectors',
+                'operator_keys': 'v_operator_keys',
+            },
+            'rst': {
+                'metric_prefix': 'rst',
+                'read': 'rst_read_vectors',
+                'write': 'rst_write_vectors',
+                'operator_keys': 'rst_operator_keys',
+            },
+            'read_probe': 'operator_key_read_probe',
+            'write_probe': 'operator_key_write_probe',
+        }
+    return {
+        'qk': {
+            'metric_prefix': 'attn_qk',
+            'read': 'attn_qk_read',
+            'write': 'attn_qk_write',
+            'operator_keys': 'attn_qk_op_key',
+        },
+        'v': {
+            'metric_prefix': 'attn_v',
+            'read': 'attn_v_read',
+            'write': 'attn_v_write',
+            'operator_keys': 'attn_v_op_key',
+        },
+        'rst': {
+            'metric_prefix': 'rst',
+            'read': 'rst_read',
+            'write': 'rst_write',
+            'operator_keys': 'rst_op_key',
+        },
+        'read_probe': 'rw_key_read_probe',
+        'write_probe': 'rw_key_write_probe',
+    }
+
+
 def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     """Observational pool norm/gain diagnostics; never feeds loss."""
     pool = params.get('neuron_pool', {})
@@ -5965,6 +6026,7 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     model_version = getattr(model, '__version__', None)
     if model_version is None and model_cfg is not None:
         model_version = model_cfg.get('model_version')
+    pool_schema = _canonical_pool_schema(model_version)
     v4170_op_keys = (
         _v4170_pool_operator_keys(pool)
         if str(model_version) == V4170_MODEL_VERSION else None)
@@ -5974,8 +6036,8 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
 
     if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         for probe_name, prefix in (
-                ('rw_key_read_probe', 'read_probe'),
-                ('rw_key_write_probe', 'write_probe')):
+                (pool_schema['read_probe'], 'read_probe'),
+                (pool_schema['write_probe'], 'write_probe')):
             probe = jnp.asarray(pool[probe_name], dtype=jnp.float32)
             out[f'{prefix}_fro_norm'] = jax.lax.stop_gradient(
                 jnp.linalg.norm(probe))
@@ -6000,19 +6062,18 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
         w_key = _unit(write) @ write_proj
         return _unit(_unit(r_key) * _unit(w_key))
 
-    specs = (
-        ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write', 'attn_qk_scale'),
-        ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write', 'attn_v_scale'),
-        ('rst', 'rst_emb', 'rst_read', 'rst_write', 'rst_scale'),
-    )
+    specs = tuple(
+        (entry['metric_prefix'], f"{entry['metric_prefix']}_emb",
+         entry['read'], entry['write'], f"{entry['metric_prefix']}_scale",
+         entry['operator_keys'])
+        for entry in (pool_schema['qk'], pool_schema['v'], pool_schema['rst']))
 
-    def _flat_pool_tensor(prefix, kind):
-        key = f'{prefix}_{kind}'
+    def _flat_pool_tensor(key):
         if key in pool:
             return pool[key]
         parts = []
         for scope in ('global', 'stage', 'local'):
-            part_key = f'{prefix}_{kind}_{scope}'
+            part_key = f'{key}_{scope}'
             if part_key in pool:
                 part = pool[part_key]
                 parts.append(part.reshape((-1, part.shape[-1])))
@@ -6020,11 +6081,12 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
             return None
         return jnp.concatenate(parts, axis=0)
 
-    for i, (name, emb_key, read_key, write_key, scale_key) in enumerate(specs):
-        read = _flat_pool_tensor(name, 'read')
-        write = _flat_pool_tensor(name, 'write')
+    for i, (name, emb_key, read_key, write_key, scale_key,
+            operator_key_name) in enumerate(specs):
+        read = _flat_pool_tensor(read_key)
+        write = _flat_pool_tensor(write_key)
         if v417x_op_keys is not None:
-            operator_keys = v417x_op_keys[f'{name}_op_key']
+            operator_keys = v417x_op_keys[operator_key_name]
             out.update(_row_norm_stats(
                 operator_keys, f'{name}_op_key_norm', full))
             if (full and str(model_version)
@@ -6033,8 +6095,8 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
                 generated = _registry_helper_for_version(
                     model_version, 'operator_key_diagnostics')(
                     read, write,
-                    pool['rw_key_read_probe'],
-                    pool['rw_key_write_probe'])
+                    pool[pool_schema['read_probe']],
+                    pool[pool_schema['write_probe']])
                 for diag_name, value in generated.items():
                     out[f'{name}_{diag_name}'] = jax.lax.stop_gradient(value)
         elif (_is_active_srw_version(model_version)
@@ -6075,7 +6137,7 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
 
 def _shared_probe_gradient_diagnostics(
         pool_params, pool_grads, model_version):
-    """Return v4172 shared-probe norms without changing optimization state."""
+    """Return shared-probe norms without changing optimization state."""
     zero = jnp.float32(0.0)
     if str(model_version) not in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         return {
@@ -6095,12 +6157,9 @@ def _shared_probe_gradient_diagnostics(
         value = jnp.asarray(tree[key], dtype=jnp.float32)
         return jax.lax.stop_gradient(jnp.linalg.norm(value))
 
-    read_name = ('operator_key_read_probe'
-                 if str(model_version) == V4174_MODEL_VERSION
-                 else 'rw_key_read_probe')
-    write_name = ('operator_key_write_probe'
-                  if str(model_version) == V4174_MODEL_VERSION
-                  else 'rw_key_write_probe')
+    schema = _canonical_pool_schema(model_version)
+    read_name = schema['read_probe']
+    write_name = schema['write_probe']
     grad_read = _norm(pool_grads, read_name)
     grad_write = _norm(pool_grads, write_name)
     param_read = _norm(pool_params, read_name)
@@ -6123,15 +6182,16 @@ def _shared_probe_gradient_diagnostics(
 
 def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
     """Return version-canonical operator-key gradient norms by pool."""
+    pool_schema = _canonical_pool_schema(model_version)
     def _norm(key):
         return (_global_norm_array(pool_grads[key])
                 if key in pool_grads else jnp.float32(0.0))
 
     if str(model_version) == V4171_MODEL_VERSION:
         return {
-            'attn_qk': _norm('attn_qk_op_key'),
-            'attn_v': _norm('attn_v_op_key'),
-            'rst': _norm('rst_op_key'),
+            entry['metric_prefix']: _norm(entry['operator_keys'])
+            for entry in (
+                pool_schema['qk'], pool_schema['v'], pool_schema['rst'])
         }
     if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         shared_probe_metrics = _shared_probe_gradient_diagnostics(
@@ -6153,20 +6213,19 @@ def _pool_update_diagnostics(params, grads, model_version=None):
     pool_p = params.get('neuron_pool', {})
     pool_g = grads.get('neuron_pool', {})
     out = {}
-    specs = (
-        ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write'),
-        ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
-        ('rst', 'rst_emb', 'rst_read', 'rst_write'),
-    )
+    pool_schema = _canonical_pool_schema(model_version)
+    specs = tuple(
+        (entry['metric_prefix'], f"{entry['metric_prefix']}_emb",
+         entry['read'], entry['write'])
+        for entry in (pool_schema['qk'], pool_schema['v'], pool_schema['rst']))
 
-    def _partition_norm(tree, prefix, kind):
-        key = f'{prefix}_{kind}'
+    def _partition_norm(tree, key):
         if key in tree:
             return _global_norm_array(tree[key])
         norms_sq = jnp.float32(0.0)
         found = False
         for scope in ('global', 'stage', 'local'):
-            part_key = f'{prefix}_{kind}_{scope}'
+            part_key = f'{key}_{scope}'
             if part_key in tree:
                 n = _global_norm_array(tree[part_key])
                 norms_sq = norms_sq + jnp.square(n)
@@ -6178,8 +6237,8 @@ def _pool_update_diagnostics(params, grads, model_version=None):
     for name, emb_key, read_key, write_key in specs:
         for short, key in (('emb', emb_key), ('read', read_key), ('write', write_key)):
             if short in ('read', 'write'):
-                p_norm = _partition_norm(pool_p, name, short)
-                g_norm = _partition_norm(pool_g, name, short)
+                p_norm = _partition_norm(pool_p, key)
+                g_norm = _partition_norm(pool_g, key)
             else:
                 p_norm = (_global_norm_array(pool_p[key])
                           if key in pool_p else jnp.float32(0.0))
@@ -6196,8 +6255,8 @@ def _pool_update_diagnostics(params, grads, model_version=None):
         )
     elif str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         op_specs = (
-            ('shared', 'read_probe', 'rw_key_read_probe'),
-            ('shared', 'write_probe', 'rw_key_write_probe'),
+            ('shared', 'read_probe', pool_schema['read_probe']),
+            ('shared', 'write_probe', pool_schema['write_probe']),
         )
     else:
         op_specs = (
@@ -7413,12 +7472,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_attn_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
-                    return any(f'router/{name}' in ps for name in (
+                    names = (
                         'q_operation_proj', 'k_operation_proj',
-                        'v_operation_proj', 'q_address_query_proj',
-                        'k_address_query_proj', 'v_address_query_proj',
-                        'qk_state_writeback', 'v_state_writeback',
-                        'operation_address_keys'))
+                        'v_operation_proj', 'qk_state_writeback',
+                        'v_state_writeback',
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['q_space_query_proj'],
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['k_space_query_proj'],
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['v_space_query_proj'],
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['operation_space_keys'])
+                    return any(f'router/{name}' in ps for name in names)
                 return (('router/proj_attn' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
                             and (('router/up_qk' in ps)
@@ -7431,9 +7493,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_rst_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
-                    return any(f'router/{name}' in ps for name in (
-                        'rst_operation_proj', 'rst_address_query_proj',
-                        'rst_state_writeback', 'operation_address_keys'))
+                    names = (
+                        'rst_operation_proj', 'rst_state_writeback',
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['rst_space_query_proj'],
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['operation_space_keys'])
+                    return any(f'router/{name}' in ps for name in names)
                 return (('router/proj_rst' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
                             and (('router/up_rst' in ps)
@@ -7921,19 +7985,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
             grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
             if str(_model_version) == V4174_MODEL_VERSION:
+                serialized_space_key = V4174_SERIALIZED_SPACE_PARAM_NAMES[
+                    'operation_space_keys']
                 grad_router_proj_attn = jnp.sqrt(sum(
                     jnp.square(_child_norm(_grouter, name))
                     for name in (
                         'q_operation_proj', 'k_operation_proj',
-                        'v_operation_proj', 'q_address_query_proj',
-                        'k_address_query_proj', 'v_address_query_proj',
+                        'v_operation_proj',
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['q_space_query_proj'],
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['k_space_query_proj'],
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['v_space_query_proj'],
                         'qk_state_writeback', 'v_state_writeback',
-                        'operation_address_keys')))
+                        serialized_space_key)))
                 grad_router_proj_rst = jnp.sqrt(sum(
                     jnp.square(_child_norm(_grouter, name))
                     for name in (
-                        'rst_operation_proj', 'rst_address_query_proj',
-                        'rst_state_writeback', 'operation_address_keys')))
+                        'rst_operation_proj',
+                        V4174_SERIALIZED_SPACE_PARAM_NAMES['rst_space_query_proj'],
+                        'rst_state_writeback', serialized_space_key)))
             if str(_model_version) == V4173_MODEL_VERSION:
                 grad_router_proj_attn = jnp.sqrt(
                     jnp.square(grad_router_proj_attn)
@@ -10151,7 +10220,7 @@ def get_param_shardings(params, mesh, model_version=None,
                     and value.ndim == 3):
                 return space_operator_sharded_3d
             if (version == V4174_MODEL_VERSION and value.ndim == 3):
-                # Address M is replicated; only N_per_address is model-sharded.
+                # Space M is replicated; only N_per_space is model-sharded.
                 return space_operator_sharded_3d
             if value.ndim == 2:
                 return n_sharded       # [N, d_bn] or [N, D]
@@ -10160,7 +10229,7 @@ def get_param_shardings(params, mesh, model_version=None,
             else:
                 return replicated
         if version == V4174_MODEL_VERSION and path_str.startswith('router/'):
-            # Address keys/query projections and address-local projection or
+            # Space keys/query projections and space-local projection or
             # writeback matrices are intentionally replicated.  This explicit
             # branch prevents accidental reliance on the default policy.
             return replicated
@@ -13215,7 +13284,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in V4173_OPERATION_SPACE_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
-    for _key in V4174_ADDRESS_METRIC_NAMES:
+    for _key in V4174_SELECTOR_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
@@ -13835,22 +13904,22 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
             f"std={float(rec['space_usage_std']):.3f}] "
             f"dead={float(rec['space_dead_frac']):.3f}")
     if (str(ctx.get('model_version')) == V4174_MODEL_VERSION
-            and all(name in rec for name in V4174_ADDRESS_METRIC_NAMES)):
-        def _address_route(route, label):
+            and all(name in rec for name in V4174_SPACE_METRIC_NAMES)):
+        def _space_route(route, label):
             return (
-                f"{label}[top1={float(rec[f'{route}_address_top1_usage_max']):.3f} "
-                f"w1={float(rec[f'{route}_address_weight_top1_mean']):.3f} "
-                f"H={float(rec[f'{route}_address_weight_entropy_mean']):.3f} "
-                f"use={float(rec[f'{route}_address_usage_min']):.3f}/"
-                f"{float(rec[f'{route}_address_usage_max']):.3f}"
-                f"±{float(rec[f'{route}_address_usage_std']):.3f} "
-                f"dead={float(rec[f'{route}_address_dead_frac']):.3f}]")
+                f"{label}[top1={float(rec[f'{route}_space_top1_usage_max']):.3f} "
+                f"w1={float(rec[f'{route}_space_weight_top1_mean']):.3f} "
+                f"H={float(rec[f'{route}_space_weight_entropy_mean']):.3f} "
+                f"use={float(rec[f'{route}_space_usage_min']):.3f}/"
+                f"{float(rec[f'{route}_space_usage_max']):.3f}"
+                f"±{float(rec[f'{route}_space_usage_std']):.3f} "
+                f"dead={float(rec[f'{route}_space_dead_frac']):.3f}]")
         log_message(
-            "  address " + _address_route('q', 'q') + " "
-            + _address_route('k', 'k'))
+            "  space " + _space_route('q', 'q') + " "
+            + _space_route('k', 'k'))
         log_message(
-            "          " + _address_route('v', 'v') + " "
-            + _address_route('rst', 'r'))
+            "        " + _space_route('v', 'v') + " "
+            + _space_route('rst', 'r'))
     if str(ctx.get('model_version')) in (
             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
         log_message(
@@ -15489,11 +15558,10 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         raise RuntimeError(
             f"{version} module is missing make_sharded_srw_paired")
     n_operation_spaces = int(model_cfg.get('n_operation_spaces', 1))
-    n_operation_addresses = int(model_cfg.get('n_operation_addresses', 1))
     for key in ('n_qk', 'n_v', 'n_rst'):
         value = int(model_cfg.get(key, model_cfg.get('n_know', 0)))
         divisor = (
-            mesh_model * n_operation_addresses
+            mesh_model * n_operation_spaces
             if version == V4174_MODEL_VERSION
             else (mesh_model * n_operation_spaces
                   if key == 'n_rst' and n_operation_spaces > 1
@@ -15502,20 +15570,17 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             raise ValueError(
                 f"model.{key}={value} must be positive and divisible by "
                 f"{divisor} (mesh_model={mesh_model}, "
-                f"n_operation_spaces={n_operation_spaces}, "
-                f"n_operation_addresses={n_operation_addresses})")
+                f"n_operation_spaces={n_operation_spaces})")
     local_counts = {
         'qk': int(model_cfg['n_qk']) // (
-            mesh_model * n_operation_addresses
+            mesh_model * n_operation_spaces
             if version == V4174_MODEL_VERSION else mesh_model),
         'v': int(model_cfg['n_v']) // (
-            mesh_model * n_operation_addresses
+            mesh_model * n_operation_spaces
             if version == V4174_MODEL_VERSION else mesh_model),
         'rst': int(model_cfg.get(
             'n_rst', model_cfg.get('n_know'))) // (
-                mesh_model * (n_operation_addresses
-                              if version == V4174_MODEL_VERSION
-                              else n_operation_spaces)),
+                mesh_model * n_operation_spaces),
     }
     chunks = {
         pool: max(1, math.ceil(
@@ -15606,28 +15671,28 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             max_chunk_size=chunks['rst'],
             **_factory_supported_kwargs(
                 dense_factory, pool_kwargs('rst')))
-    if version == V4174_MODEL_VERSION and n_operation_addresses > 1:
+    if version == V4174_MODEL_VERSION and n_operation_spaces > 1:
         dense_factory_name = (
-            'make_sharded_address_dense_diagnostics'
+            'make_sharded_space_dense_diagnostics'
             if kernel_profile == 'production_diagnostics'
-            else 'make_sharded_address_dense_minimal')
-        paired_address_factory_name = (
-            'make_sharded_qk_address_dense_diagnostics'
+            else 'make_sharded_space_dense_minimal')
+        paired_space_factory_name = (
+            'make_sharded_qk_space_dense_diagnostics'
             if kernel_profile == 'production_diagnostics'
-            else 'make_sharded_qk_address_dense_minimal')
+            else 'make_sharded_qk_space_dense_minimal')
         dense_factory = getattr(module, dense_factory_name, None)
-        paired_address_factory = getattr(
-            module, paired_address_factory_name, None)
-        if dense_factory is None or paired_address_factory is None:
+        paired_space_factory = getattr(
+            module, paired_space_factory_name, None)
+        if dense_factory is None or paired_space_factory is None:
             raise RuntimeError(
-                "v4174 multi-address config requires "
-                f"{dense_factory_name} and {paired_address_factory_name}")
-        sharded['qk_address_dense'] = paired_address_factory(
+                "v4174 multi-space config requires "
+                f"{dense_factory_name} and {paired_space_factory_name}")
+        sharded['qk_space_dense'] = paired_space_factory(
             max_chunk_size=chunks['qk'],
             **_factory_supported_kwargs(
-                paired_address_factory, pool_kwargs('qk')))
+                paired_space_factory, pool_kwargs('qk')))
         for pool, route_key in (
-                ('v', 'v_address_dense'), ('rst', 'rst_address_dense')):
+                ('v', 'v_space_dense'), ('rst', 'rst_space_dense')):
             sharded[route_key] = dense_factory(
                 max_chunk_size=chunks[pool],
                 **_factory_supported_kwargs(
@@ -16049,6 +16114,16 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
         kwargs['analysis'] = False
     if _model_accepts_minimal_train(model):
         kwargs['minimal_train'] = True
+    if (_is_v417x_version(model_version)
+            and _model_accepts_minimal_runtime_profile(model)):
+        kernel_profile = (
+            sharded_fns.get(_v417x_kernel_profile_key(model_version))
+            if isinstance(sharded_fns, dict) else None)
+        if kernel_profile != 'production_diagnostics':
+            raise ValueError(
+                "v417x transfer scoring requires production_diagnostics "
+                f"kernels, got {kernel_profile!r}")
+        kwargs['minimal_runtime_profile'] = 'diagnostics'
     signature = inspect.signature(model.__call__).parameters
     for key in (
             'soft_gate_temperature', 'soft_gate_T_qk', 'soft_gate_T_v',
@@ -17586,8 +17661,8 @@ def main():
                 'qk': _opspace_materialized_pool('qk'),
                 'v': _opspace_materialized_pool('v'),
                 'rst': _opspace_materialized_pool('rst'),
-            },
-        }
+        },
+    }
         if _raw_repack_training or operation_space_repack_enabled:
             _opspace_materialized_training['repack'] = {
                 'enabled': bool(operation_space_repack_enabled),
@@ -17977,14 +18052,14 @@ def main():
             f"expected={symbolic_counts['total']} actual={n_params}")
     if (not _has_resume_checkpoint
             and str(model_version_cfg) == V4174_MODEL_VERSION):
-        address_init_diagnostics = _v4174_initialization_diagnostics(
+        space_init_diagnostics = _v4174_initialization_diagnostics(
             params, dummy_input,
-            int(cfg['model']['operation_address_top_k']))
+            int(cfg['model']['operation_space_top_k']))
         if is_host0:
-            print("v4174 operation-address initialization diagnostics:", flush=True)
-            for key in sorted(address_init_diagnostics):
+            print("v4174 operation-space initialization diagnostics:", flush=True)
+            for key in sorted(space_init_diagnostics):
                 print(
-                    f"  {key}: {address_init_diagnostics[key]:.8g}",
+                    f"  {key}: {space_init_diagnostics[key]:.8g}",
                     flush=True)
 
     if is_host0:
@@ -18778,22 +18853,28 @@ def main():
             raise ValueError(
                 "tau_init_mode=quantile_frac requires at least one "
                 "training batch for calibration.")
-        _tau_init_summary_json = None
+        _tau_init_apply_json = None
         if is_host0:
             calibration_input_ids, _ = next(iter(train_loader))
             tau_init_summary = _compute_srw_quantile_tau_init(
                 params, calibration_input_ids, cfg, tau_init_cfg)
-            _tau_init_summary_json = json.dumps(tau_init_summary)
-        _tau_init_summary_json = _broadcast_str_from_host0(
-            _tau_init_summary_json, max_len=65536)
-        if not _tau_init_summary_json:
+            _tau_init_apply_json = json.dumps(
+                _tau_init_apply_payload(tau_init_summary),
+                ensure_ascii=False, separators=(',', ':'))
+        _tau_init_apply_json = _broadcast_str_from_host0(
+            _tau_init_apply_json, max_len=None)
+        if not _tau_init_apply_json:
             raise RuntimeError(
-                "Failed to broadcast quantile tau initialization summary.")
-        tau_init_summary = json.loads(_tau_init_summary_json)
+                "Failed to broadcast quantile tau initialization apply payload.")
+        try:
+            tau_init_apply_payload = json.loads(_tau_init_apply_json)
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                "Failed to decode quantile tau initialization apply payload") from exc
         params = _set_srw_quantile_tau_biases(
-            params, tau_init_summary, model_version_cfg)
+            params, tau_init_apply_payload, model_version_cfg)
         fixed_tau_materialized = _materialize_fixed_tau_config(
-            cfg, training_config, tau_init_summary, model_version_cfg)
+            cfg, training_config, tau_init_apply_payload, model_version_cfg)
         if fixed_tau_materialized:
             model = build_model_from_config(cfg)
             if is_host0:
@@ -20744,13 +20825,13 @@ def main():
                 if str(model_version_cfg) == V4174_MODEL_VERSION:
                     log_message("DAWN spatial-r1-v4.1.7.4")
                     log_message(
-                        "Execution: shared operation-address lookup with "
-                        "all-address dense Q/K/V/RST routes")
+                        "Execution: one shared operation-coordinate system "
+                        "with all-space dense Q/K/V/RST routes")
                     log_message(
-                        "Address shape: "
-                        f"M={cfg['model']['n_operation_addresses']} "
-                        f"K={cfg['model']['operation_address_top_k']} "
-                        f"d_address=d_route={cfg['model']['d_route']}")
+                        "Operation spaces: "
+                        f"M={cfg['model']['n_operation_spaces']} "
+                        f"K={cfg['model']['operation_space_top_k']} "
+                        f"d_space=d_route={cfg['model']['d_route']}")
                 elif str(model_version_cfg) == V4173_MODEL_VERSION:
                     log_message("DAWN spatial-r1-v4.1.7.3")
                     log_message(

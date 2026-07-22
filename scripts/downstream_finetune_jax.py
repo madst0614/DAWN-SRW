@@ -640,8 +640,11 @@ def main() -> None:
         vocab_size_padded=model_cfg.get('vocab_size_padded'))
     params = tj.shard_params_to_mesh(params, param_shardings)
     sharded_train = tj.build_canonical_sharded_fns(cfg, mesh)
+    eval_sharding_kwargs = {'for_eval': True}
+    if tj._is_v417x_version(model_cfg['model_version']):
+        eval_sharding_kwargs['kernel_profile'] = 'production_diagnostics'
     sharded_eval = tj.build_canonical_sharded_fns(
-        cfg, mesh, for_eval=True)
+        cfg, mesh, **eval_sharding_kwargs)
 
     grad_accum = int(training_cfg.get('gradient_accumulation_steps', 1))
     total_optimizer_steps = math.ceil(total_steps / max(grad_accum, 1))

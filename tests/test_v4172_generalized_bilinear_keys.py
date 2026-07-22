@@ -713,6 +713,70 @@ def test_v4172_canonical_builder_routes_pool_denominator_powers() -> None:
         expected_power_v=1.0, expected_power_rst=1.2)
 
 
+def test_v4172_candidate_scoring_uses_diagnostics_runtime_profile() -> None:
+    from scripts import train_jax
+
+    cfg = {
+        "model": {
+            "model_version": V4172_MODEL_VERSION,
+            "d_route": 4,
+            "n_qk": 4,
+            "n_v": 4,
+            "n_rst": 4,
+            "admission_den_power": 1.0,
+            "admission_den_power_qk": 0.5,
+            "admission_den_power_v": 1.0,
+            "admission_den_power_rst": 1.2,
+        },
+        "training": {
+            "mesh_model": 1,
+            "max_chunk_size": 2,
+            "ce_token_chunk_size": 8,
+        },
+    }
+    mesh = _one_device_mesh()
+    sharded = train_jax.build_canonical_sharded_fns(
+        cfg, mesh, for_eval=True,
+        kernel_profile="production_diagnostics")
+    model = DAWN_SRW_V4172(
+        **_tiny_kwargs(), admission_den_power=1.0,
+        admission_den_power_qk=0.5,
+        admission_den_power_v=1.0,
+        admission_den_power_rst=1.2)
+    input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+    labels = jnp.asarray([[-100, 2, 3]], dtype=jnp.int32)
+    params = model.init(
+        {"params": jax.random.PRNGKey(81),
+         "dropout": jax.random.PRNGKey(82)},
+        input_ids, labels=labels, deterministic=True)["params"]
+    runtime_state = {
+        "soft_gate_temperature": 0.07,
+        "soft_gate_T_qk": 0.07,
+        "soft_gate_T_v": 0.07,
+        "soft_gate_T_rst": 0.07,
+        "soft_gate_t_final": 0.07,
+        "soft_gate_boundary_power": 2.0,
+        "soft_gate_boundary_power_final": 4.0,
+        "admission_den_power": 1.0,
+        "admission_den_grad_scale": 1.0,
+        "srw_composition_mode": "linear_angular",
+        "heat_kernel_beta": 2.0,
+        "training_tokens": 0.0,
+        "ce_token_chunk_size": 8,
+    }
+
+    forward_kwargs = train_jax._fixed_runtime_forward_kwargs(
+        model, sharded, runtime_state, compute_accuracy=False)
+    assert forward_kwargs["minimal_runtime_profile"] == "diagnostics"
+
+    score_step = train_jax.create_candidate_score_step(
+        model, sharded, runtime_state)
+    scores = score_step(
+        params, input_ids, labels, jnp.ones_like(input_ids))
+    assert scores.shape == (1,)
+    assert np.isfinite(np.asarray(scores)).all()
+
+
 def test_v4172_pool_powers_preserve_parameter_schema_and_default_forward() -> None:
     from scripts import train_jax
 

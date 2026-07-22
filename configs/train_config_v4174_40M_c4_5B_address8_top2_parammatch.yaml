@@ -1,18 +1,22 @@
-# DAWN-SRW v4.1.7.4 - 8 shared operation addresses, top-2, parameter matched
+# DAWN-SRW v4.1.7.4 - 8 operation spaces, top-2, parameter matched
+#
+# The filename and serialized config aliases retain "address" for compatibility
+# with the active native-v4174 run. Architecturally, M denotes operation spaces
+# and the shared key table contains one learned key per operation space.
 #
 # Parameter match (symbolic counter; initialized-tree equality is unit tested):
 #   baseline v4173 params:       40,343,044
-#   v4174 address params:        40,343,584
+#   v4174 operation-space params: 40,343,584
 #   absolute difference:                540
 #   relative difference:          0.001339%
 #   baseline qk/v/rst counts:  9,748 / 30,730 / 62,094
 #   new qk/v/rst totals:       8,776 / 27,664 / 55,896
-#   per-address counts:        1,097 /  3,458 /  6,987
+#   per-space counts:          1,097 /  3,458 /  6,987
 #   n_operation_addresses: 8
 #   operation_address_top_k: 2
 #
-# Explicit per-address tau targets preserve the approximate selected active
-# count of the single-address model.  With M=8 and K=2:
+# Explicit per-space tau targets preserve the approximate selected active
+# count of the single-space baseline. With M=8 and K=2:
 #   K * (N/M) * target_multi ~= N * target_single
 #   Q/K: 2 * (N/8) * 0.20 ~= N * 0.05
 #   V:   2 * (N/8) * 0.12 ~= N * 0.03
