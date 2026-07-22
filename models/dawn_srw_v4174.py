@@ -1561,4 +1561,3 @@ def _validate_v4174_sharded_fns(
 
 def get_model_version() -> str:
     return MODEL_VERSION
-

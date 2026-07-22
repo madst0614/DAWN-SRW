@@ -506,7 +506,7 @@ def test_o_checkpoint_round_trip_preserves_params_optimizer_and_config():
 
 
 @pytest.mark.parametrize("spaces", (8, 32))
-def test_p_tau_compact_dynamic_broadcast_payload(spaces):
+def test_p_tau_compact_dynamic_broadcast_payload(spaces, monkeypatch):
     tau = {
         route: np.linspace(-0.5, 0.5, spaces).tolist()
         for route in ("q", "k", "qk", "v", "rst")}
@@ -526,6 +526,21 @@ def test_p_tau_compact_dynamic_broadcast_payload(spaces):
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     received = train_jax.broadcast_str_from_host0(encoded, max_len=None)
     assert json.loads(received) == payload
+
+    encoded_bytes = encoded.encode("utf-8")
+    host0_buffer = np.frombuffer(encoded_bytes, dtype=np.uint8).copy()
+    broadcast_values = iter((
+        np.asarray([len(encoded_bytes)], dtype=np.uint64),
+        host0_buffer,
+    ))
+    monkeypatch.setattr(jax, "process_index", lambda: 1)
+    monkeypatch.setattr(train_jax, "_HAVE_BROADCAST", True)
+    monkeypatch.setattr(
+        train_jax, "_bcast_one_to_all", lambda _value: next(broadcast_values))
+    remote_received = train_jax.broadcast_str_from_host0(None, max_len=None)
+    assert remote_received == received
+    assert json.loads(remote_received) == payload
+
     for route in tau:
         np.testing.assert_array_equal(
             json.loads(received)["tau_init_quantile_tau"][route], tau[route])
