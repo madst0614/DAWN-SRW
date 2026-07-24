@@ -6787,6 +6787,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             V4166_MODEL_VERSION, V4168_MODEL_VERSION, V4169_MODEL_VERSION,
             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS)
         and _pass_minimal_train_kw)
+    if _is_v417x_version(_model_version):
+        if not _pass_minimal_runtime_profile_kw:
+            raise RuntimeError(
+                "v417x training requires minimal_runtime_profile support")
+        if isinstance(sharded_fns, dict):
+            kernel_profile = sharded_fns.get(
+                _v417x_kernel_profile_key(_model_version))
+            if kernel_profile != 'production':
+                raise ValueError(
+                    "v417x training requires production kernels, got "
+                    f"{kernel_profile!r}")
     if jax.process_index() == 0:
         print(
             f"train minimal path: enabled={_use_minimal_train_path} "
@@ -9747,11 +9758,14 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         kernel_profile = (
             sharded_fns.get(_v417x_kernel_profile_key(_model_version))
             if isinstance(sharded_fns, dict) else None)
-        if kernel_profile != 'production_diagnostics':
+        if kernel_profile not in ('production', 'production_diagnostics'):
             raise ValueError(
-                "v417x eval requires production_diagnostics kernels, got "
+                "v417x eval requires production or production_diagnostics "
+                "kernels, got "
                 f"{kernel_profile!r}")
-        _minimal_eval_runtime_profile = 'diagnostics'
+        _minimal_eval_runtime_profile = (
+            'diagnostics'
+            if kernel_profile == 'production_diagnostics' else 'training')
     _soft_gate_runtime_enabled = bool(
         soft_gate_schedule_active
         and _is_active_srw_version(_model_version)
@@ -12736,6 +12750,68 @@ def _attach_v4174_direct_tau_regular_metrics(rec, metrics):
     for key in ('attn_out_norm', 'rst_out_norm', 'residual_norm'):
         rec[key] = float(metrics[key])
     return rec
+
+
+MINIMAL_PRETRAINING_REQUIRED_LOG_KEYS = (
+    'step',
+    'epoch',
+    'loss',
+    'ce_loss',
+    'aux_loss',
+    'grad_norm',
+    'learning_rate',
+    'sec_per_it',
+    'tokens_per_sec',
+)
+MINIMAL_PRETRAINING_OPTIONAL_LOG_KEYS = (
+    'tau_reg',
+    'orth_loss',
+    'div_loss',
+    *V4170_TAU_UPDATE_METRIC_NAMES,
+    *V4174_DIRECT_RW_GRADIENT_METRIC_NAMES,
+)
+
+
+def _build_minimal_pretraining_record(
+        metrics, win_avgs, ctx, global_step, epoch, *,
+        sec_per_it, tokens_per_sec):
+    """Build the v417x regular record from train-step scalars only."""
+    rec = {
+        'step': int(global_step),
+        'epoch': int(epoch),
+        'loss': float(win_avgs['loss']),
+        'ce_loss': float(win_avgs['ce']),
+        'aux_loss': float(win_avgs['aux']),
+        'grad_norm': float(metrics['grad_norm']),
+        'learning_rate': float(ctx['current_lr']),
+        'sec_per_it': float(sec_per_it),
+        'tokens_per_sec': float(tokens_per_sec),
+        'tau_reg': float(win_avgs['tau_reg']),
+        'orth_loss': float(win_avgs['orth']),
+        'div_loss': float(win_avgs['div']),
+    }
+    for key in V4170_TAU_UPDATE_METRIC_NAMES:
+        if key in metrics:
+            rec[key] = float(metrics[key])
+    if str(ctx.get('model_version')) == V4174_MODEL_VERSION:
+        for key in V4174_DIRECT_RW_GRADIENT_METRIC_NAMES:
+            if key in metrics:
+                rec[key] = float(metrics[key])
+    rec['timestamp'] = datetime.now().isoformat()
+    return rec
+
+
+def _print_minimal_pretraining_record(rec):
+    """Print the scalar-only canonical pretraining record."""
+    log_message(
+        f"[Step {rec['step']}] "
+        f"loss={rec['loss']:.4f} "
+        f"ce={rec['ce_loss']:.4f} "
+        f"aux={rec['aux_loss']:.4f} "
+        f"grad={rec['grad_norm']:.2f} "
+        f"lr={rec['learning_rate']:.2e} "
+        f"{rec['sec_per_it']:.3f}s/it "
+        f"{rec['tokens_per_sec']:.1f} tok/s")
 
 
 def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
@@ -19780,12 +19856,11 @@ def main():
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path.
     #
-    # v4164: `_sharded_fns` is the slim train path; `_sharded_fns_analysis`
-    # is the full observational path used only by analysis_step.
+    # Pretraining constructs only the production train kernels and the normal
+    # validation kernels. Analysis/diagnostic kernels belong to dedicated
+    # external analysis items.
     _sharded_fns = None
     _sharded_fns_eval = None
-    _sharded_fns_diagnostics = None
-    _sharded_fns_analysis = None
     _force_sharded = _is_active_srw_version(model_version_cfg)
     if is_baseline and mesh_model > 1:
         _sharded_fns = create_baseline_sharded_fns(mesh, cfg)
@@ -19800,12 +19875,6 @@ def main():
         _sharded_fns = build_canonical_sharded_fns(cfg, mesh)
         _sharded_fns_eval = build_canonical_sharded_fns(
             cfg, mesh, for_eval=True)
-        if _is_v417x_version(model_version_cfg):
-            _sharded_fns_diagnostics = build_canonical_sharded_fns(
-                cfg, mesh, for_eval=True,
-                kernel_profile='production_diagnostics')
-        _sharded_fns_analysis = build_canonical_sharded_fns(
-            cfg, mesh, for_eval=True, analysis=True)
         if is_host0:
             print(
                 f"  canonical shard_map enabled "
@@ -19912,9 +19981,6 @@ def main():
                 kwargs.update(_opspace_pool_kwargs(pool))
             return kwargs
 
-        _supports_analysis = (
-            'analysis' in _inspect.signature(make_sharded_srw).parameters
-        )
         # Slim train kernel; analysis defaults to False.
         if operation_space_tau_free_enabled:
             _sharded_single_v = None
@@ -20048,32 +20114,6 @@ def main():
                 'v_backend': _opspace_backends['v'],
                 'rst_backend': _opspace_backends['rst'],
             })
-        # Analysis (observation only). Factory kwargs forward analysis=True
-        # only when the v4164 factory advertises the kwarg.
-        if _supports_analysis and not operation_space_tau_free_enabled:
-            _sharded_single_v_a = make_sharded_srw(
-                analysis=True, max_chunk_size=attn_v_max_chunk,
-                **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('v')))
-            _sharded_single_rst_a = make_sharded_srw(
-                analysis=True, max_chunk_size=rst_max_chunk,
-                **_factory_kwargs(make_sharded_srw, _srw_pool_kwargs('rst')))
-            if hasattr(_v4164_module, 'make_sharded_srw_paired'):
-                _paired_factory = _v4164_module.make_sharded_srw_paired
-                _sharded_paired_a = _v4164_module.make_sharded_srw_paired(
-                    analysis=True, max_chunk_size=attn_qk_max_chunk,
-                    **_factory_kwargs(_paired_factory, _srw_pool_kwargs('qk')))
-                _sharded_fns_analysis = {
-                    'single': _sharded_single_v_a,
-                    'attn_v_single': _sharded_single_v_a,
-                    'rst_single': _sharded_single_rst_a,
-                    'paired': _sharded_paired_a,
-                    'attn_qk_paired': _sharded_paired_a,
-                }
-            else:
-                _sharded_fns_analysis = _sharded_single_rst_a
-            if (str(model_version_cfg) == V4167_MODEL_VERSION
-                    and isinstance(_sharded_fns_analysis, dict)):
-                _sharded_fns_analysis.update(_v4167_extra_fns)
         _vocab_parallel_model = str(model_version_cfg) in (
             V4166_MODEL_VERSION,
             V4168_MODEL_VERSION,
@@ -20128,34 +20168,12 @@ def main():
                 vocab_size_padded=_vp_vocab_size_padded,
                 token_chunk_size=ce_token_chunk_size,
                 compute_accuracy=True)
-            _vp_vocab_ce_diagnostics = (
-                make_vocab_parallel_ce(
-                    mesh,
-                    logical_vocab_size=_vp_logical_vocab_size,
-                    vocab_size_padded=_vp_vocab_size_padded,
-                    token_chunk_size=ce_token_chunk_size,
-                    compute_accuracy=True,
-                    compute_logit_stats=True)
-                if _vp_is_v417x else None)
             _sharded_fns['vocab_parallel_embedding'] = _vp_vocab_embed
             _sharded_fns['vocab_ce'] = _vp_vocab_ce_train
             if _vp_vocab_ce_train_loss is not None:
                 _sharded_fns['vocab_ce_loss'] = _vp_vocab_ce_train_loss
             _sharded_fns_eval = dict(_sharded_fns)
             _sharded_fns_eval['vocab_ce'] = _vp_vocab_ce_eval
-            if isinstance(_sharded_fns_diagnostics, dict):
-                _sharded_fns_diagnostics = dict(
-                    _sharded_fns_diagnostics)
-                _sharded_fns_diagnostics['vocab_parallel_embedding'] = (
-                    _vp_vocab_embed)
-                _sharded_fns_diagnostics['vocab_ce'] = (
-                    _vp_vocab_ce_diagnostics)
-                _sharded_fns_diagnostics.pop('vocab_ce_loss', None)
-            if isinstance(_sharded_fns_analysis, dict):
-                _sharded_fns_analysis = dict(_sharded_fns_analysis)
-                _sharded_fns_analysis['vocab_parallel_embedding'] = (
-                    _vp_vocab_embed)
-                _sharded_fns_analysis['vocab_ce'] = _vp_vocab_ce_eval
             _vocab_parallel_enabled = True
         if is_host0:
             _extra_msg = (
@@ -20192,14 +20210,9 @@ def main():
                  if _opspace_enabled else "QK dense-distributed")
                 if str(model_version_cfg) == V4168_MODEL_VERSION
                 else "QK fused")
-            _analysis_kernel_status = (
-                "off"
-                if operation_space_tau_free_enabled
-                else ("on" if _supports_analysis else "off"))
             print(f"  shard_map enabled (mesh_model={mesh_model}, {_qk_mode_msg}"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={_analysis_kernel_status}"
                   f"{_extra_msg})")
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 if _opspace_enabled:
@@ -20285,11 +20298,8 @@ def main():
                         flush=True)
 
     _eval_sharded_fns = (
-        _sharded_fns_diagnostics
-        if (_is_v417x_version(model_version_cfg)
-            and _sharded_fns_diagnostics is not None)
-        else (_sharded_fns_eval
-              if _sharded_fns_eval is not None else _sharded_fns))
+        _sharded_fns_eval
+        if _sharded_fns_eval is not None else _sharded_fns)
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -20382,42 +20392,6 @@ def main():
             False
             if _is_v417x_version(model_version_cfg)
             else train_compute_accuracy))
-    production_diagnostic_step_fn = None
-    if _is_v417x_version(model_version_cfg):
-        if _sharded_fns_diagnostics is None:
-            raise RuntimeError(
-                "v417x production diagnostics are enabled but the static "
-                "diagnostics sharded functions were not built")
-        production_diagnostic_step_fn = create_production_diagnostic_step(
-            model, _sharded_fns_diagnostics,
-            total_training_steps=total_steps,
-            soft_gate_schedule_active=soft_gate_schedule_active,
-            soft_gate_t_start=soft_gate_t_start,
-            soft_gate_t_final=soft_gate_t_final,
-            soft_gate_t_hold_frac=soft_gate_t_hold_frac,
-            soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
-            soft_gate_schedule=soft_gate_schedule,
-            soft_gate_t_power=soft_gate_t_power,
-            soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
-            soft_gate_t_gompertz_steepness=(
-                soft_gate_t_gompertz_steepness),
-            pool_specific_gate_t=pool_specific_gate_t,
-            soft_gate_pool_schedules=soft_gate_pool_schedules,
-            boundary_power_schedule_active=(
-                boundary_power_schedule_active),
-            soft_gate_boundary_power_start=(
-                soft_gate_boundary_power_start),
-            soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
-            soft_gate_boundary_power_final=(
-                soft_gate_boundary_power_final),
-            soft_gate_boundary_power_start_frac=(
-                soft_gate_boundary_power_start_frac),
-            soft_gate_boundary_power_mid_frac=(
-                soft_gate_boundary_power_mid_frac),
-            soft_gate_boundary_power_final_frac=(
-                soft_gate_boundary_power_final_frac),
-            admission_den_power=admission_den_power,
-            ce_token_chunk_size=ce_token_chunk_size)
     eval_step_fn = create_eval_step(
         model, sharded_fns=_eval_sharded_fns, return_dead_stats=True,
         total_training_steps=total_steps,
@@ -20469,46 +20443,6 @@ def main():
                 soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
                 admission_den_power=admission_den_power,
                 ce_token_chunk_size=ce_token_chunk_size)
-    # v4164 analysis_step is active when the full analysis kernels exist.
-    if operation_space_tau_free_enabled:
-        analysis_step_fn = None
-    elif _sharded_fns_analysis is not None:
-        analysis_step_fn = create_analysis_step(
-            model, sharded_fns=_sharded_fns_analysis,
-            total_training_steps=total_steps,
-            soft_gate_schedule_active=soft_gate_schedule_active,
-            soft_gate_t_start=soft_gate_t_start,
-            soft_gate_t_final=soft_gate_t_final,
-            soft_gate_t_hold_frac=soft_gate_t_hold_frac,
-            soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
-            soft_gate_schedule=soft_gate_schedule,
-            soft_gate_t_power=soft_gate_t_power,
-            soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
-            soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-            pool_specific_gate_t=pool_specific_gate_t,
-            soft_gate_pool_schedules=soft_gate_pool_schedules,
-            boundary_power_schedule_active=boundary_power_schedule_active,
-            soft_gate_boundary_power_start=soft_gate_boundary_power_start,
-            soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
-            soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-            soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
-            soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-            soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-            admission_den_power=admission_den_power,
-            ce_token_chunk_size=ce_token_chunk_size)
-    else:
-        analysis_step_fn = None
-    # No current-train-batch diagnostic forward.
-    _geometry_default_sample = (
-        2048 if str(model_version_cfg) in (
-            V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS) else 512)
-    geometry_step_fn = None if is_baseline else create_geometry_step(
-        max_sample=int(tcfg.get(
-            'geometry_max_sample',
-            tcfg.get('heavy_geometry_max_sample',
-                     _geometry_default_sample))),
-        model_version=model_version_cfg)
-
     # Initial operator-key drift snapshot. Identity here means drift=0 on the
     # first step; legacy pools use their route embeddings as the signature.
     def _drift_snap(p):
@@ -21465,18 +21399,9 @@ def main():
     val_interval = int(cfg['training'].get('val_interval', 5000))
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
-    # Logging cadence. REGULAR every log_interval steps. ANALYSIS every
-    # log_interval * log_analysis_multiplier steps.
+    # The canonical pretraining loop has one logging cadence. Analysis and
+    # geometry cadence settings are intentionally external-only.
     LOG_REGULAR = log_interval
-    LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
-    LOG_GEOMETRY = max(1, LOG_REGULAR * heavy_geometry_multiplier)
-    _v417x_split_runtime = _is_v417x_version(model_version_cfg)
-    _production_diagnostics_enabled = _v417x_split_runtime
-    if (_production_diagnostics_enabled
-            and production_diagnostic_step_fn is None):
-        raise RuntimeError(
-            "production diagnostics are enabled but their static executable "
-            "was not created")
     main_val_path = (
         'operation_space_tau_free_relu'
         if operation_space_tau_free_enabled else (
@@ -21485,21 +21410,20 @@ def main():
             else 'standard'))
     if is_host0:
         print(f"  Log cadence: regular={LOG_REGULAR}"
-              f" analysis={LOG_ANALYSIS}"
-              f" geometry={LOG_GEOMETRY}"
               f" val={val_interval}",
               flush=True)
-        if _is_v417x_version(model_version_cfg):
-            print("  training_runtime_profile=fast", flush=True)
+        print("  training_runtime_profile=minimal", flush=True)
+        print("  training_extra_forward=false", flush=True)
+        print("  training_analysis=false", flush=True)
+        print("  training_geometry=false", flush=True)
+        print("  analysis_execution=external_only", flush=True)
+        if ('log_analysis_multiplier' in tcfg
+                or 'heavy_geometry_multiplier' in tcfg):
             print(
-                "  production_diagnostics_cadence=regular_log", flush=True)
-            print(
-                "  production_diagnostics_parameter_timing=pre_update",
+                "  WARNING: Analysis and geometry cadence settings are "
+                "ignored by the minimal pretraining trainer; run dedicated "
+                "analysis items separately.",
                 flush=True)
-            print(
-                "  production_diagnostics_same_batch=true", flush=True)
-            print(
-                "  production_diagnostics_same_rng=true", flush=True)
 
     # Operator-key drift snapshot. Non-compact runs refresh the real snap at
     # log events; compact/baseline runs carry dummy zero leaves.
@@ -21507,25 +21431,6 @@ def main():
         _prev_op_key_snap = _drift_snap(params)
     else:
         _prev_op_key_snap = _dummy_drift_snap()
-    _latest_val_dead_stats = None
-    _latest_val_dead_step = None
-    _latest_production_diagnostic_metrics = None
-    _latest_production_diagnostic_step = None
-    _production_diagnostic_seen = False
-    _production_diagnostic_parity_checked = False
-    # training_fast and production_diagnostics are deliberately distinct TPU
-    # executables.  Their model math is the same, but XLA may choose a
-    # different float32 reduction order when the diagnostics graph retains
-    # observational outputs.  V4.1.7.3 reports a finite tolerance miss once and
-    # continues; non-finite losses remain fatal, as do legacy-version misses.
-    (_production_diagnostic_parity_atol,
-     _production_diagnostic_parity_rtol) = (
-        _production_diagnostic_parity_tolerances(
-            cfg.get('training', {}), model_version_cfg))
-    # The optional startup OOM probe executes and blocks on train_step once.
-    # Otherwise the first real call is compile-inclusive and is excluded from
-    # steady-state timing below.
-    _fast_train_step_seen = bool(run_oom_check)
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -21551,8 +21456,6 @@ def main():
         _regular_cap_window_jax = _init_update_cap_window_stats()
         win_count = 0
         win_start_time = time.time()
-        _non_log_fast_step_time_ms_sum = 0.0
-        _non_log_fast_step_count = 0
 
         for local_step, (input_ids, attention_mask) in enumerate(train_loader):
 
@@ -21592,117 +21495,11 @@ def main():
             _upcoming_is_regular = (
                 step_after_update % LOG_REGULAR == 0
                 or _upcoming_is_early_log)
-            _production_diagnostic_due = bool(
-                _production_diagnostics_enabled
-                and _upcoming_is_regular)
-
-            diagnostic_metrics = None
-            _diagnostic_forward_time_ms = 0.0
-            _diagnostic_step_total_time_ms = 0.0
-            _diagnostic_compile_time_ms = 0.0
-            _diagnostic_timing_excluded_compile = False
-            if _production_diagnostic_due:
-                # Every host enters this executable. It observes the exact
-                # params, batch, and dropout key that the following train step
-                # uses, before donation/update can invalidate the old state.
-                _diagnostic_t0 = time.perf_counter()
-                diagnostic_metrics = production_diagnostic_step_fn(
-                    params, input_ids, labels, attention_mask, step_rng,
-                    jnp.asarray(global_step, jnp.int32))
-                jax.block_until_ready(diagnostic_metrics)
-                _diagnostic_forward_done = time.perf_counter()
-                if 'loss' not in diagnostic_metrics:
-                    raise KeyError(
-                        "production diagnostics result is missing loss")
-                _ = float(diagnostic_metrics['loss'])
-                _diagnostic_done = time.perf_counter()
-                _raw_diagnostic_forward_ms = (
-                    (_diagnostic_forward_done - _diagnostic_t0) * 1000.0)
-                _raw_diagnostic_total_ms = (
-                    (_diagnostic_done - _diagnostic_t0) * 1000.0)
-                _diagnostic_timing_excluded_compile = bool(
-                    not _production_diagnostic_seen)
-                if _diagnostic_timing_excluded_compile:
-                    _diagnostic_compile_time_ms = _raw_diagnostic_total_ms
-                else:
-                    _diagnostic_forward_time_ms = (
-                        _raw_diagnostic_forward_ms)
-                    _diagnostic_step_total_time_ms = (
-                        _raw_diagnostic_total_ms)
-                _production_diagnostic_seen = True
-                _latest_production_diagnostic_metrics = diagnostic_metrics
-                _latest_production_diagnostic_step = step_after_update
-
-            _fast_timing_excluded_compile = bool(
-                _v417x_split_runtime and not _fast_train_step_seen)
-            _fast_train_t0 = (
-                time.perf_counter() if _v417x_split_runtime else None)
             new_params, new_opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, labels, attention_mask, step_rng,
                 _prev_op_key_snap,
                 jnp.asarray(global_step, jnp.int32))
-            if _v417x_split_runtime:
-                jax.block_until_ready(metrics['total_loss'])
-                _raw_fast_step_time_ms = (
-                    (time.perf_counter() - _fast_train_t0) * 1000.0)
-                _fast_compile_time_ms = (
-                    _raw_fast_step_time_ms
-                    if _fast_timing_excluded_compile else 0.0)
-                _fast_step_time_ms = (
-                    0.0 if _fast_timing_excluded_compile
-                    else _raw_fast_step_time_ms)
-                _fast_train_step_seen = True
-            else:
-                _fast_compile_time_ms = 0.0
-                _fast_step_time_ms = 0.0
-
-            if (_production_diagnostic_due
-                    and not _production_diagnostic_parity_checked):
-                _diagnostic_loss_value = np.asarray(jax.device_get(
-                    diagnostic_metrics['loss']))
-                _fast_loss_value = np.asarray(jax.device_get(
-                    metrics['ce_loss']))
-                _diagnostic_loss_f64 = (
-                    _diagnostic_loss_value.astype(np.float64))
-                _fast_loss_f64 = _fast_loss_value.astype(np.float64)
-                _parity_abs_diff = float(np.max(np.abs(
-                    _diagnostic_loss_f64 - _fast_loss_f64)))
-                _parity_limit = float(
-                    _production_diagnostic_parity_atol
-                    + _production_diagnostic_parity_rtol
-                    * np.max(np.abs(_fast_loss_f64)))
-                _parity_finite = bool(
-                    np.all(np.isfinite(_diagnostic_loss_f64))
-                    and np.all(np.isfinite(_fast_loss_f64)))
-                # Diagnostics are observational and must never reject a valid
-                # production update.  Report any mismatch in the training log
-                # and continue with the training_fast result.
-                _parity_exceeded = (
-                    not _parity_finite
-                    or _parity_abs_diff > _parity_limit)
-                _production_diagnostic_parity_checked = True
-                if is_host0:
-                    if _parity_exceeded:
-                        print(
-                            "  WARNING: production diagnostics parity "
-                            "exceeded tolerance; continuing training "
-                            "(pre_update; "
-                            f"finite={_parity_finite}, "
-                            f"fast={float(_fast_loss_value):.9g}, "
-                            f"diagnostic={float(_diagnostic_loss_value):.9g}, "
-                            f"abs_diff={_parity_abs_diff:.9g}, "
-                            f"limit={_parity_limit:.9g}, "
-                            f"atol={_production_diagnostic_parity_atol:.9g}, "
-                            f"rtol={_production_diagnostic_parity_rtol:.9g})",
-                            flush=True)
-                    else:
-                        print(
-                            "  production diagnostics parity: "
-                            "loss close (pre_update; "
-                            f"abs_diff={_parity_abs_diff:.9g}, "
-                            f"limit={_parity_limit:.9g})",
-                            flush=True)
 
             params, opt_state = new_params, new_opt_state
 
@@ -21785,12 +21582,6 @@ def main():
 
             win_count += 1
             epoch_steps += 1
-            if (_v417x_split_runtime
-                    and not _upcoming_is_regular
-                    and not _production_diagnostic_due
-                    and not _fast_timing_excluded_compile):
-                _non_log_fast_step_time_ms_sum += _fast_step_time_ms
-                _non_log_fast_step_count += 1
 
             # Per-step NaN check on total_loss only. A single scalar sync
             # catches loss explosions immediately; the full 6-key check runs
@@ -21849,26 +21640,12 @@ def main():
             epoch_step_counter += 1
 
             # ---- REGULAR periodic logging ----
-            # ANALYSIS is driven from the val path (below), not from here -
-            # the ANALYSIS stats now require a separate forward with the
-            # full-stats kernels and only run on val ticks.
             _is_early_log = _upcoming_is_early_log
             is_regular = _upcoming_is_regular
 
             if is_regular:
-                if _production_diagnostics_enabled:
-                    if diagnostic_metrics is None:
-                        raise RuntimeError(
-                            "regular log step did not run production "
-                            "diagnostics on every host")
-                    if _latest_production_diagnostic_step != global_step:
-                        raise RuntimeError(
-                            "regular log diagnostics are not from the same "
-                            f"pre-update step: diagnostic_step="
-                            f"{_latest_production_diagnostic_step}, "
-                            f"train_step={global_step}")
-                # Refresh the real op-key drift snapshot on every host when
-                # diagnostics are enabled; compact/baseline keep the dummy snap.
+                # Legacy non-compact paths may refresh their cheap parameter
+                # snapshot. Canonical v417x uses compact train metrics.
                 if drift_diagnostics_enabled:
                     _prev_op_key_snap = _drift_snap(params)
                 _raw_step_time_window = time.time() - win_start_time
@@ -21906,29 +21683,6 @@ def main():
 
                 if is_host0:
                     _regular_metrics = metrics
-                    _diagnostic_accuracy = None
-                    _diagnostic_loss = None
-                    if diagnostic_metrics is not None:
-                        _regular_metrics = dict(diagnostic_metrics)
-                        # Optimization/update scalars remain authoritative
-                        # from training_fast; observational fields come from
-                        # the read-only diagnostics forward.
-                        _regular_metrics.update(metrics)
-                        _diagnostic_loss = float(
-                            diagnostic_metrics['loss'])
-                        _diagnostic_counts = jax.device_get({
-                            'correct': diagnostic_metrics['correct'],
-                            'valid': diagnostic_metrics['valid_count'],
-                        })
-                        _diagnostic_valid = int(
-                            _diagnostic_counts['valid'])
-                        _diagnostic_accuracy = (
-                            int(_diagnostic_counts['correct'])
-                            / max(_diagnostic_valid, 1))
-                    _rolling_non_log_step_time_ms = (
-                        _non_log_fast_step_time_ms_sum
-                        / _non_log_fast_step_count
-                        if _non_log_fast_step_count > 0 else 0.0)
                     _elapsed = time.time() - win_start_time
                     _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
                     _opt_step = global_step // grad_accum_steps
@@ -21978,7 +21732,6 @@ def main():
                             _opspace_load_smoothing_ctx.get(
                                 'mode', 'neighbor')).strip().lower(),
                         'train_compute_accuracy': train_compute_accuracy,
-                        'diagnostic_accuracy': _diagnostic_accuracy,
                         'regular_console_level': regular_console_level,
                         'regular_console_host_timing':
                             regular_console_host_timing,
@@ -22023,54 +21776,33 @@ def main():
                             if _is_active_srw_version(model_version_cfg)
                             else 0),
                     }
-                    rec = _build_regular_record(
-                        _regular_metrics, win_avgs, ctx, global_step, epoch)
-                    rec = _attach_update_cap_window_stats(
-                        rec, jax.device_get(_regular_cap_window_jax))
-                    rec['raw_step_time_window'] = float(_raw_step_time_window)
-                    rec['logging_time'] = 0.0
-                    if _v417x_split_runtime:
-                        rec['fast_step_time_ms'] = float(
-                            _fast_step_time_ms)
-                        rec['diagnostic_forward_time_ms'] = float(
-                            _diagnostic_forward_time_ms)
-                        rec['diagnostic_step_total_time_ms'] = float(
-                            _diagnostic_step_total_time_ms)
-                        rec['rolling_non_log_step_time_ms'] = float(
-                            _rolling_non_log_step_time_ms)
-                        rec['diagnostic_loss'] = _diagnostic_loss
-                        rec['diagnostic_parameter_timing'] = 'pre_update'
-                        rec['diagnostic_step'] = int(
-                            _latest_production_diagnostic_step)
-                        rec['diagnostic_timing_excluded_compile'] = bool(
-                            _diagnostic_timing_excluded_compile)
-                        rec['diagnostic_compile_time_ms'] = float(
-                            _diagnostic_compile_time_ms)
-                        rec['fast_timing_excluded_compile'] = bool(
-                            _fast_timing_excluded_compile)
-                        rec['fast_compile_time_ms'] = float(
-                            _fast_compile_time_ms)
-                    _print_regular_block(rec, ctx)
-                    rec.pop('_active_tau_regular_available', None)
-                    regular_jsonl_rec = rec
-                    if str(model_version_cfg) in (
-                            V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
-                        regular_jsonl_rec = (
-                            _v4170_compact_regular_jsonl_record(rec, ctx))
-                    if _v417x_split_runtime:
-                        for _timing_key in (
-                                'fast_step_time_ms',
-                                'diagnostic_forward_time_ms',
-                                'diagnostic_step_total_time_ms',
-                                'rolling_non_log_step_time_ms',
-                                'diagnostic_loss',
-                                'diagnostic_parameter_timing',
-                                'diagnostic_step',
-                                'diagnostic_timing_excluded_compile',
-                                'diagnostic_compile_time_ms',
-                                'fast_timing_excluded_compile',
-                                'fast_compile_time_ms'):
-                            regular_jsonl_rec[_timing_key] = rec[_timing_key]
+                    if _is_v417x_version(model_version_cfg):
+                        rec = _build_minimal_pretraining_record(
+                            _regular_metrics, win_avgs, ctx,
+                            global_step, epoch,
+                            sec_per_it=(
+                                _elapsed / win_count
+                                if win_count > 0 else 0.0),
+                            tokens_per_sec=(
+                                _win_valid_py / _elapsed
+                                if _elapsed > 0.0 else 0.0))
+                        _print_minimal_pretraining_record(rec)
+                        regular_jsonl_rec = rec
+                    else:
+                        rec = _build_regular_record(
+                            _regular_metrics, win_avgs, ctx,
+                            global_step, epoch)
+                        rec = _attach_update_cap_window_stats(
+                            rec, jax.device_get(_regular_cap_window_jax))
+                        rec['raw_step_time_window'] = float(
+                            _raw_step_time_window)
+                        rec['logging_time'] = 0.0
+                        _print_regular_block(rec, ctx)
+                        rec.pop('_active_tau_regular_available', None)
+                        regular_jsonl_rec = rec
+                        if str(model_version_cfg) == V4170_MODEL_VERSION:
+                            regular_jsonl_rec = (
+                                _v4170_compact_regular_jsonl_record(rec, ctx))
                     log_jsonl({'type': 'train', **regular_jsonl_rec})
                     sync_logs()
                     _regular_logging_time = time.time() - _regular_logging_t0
@@ -22085,24 +21817,6 @@ def main():
                         'logging_time': float(_regular_logging_time),
                         'timestamp': datetime.now().isoformat(),
                     }
-                    if _v417x_split_runtime:
-                        _train_timing_rec.update({
-                            'fast_step_time_ms': float(_fast_step_time_ms),
-                            'diagnostic_forward_time_ms': float(
-                                _diagnostic_forward_time_ms),
-                            'diagnostic_step_total_time_ms': float(
-                                _diagnostic_step_total_time_ms),
-                            'rolling_non_log_step_time_ms': float(
-                                _rolling_non_log_step_time_ms),
-                            'diagnostic_timing_excluded_compile': bool(
-                                _diagnostic_timing_excluded_compile),
-                            'diagnostic_compile_time_ms': float(
-                                _diagnostic_compile_time_ms),
-                            'fast_timing_excluded_compile': bool(
-                                _fast_timing_excluded_compile),
-                            'fast_compile_time_ms': float(
-                                _fast_compile_time_ms),
-                        })
                     log_jsonl(_train_timing_rec)
                     sync_logs()
 
@@ -22118,12 +21832,8 @@ def main():
                 _regular_cap_window_jax = _init_update_cap_window_stats()
                 win_count = 0
                 win_start_time = time.time()
-                _non_log_fast_step_time_ms_sum = 0.0
-                _non_log_fast_step_count = 0
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
-            _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
-            _do_geometry = (global_step % LOG_GEOMETRY == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
             _new_best = False
 
@@ -22135,8 +21845,6 @@ def main():
                     eval_step_fn, params, val_loader, n_local_devices,
                     verbose=is_host0, data_sharding_spec=data_sharding,
                     return_dead_stats=True, current_step=global_step)
-                _latest_val_dead_stats = val_dead_stats
-                _latest_val_dead_step = global_step
                 prune_eval_log = {}
                 if eval_prune_step_fns:
                     prune_eval_log = run_eval_prune_sweep(
@@ -22166,8 +21874,7 @@ def main():
                                 f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
                                 f"compute={prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
                                 f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
-                    if not (_do_analysis and analysis_step_fn is not None):
-                        _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
+                    _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
                     log_jsonl({
                         'type': 'val',
                         'step': global_step,
@@ -22182,114 +21889,6 @@ def main():
                 if np.isfinite(val_loss) and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     _new_best = True
-
-
-            # ---- ANALYSIS: run full-stats forward on one val batch ----
-            # Single analysis forward at the configured analysis cadence. Compiles
-            # once on first call (extra HBM + time logged). Result dict
-            # is released after the JSONL write so HBM snaps back.
-            if _do_analysis and analysis_step_fn is not None:
-                val_loader.reset()
-                _analysis_batch = None
-                for _ab_ids, _ab_mask in val_loader:
-                    _analysis_batch = (_ab_ids, _ab_mask)
-                    break
-                if _analysis_batch is not None:
-                    _a_ids, _a_mask = _analysis_batch
-                    _a_gb = _a_ids.shape[0] * jax.process_count()
-                    _a_gs = (_a_gb, _a_ids.shape[1])
-                    _a_ids = shard_to_mesh(_a_ids, data_sharding, _a_gs)
-                    _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
-                    try:
-                        _a_compile_start = time.time()
-                        analysis_result = analysis_step_fn(
-                            params, _a_ids, _a_mask, jnp.int32(global_step))
-                        # Force the computation so HBM usage of the
-                        # analysis kernels registers now, not on the
-                        # next Python line.
-                        jax.block_until_ready(
-                            analysis_result.get('aux_loss',
-                                                jnp.float32(0.0)))
-                        _a_elapsed = time.time() - _a_compile_start
-                        if is_host0:
-                            _ctx_a = {
-                                'n_qk_cfg': cfg['model'].get(
-                                    'n_qk', cfg['model'].get('n_q', 0)),
-                                'n_v_cfg': cfg['model'].get('n_v', 0),
-                                'n_rst_cfg': cfg['model'].get(
-                                    'n_rst', cfg['model'].get('n_know', 0)),
-                                'd_model_cfg': cfg['model'].get('d_model', 0),
-                                'n_layers_cfg': cfg['model'].get(
-                                    'n_layers', 0),
-                                'current_lr': float(schedule(global_step // grad_accum_steps)),
-                                'model_version': model_version,
-                            }
-                            analysis_payload = dict(analysis_result)
-                            if _latest_val_dead_step == global_step \
-                                    and _latest_val_dead_stats is not None:
-                                analysis_payload.update(_latest_val_dead_stats)
-                            for _pool in ('qk', 'v', 'know'):
-                                for _part in ('emb', 'read', 'write'):
-                                    _key = f'{_pool}_{_part}_grad_ratio'
-                                    analysis_payload[_key] = metrics.get(
-                                        _key, jnp.float32(0.0))
-                            _analysis_gradient_names = (
-                                V4174_DIRECT_RW_GRADIENT_METRIC_NAMES
-                                if str(model_version) == V4174_MODEL_VERSION
-                                else V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
-                            for _key in _analysis_gradient_names:
-                                analysis_payload[_key] = metrics.get(
-                                    _key, jnp.float32(0.0))
-                            if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
-                                for _key in (
-                                        V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES):
-                                    analysis_payload[_key] = metrics.get(
-                                        _key, jnp.float32(0.0))
-                            a_rec = _build_analysis_record(
-                                {}, analysis_payload, _ctx_a)
-                            a_rec['step'] = global_step
-                            a_rec['epoch'] = epoch
-                            a_rec['analysis_step_sec'] = float(_a_elapsed)
-                            if _do_analysis:
-                                _print_analysis_block(a_rec, _ctx_a)
-                                log_jsonl({'type': 'train_analysis', **a_rec})
-                            sync_logs()
-                    finally:
-                        # Explicit release -jit-returned dict holds
-                        # TPU buffers that outlive the val block
-                        # otherwise.
-                        try:
-                            del analysis_result
-                        except NameError:
-                            pass
-                        del _a_ids, _a_mask, _analysis_batch
-
-            if _do_geometry and geometry_step_fn is not None:
-                try:
-                    geom = geometry_step_fn(params)
-                    jax.block_until_ready(
-                        geom.get(
-                            'attn_qk_op_key_geom_rank',
-                            geom.get('attn_qk_emb_geom_rank',
-                                     jnp.float32(0.0))))
-                    if is_host0:
-                        geom_host = jax.device_get(geom)
-                        log_message("  Rare geometry diagnostics:")
-                        _print_geometry_block(geom_host)
-                        log_jsonl({
-                            'type': 'geometry',
-                            'step': global_step,
-                            'epoch': epoch,
-                            **{k: float(v) for k, v in geom_host.items()},
-                            'timestamp': datetime.now().isoformat(),
-                        })
-                        sync_logs()
-                finally:
-                    try:
-                        del geom
-                    except NameError:
-                        pass
-
             # ---- Split Orbax save paths ----
             if _do_ckpt:
                 saved = save_orbax_checkpoint(
@@ -22387,8 +21986,6 @@ def main():
             eval_step_fn, params, val_loader, n_local_devices,
             verbose=is_host0, data_sharding_spec=data_sharding,
             return_dead_stats=True, current_step=global_step)
-        _latest_val_dead_stats = val_dead_stats
-        _latest_val_dead_step = global_step
         prune_eval_log = {}
         if eval_prune_step_fns:
             prune_eval_log = run_eval_prune_sweep(

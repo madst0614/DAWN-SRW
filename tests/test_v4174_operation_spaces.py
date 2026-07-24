@@ -903,7 +903,12 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
         jnp.int32(0),
     )
     jax.block_until_ready(metrics["total_loss"])
-    assert bool(jnp.isfinite(metrics["total_loss"]))
+    assert all(
+        bool(jnp.isfinite(metrics[name]))
+        for name in ("total_loss", "ce_loss", "grad_norm"))
+    assert all(
+        getattr(value, "shape", None) == ()
+        for value in metrics.values())
     assert all(
         bool(jnp.all(jnp.isfinite(value)))
         for value in jax.tree.leaves(new_params))
