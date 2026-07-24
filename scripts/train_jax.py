@@ -15867,8 +15867,9 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         for pool in chunk_pools
     }
     base_kwargs = {'mesh': mesh, **_v4164_sharded_kwargs(cfg)}
-    if analysis and 'analysis' in inspect.signature(
-            single_factory).parameters:
+    if (analysis
+            and single_factory is not None
+            and 'analysis' in inspect.signature(single_factory).parameters):
         base_kwargs['analysis'] = True
 
     def pool_kwargs(pool):

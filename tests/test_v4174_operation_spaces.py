@@ -555,6 +555,18 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     diagnostics_fns = train_jax.build_canonical_sharded_fns(
         cfg, mesh, for_eval=True,
         kernel_profile="production_diagnostics")
+    analysis_fns = train_jax.build_canonical_sharded_fns(
+        cfg, mesh, for_eval=True, analysis=True)
+    assert all(
+        name in analysis_fns
+        for name in (
+            "q_space_dense", "k_space_dense",
+            "v_space_dense", "rst_space_dense"))
+    assert all(
+        getattr(
+            analysis_fns[f"{route}_space_dense"],
+            "_v4174_kernel_profile") == "production_diagnostics"
+        for route in ("q", "k", "v", "rst"))
     sharded_diagnostics = built.apply(
         {"params": params},
         tokens,
