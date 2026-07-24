@@ -3266,7 +3266,7 @@ def _v4170_compact_train_metrics(
         result, *, total_loss, ce_loss, aux_loss, tau_reg, orth_loss,
         div_loss, grad_norm, tau_lr_mult, tau_update_qk_max_abs,
         tau_update_v_max_abs, tau_update_rst_max_abs,
-        model_version=None, pool_gradient_metrics=None):
+        model_version=None, operator_key_gradient_metrics=None):
     """Build the exact payload; tau_update_* are raw_tau parameter updates."""
     metrics = {
         'total_loss': total_loss,
@@ -3287,7 +3287,7 @@ def _v4170_compact_train_metrics(
             'tau_update_v_max_abs': tau_update_v_max_abs,
             'tau_update_rst_max_abs': tau_update_rst_max_abs,
         })
-        if pool_gradient_metrics is None:
+        if operator_key_gradient_metrics is None:
             raise RuntimeError(
                 "v417x fast train metrics require pool-gradient scalars")
         gradient_metric_names = (
@@ -3295,15 +3295,15 @@ def _v4170_compact_train_metrics(
             if str(model_version) == V4174_MODEL_VERSION
             else V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
         metrics.update({
-            key: pool_gradient_metrics[key]
+            key: operator_key_gradient_metrics[key]
             for key in gradient_metric_names})
         if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
-                key: pool_gradient_metrics[key]
+                key: operator_key_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
         if str(model_version) == V4173_MODEL_VERSION:
             metrics.update({
-                key: pool_gradient_metrics[key]
+                key: operator_key_gradient_metrics[key]
                 for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
             present_space_metrics = tuple(
                 key for key in V4173_OPERATION_SPACE_METRIC_NAMES
@@ -3343,20 +3343,20 @@ def _v4170_compact_train_metrics(
     if is_v4171:
         metrics.update({
             key: result[key] for key in V4171_COMPOSITION_METRIC_NAMES})
-        if pool_gradient_metrics is None:
+        if operator_key_gradient_metrics is None:
             raise RuntimeError(
                 "v417x compact train metrics require operator-key gradient "
                 "diagnostics")
         metrics.update({
-            key: pool_gradient_metrics[key]
+            key: operator_key_gradient_metrics[key]
             for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
         if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
-                key: pool_gradient_metrics[key]
+                key: operator_key_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
         if str(model_version) == V4173_MODEL_VERSION:
             metrics.update({
-                key: pool_gradient_metrics[key]
+                key: operator_key_gradient_metrics[key]
                 for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
     v4172_alias_names = (
         V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES
@@ -3756,10 +3756,13 @@ def _pool_score_page_stats(route_stats):
     return out
 
 
-def _sample_srw_selection_scores(params, input_ids, cfg, max_tokens):
+def _sample_srw_selection_scores(
+        params, input_ids, cfg, max_tokens, *, production_rst=True):
     """Return host-side fresh-init selection score samples by SRW pool."""
     version, score_impl, score_params, score_kwargs = (
         _srw_selection_score_setup(params, cfg, max_tokens))
+    if str(version) == V4174_MODEL_VERSION:
+        score_kwargs['production_rst'] = bool(production_rst)
     score_fn = jax.jit(partial(score_impl, **score_kwargs))
     score_out = score_fn(score_params, input_ids)
     sampled = jax.device_get(score_out)
@@ -3841,7 +3844,8 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     """Compute host-side quantiles from a small deterministic score sample."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     scores, sampled, page_stats = _sample_srw_selection_scores(
-        params, input_ids, cfg, tau_init_cfg['calibration_tokens'])
+        params, input_ids, cfg, tau_init_cfg['calibration_tokens'],
+        production_rst=(str(version) != V4174_MODEL_VERSION))
     per_space_rst = (
         str(version) == V4173_MODEL_VERSION
         and np.asarray(scores['rst']).ndim == 2)
@@ -8176,7 +8180,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 tau_update_v_max_abs=tau_update_v_max_abs,
                 tau_update_rst_max_abs=tau_update_rst_max_abs,
                 model_version=_model_version,
-                pool_gradient_metrics=compact_pool_gradient_metrics)
+                operator_key_gradient_metrics=compact_pool_gradient_metrics)
             return new_params, new_opt_state, metrics
         _pool_op_key_grad_norms = (
             {

@@ -634,10 +634,16 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
         np.asarray(new_params["token_emb"]["embedding"]))
     assert set(metrics) == set(train_jax.V4174_COMPACT_TRAIN_METRIC_NAMES)
     assert all(
-        bool(jnp.isfinite(metrics[name]))
+        bool(jnp.isfinite(metrics[name])) and float(metrics[name]) > 0.0
         for name in train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
     assert not any(
         name in metrics
+        for name in train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
+    assert all(
+        name in train_jax.V4174_COMPACT_REGULAR_JSONL_REC_KEYS
+        for name in train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
+    assert not any(
+        name in train_jax.V4174_COMPACT_REGULAR_JSONL_REC_KEYS
         for name in train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
 
 

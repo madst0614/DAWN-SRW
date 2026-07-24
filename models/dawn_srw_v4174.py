@@ -1134,7 +1134,8 @@ def _sampled_layer_states(
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_power_qk=None, admission_den_power_v=None,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
+        production_rst=True):
     """Sample block-0 Norm1 and production post-attention Norm2 states."""
     max_tokens = _positive_int("max_tokens", int(max_tokens))
     input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
@@ -1156,6 +1157,8 @@ def _sampled_layer_states(
         state, block["norm1"]["scale"], block["norm1"]["bias"])
     flat_attention_state = attention_state.reshape(
         (-1, attention_state.shape[-1]))
+    if not production_rst:
+        return flat_attention_state, flat_attention_state
     router = params["router"]
     pool = params["neuron_pool"]
     routing = _compute_space_routing(
@@ -1239,18 +1242,31 @@ def _tau_init_calibration_scores(
     router = params["router"]
     pool = params["neuron_pool"]
 
-    def score(state, route):
-        local = _project_space_local_states(
-            state, router["space_state_proj"])
+    def score(local, route):
         _, rho, _ = _direct_read_match(
             local, pool[f"{route}_read_vectors"])
         return rho
 
+    attention_local = _project_space_local_states(
+        attention_state, router["space_state_proj"])
+    production_rst = bool(production_kwargs.get("production_rst", True))
+    rst_local = (
+        _project_space_local_states(
+            rst_state, router["space_state_proj"])
+        if production_rst else None)
     return {
-        "q": score(attention_state, "q"),
-        "k": score(attention_state, "k"),
-        "v": score(attention_state, "v"),
-        "rst": score(rst_state, "rst"),
+        "q": score(attention_local, "q"),
+        "k": score(attention_local, "k"),
+        "v": score(attention_local, "v"),
+        "rst": (
+            score(rst_local, "rst")
+            if production_rst else jnp.zeros(
+                (
+                    attention_local.shape[0],
+                    attention_local.shape[1],
+                    pool["rst_read_vectors"].shape[1],
+                ),
+                dtype=jnp.float32)),
     }
 
 
@@ -1298,7 +1314,7 @@ def initialization_diagnostics_from_params(
         operation_space_top_k: int) -> dict[str, float]:
     """Host-side one-shot routing/local-geometry diagnostics."""
     attention_state, _ = _sampled_layer_states(
-        params, input_ids, 4096)
+        params, input_ids, 4096, production_rst=False)
     router = params["router"]
     routing = _compute_space_routing(
         attention_state,
