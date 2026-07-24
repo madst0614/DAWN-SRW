@@ -56,6 +56,8 @@ def _model(**updates):
         n_heads=config["n_heads"],
         max_seq_len=config["max_seq_len"],
         dropout_rate=0.0,
+        gradient_checkpointing=config.get(
+            "gradient_checkpointing", False),
         n_q=config["n_q"],
         n_k=config["n_k"],
         n_v=config["n_v"],
@@ -334,7 +336,8 @@ def test_qk_banks_and_execution_are_fully_separate():
     assert not np.allclose(q_output, k_output)
     source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
     assert "_qk_shared_read" not in source
-    assert 'bank_values[route]' in source
+    assert 'pool_params[f"{route}_read_vectors"]' in source
+    assert 'pool_params[f"{route}_write_vectors"]' in source
 
 
 def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
@@ -378,8 +381,88 @@ def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
         for left, right in zip(before, after))
     source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
     assert "flat_rst_state" in source
-    assert "rst_routing, rst_local = route_and_local(flat_rst_state)" in source
-    assert "execute(\"rst\", rst_local, rst_tau)" in source
+    assert "rst_routing, rst_local = route_and_local" in source
+    assert "flat_rst_state, router_params" in source
+    assert '"rst", rst_local, rst_tau, pool_params' in source
+
+
+def test_full_18_layer_checkpointing_is_equivalent_and_changes_ir():
+    tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
+    plain_model = _model(
+        n_layers=18, gradient_checkpointing=False)
+    remat_model = _model(
+        n_layers=18, gradient_checkpointing=True)
+    variables = plain_model.init(
+        {
+            "params": jax.random.PRNGKey(71),
+            "dropout": jax.random.PRNGKey(72),
+        },
+        tokens,
+        deterministic=True,
+    )
+    params = variables["params"]
+
+    def forward(model, current):
+        return model.apply(
+            {"params": current},
+            tokens,
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(73)},
+        )["logits"]
+
+    def loss(model, current):
+        return model.apply(
+            {"params": current},
+            tokens,
+            labels=tokens,
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(74)},
+        )["loss"]
+
+    plain_logits = forward(plain_model, params)
+    remat_logits = forward(remat_model, params)
+    np.testing.assert_allclose(
+        remat_logits, plain_logits, atol=0.0, rtol=0.0)
+    plain_loss, plain_grads = jax.value_and_grad(
+        lambda current: loss(plain_model, current))(params)
+    remat_loss, remat_grads = jax.value_and_grad(
+        lambda current: loss(remat_model, current))(params)
+    np.testing.assert_allclose(
+        remat_loss, plain_loss, atol=2.0e-6, rtol=2.0e-6)
+    for path in (
+            ("block_0", "attn", "expand_O", "kernel"),
+            ("router", "space_state_proj"),
+            ("neuron_pool", "q_read_vectors"),
+            ("neuron_pool", "rst_write_vectors")):
+        np.testing.assert_allclose(
+            _path(remat_grads, *path),
+            _path(plain_grads, *path),
+            atol=5.0e-6,
+            rtol=5.0e-5,
+        )
+
+    plain_grad = lambda current: jax.grad(
+        lambda value: loss(plain_model, value))(current)
+    remat_grad = lambda current: jax.grad(
+        lambda value: loss(remat_model, value))(current)
+    plain_jaxpr = str(jax.make_jaxpr(plain_grad)(params))
+    remat_jaxpr = str(jax.make_jaxpr(remat_grad)(params))
+    assert "remat2" not in plain_jaxpr
+    assert "remat2" in remat_jaxpr
+    plain_lowered = jax.jit(plain_grad).lower(params)
+    remat_lowered = jax.jit(remat_grad).lower(params)
+    plain_hlo = plain_lowered.compiler_ir(
+        dialect="hlo").as_hlo_text()
+    remat_hlo = remat_lowered.compiler_ir(
+        dialect="hlo").as_hlo_text()
+    assert plain_hlo != remat_hlo
+    assert "while" in plain_hlo.lower()
+    assert "while" in remat_hlo.lower()
+    plain_memory = plain_lowered.compile().memory_analysis()
+    remat_memory = remat_lowered.compile().memory_analysis()
+    assert (
+        remat_memory.temp_size_in_bytes
+        < plain_memory.temp_size_in_bytes)
 
 
 def test_forward_loss_gradient_jit_diagnostics_and_analysis_smoke():
@@ -467,12 +550,33 @@ def test_symbolic_count_matches_tree_and_canonical_budget():
     assert tiny["bilinear_probe_matrices"] == 0
     assert tiny["operator_query_projections"] == 0
 
-    canonical = yaml.safe_load(
-        CANONICAL_CONFIG.read_text(encoding="utf-8"))["model"]
+    canonical_config = yaml.safe_load(
+        CANONICAL_CONFIG.read_text(encoding="utf-8"))
+    canonical = canonical_config["model"]
+    training = canonical_config["training"]
     counts = v4174.symbolic_parameter_count(canonical)
     assert counts["total"] == 214_502_404
+    assert canonical["d_model"] == 2048
+    assert canonical["d_route"] == 256
+    assert canonical["n_layers"] == 18
+    assert canonical["n_heads"] == 32
+    assert canonical["gradient_checkpointing"] is True
+    assert canonical["n_operation_spaces"] == 8
+    assert canonical["operation_space_top_k"] == 2
     assert canonical["n_q"] == canonical["n_k"] == 6_160
     assert canonical["n_q"] + canonical["n_k"] == 12_320
+    assert canonical["n_v"] == 38_832
+    assert canonical["n_rst"] == 78_496
+    assert training["batch_size"] == 1_024
+    assert training["mesh_data"] == 16
+    assert training["mesh_model"] == 2
+    assert training["gradient_accumulation_steps"] == 1
+    assert (
+        training["n_chunks_q"],
+        training["n_chunks_k"],
+        training["n_chunks_v"],
+        training["n_chunks_rst"],
+    ) == (1, 1, 2, 8)
     for name in ("n_q", "n_k", "n_v", "n_rst"):
         assert canonical[name] % canonical["n_operation_spaces"] == 0
 
@@ -480,7 +584,7 @@ def test_symbolic_count_matches_tree_and_canonical_budget():
 def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     from scripts import train_jax
 
-    model_cfg = _model_config()
+    model_cfg = _model_config(gradient_checkpointing=True)
     cfg = {
         "model": model_cfg,
         "training": {
@@ -497,8 +601,10 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert "n_know" not in kwargs
     assert "operator_key_mode" not in kwargs
     assert "router_dropout" not in kwargs
+    assert kwargs["gradient_checkpointing"] is True
     built = train_jax.build_model_from_config(cfg)
     assert isinstance(built, v4174.DAWN_SRW_V4174)
+    assert built.gradient_checkpointing is True
     mesh = jax.sharding.Mesh(
         np.asarray(jax.devices()[:1]).reshape((1, 1)),
         ("data", "model"),
@@ -598,12 +704,13 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
 def test_actual_create_train_step_updates_with_complete_compact_schema():
     from scripts import train_jax
 
-    model, tokens, variables = _variables(seed=41)
+    model, tokens, variables = _variables(
+        model=_model(gradient_checkpointing=True), seed=41)
     params = variables["params"]
     optimizer = optax.adam(1.0e-3)
     opt_state = optimizer.init(params)
     cfg = {
-        "model": _model_config(),
+        "model": _model_config(gradient_checkpointing=True),
         "training": {
             "batch_size": 1,
             "weight_decay": 0.0,
@@ -700,5 +807,7 @@ def test_model_info_describes_only_canonical_architecture():
     assert "Q/K/V/RST are fully separate" in info
     assert "RST recomputes routing after attention" in info
     assert "physical all-space dense" in info
+    assert "lax.scan" in info
+    assert v4174.ATTENTION_CORE_NAME in info
     assert "kernel sketch" not in info
     assert "generalized" not in info

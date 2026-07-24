@@ -138,7 +138,9 @@ from models.dawn_srw_v4173 import (
     symbolic_parameter_count as _v4173_symbolic_parameter_count,
 )
 from models.dawn_srw_v4174 import (
+    ATTENTION_CORE_NAME as V4174_ATTENTION_CORE_NAME,
     DAWN_SRW_V4174,
+    LAYER_EXECUTION_NAME as V4174_LAYER_EXECUTION_NAME,
     _direct_read_geometry_diagnostics as
         _v4174_direct_read_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4174_raw_tau_init_from_cosine_tau,
@@ -18321,6 +18323,20 @@ def main():
     cfg['model']['vocab_size'] = vocab_size
     _maybe_materialize_vocab_parallel_config(cfg)
     model = build_model_from_config(cfg)
+    if is_host0 and str(model_version_cfg) == V4174_MODEL_VERSION:
+        checkpointing = bool(model.gradient_checkpointing)
+        print(
+            f"gradient_checkpointing={str(checkpointing).lower()}",
+            flush=True)
+        print(
+            "layer_execution="
+            + (V4174_LAYER_EXECUTION_NAME
+               if checkpointing else "scan_uncheckpointed"),
+            flush=True)
+        print("layer_iteration=scan", flush=True)
+        print(
+            f"attention_core={V4174_ATTENTION_CORE_NAME}",
+            flush=True)
 
     # Resume must construct only an abstract target. Concrete params are
     # created exclusively for a scratch run.

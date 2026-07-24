@@ -52,6 +52,8 @@ from models.dawn_srw_v4173 import (
 MODEL_VERSION = "spatial-r1-v4.1.7.4"
 ROUTES = ("q", "k", "v", "rst")
 POOLS = ROUTES
+ATTENTION_CORE_NAME = "causal_dot_product_fp32_softmax"
+LAYER_EXECUTION_NAME = "rematerialized"
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -677,6 +679,29 @@ def _read_bank_geometry_diagnostics(
     return out
 
 
+def _causal_attention_core(
+        query: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        dropout_rate: float,
+        deterministic: bool,
+        dropout_rng: jax.Array) -> jax.Array:
+    """Production causal attention with FP32 score/softmax semantics."""
+    d_head = int(query.shape[-1])
+    sequence_length = int(query.shape[-2])
+    scores = jnp.einsum(
+        "bhsd,bhtd->bhst", query, key
+    ) / jnp.sqrt(jnp.float32(d_head))
+    causal = jnp.tril(jnp.ones(
+        (sequence_length, sequence_length), dtype=jnp.bool_))
+    scores = jnp.where(
+        causal, scores, jnp.finfo(scores.dtype).min)
+    weights = jax.nn.softmax(scores, axis=-1)
+    weights = _shared_safe_dropout(
+        weights, dropout_rate, deterministic, dropout_rng)
+    return jnp.einsum("bhst,bhtd->bhsd", weights, value)
+
+
 class DAWN_SRW_V4174(nn.Module):
     """Canonical explicit-space-read, direct-operator-read DAWN-SRW."""
     __version__ = MODEL_VERSION
@@ -862,11 +887,6 @@ class DAWN_SRW_V4174(nn.Module):
         params = self.variables["params"]
         pool = params["neuron_pool"]
         router = params["router"]
-        bank_values = {
-            route: (
-                pool[f"{route}_read_vectors"],
-                pool[f"{route}_write_vectors"])
-            for route in ROUTES}
         route_counts = {
             "q": int(self.n_q),
             "k": int(self.n_k),
@@ -897,13 +917,15 @@ class DAWN_SRW_V4174(nn.Module):
         analysis_lists: dict[str, list[jax.Array]] = {}
         last_local_input = None
         last_route_state = None
+        scanned_regular_metrics: dict[str, jax.Array] = {}
 
         def append(target, values):
             for key, value in values.items():
                 target.setdefault(key, []).append(value)
 
-        def execute(route, local_states, raw_tau):
-            read, write = bank_values[route]
+        def execute(route, local_states, raw_tau, pool_params):
+            read = pool_params[f"{route}_read_vectors"]
+            write = pool_params[f"{route}_write_vectors"]
             direct_kernel = (
                 sharded_fns.get(f"{route}_space_dense")
                 if isinstance(sharded_fns, dict) else None)
@@ -926,46 +948,56 @@ class DAWN_SRW_V4174(nn.Module):
                 max_chunk_size=route_chunks[route],
                 diagnostics=diagnostics_enabled)
 
-        def route_and_local(flat_state):
+        def route_and_local(flat_state, router_params):
             routing = _compute_space_routing(
                 flat_state,
-                router["space_route_proj"]["kernel"],
-                router["space_read_vectors"],
+                router_params["space_route_proj"]["kernel"],
+                router_params["space_read_vectors"],
                 top_k)
             local_states = _project_space_local_states(
-                flat_state, router["space_state_proj"])
+                flat_state, router_params["space_state_proj"])
             return routing, local_states
 
-        for layer_index, layer in enumerate(self.layers):
+        def layer_forward(
+                current_state, block_params, pool_params,
+                router_params, layer_rng):
+            """One complete checkpointable Q/K/V-attention-RST layer."""
+            regular_metrics: dict[str, jax.Array] = {}
+            analysis_metrics: dict[str, jax.Array] = {}
             rng, rng_attn, rng_rst = jax.random.split(
-                layer_rngs[layer_index], 3)
-            normalized = layer.norm1(state)
+                layer_rng, 3)
+            normalized = _shared_layer_norm(
+                current_state,
+                block_params["norm1"]["scale"],
+                block_params["norm1"]["bias"])
             batch_size, sequence_length = normalized.shape[:2]
             flat_attention_state = normalized.reshape((-1, self.d_model))
             attention_routing, attention_local = route_and_local(
-                flat_attention_state)
+                flat_attention_state, router_params)
             attention_tau = {
                 route: _linear(
-                    router[f"{route}_operator_tau_proj"], attention_local)
+                    router_params[f"{route}_operator_tau_proj"],
+                    attention_local)
                 for route in ("q", "k", "v")}
             route_outputs = {}
             for route in ("q", "k", "v"):
                 route_result = execute(
-                    route, attention_local, attention_tau[route])
+                    route, attention_local, attention_tau[route],
+                    pool_params)
                 if diagnostics_enabled:
                     local_output = route_result[0]
                     scalar, arrays = _aggregate_operator_diagnostics(
                         route_result, route_counts[route] // n_spaces,
                         route, composition_mode)
-                    append(regular_lists, scalar)
+                    regular_metrics.update(scalar)
                     if analysis:
-                        append(analysis_lists, arrays)
+                        analysis_metrics.update(arrays)
                 else:
                     local_output = route_result
                 route_outputs[route] = _space_weighted_writeback(
                     local_output,
                     attention_routing["dense_space_weights"],
-                    router["space_state_writeback"],
+                    router_params["space_state_writeback"],
                     route_scales[route]).reshape(normalized.shape)
 
             d_head = self.d_model // self.n_heads
@@ -978,58 +1010,52 @@ class DAWN_SRW_V4174(nn.Module):
             value = route_outputs["v"].reshape(
                 batch_size, sequence_length, self.n_heads, d_head
             ).transpose(0, 2, 1, 3)
-            attention_scores = jnp.einsum(
-                "bhsd,bhtd->bhst", query, key
-            ) / jnp.sqrt(jnp.float32(d_head))
-            causal = jnp.tril(jnp.ones(
-                (sequence_length, sequence_length), dtype=jnp.bool_))
-            attention_scores = jnp.where(
-                causal, attention_scores,
-                jnp.finfo(attention_scores.dtype).min)
-            attention_weights = jax.nn.softmax(
-                attention_scores, axis=-1)
-            attention_weights = _shared_safe_dropout(
-                attention_weights, self.dropout_rate,
+            attention_output = _causal_attention_core(
+                query, key, value, self.dropout_rate,
                 deterministic, rng_attn)
-            attention_output = jnp.einsum(
-                "bhst,bhtd->bhsd", attention_weights, value)
             attention_output = attention_output.transpose(
                 0, 2, 1, 3).reshape(
                     batch_size, sequence_length, self.d_model)
-            attention_output = layer.attn.expand_O(attention_output)
-            state = state + _shared_safe_dropout(
+            attention_output = _linear(
+                block_params["attn"]["expand_O"], attention_output)
+            current_state = current_state + _shared_safe_dropout(
                 attention_output, self.dropout_rate, deterministic, rng)
 
-            rst_normalized = layer.norm2(state)
+            rst_normalized = _shared_layer_norm(
+                current_state,
+                block_params["norm2"]["scale"],
+                block_params["norm2"]["bias"])
             flat_rst_state = rst_normalized.reshape((-1, self.d_model))
-            rst_routing, rst_local = route_and_local(flat_rst_state)
+            rst_routing, rst_local = route_and_local(
+                flat_rst_state, router_params)
             rst_tau = _linear(
-                router["rst_operator_tau_proj"], rst_local)
-            rst_result = execute("rst", rst_local, rst_tau)
+                router_params["rst_operator_tau_proj"], rst_local)
+            rst_result = execute(
+                "rst", rst_local, rst_tau, pool_params)
             if diagnostics_enabled:
                 rst_space_output = rst_result[0]
                 scalar, arrays = _aggregate_operator_diagnostics(
                     rst_result, route_counts["rst"] // n_spaces,
                     "rst", composition_mode)
-                append(regular_lists, scalar)
+                regular_metrics.update(scalar)
                 if analysis:
-                    append(analysis_lists, arrays)
+                    analysis_metrics.update(arrays)
             else:
                 rst_space_output = rst_result
             rst_route_update = _space_weighted_writeback(
                 rst_space_output,
                 rst_routing["dense_space_weights"],
-                router["space_state_writeback"],
+                router_params["space_state_writeback"],
                 route_scales["rst"]).reshape(rst_normalized.shape)
-            state = state + _shared_safe_dropout(
+            current_state = current_state + _shared_safe_dropout(
                 rst_route_update, self.dropout_rate, deterministic, rng_rst)
 
-            append(regular_lists, _space_routing_metrics(
+            regular_metrics.update(_space_routing_metrics(
                 attention_routing, "attention"))
-            append(regular_lists, _space_routing_metrics(
+            regular_metrics.update(_space_routing_metrics(
                 rst_routing, "rst"))
             if diagnostics_enabled:
-                append(regular_lists, {
+                regular_metrics.update({
                     "attn_out_norm": jnp.linalg.norm(
                         attention_output.astype(jnp.float32),
                         axis=-1).mean(),
@@ -1037,7 +1063,7 @@ class DAWN_SRW_V4174(nn.Module):
                         rst_route_update.astype(jnp.float32),
                         axis=-1).mean(),
                     "residual_norm": jnp.linalg.norm(
-                        state.astype(jnp.float32), axis=-1).mean(),
+                        current_state.astype(jnp.float32), axis=-1).mean(),
                     "q_route_output_norm": jnp.linalg.norm(
                         route_outputs["q"].astype(jnp.float32),
                         axis=-1).mean(),
@@ -1051,8 +1077,59 @@ class DAWN_SRW_V4174(nn.Module):
                         rst_route_update.astype(jnp.float32),
                         axis=-1).mean(),
                 })
-            last_local_input = flat_rst_state
-            last_route_state = rst_routing["route_state"]
+            layer_aux = {"regular": regular_metrics}
+            if analysis:
+                layer_aux.update({
+                    "analysis": analysis_metrics,
+                    "last_local_input": flat_rst_state,
+                    "last_route_state": rst_routing["route_state"],
+                })
+            return current_state, layer_aux
+
+        layer_impl = layer_forward
+        if self.gradient_checkpointing:
+            layer_impl = jax.checkpoint(
+                layer_forward, prevent_cse=False)
+
+        block_params = [
+            params[f"block_{index}"] for index in range(self.n_layers)]
+        stacked_block_params = jax.tree.map(
+            lambda *values: jnp.stack(values), *block_params)
+        if not diagnostics_enabled:
+            def scan_body(current_state, layer_inputs):
+                return layer_impl(
+                    current_state,
+                    layer_inputs["params"],
+                    pool,
+                    router,
+                    layer_inputs["rng"])
+
+            state, scan_aux = jax.lax.scan(
+                scan_body,
+                state,
+                {
+                    "params": stacked_block_params,
+                    "rng": layer_rngs,
+                })
+            scanned_regular_metrics = {
+                key: values.mean()
+                for key, values in scan_aux["regular"].items()}
+        else:
+            for layer_index in range(self.n_layers):
+                layer_block_params = jax.tree.map(
+                    lambda values: values[layer_index],
+                    stacked_block_params)
+                state, layer_aux = layer_impl(
+                    state,
+                    layer_block_params,
+                    pool,
+                    router,
+                    layer_rngs[layer_index])
+                append(regular_lists, layer_aux["regular"])
+                if analysis:
+                    append(analysis_lists, layer_aux["analysis"])
+                    last_local_input = layer_aux["last_local_input"]
+                    last_route_state = layer_aux["last_route_state"]
 
         state = self.norm(state)
         result: dict[str, jax.Array] = {}
@@ -1104,6 +1181,7 @@ class DAWN_SRW_V4174(nn.Module):
             })
         for key, values in regular_lists.items():
             result[key] = jnp.stack(values).mean()
+        result.update(scanned_regular_metrics)
         if diagnostics_enabled:
             result.update(_canonical_regular_operator_metrics(result))
             result["heat_kernel_beta"] = jnp.float32(self.heat_kernel_beta)
@@ -1138,6 +1216,11 @@ class DAWN_SRW_V4174(nn.Module):
             f"rst={int(self.n_rst)//n_spaces}",
             "execution: semantic hard top-k, physical all-space dense, one "
             "shared P_m/U_m coordinate system and fused writeback",
+            "layer execution: lax.scan with "
+            + ("full-layer rematerialization"
+               if self.gradient_checkpointing
+               else "uncheckpointed scan"),
+            f"attention core: {ATTENTION_CORE_NAME}",
         ]
 
 
