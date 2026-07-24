@@ -16232,10 +16232,9 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                 'heat_kernel_beta': float(model_cfg.get(
                     'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)),
                 'soft_gate_effective_active_eps': 1.0e-6,
-                # Full-layer remat is canonical for production. Preserve the
-                # previous inner-remat policy for uncheckpointed experiments.
-                'remat_chunks': not bool(
-                    model_cfg.get('gradient_checkpointing', False)),
+                # Candidate A keeps the faster grouped production scan without
+                # inner remat. Enable chunk remat only after measured TPU need.
+                'remat_chunks': False,
             }
             sharded['attention_space_dense'] = attention_factory(
                 max_chunk_size_qk=chunks['q'],
@@ -20737,7 +20736,31 @@ def main():
         else:
             _dummy_op_key_snap = _dummy_drift_snap()
 
-        # First call: JIT compilation (slow)
+        def _train_step_cache_size():
+            cache_size = getattr(train_step_fn, '_cache_size', None)
+            return int(cache_size()) if callable(cache_size) else None
+
+        def _validate_startup_probe(probe_metrics, expected_collected):
+            probe_loss = float(probe_metrics['total_loss'])
+            if not np.isfinite(probe_loss):
+                raise FloatingPointError(
+                    f"startup train_step returned non-finite total_loss "
+                    f"{probe_loss!r}")
+            if str(model_version) == V4174_MODEL_VERSION:
+                if 'train_metrics_collected' not in probe_metrics:
+                    raise RuntimeError(
+                        "v4174 startup probe is missing "
+                        "train_metrics_collected")
+                collected = float(probe_metrics['train_metrics_collected'])
+                if collected != float(expected_collected):
+                    raise RuntimeError(
+                        "v4174 startup probe metric invariant failed: "
+                        f"expected train_metrics_collected="
+                        f"{float(expected_collected):.1f}, got {collected!r}")
+            return probe_loss
+
+        # First call: compile the current dynamic-flag candidate with metrics
+        # off. Cache counts below are observations, not a selection invariant.
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_labels, dummy_mask,
@@ -20746,16 +20769,49 @@ def main():
             jnp.asarray(False, dtype=jnp.bool_))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
-        jit_loss = float(dummy_metrics['total_loss'])
+        jit_loss = _validate_startup_probe(
+            dummy_metrics, expected_collected=False)
+        compiled_cache_size = _train_step_cache_size()
         if is_host0:
             print(f"  JIT compile: {jit_time:.1f}s", flush=True)
             print(f"  train_step OK -- loss={jit_loss:.4f}", flush=True)
+        del _dp, _do, dummy_metrics
 
-        if run_speed_check:
-            # Free first step outputs before second call
-            del _dp, _do, dummy_metrics
+        log_step_time = None
+        log_step_loss = None
+        if str(model_version) == V4174_MODEL_VERSION:
+            # Exercise the metric branch and record whether the runtime reuses
+            # the current executable; do not require a particular cache count.
+            rng, dummy_step_rng2 = jax.random.split(rng)
+            log_step_start = time.time()
+            _dp2, _do2, dummy_metrics2 = train_step_fn(
+                params, opt_state, dummy_ids, dummy_labels, dummy_mask,
+                dummy_step_rng2,
+                _dummy_op_key_snap, jnp.asarray(0, jnp.int32),
+                jnp.asarray(True, dtype=jnp.bool_))
+            jax.block_until_ready(dummy_metrics2['total_loss'])
+            log_step_time = time.time() - log_step_start
+            log_step_loss = _validate_startup_probe(
+                dummy_metrics2, expected_collected=True)
+            true_cache_size = _train_step_cache_size()
+            del _dp2, _do2, dummy_metrics2
 
-            # Second call: measure actual step time (post-JIT)
+            # Re-enter the non-log branch to validate False -> True -> False
+            # behavior and observe the resulting cache count.
+            rng, dummy_step_rng3 = jax.random.split(rng)
+            step_start = time.time()
+            _dp3, _do3, dummy_metrics3 = train_step_fn(
+                params, opt_state, dummy_ids, dummy_labels, dummy_mask,
+                dummy_step_rng3,
+                _dummy_op_key_snap, jnp.asarray(0, jnp.int32),
+                jnp.asarray(False, dtype=jnp.bool_))
+            jax.block_until_ready(dummy_metrics3['total_loss'])
+            step_time = time.time() - step_start
+            _validate_startup_probe(
+                dummy_metrics3, expected_collected=False)
+            final_cache_size = _train_step_cache_size()
+            del _dp3, _do3, dummy_metrics3
+        elif run_speed_check:
             rng, dummy_step_rng2 = jax.random.split(rng)
             step_start = time.time()
             _dp2, _do2, dummy_metrics2 = train_step_fn(
@@ -20765,14 +20821,36 @@ def main():
                 jnp.asarray(False, dtype=jnp.bool_))
             jax.block_until_ready(dummy_metrics2['total_loss'])
             step_time = time.time() - step_start
+            _validate_startup_probe(
+                dummy_metrics2, expected_collected=False)
+            del _dp2, _do2, dummy_metrics2
         else:
             step_time = None
 
         if is_host0:
             if run_speed_check:
-                print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
+                print(
+                    f"  Non-log step: {step_time*1000:.1f}ms/batch",
+                    flush=True)
+                if log_step_time is not None:
+                    print(
+                        f"  Log step: {log_step_time*1000:.1f}ms/batch "
+                        f"(loss={log_step_loss:.4f})",
+                        flush=True)
+                steady_tokens_per_second = (
+                    float(batch_size * max_seq_len) / step_time)
+                print(
+                    f"  Steady-state throughput: "
+                    f"{steady_tokens_per_second:,.0f} tokens/sec",
+                    flush=True)
             else:
                 print("  Speed check skipped (disabled by default)", flush=True)
+            if str(model_version) == V4174_MODEL_VERSION:
+                print(
+                    "  Dynamic metric probe: False -> True -> False; "
+                    f"train_step cache={compiled_cache_size} -> "
+                    f"{true_cache_size} -> {final_cache_size}",
+                    flush=True)
 
             # Show memory usage after JIT compilation
             try:
@@ -21303,10 +21381,6 @@ def main():
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
         del dummy_ids, dummy_mask
-        if run_speed_check:
-            del _dp2, _do2, dummy_metrics2
-        else:
-            del _dp, _do, dummy_metrics
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except _SkipStartupCheck:

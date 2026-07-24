@@ -1281,6 +1281,94 @@ def test_dynamic_metric_flag_preserves_logits_loss_gradients_and_jit_cache():
     np.testing.assert_allclose(
         false_logits, true_logits, atol=0.0, rtol=0.0)
 
+    current_state = jax.random.normal(
+        jax.random.PRNGKey(89), (1, tokens.shape[1], 16))
+    block_params = params["block_0"]
+    router_params = params["router"]
+    pool_params = params["neuron_pool"]
+    qk_scale, v_scale, rst_scale = v4174._shared_pool_output_scales(16, 1)
+
+    def layer_intermediates(collect_metrics):
+        normalized = v4174._shared_layer_norm(
+            current_state,
+            block_params["norm1"]["scale"],
+            block_params["norm1"]["bias"])
+        flat_attention = normalized.reshape((-1, 16))
+        q_output, k_output, v_output, _ = (
+            sharded["attention_space_dense"](
+                flat_attention,
+                router_params["space_route_proj"]["kernel"],
+                router_params["space_read_vectors"],
+                router_params["space_state_proj"],
+                router_params["space_state_writeback"],
+                router_params["q_operator_tau_proj"]["kernel"],
+                router_params["q_operator_tau_proj"]["bias"],
+                router_params["k_operator_tau_proj"]["kernel"],
+                router_params["k_operator_tau_proj"]["bias"],
+                router_params["v_operator_tau_proj"]["kernel"],
+                router_params["v_operator_tau_proj"]["bias"],
+                pool_params["q_read_vectors"],
+                pool_params["q_write_vectors"],
+                pool_params["k_read_vectors"],
+                pool_params["k_write_vectors"],
+                pool_params["v_read_vectors"],
+                pool_params["v_write_vectors"],
+                jnp.float32(0.07),
+                jnp.float32(0.07),
+                jnp.float32(2.0),
+                jnp.float32(0.0),
+                qk_scale,
+                v_scale,
+                collect_metrics))
+        head_width = 4
+        query = q_output.reshape(
+            1, tokens.shape[1], 4, head_width).transpose(0, 2, 1, 3)
+        key = k_output.reshape(
+            1, tokens.shape[1], 4, head_width).transpose(0, 2, 1, 3)
+        value = v_output.reshape(
+            1, tokens.shape[1], 4, head_width).transpose(0, 2, 1, 3)
+        attention_output = v4174._causal_attention_core(
+            query, key, value, 0.0, True, jax.random.PRNGKey(90),
+            throughput_bf16=False)
+        attention_output = attention_output.transpose(
+            0, 2, 1, 3).reshape(current_state.shape)
+        attention_output = v4174._linear(
+            block_params["attn"]["expand_O"], attention_output)
+        post_attention = current_state + attention_output
+        rst_normalized = v4174._shared_layer_norm(
+            post_attention,
+            block_params["norm2"]["scale"],
+            block_params["norm2"]["bias"])
+        rst_output, _ = sharded["rst_space_dense"](
+            rst_normalized.reshape((-1, 16)),
+            router_params["space_route_proj"]["kernel"],
+            router_params["space_read_vectors"],
+            router_params["space_state_proj"],
+            router_params["space_state_writeback"],
+            router_params["rst_operator_tau_proj"]["kernel"],
+            router_params["rst_operator_tau_proj"]["bias"],
+            pool_params["rst_read_vectors"],
+            pool_params["rst_write_vectors"],
+            jnp.float32(0.07),
+            jnp.float32(2.0),
+            jnp.float32(0.0),
+            rst_scale,
+            collect_metrics)
+        return (
+            q_output,
+            k_output,
+            v_output,
+            attention_output,
+            rst_output,
+        )
+
+    false_intermediates = layer_intermediates(false_flag)
+    true_intermediates = layer_intermediates(true_flag)
+    for false_value, true_value in zip(
+            false_intermediates, true_intermediates):
+        np.testing.assert_allclose(
+            false_value, true_value, atol=1.0e-6, rtol=0.0)
+
     calls = [
         train_math(params, flag)
         for flag in (false_flag, true_flag, false_flag, true_flag)

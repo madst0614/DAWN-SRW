@@ -98,55 +98,86 @@ def test_v4174_dynamic_metric_source_contract():
     from models import dawn_srw_v4174 as v4174
 
     model_source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
-    rw_source = inspect.getsource(v4174._dense_rw_routes_sharded)
+    output_source = inspect.getsource(v4174._dense_rw_output_sharded)
     reduce_source = inspect.getsource(
-        v4174._reduce_dense_rw_routes_sharded)
-    packed_source = inspect.getsource(
-        v4174._sharded_packed_scalar_metrics)
+        v4174._reduce_dense_rw_output_sharded)
+    metric_scan_source = inspect.getsource(
+        v4174._dense_rw_metric_stats_sharded)
+    metric_vector_source = inspect.getsource(
+        v4174._collect_dense_rw_metric_vector_sharded)
+    metric_cond_source = inspect.getsource(v4174._metric_only_cond)
+    metric_cond_fwd_source = inspect.getsource(
+        v4174._metric_only_cond_fwd)
+    metric_cond_bwd_source = inspect.getsource(
+        v4174._metric_only_cond_bwd)
     attention_source = inspect.getsource(
         v4174._make_sharded_attention_space_dense)
     rst_source = inspect.getsource(v4174._make_sharded_rst_space_dense)
     trainer_source = inspect.getsource(train_jax.create_train_step)
+    builder_source = inspect.getsource(train_jax.build_canonical_sharded_fns)
     main_source = inspect.getsource(train_jax.main)
 
     assert "collect_train_metrics=True" in model_source
     assert "collect_regular_metrics" in model_source
     assert "jax.lax.cond(" in model_source
-    assert "collect_metrics: jax.Array" in rw_source
-    assert "jax.lax.cond(" in rw_source
-    minimal_step_source = rw_source.split(
-        "def minimal_step", 1)[1].split("def metric_step", 1)[0]
-    assert "jnp.square" not in minimal_step_source
-    assert "gate.max" not in minimal_step_source
-    assert "margin >" not in minimal_step_source
-    assert "depth.sum" not in minimal_step_source
-    assert "raw_out, gate_mass = carry_value" in minimal_step_source
-    metric_step_source = rw_source.split(
-        "def metric_step", 1)[1].split("def run_minimal", 1)[0]
-    assert "jnp.square" in metric_step_source
-    assert "gate.max" in metric_step_source
-    assert "margin >" in metric_step_source
-    assert "depth.sum" in metric_step_source
+    assert "collect_metrics" not in output_source
+    assert "jax.lax.cond(" not in output_source
+    assert "raw_out, gate_mass = carry_value" in output_source
+    assert "jnp.square" not in output_source
+    assert "gate.max" not in output_source
+    assert "margin >" not in output_source
+    assert "depth.sum" not in output_source
+    assert "jax.checkpoint(production_step, prevent_cse=False)" in output_source
+    production_step_source = output_source.split(
+        "def production_step", 1)[1].split("scan_step =", 1)[0]
+    for required in (
+            "read_value", "rho", "gate", "valid", "execution_weight"):
+        assert required in production_step_source
 
-    minimal_reduce_source = reduce_source.split(
-        "def reduce_minimal", 1)[1].split("def reduce_metrics", 1)[0]
-    assert "pmax" not in minimal_reduce_source
-    assert "gate_sq" not in minimal_reduce_source
-    assert "depth_sum" not in minimal_reduce_source
-    assert "jax.lax.psum(gate_mass, \"model\")" in minimal_reduce_source
-    assert reduce_source.count("jax.lax.pmax(") == 1
-    assert packed_source.count("jax.lax.psum(") == 1
-    assert "packed_metrics" in packed_source
-    assert "jax.nn.one_hot" in packed_source
-    assert "jax.lax.cond(" in attention_source
-    assert "jax.lax.cond(" in rst_source
-    assert "collect_metrics" in attention_source
-    assert "collect_metrics" in rst_source
+    assert "jax.lax.cond(" not in reduce_source
+    assert "jax.lax.psum(gate_mass, \"model\")" in reduce_source
+    assert "raw_out / gate_den" in reduce_source
+    assert "write_vectors" not in metric_scan_source
+    assert "\"amtn,amnr->amtr\"" not in metric_scan_source
+    assert "raw_out" not in metric_scan_source
+    assert "chunk_out" not in metric_scan_source
+    assert metric_scan_source.count("jax.lax.stop_gradient(") >= 4
+    assert "gate_mass, gate_sq, gate_max, active_count, depth_sum" in (
+        metric_scan_source)
+    assert "jnp.square" in metric_scan_source
+    assert "gate.max" in metric_scan_source
+    assert "margin >" in metric_scan_source
+    assert "depth.sum" in metric_scan_source
+    assert metric_vector_source.count("jax.lax.psum(") == 2
+    assert metric_vector_source.count("jax.lax.pmax(") == 1
+    assert "packed_metrics" in metric_vector_source
+    assert "jax.nn.one_hot" in metric_vector_source
+    assert "return jax.lax.stop_gradient(jnp.stack(metric_values))" in (
+        metric_vector_source)
+    assert "return jax.lax.cond(" in metric_cond_source
+    assert "jnp.zeros((metric_count,), dtype=jnp.float32)" in (
+        metric_cond_source)
+    assert "None)" in metric_cond_fwd_source
+    assert "return None, None" in metric_cond_bwd_source
+
+    for executor_source in (attention_source, rst_source):
+        assert "metric_vector = _metric_only_cond(" in executor_source
+        assert "len(metric_names)" in executor_source
+        assert "collect_metrics" in executor_source
+    assert "grouped_local_output" in attention_source
+    assert "grouped_space_results" in attention_source
+    assert "grouped_output" in attention_source
+    assert attention_source.count("_reduce_dense_rw_output_sharded(") == 1
+    assert "'remat_chunks': False" in builder_source
     assert "static_argnames" not in trainer_source
     assert "collect_train_metrics=True" in trainer_source
     assert "step_after_update in (1, 5, 10, 20, 50)" in main_source
     assert "_upcoming_is_regular" in main_source
     assert "train_metrics_collected != 1.0" in main_source
+    assert "False -> True -> False" in main_source
+    assert "true_cache_size = _train_step_cache_size()" in main_source
+    assert "final_cache_size = _train_step_cache_size()" in main_source
+    assert "created a second train_step executable" not in main_source
 
 
 def test_regular_record_uses_train_step_scalars_without_diagnostics():
