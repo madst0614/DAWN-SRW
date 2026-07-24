@@ -821,7 +821,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert rst_dense._v4174_dense_grouped_execution == "rst_end_to_end"
     assert rst_dense._v4174_dynamic_metric_flag is True
     assert attention_dense._v4174_inner_chunk_remat is False
-    assert rst_dense._v4174_inner_chunk_remat is False
+    assert rst_dense._v4174_inner_chunk_remat is True
     assert attention_dense._v4174_throughput_precision == (
         "bf16_operands_f32_accum")
     assert rst_dense._v4174_throughput_precision == (

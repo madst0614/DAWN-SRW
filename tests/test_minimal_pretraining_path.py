@@ -168,7 +168,14 @@ def test_v4174_dynamic_metric_source_contract():
     assert "grouped_space_results" in attention_source
     assert "grouped_output" in attention_source
     assert attention_source.count("_reduce_dense_rw_output_sharded(") == 1
-    assert "'remat_chunks': False" in builder_source
+    attention_builder_source = builder_source.split(
+        "sharded['attention_space_dense'] = attention_factory(", 1)[1].split(
+            "sharded['rst_space_dense'] = rst_factory(", 1)[0]
+    rst_builder_source = builder_source.split(
+        "sharded['rst_space_dense'] = rst_factory(", 1)[1].split(
+            "else:", 1)[0]
+    assert "remat_chunks=False" in attention_builder_source
+    assert "remat_chunks=True" in rst_builder_source
     assert "static_argnames" not in trainer_source
     assert "collect_train_metrics=True" in trainer_source
     assert "step_after_update in (1, 5, 10, 20, 50)" in main_source
