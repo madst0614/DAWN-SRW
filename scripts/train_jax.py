@@ -12693,6 +12693,51 @@ def _fixed_depth_pool_scale_from_ctx(ctx):
     return math.sqrt(d_model / n_layers)
 
 
+def _attach_v4174_direct_tau_regular_metrics(rec, metrics):
+    """Map real v4174 direct-operator diagnostics to console field names."""
+    suffix_map = {
+        'active_tau_frac': 'active_tau_frac',
+        'active_tau_count': 'active_tau_count',
+        'gate_mass': 'gate_mass_mean',
+        'gate_den': 'gate_den_mean',
+        'depth_active': 'depth_active_mean',
+        'gate_eff_n': 'gate_eff_n_mean',
+        'top1_gate_frac': 'top1_gate_frac_mean',
+        'den_floor_frac': 'den_floor_frac',
+        'tau_mean': 'tau_mean',
+    }
+    required = [
+        f'{route}_operator_{source_suffix}'
+        for route in ('q', 'k', 'v', 'rst')
+        for source_suffix in suffix_map.values()
+    ]
+    required.extend(('attn_out_norm', 'rst_out_norm', 'residual_norm'))
+    missing = tuple(key for key in required if key not in metrics)
+    if missing:
+        raise KeyError(
+            "v4174 production diagnostics missing direct operator metrics: "
+            + ", ".join(missing))
+
+    legacy_prefix = {
+        'q': 'attn_q',
+        'k': 'attn_k',
+        'v': 'attn_v',
+        'rst': 'rst',
+    }
+    for route, prefix in legacy_prefix.items():
+        for destination_suffix, source_suffix in suffix_map.items():
+            rec[f'{prefix}_{destination_suffix}'] = float(
+                metrics[f'{route}_operator_{source_suffix}'])
+
+    for destination_suffix in suffix_map:
+        rec[f'attn_qk_{destination_suffix}'] = 0.5 * (
+            rec[f'attn_q_{destination_suffix}']
+            + rec[f'attn_k_{destination_suffix}'])
+    for key in ('attn_out_norm', 'rst_out_norm', 'residual_norm'):
+        rec[key] = float(metrics[key])
+    return rec
+
+
 def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     """REGULAR tier: all training-dynamics fields needed for live monitoring.
 
@@ -13574,9 +13619,13 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in V4174_SELECTOR_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    if str(ctx.get('model_version')) == V4174_MODEL_VERSION:
+        _attach_v4174_direct_tau_regular_metrics(rec, m)
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
         _key for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES
-        if _key not in m)
+        if _key not in (
+            rec if str(ctx.get('model_version')) == V4174_MODEL_VERSION
+            else m))
     if str(ctx.get('model_version')) in (
             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
         missing_tau_updates = tuple(

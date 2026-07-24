@@ -386,12 +386,12 @@ def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
     assert '"rst", rst_local, rst_tau, pool_params' in source
 
 
-def test_full_18_layer_checkpointing_is_equivalent_and_changes_ir():
+def test_one_layer_checkpointing_is_numerically_equivalent():
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
     plain_model = _model(
-        n_layers=18, gradient_checkpointing=False)
+        n_layers=1, gradient_checkpointing=False)
     remat_model = _model(
-        n_layers=18, gradient_checkpointing=True)
+        n_layers=1, gradient_checkpointing=True)
     variables = plain_model.init(
         {
             "params": jax.random.PRNGKey(71),
@@ -437,9 +437,35 @@ def test_full_18_layer_checkpointing_is_equivalent_and_changes_ir():
         np.testing.assert_allclose(
             _path(remat_grads, *path),
             _path(plain_grads, *path),
-            atol=5.0e-6,
-            rtol=5.0e-5,
+            atol=2.0e-6,
+            rtol=2.0e-6,
         )
+
+
+def test_full_18_layer_checkpointing_changes_ir_and_reduces_temp_memory():
+    tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
+    plain_model = _model(
+        n_layers=18, gradient_checkpointing=False)
+    remat_model = _model(
+        n_layers=18, gradient_checkpointing=True)
+    variables = plain_model.init(
+        {
+            "params": jax.random.PRNGKey(75),
+            "dropout": jax.random.PRNGKey(76),
+        },
+        tokens,
+        deterministic=True,
+    )
+    params = variables["params"]
+
+    def loss(model, current):
+        return model.apply(
+            {"params": current},
+            tokens,
+            labels=tokens,
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(77)},
+        )["loss"]
 
     plain_grad = lambda current: jax.grad(
         lambda value: loss(plain_model, value))(current)
@@ -449,6 +475,8 @@ def test_full_18_layer_checkpointing_is_equivalent_and_changes_ir():
     remat_jaxpr = str(jax.make_jaxpr(remat_grad)(params))
     assert "remat2" not in plain_jaxpr
     assert "remat2" in remat_jaxpr
+    assert "length=18" in plain_jaxpr
+    assert "length=18" in remat_jaxpr
     plain_lowered = jax.jit(plain_grad).lower(params)
     remat_lowered = jax.jit(remat_grad).lower(params)
     plain_hlo = plain_lowered.compiler_ir(
@@ -699,6 +727,84 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert pool_diagnostics
     assert any(key.startswith("attn_q_read_") for key in pool_diagnostics)
     assert any(key.startswith("attn_k_read_") for key in pool_diagnostics)
+
+
+def test_v4174_regular_console_maps_direct_operator_diagnostics(monkeypatch):
+    from scripts import train_jax
+
+    model, tokens, variables = _variables(seed=35)
+    metrics = dict(model.apply(
+        {"params": variables["params"]},
+        tokens,
+        labels=tokens,
+        deterministic=True,
+        minimal_runtime_profile="diagnostics",
+        rngs={"dropout": jax.random.PRNGKey(36)},
+    ))
+    metrics.update({
+        "tau_lr_mult": jnp.float32(0.001),
+        **{
+            key: jnp.float32(0.0)
+            for key in train_jax.V4170_TAU_UPDATE_METRIC_NAMES
+        },
+        **{
+            key: jnp.float32(index + 1)
+            for index, key in enumerate(
+                train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
+        },
+    })
+    for key in train_jax.V4174_COMPACT_TRAIN_METRIC_NAMES:
+        metrics.setdefault(key, jnp.float32(0.0))
+    win_avgs = {
+        "loss": float(metrics["loss"]),
+        "ce": float(metrics["loss"]),
+        "aux": 0.0,
+        "tau_reg": 0.0,
+        "orth": 0.0,
+        "div": 0.0,
+        "acc": 0.0,
+    }
+    ctx = {
+        "model_version": v4174.MODEL_VERSION,
+        "lb_weight": 0.0,
+        "tau_reg_weight": 0.0,
+        "orth_weight": 0.0,
+        "div_weight": 0.0,
+        "dead_penalty_weight": 0.0,
+        "current_lr": 0.0,
+        "steps_per_sec": 1.0,
+        "total_elapsed": 1.0,
+        "epoch_elapsed": 1.0,
+        "eta": 1.0,
+        "s_per_it": 1.0,
+        "progress": 0.0,
+        "d_model_cfg": model.d_model,
+        "n_layers_cfg": model.n_layers,
+        "train_compute_accuracy": True,
+    }
+    rec = train_jax._build_regular_record(
+        metrics, win_avgs, ctx, global_step=1, epoch=0)
+    rec["raw_step_time_window"] = 1.0
+    rec["logging_time"] = 0.0
+    assert rec["_linear_direct_tau_regular_missing_metrics"] == ()
+    np.testing.assert_allclose(
+        rec["attn_q_active_tau_frac"],
+        metrics["q_operator_active_tau_frac"])
+    np.testing.assert_allclose(
+        rec["attn_k_active_tau_frac"],
+        metrics["k_operator_active_tau_frac"])
+    np.testing.assert_allclose(
+        rec["attn_qk_active_tau_frac"],
+        0.5 * (
+            metrics["q_operator_active_tau_frac"]
+            + metrics["k_operator_active_tau_frac"]))
+
+    messages = []
+    monkeypatch.setattr(train_jax, "log_message", messages.append)
+    train_jax._print_linear_direct_tau_regular_block(rec, ctx)
+    assert any(message.startswith("  active:") for message in messages)
+    compact = train_jax._v4170_compact_regular_jsonl_record(rec, ctx)
+    assert tuple(compact) == train_jax.V4174_COMPACT_REGULAR_JSONL_KEYS
 
 
 def test_actual_create_train_step_updates_with_complete_compact_schema():
