@@ -7,6 +7,8 @@ import numpy as np
 import optax
 import pytest
 import yaml
+from jax.experimental.shard_map import shard_map
+from jax.sharding import PartitionSpec as P
 
 from models import dawn_srw_v4174 as v4174
 
@@ -108,6 +110,117 @@ def _execution_kwargs():
         "admission_den_power": 1.0,
         "srw_composition_mode": "linear_angular",
         "heat_kernel_beta": 4.0,
+    }
+
+
+def _fp32_rw_reference(
+        local, read_vectors, write_vectors, raw_tau, *,
+        temperature, boundary_power, den_power):
+    read_unit = v4174.forward_unit_direction(read_vectors)
+    write_unit = v4174.forward_unit_direction(write_vectors)
+    read_value = v4174._control_einsum_f32(
+        "mtr,mnr->mtn", local, read_unit)
+    local_norm = jnp.maximum(
+        jnp.linalg.norm(local.astype(jnp.float32), axis=-1, keepdims=True),
+        jnp.float32(v4174.RW_FORWARD_NORM_EPS))
+    tau = v4174._shared_tau_from_param(raw_tau)
+    rho = jnp.clip(read_value / local_norm, -1.0, 1.0)
+    margin, gate, depth, execution_weight, _ = (
+        v4174._shared_compute_admission_drive(
+            rho, tau, jnp.float32(temperature),
+            boundary_power=jnp.float32(boundary_power),
+            effective_active_eps=jnp.float32(1.0e-6),
+            execution_prune_eps=jnp.float32(0.0),
+            srw_composition_mode="linear_angular",
+            heat_kernel_beta=jnp.float32(
+                v4174.DEFAULT_HEAT_KERNEL_BETA)))
+    raw_out = v4174._control_einsum_f32(
+        "mtn,mnr->mtr", execution_weight * read_value, write_unit)
+    gate_mass = gate.sum(axis=-1, keepdims=True)
+    gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
+    gate_max = gate.max(axis=-1, keepdims=True)
+    active_count = (margin > 0.0).sum(
+        axis=-1, keepdims=True).astype(jnp.float32)
+    depth_sum = depth.sum(axis=-1, keepdims=True)
+    gate_den = v4174._shared_composition_den(
+        gate_mass, jnp.float32(den_power), "linear_angular")
+    return (
+        raw_out / gate_den,
+        active_count,
+        gate_mass,
+        gate_sq,
+        gate_max,
+        depth_sum,
+        tau,
+        gate_den,
+    )
+
+
+def _fp32_fused_sharded(mesh, *, remat_chunks=False):
+    common = {
+        "operation_space_top_k": 2,
+        "srw_composition_mode": "linear_angular",
+        "heat_kernel_beta": v4174.DEFAULT_HEAT_KERNEL_BETA,
+        "soft_gate_effective_active_eps": 1.0e-6,
+        "remat_chunks": remat_chunks,
+    }
+    return {
+        "attention_space_dense":
+            v4174.make_sharded_attention_space_dense_fp32_reference(
+                mesh,
+                max_chunk_size_qk=8,
+                max_chunk_size_v=8,
+                admission_den_power_qk=0.5,
+                admission_den_power_v=1.0,
+                **common),
+        "rst_space_dense":
+            v4174.make_sharded_rst_space_dense_fp32_reference(
+                mesh,
+                max_chunk_size=8,
+                admission_den_power=1.2,
+                **common),
+        "_v4174_kernel_profile": "production",
+    }
+
+
+def _fp32_separate_sharded(mesh):
+    def make_route(den_power):
+        def route_core(
+                local, raw_tau, token_valid, read_vectors, write_vectors,
+                temperature, temperature_final,
+                boundary_power, boundary_power_final,
+                execution_prune_eps):
+            del (
+                token_valid, temperature_final,
+                boundary_power_final, execution_prune_eps)
+            return _fp32_rw_reference(
+                local, read_vectors, write_vectors, raw_tau,
+                temperature=temperature,
+                boundary_power=boundary_power,
+                den_power=den_power)[0]
+
+        return shard_map(
+            route_core,
+            mesh=mesh,
+            in_specs=(
+                P(None, "data", None),
+                P(None, "data", None),
+                P(None, "data"),
+                P(None, "model", None),
+                P(None, "model", None),
+                P(), P(), P(), P(), P(),
+            ),
+            out_specs=P(None, "data", None),
+            check_rep=False)
+
+    return {
+        f"{route}_space_dense": make_route(den_power)
+        for route, den_power in (
+            ("q", 0.5),
+            ("k", 0.5),
+            ("v", 1.0),
+            ("rst", 1.2),
+        )
     }
 
 
@@ -343,16 +456,8 @@ def test_space_gate_is_fixed_nonsoftmax_topk_relu_squared_gate():
     np.testing.assert_array_equal(zero_route, np.zeros((2, 5)))
 
 
-def test_qk_banks_and_execution_are_fully_separate():
-    paired_factories = (
-        "make_sharded_srw_paired",
-        "make_sharded_srw_paired_minimal",
-        "make_sharded_srw_paired_diagnostics_minimal",
-        "make_sharded_srw_paired_retention_minimal",
-        "make_sharded_srw_paired_suppression_minimal",
-        "make_sharded_srw_paired_trajectory_minimal",
-    )
-    assert not any(hasattr(v4174, name) for name in paired_factories)
+def test_qk_banks_are_independent_and_production_execution_is_paired():
+    assert hasattr(v4174, "make_sharded_attention_space_dense_minimal")
     _, _, variables = _variables(seed=7)
     params = variables["params"]
     pool = params["neuron_pool"]
@@ -376,10 +481,15 @@ def test_qk_banks_and_execution_are_fully_separate():
         k_tau, **_execution_kwargs())
     assert q_output.shape == k_output.shape == (4, 6, 4)
     assert not np.allclose(q_output, k_output)
-    source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
-    assert "_qk_shared_read" not in source
-    assert 'pool_params[f"{route}_read_vectors"]' in source
-    assert 'pool_params[f"{route}_write_vectors"]' in source
+    source = inspect.getsource(
+        v4174._make_sharded_attention_space_dense)
+    assert "jnp.stack((q_read, k_read), axis=0)" in source
+    assert "jnp.stack((q_write, k_write), axis=0)" in source
+    assert "qk_raw_tau" in source
+    assert "q_tau_kernel" in source and "k_tau_kernel" in source
+    assert "throughput_dot_bf16_f32" in source
+    assert "_control_einsum_f32" in source
+    assert "grouped_output" in source
 
 
 def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
@@ -421,11 +531,11 @@ def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
     assert all(
         not np.allclose(left, right)
         for left, right in zip(before, after))
-    source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
-    assert "flat_rst_state" in source
-    assert "rst_routing, rst_local = route_and_local" in source
-    assert "flat_rst_state, router_params" in source
-    assert '"rst", rst_local, rst_tau, pool_params' in source
+    source = inspect.getsource(v4174._make_sharded_rst_space_dense)
+    assert "_compute_space_routing" in source
+    assert "throughput_dot_bf16_f32" in source
+    assert '"mtr,mrd->td"' in source
+    assert "return update, metrics" in source
 
 
 def test_one_layer_checkpointing_is_numerically_equivalent():
@@ -692,46 +802,204 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         ("data", "model"),
     )
     sharded = train_jax.build_canonical_sharded_fns(cfg, mesh)
-    assert all(
+    assert "attention_space_dense" in sharded
+    assert "rst_space_dense" in sharded
+    assert not any(
         name in sharded
         for name in (
             "q_space_dense", "k_space_dense",
-            "v_space_dense", "rst_space_dense"))
-    assert not any("qk" in name for name in sharded)
-    assert all(
-        getattr(sharded[f"{route}_space_dense"],
-                "_v4174_direct_read_matmuls") == 1
-        for route in ("q", "k", "v", "rst"))
-    sharded_source = inspect.getsource(
-        v4174._make_sharded_space_dense_direct)
-    assert sharded_source.count('"mtr,mnr->mtn"') == 1
+            "v_space_dense"))
+    attention_dense = sharded["attention_space_dense"]
+    rst_dense = sharded["rst_space_dense"]
+    fp32_sharded = _fp32_fused_sharded(mesh)
+    fp32_separate_sharded = _fp32_separate_sharded(mesh)
+    fp32_attention_dense = fp32_sharded["attention_space_dense"]
+    fp32_rst_dense = fp32_sharded["rst_space_dense"]
+    assert attention_dense._v4174_qk_paired is True
+    assert attention_dense._v4174_dense_grouped_execution == "attention_qkv"
+    assert rst_dense._v4174_dense_grouped_execution == "rst_end_to_end"
+    assert attention_dense._v4174_inner_chunk_remat is False
+    assert rst_dense._v4174_inner_chunk_remat is False
+    assert attention_dense._v4174_throughput_precision == (
+        "bf16_operands_f32_accum")
+    assert rst_dense._v4174_throughput_precision == (
+        "bf16_operands_f32_accum")
+    assert fp32_attention_dense._v4174_throughput_precision == (
+        "fp32_reference")
+    assert fp32_rst_dense._v4174_throughput_precision == "fp32_reference"
+    assert attention_dense._v4174_output_contract == (
+        "q[T,D]", "k[T,D]", "v[T,D]", "scalars")
+    assert rst_dense._v4174_output_contract == ("rst[T,D]", "scalars")
 
     _, tokens, variables = _variables()
     params = variables["params"]
-    local = jax.random.normal(jax.random.PRNGKey(21), (4, 6, 4))
-    raw_tau = v4174._linear(
-        params["router"]["q_operator_tau_proj"], local)
-    direct_sharded = sharded["q_space_dense"](
-        local,
-        raw_tau,
-        jnp.ones(local.shape[:2], dtype=jnp.bool_),
-        params["neuron_pool"]["q_read_vectors"],
-        params["neuron_pool"]["q_write_vectors"],
-        0.07, 0.07, 2.0, 2.0, 0.0,
-    )
-    direct_reference = v4174._rw_compose_space_dense(
-        local,
-        params["neuron_pool"]["q_read_vectors"],
-        params["neuron_pool"]["q_write_vectors"],
-        raw_tau,
-        soft_gate_temperature=0.07,
-        soft_gate_boundary_power=2.0,
-        admission_den_power=0.5,
-        srw_composition_mode="linear_angular",
-        heat_kernel_beta=v4174.DEFAULT_HEAT_KERNEL_BETA,
-    )
+    router = params["router"]
+    pool = params["neuron_pool"]
+    flat = jax.random.normal(jax.random.PRNGKey(21), (6, 16))
+    qk_scale, v_scale, rst_scale = v4174._shared_pool_output_scales(16, 1)
+    attention_args = (
+        flat,
+        router["space_route_proj"]["kernel"],
+        router["space_read_vectors"],
+        router["space_state_proj"],
+        router["space_state_writeback"],
+        router["q_operator_tau_proj"]["kernel"],
+        router["q_operator_tau_proj"]["bias"],
+        router["k_operator_tau_proj"]["kernel"],
+        router["k_operator_tau_proj"]["bias"],
+        router["v_operator_tau_proj"]["kernel"],
+        router["v_operator_tau_proj"]["bias"],
+        pool["q_read_vectors"], pool["q_write_vectors"],
+        pool["k_read_vectors"], pool["k_write_vectors"],
+        pool["v_read_vectors"], pool["v_write_vectors"],
+        0.07, 0.07, 2.0, 0.0, qk_scale, v_scale)
+    q_output, k_output, v_output, attention_metrics = attention_dense(
+        *attention_args)
+    (q_output_fp32, k_output_fp32, v_output_fp32,
+     attention_metrics_fp32) = fp32_attention_dense(*attention_args)
+    assert q_output.shape == k_output.shape == v_output.shape == (6, 16)
+    assert all(value.shape == () for value in attention_metrics.values())
+    assert all(
+        value.shape == () for value in attention_metrics_fp32.values())
+    assert all(
+        value.dtype == jnp.float32
+        for value in (
+            q_output, k_output, v_output,
+            q_output_fp32, k_output_fp32, v_output_fp32))
+
+    routing = v4174._compute_space_routing(
+        flat, router["space_route_proj"]["kernel"],
+        router["space_read_vectors"], 2)
     np.testing.assert_allclose(
-        direct_sharded, direct_reference, atol=1e-5, rtol=1e-5)
+        attention_metrics["attention_space_gate_mass_mean"],
+        routing["space_gate_mass"].mean(),
+        atol=1e-5, rtol=1e-5)
+    local = v4174._control_einsum_f32(
+        "td,mdr->mtr", flat, router["space_state_proj"])
+    reference_outputs = {}
+    for route, scale, den in (
+            ("q", qk_scale, 0.5),
+            ("k", qk_scale, 0.5),
+            ("v", v_scale, 1.0)):
+        raw_tau = v4174._control_linear_f32(
+            router[f"{route}_operator_tau_proj"], local)
+        direct_details = _fp32_rw_reference(
+            local,
+            pool[f"{route}_read_vectors"],
+            pool[f"{route}_write_vectors"],
+            raw_tau,
+            temperature=0.07,
+            boundary_power=2.0,
+            den_power=den)
+        local_output = direct_details[0]
+        np.testing.assert_allclose(
+            attention_metrics_fp32[
+                f"{route}_operator_gate_mass_mean"],
+            direct_details[2].mean(), atol=1e-6, rtol=1e-6)
+        weighted = (
+            local_output
+            * jnp.swapaxes(
+                routing["dense_space_weights"], 0, 1)[..., None]
+            * jnp.float32(scale))
+        reference_outputs[route] = v4174._control_einsum_f32(
+            "mtr,mrd->td", weighted,
+            router["space_state_writeback"])
+        assert abs(float(
+            attention_metrics[
+                f"{route}_operator_active_tau_frac"]
+            - attention_metrics_fp32[
+                f"{route}_operator_active_tau_frac"])) <= 0.001
+    for actual, route in zip(
+            (q_output_fp32, k_output_fp32, v_output_fp32),
+            ("q", "k", "v")):
+        np.testing.assert_allclose(
+            actual, reference_outputs[route], atol=1e-5, rtol=1e-5)
+    for mixed, fp32 in zip(
+            (q_output, k_output, v_output),
+            (q_output_fp32, k_output_fp32, v_output_fp32)):
+        mixed_norm = float(jnp.linalg.norm(mixed))
+        fp32_norm = float(jnp.linalg.norm(fp32))
+        assert 0.98 <= mixed_norm / max(fp32_norm, 1.0e-8) <= 1.02
+
+    def rst_routing_after_attention(q_value, k_value, v_value, mixed):
+        def heads(value):
+            return value.reshape(1, 6, 4, 4).transpose(0, 2, 1, 3)
+
+        attention = v4174._causal_attention_core(
+            heads(q_value), heads(k_value), heads(v_value),
+            0.0, True, jax.random.PRNGKey(25),
+            throughput_bf16=mixed)
+        attention = attention.transpose(0, 2, 1, 3).reshape(1, 6, 16)
+        block = params["block_0"]
+        attention = (
+            v4174._throughput_linear_bf16_f32(
+                block["attn"]["expand_O"], attention)
+            if mixed else v4174._control_linear_f32(
+                block["attn"]["expand_O"], attention))
+        post_attention = flat.reshape(1, 6, 16) + attention
+        rst_state = v4174._shared_layer_norm(
+            post_attention,
+            block["norm2"]["scale"],
+            block["norm2"]["bias"]).reshape(6, 16)
+        return v4174._compute_space_routing(
+            rst_state,
+            router["space_route_proj"]["kernel"],
+            router["space_read_vectors"],
+            2)
+
+    mixed_rst_routing = rst_routing_after_attention(
+        q_output, k_output, v_output, True)
+    fp32_rst_routing = rst_routing_after_attention(
+        q_output_fp32, k_output_fp32, v_output_fp32, False)
+    top_k_agreement = jnp.mean(
+        jnp.all(
+            mixed_rst_routing["selected_ids"]
+            == fp32_rst_routing["selected_ids"],
+            axis=-1).astype(jnp.float32))
+    assert float(top_k_agreement) >= 0.995
+
+    rst_args = (
+        flat,
+        router["space_route_proj"]["kernel"],
+        router["space_read_vectors"],
+        router["space_state_proj"],
+        router["space_state_writeback"],
+        router["rst_operator_tau_proj"]["kernel"],
+        router["rst_operator_tau_proj"]["bias"],
+        pool["rst_read_vectors"], pool["rst_write_vectors"],
+        0.07, 2.0, 0.0, rst_scale)
+    rst_output, rst_metrics = rst_dense(*rst_args)
+    rst_output_fp32, rst_metrics_fp32 = fp32_rst_dense(*rst_args)
+    assert rst_output.shape == (6, 16)
+    assert all(value.shape == () for value in rst_metrics.values())
+    assert rst_output.dtype == rst_output_fp32.dtype == jnp.float32
+    rst_tau = v4174._control_linear_f32(
+        router["rst_operator_tau_proj"], local)
+    rst_reference_details = _fp32_rw_reference(
+        local,
+        pool["rst_read_vectors"],
+        pool["rst_write_vectors"],
+        rst_tau,
+        temperature=0.07,
+        boundary_power=2.0,
+        den_power=1.2)
+    rst_reference_weighted = (
+        rst_reference_details[0]
+        * jnp.swapaxes(
+            routing["dense_space_weights"], 0, 1)[..., None]
+        * jnp.float32(rst_scale))
+    rst_reference = v4174._control_einsum_f32(
+        "mtr,mrd->td", rst_reference_weighted,
+        router["space_state_writeback"])
+    np.testing.assert_allclose(
+        rst_output_fp32, rst_reference, atol=1e-5, rtol=1e-5)
+    assert abs(float(
+        rst_metrics["rst_operator_active_tau_frac"]
+        - rst_metrics_fp32["rst_operator_active_tau_frac"])) <= 0.001
+    rst_norm_ratio = float(
+        jnp.linalg.norm(rst_output)
+        / jnp.maximum(jnp.linalg.norm(rst_output_fp32), 1.0e-8))
+    assert 0.98 <= rst_norm_ratio <= 1.02
     sharded_forward = built.apply(
         {"params": params},
         tokens,
@@ -739,7 +1007,102 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         sharded_fns=sharded,
         rngs={"dropout": jax.random.PRNGKey(22)},
     )
+    reference_forward = built.apply(
+        {"params": params},
+        tokens,
+        deterministic=True,
+        sharded_fns=fp32_sharded,
+        rngs={"dropout": jax.random.PRNGKey(22)},
+    )
+    separate_fp32_forward = built.apply(
+        {"params": params},
+        tokens,
+        deterministic=True,
+        sharded_fns=fp32_separate_sharded,
+        rngs={"dropout": jax.random.PRNGKey(22)},
+    )
     assert sharded_forward["logits"].shape == (1, 16, 64)
+    np.testing.assert_allclose(
+        reference_forward["logits"], separate_fp32_forward["logits"],
+        atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(
+        sharded_forward["logits"], reference_forward["logits"],
+        atol=2e-2, rtol=2e-2)
+
+    def model_loss(current, sharded_fns):
+        return built.apply(
+            {"params": current},
+            tokens,
+            labels=tokens,
+            deterministic=True,
+            sharded_fns=sharded_fns,
+            compute_accuracy=False,
+            rngs={"dropout": jax.random.PRNGKey(24)},
+        )["loss"]
+
+    reference_loss, reference_grads = jax.jit(jax.value_and_grad(
+        lambda current: model_loss(current, fp32_sharded)))(params)
+    separate_fp32_loss, separate_fp32_grads = jax.jit(
+        jax.value_and_grad(
+            lambda current: model_loss(
+                current, fp32_separate_sharded)))(params)
+    fused_loss, fused_grads = jax.jit(jax.value_and_grad(
+        lambda current: model_loss(current, sharded)))(params)
+    assert bool(jnp.isfinite(reference_loss))
+    assert bool(jnp.isfinite(fused_loss))
+    np.testing.assert_allclose(
+        reference_loss, separate_fp32_loss, atol=1e-6, rtol=1e-6)
+    separate_gradient_dot = sum(
+        jnp.sum(
+            left.astype(jnp.float32) * right.astype(jnp.float32))
+        for left, right in zip(
+            jax.tree.leaves(reference_grads),
+            jax.tree.leaves(separate_fp32_grads)))
+    separate_gradient_sq = sum(
+        jnp.sum(jnp.square(value.astype(jnp.float32)))
+        for value in jax.tree.leaves(separate_fp32_grads))
+    reference_gradient_sq = sum(
+        jnp.sum(jnp.square(value.astype(jnp.float32)))
+        for value in jax.tree.leaves(reference_grads))
+    assert float(
+        separate_gradient_dot / jnp.sqrt(jnp.maximum(
+            separate_gradient_sq * reference_gradient_sq,
+            1.0e-12))) >= 0.999
+    assert float(
+        jnp.abs(fused_loss - reference_loss)
+        / jnp.maximum(jnp.abs(reference_loss), 1.0e-8)) <= 0.002
+    assert all(
+        bool(jnp.all(jnp.isfinite(value)))
+        for value in jax.tree.leaves(fused_grads))
+    assert all(
+        not jnp.issubdtype(value.dtype, jnp.inexact)
+        or value.dtype == jnp.float32
+        for value in jax.tree.leaves(fused_grads))
+    grad_diff_sq = sum(
+        jnp.sum(jnp.square(
+            left.astype(jnp.float32) - right.astype(jnp.float32)))
+        for left, right in zip(
+            jax.tree.leaves(fused_grads),
+            jax.tree.leaves(reference_grads)))
+    grad_reference_sq = sum(
+        jnp.sum(jnp.square(value.astype(jnp.float32)))
+        for value in jax.tree.leaves(reference_grads))
+    gradient_relative_error = jnp.sqrt(
+        grad_diff_sq / jnp.maximum(grad_reference_sq, 1.0e-12))
+    assert float(gradient_relative_error) < 0.05
+    gradient_dot = sum(
+        jnp.sum(
+            left.astype(jnp.float32) * right.astype(jnp.float32))
+        for left, right in zip(
+            jax.tree.leaves(fused_grads),
+            jax.tree.leaves(reference_grads)))
+    fused_gradient_sq = sum(
+        jnp.sum(jnp.square(value.astype(jnp.float32)))
+        for value in jax.tree.leaves(fused_grads))
+    gradient_cosine = gradient_dot / jnp.sqrt(
+        jnp.maximum(
+            fused_gradient_sq * grad_reference_sq, 1.0e-12))
+    assert float(gradient_cosine) >= 0.99
     diagnostics_fns = train_jax.build_canonical_sharded_fns(
         cfg, mesh, for_eval=True,
         kernel_profile="production_diagnostics")
@@ -783,6 +1146,168 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert any(key.startswith("attn_k_read_") for key in pool_diagnostics)
 
 
+def test_v4174_precision_partition_and_vocab_ce_contract():
+    from models.vocab_parallel import make_vocab_parallel_ce_loss
+
+    control = v4174.control_dot_f32(
+        jnp.ones((3, 4), dtype=jnp.bfloat16),
+        jnp.ones((4, 2), dtype=jnp.bfloat16),
+        dimension_numbers=(((1,), (0,)), ((), ())))
+    throughput = v4174.throughput_dot_bf16_f32(
+        jnp.ones((3, 4), dtype=jnp.float32),
+        jnp.ones((4, 2), dtype=jnp.float32),
+        dimension_numbers=(((1,), (0,)), ((), ())))
+    assert control.dtype == throughput.dtype == jnp.float32
+    throughput_hlo = jax.jit(
+        lambda left, right: v4174.throughput_dot_bf16_f32(
+            left, right,
+            dimension_numbers=(((1,), (0,)), ((), ())))
+    ).lower(
+        jnp.ones((3, 4), dtype=jnp.float32),
+        jnp.ones((4, 2), dtype=jnp.float32),
+    ).compiler_ir(dialect="hlo").as_hlo_text().lower()
+    assert "bf16" in throughput_hlo
+    assert "f32" in throughput_hlo
+    assert "jax_default_matmul_precision" not in inspect.getsource(v4174)
+
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]).reshape((1, 1)),
+        ("data", "model"),
+    )
+    mixed_ce = make_vocab_parallel_ce_loss(
+        mesh,
+        logical_vocab_size=16,
+        vocab_size_padded=16,
+        token_chunk_size=8,
+        throughput_bf16_f32=True)
+    fp32_ce = make_vocab_parallel_ce_loss(
+        mesh,
+        logical_vocab_size=16,
+        vocab_size_padded=16,
+        token_chunk_size=8,
+        throughput_bf16_f32=False)
+    hidden = jax.random.normal(jax.random.PRNGKey(81), (1, 8, 4))
+    embedding = jax.random.normal(jax.random.PRNGKey(82), (16, 4))
+    labels = jnp.arange(8, dtype=jnp.int32)[None, :] % 16
+    valid = jnp.ones_like(labels, dtype=jnp.bool_)
+    mixed_loss = mixed_ce(hidden, embedding, labels, valid)
+    fp32_loss = fp32_ce(hidden, embedding, labels, valid)
+    assert mixed_loss.dtype == fp32_loss.dtype == jnp.float32
+    assert bool(jnp.isfinite(mixed_loss))
+    assert float(
+        jnp.abs(mixed_loss - fp32_loss)
+        / jnp.maximum(jnp.abs(fp32_loss), 1.0e-8)) <= 0.002
+
+
+def test_v4174_mixed_precision_20_step_trajectory_is_stable():
+    from scripts import train_jax
+
+    model, tokens, variables = _variables(
+        model=_model(gradient_checkpointing=True), seed=91)
+    initial_params = variables["params"]
+    assert all(
+        not jnp.issubdtype(value.dtype, jnp.inexact)
+        or value.dtype == jnp.float32
+        for value in jax.tree.leaves(initial_params))
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]).reshape((1, 1)),
+        ("data", "model"),
+    )
+    cfg = {
+        "model": _model_config(gradient_checkpointing=True),
+        "training": {
+            "n_chunks_q": 1,
+            "n_chunks_k": 1,
+            "n_chunks_v": 1,
+            "n_chunks_rst": 1,
+            "tau_lr_mult": 0.001,
+        },
+    }
+    mixed_sharded = train_jax.build_canonical_sharded_fns(cfg, mesh)
+    fp32_sharded = _fp32_fused_sharded(mesh)
+    optimizer = optax.adam(2.0e-4)
+
+    def make_step(sharded_fns):
+        def step(params, opt_state):
+            def loss_fn(current):
+                result = model.apply(
+                    {"params": current},
+                    tokens,
+                    labels=tokens,
+                    deterministic=True,
+                    sharded_fns=sharded_fns,
+                    compute_accuracy=False,
+                    rngs={"dropout": jax.random.PRNGKey(92)},
+                )
+                active = jnp.stack([
+                    result["attn_q_active_tau_frac"],
+                    result["attn_k_active_tau_frac"],
+                    result["attn_v_active_tau_frac"],
+                    result["rst_active_tau_frac"],
+                ])
+                return result["loss"], active
+
+            (loss, active), grads = jax.value_and_grad(
+                loss_fn, has_aux=True)(params)
+            grad_sq = sum(
+                jnp.sum(jnp.square(value.astype(jnp.float32)))
+                for value in jax.tree.leaves(grads))
+            grad_norm = jnp.sqrt(grad_sq)
+            updates, new_opt_state = optimizer.update(
+                grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, loss, grad_norm, active
+
+        return jax.jit(step)
+
+    mixed_step = make_step(mixed_sharded)
+    fp32_step = make_step(fp32_sharded)
+    mixed_params = initial_params
+    fp32_params = initial_params
+    mixed_opt_state = optimizer.init(mixed_params)
+    fp32_opt_state = optimizer.init(fp32_params)
+    assert all(
+        not jnp.issubdtype(value.dtype, jnp.inexact)
+        or value.dtype == jnp.float32
+        for value in (
+            *jax.tree.leaves(mixed_opt_state),
+            *jax.tree.leaves(fp32_opt_state)))
+    mixed_history = []
+    fp32_history = []
+    for _ in range(20):
+        (mixed_params, mixed_opt_state, mixed_loss,
+         mixed_grad, mixed_active) = mixed_step(
+             mixed_params, mixed_opt_state)
+        (fp32_params, fp32_opt_state, fp32_loss,
+         fp32_grad, fp32_active) = fp32_step(
+             fp32_params, fp32_opt_state)
+        mixed_history.append((
+            float(mixed_loss), float(mixed_grad),
+            np.asarray(mixed_active)))
+        fp32_history.append((
+            float(fp32_loss), float(fp32_grad),
+            np.asarray(fp32_active)))
+
+    mixed_losses = np.asarray([value[0] for value in mixed_history])
+    fp32_losses = np.asarray([value[0] for value in fp32_history])
+    mixed_grads = np.asarray([value[1] for value in mixed_history])
+    fp32_grads = np.asarray([value[1] for value in fp32_history])
+    assert np.all(np.isfinite(mixed_losses))
+    assert np.all(np.isfinite(mixed_grads))
+    loss_relative = np.abs(
+        mixed_losses - fp32_losses) / np.maximum(
+            np.abs(fp32_losses), 1.0e-8)
+    grad_ratio = mixed_grads / np.maximum(fp32_grads, 1.0e-8)
+    assert loss_relative[0] <= 0.002
+    assert np.max(loss_relative) <= 0.02
+    assert np.all((grad_ratio >= 0.8) & (grad_ratio <= 1.2))
+    active_diffs = np.abs(
+        np.stack([value[2] for value in mixed_history])
+        - np.stack([value[2] for value in fp32_history]))
+    assert np.max(active_diffs[0]) <= 0.001
+    assert np.max(active_diffs) <= 0.01
+
+
 def test_v4174_regular_console_maps_direct_operator_diagnostics(monkeypatch):
     from scripts import train_jax
 
@@ -800,11 +1325,6 @@ def test_v4174_regular_console_maps_direct_operator_diagnostics(monkeypatch):
         **{
             key: jnp.float32(0.0)
             for key in train_jax.V4170_TAU_UPDATE_METRIC_NAMES
-        },
-        **{
-            key: jnp.float32(index + 1)
-            for index, key in enumerate(
-                train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
         },
     })
     for key in train_jax.V4174_COMPACT_TRAIN_METRIC_NAMES:
@@ -878,13 +1398,22 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
             "inactive_aux_enabled": False,
             "soft_gate_t_start": 0.07,
             "soft_gate_t_final": 0.07,
-            "soft_gate_boundary_power_start": 2.0,
-            "soft_gate_boundary_power_mid": 2.0,
-            "soft_gate_boundary_power_final": 2.0,
-        },
-    }
+                "soft_gate_boundary_power_start": 2.0,
+                "soft_gate_boundary_power_mid": 2.0,
+                "soft_gate_boundary_power_final": 2.0,
+                "n_chunks_q": 1,
+                "n_chunks_k": 1,
+                "n_chunks_v": 1,
+                "n_chunks_rst": 1,
+            },
+        }
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]).reshape((1, 1)),
+        ("data", "model"),
+    )
+    sharded = train_jax.build_canonical_sharded_fns(cfg, mesh)
     train_step = train_jax.create_canonical_train_step(
-        model, optimizer, cfg, None, None, total_training_steps=2)
+        model, optimizer, cfg, sharded, mesh, total_training_steps=2)
     token_embedding_before = np.array(
         params["token_emb"]["embedding"], copy=True)
     dummy_drift = {
@@ -918,17 +1447,20 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
         np.asarray(new_params["token_emb"]["embedding"]))
     assert set(metrics) == set(train_jax.V4174_COMPACT_TRAIN_METRIC_NAMES)
     assert all(
-        bool(jnp.isfinite(metrics[name])) and float(metrics[name]) > 0.0
+        name not in metrics
         for name in train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
     assert not any(
         name in metrics
         for name in train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
-    assert all(
+    assert not any(
         name in train_jax.V4174_COMPACT_REGULAR_JSONL_REC_KEYS
         for name in train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
     assert not any(
         name in train_jax.V4174_COMPACT_REGULAR_JSONL_REC_KEYS
         for name in train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
+    assert all(
+        name in metrics
+        for name in train_jax.LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES)
 
 
 def test_rare_analysis_step_uses_model_geometry_contract():

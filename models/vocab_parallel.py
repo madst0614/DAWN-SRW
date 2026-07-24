@@ -139,6 +139,7 @@ def make_vocab_parallel_ce(
     token_chunk_size: int = 32768,
     compute_accuracy: bool = True,
     compute_logit_stats: bool = True,
+    throughput_bf16_f32: bool = False,
 ):
     """Exact vocab-parallel CE over a row-sharded tied embedding table.
 
@@ -151,6 +152,7 @@ def make_vocab_parallel_ce(
     token_chunk_size = int(token_chunk_size)
     compute_accuracy = bool(compute_accuracy)
     compute_logit_stats = bool(compute_logit_stats)
+    throughput_bf16_f32 = bool(throughput_bf16_f32)
     if logical_vocab_size <= 0:
         raise ValueError(
             f"logical_vocab_size must be > 0, got {logical_vocab_size}")
@@ -207,7 +209,16 @@ def make_vocab_parallel_ce(
         def chunk_step(carry, xs):
             del carry
             x_c, labels_c, valid_c = xs
-            local_logits = (x_c @ embedding_local.T).astype(jnp.float32)
+            if throughput_bf16_f32:
+                local_logits = jnp.einsum(
+                    "td,vd->tv",
+                    x_c.astype(jnp.bfloat16),
+                    embedding_local.astype(jnp.bfloat16),
+                    precision=jax.lax.Precision.DEFAULT,
+                    preferred_element_type=jnp.float32)
+            else:
+                local_logits = x_c @ embedding_local.T
+            local_logits = local_logits.astype(jnp.float32)
             local_logits = jnp.where(
                 valid_vocab[None, :], local_logits, neg_inf)
 
@@ -364,6 +375,7 @@ def make_vocab_parallel_ce_loss(
     logical_vocab_size: int,
     vocab_size_padded: int,
     token_chunk_size: int = 32768,
+    throughput_bf16_f32: bool = False,
 ):
     """Static training-fast CE profile returning only scalar loss."""
     full_ce = make_vocab_parallel_ce(
@@ -373,6 +385,7 @@ def make_vocab_parallel_ce_loss(
         token_chunk_size=token_chunk_size,
         compute_accuracy=False,
         compute_logit_stats=False,
+        throughput_bf16_f32=throughput_bf16_f32,
     )
 
     def vocab_parallel_ce_loss(

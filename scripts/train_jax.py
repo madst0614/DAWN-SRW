@@ -1319,17 +1319,12 @@ V4174_SELECTOR_METRIC_NAMES = tuple(
     for stage in ('attention', 'rst')
     for suffix in (
         'gate_mass_mean',
-        'gate_den_mean',
         'active_count_mean',
         'zero_gate_frac',
         'top1_rate',
-        'usage_min',
-        'usage_max',
-        'usage_std',
     ))
 
 V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
-    'heat_kernel_beta',
     *tuple(
         f'{pool}_{name}'
         for pool in ('attn_qk', 'attn_v', 'rst')
@@ -1353,14 +1348,14 @@ V4174_COMPACT_TRAIN_METRIC_NAMES = (
     'grad_norm',
     'tau_lr_mult',
     *V4170_TAU_UPDATE_METRIC_NAMES,
-    *V4174_DIRECT_RW_GRADIENT_METRIC_NAMES,
+    *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+    *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
 )
 
 V4174_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
-    *V4174_DIRECT_RW_GRADIENT_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
 )
 V4174_COMPACT_REGULAR_JSONL_KEYS = (
@@ -3289,16 +3284,29 @@ def _v4170_compact_train_metrics(
             'tau_update_v_max_abs': tau_update_v_max_abs,
             'tau_update_rst_max_abs': tau_update_rst_max_abs,
         })
+        if str(model_version) == V4174_MODEL_VERSION:
+            required = (
+                *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+                *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+                *V4174_SELECTOR_METRIC_NAMES,
+            )
+            missing = tuple(key for key in required if key not in result)
+            if missing:
+                raise RuntimeError(
+                    "v4174 production train metrics are incomplete: "
+                    + ", ".join(missing))
+            metrics.update({key: result[key] for key in required})
+            if tuple(metrics) != V4174_COMPACT_TRAIN_METRIC_NAMES:
+                raise RuntimeError(
+                    "v4174 compact train metric schema drift: "
+                    f"actual={tuple(metrics)}")
+            return metrics
         if operator_key_gradient_metrics is None:
             raise RuntimeError(
                 "v417x fast train metrics require pool-gradient scalars")
-        gradient_metric_names = (
-            V4174_DIRECT_RW_GRADIENT_METRIC_NAMES
-            if str(model_version) == V4174_MODEL_VERSION
-            else V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
         metrics.update({
             key: operator_key_gradient_metrics[key]
-            for key in gradient_metric_names})
+            for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
         if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
                 key: operator_key_gradient_metrics[key]
@@ -3316,20 +3324,6 @@ def _v4170_compact_train_metrics(
                     "v4173 operation-space train metrics are incomplete")
             metrics.update({
                 key: result[key] for key in present_space_metrics})
-        if str(model_version) == V4174_MODEL_VERSION:
-            missing_space_metrics = tuple(
-                key for key in V4174_SELECTOR_METRIC_NAMES
-                if key not in result)
-            if missing_space_metrics:
-                raise RuntimeError(
-                    "v4174 operation-space train metrics are incomplete: "
-                    + ", ".join(missing_space_metrics))
-            metrics.update({
-                key: result[key] for key in V4174_SELECTOR_METRIC_NAMES})
-            if tuple(metrics) != V4174_COMPACT_TRAIN_METRIC_NAMES:
-                raise RuntimeError(
-                    "v4174 compact train metric schema drift: "
-                    f"actual={tuple(metrics)}")
         return metrics
     metrics.update({
         key: result[key]
@@ -7535,6 +7529,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                         key: result[key]
                         for key in (
                             'correct', 'valid_count',
+                            *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+                            *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
                             *V4174_SELECTOR_METRIC_NAMES)}
                 elif _is_v417x_model:
                     result_payload = {
@@ -8144,8 +8140,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _ppool = params.get('neuron_pool', {})
         if str(_model_version) == V4174_MODEL_VERSION:
             _shared_probe_metrics = {}
-            _direct_rw_gradient_metrics = (
-                _v4174_direct_rw_gradient_diagnostics(_gpool))
+            # Regular v4174 logging intentionally avoids full-bank read/write
+            # gradient reductions. Raw tau update metrics are taken from the
+            # small router tau subtree after optimizer scaling/capping.
+            _direct_rw_gradient_metrics = {}
         else:
             _shared_probe_metrics = _shared_probe_gradient_diagnostics(
                 _ppool, _gpool, _model_version)
@@ -8164,7 +8162,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_norm = _tree_norm(grads)
         if _is_v4170_compact_train:
             compact_pool_gradient_metrics = (
-                dict(_direct_rw_gradient_metrics)
+                None
                 if str(_model_version) == V4174_MODEL_VERSION
                 else dict(_shared_probe_metrics))
             if str(_model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
@@ -12764,11 +12762,18 @@ MINIMAL_PRETRAINING_REQUIRED_LOG_KEYS = (
     'tokens_per_sec',
 )
 MINIMAL_PRETRAINING_OPTIONAL_LOG_KEYS = (
+    'total_steps',
+    'progress',
+    'elapsed',
+    'eta',
     'tau_reg',
     'orth_loss',
     'div_loss',
+    'tau_lr_mult',
+    *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
     *V4170_TAU_UPDATE_METRIC_NAMES,
-    *V4174_DIRECT_RW_GRADIENT_METRIC_NAMES,
+    *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+    *V4174_SELECTOR_METRIC_NAMES,
 )
 
 
@@ -12786,31 +12791,99 @@ def _build_minimal_pretraining_record(
         'learning_rate': float(ctx['current_lr']),
         'sec_per_it': float(sec_per_it),
         'tokens_per_sec': float(tokens_per_sec),
+        'total_steps': int(ctx.get('total_micro_steps', 0)),
+        'progress': float(ctx.get('progress', 0.0)),
+        'elapsed': float(ctx.get('total_elapsed', 0.0)),
+        'eta': ctx.get('eta'),
         'tau_reg': float(win_avgs['tau_reg']),
         'orth_loss': float(win_avgs['orth']),
         'div_loss': float(win_avgs['div']),
     }
-    for key in V4170_TAU_UPDATE_METRIC_NAMES:
+    for key in (
+            'tau_lr_mult',
+            *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+            *V4170_TAU_UPDATE_METRIC_NAMES,
+            *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+            *V4174_SELECTOR_METRIC_NAMES):
         if key in metrics:
             rec[key] = float(metrics[key])
-    if str(ctx.get('model_version')) == V4174_MODEL_VERSION:
-        for key in V4174_DIRECT_RW_GRADIENT_METRIC_NAMES:
-            if key in metrics:
-                rec[key] = float(metrics[key])
     rec['timestamp'] = datetime.now().isoformat()
     return rec
 
 
 def _print_minimal_pretraining_record(rec):
     """Print the scalar-only canonical pretraining record."""
+    total_steps = int(rec.get('total_steps', 0))
+    step_label = (
+        f"{rec['step']}/{total_steps}" if total_steps > 0
+        else str(rec['step']))
     log_message(
-        f"[Step {rec['step']}] "
+        f"[Step {step_label} ({rec.get('progress', 0.0):.1f}%)] "
         f"loss={rec['loss']:.4f} "
         f"ce={rec['ce_loss']:.4f} "
         f"aux={rec['aux_loss']:.4f} "
         f"grad={rec['grad_norm']:.2f} "
-        f"lr={rec['learning_rate']:.2e} "
-        f"{rec['sec_per_it']:.3f}s/it "
+        f"lr={rec['learning_rate']:.2e}")
+    if all(
+            key in rec
+            for key in (
+                'attn_q_active_tau_frac', 'attn_k_active_tau_frac',
+                'attn_qk_active_tau_frac', 'attn_v_active_tau_frac',
+                'rst_active_tau_frac')):
+        log_message(
+            "  active: "
+            f"q={100.0 * rec['attn_q_active_tau_frac']:.2f}%"
+            f"({rec['attn_q_active_tau_count']:.2f}) "
+            f"k={100.0 * rec['attn_k_active_tau_frac']:.2f}%"
+            f"({rec['attn_k_active_tau_count']:.2f}) "
+            f"qk={100.0 * rec['attn_qk_active_tau_frac']:.2f}%"
+            f"({rec['attn_qk_active_tau_count']:.2f}) "
+            f"v={100.0 * rec['attn_v_active_tau_frac']:.2f}%"
+            f"({rec['attn_v_active_tau_count']:.2f}) "
+            f"rst={100.0 * rec['rst_active_tau_frac']:.2f}%"
+            f"({rec['rst_active_tau_count']:.2f})")
+        log_message(
+            f"  gate: qk[{_fmt_linear_direct_tau_gate(rec, 'attn_qk')}]")
+        log_message(
+            f"        v [{_fmt_linear_direct_tau_gate(rec, 'attn_v')}]")
+        log_message(
+            f"        rst[{_fmt_linear_direct_tau_gate(rec, 'rst')}]")
+        log_message(
+            f"  tau: q={rec['attn_q_tau_mean']:+.6f} "
+            f"k={rec['attn_k_tau_mean']:+.6f} "
+            f"qk={rec['attn_qk_tau_mean']:+.6f} "
+            f"v={rec['attn_v_tau_mean']:+.6f} "
+            f"rst={rec['rst_tau_mean']:+.6f}")
+    if all(key in rec for key in V4170_TAU_UPDATE_METRIC_NAMES):
+        log_message(
+            f"  raw_tau_update: qk={rec['tau_update_qk_max_abs']:.2e} "
+            f"v={rec['tau_update_v_max_abs']:.2e} "
+            f"rst={rec['tau_update_rst_max_abs']:.2e} "
+            f"mult={rec.get('tau_lr_mult', 1.0):.3e}")
+    if all(key in rec for key in V4174_SELECTOR_METRIC_NAMES):
+        def _space(stage, label):
+            return (
+                f"{label}[mass={rec[f'{stage}_space_gate_mass_mean']:.3f} "
+                f"active={rec[f'{stage}_space_active_count_mean']:.3f} "
+                f"zero={rec[f'{stage}_space_zero_gate_frac']:.3f} "
+                f"top1={rec[f'{stage}_space_top1_rate']:.3f}]")
+        log_message(
+            "  space: " + _space('attention', 'attn') + " "
+            + _space('rst', 'rst'))
+    if all(
+            key in rec for key in (
+                'attn_out_norm', 'rst_out_norm', 'residual_norm')):
+        log_message(
+            f"  norm: attn={rec['attn_out_norm']:.3f} "
+            f"rst={rec['rst_out_norm']:.3f} "
+            f"residual={rec['residual_norm']:.3f}")
+    eta = rec.get('eta')
+    eta_text = (
+        "warming_up" if eta is None
+        else format_time(float(eta)))
+    log_message(
+        f"  time: {format_time(rec.get('elapsed', 0.0))}<"
+        f"{eta_text}, {rec['sec_per_it']:.3f}s/it "
         f"{rec['tokens_per_sec']:.1f} tok/s")
 
 
@@ -14320,13 +14393,9 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
         def _space_stage(stage, label):
             return (
                 f"{label}[mass={float(rec[f'{stage}_space_gate_mass_mean']):.3f} "
-                f"den={float(rec[f'{stage}_space_gate_den_mean']):.3f} "
                 f"active={float(rec[f'{stage}_space_active_count_mean']):.3f} "
                 f"zero={float(rec[f'{stage}_space_zero_gate_frac']):.3f} "
-                f"top1={float(rec[f'{stage}_space_top1_rate']):.3f} "
-                f"use={float(rec[f'{stage}_space_usage_min']):.3f}/"
-                f"{float(rec[f'{stage}_space_usage_max']):.3f}"
-                f"±{float(rec[f'{stage}_space_usage_std']):.3f}]")
+                f"top1={float(rec[f'{stage}_space_top1_rate']):.3f}]")
         log_message(
             "  space " + _space_stage('attention', 'attn') + " "
             + _space_stage('rst', 'rst'))
@@ -16116,23 +16185,65 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             **_factory_supported_kwargs(
                 dense_factory, pool_kwargs('rst')))
     if version == V4174_MODEL_VERSION:
-        dense_factory_name = (
-            'make_sharded_space_dense_diagnostics'
-            if (kernel_profile == 'production_diagnostics' or analysis)
-            else 'make_sharded_space_dense_minimal')
-        dense_factory = getattr(module, dense_factory_name, None)
-        if dense_factory is None:
-            raise RuntimeError(
-                "v4174 multi-space config requires "
-                f"{dense_factory_name}")
-        for pool, route_key in (
-                ('q', 'q_space_dense'), ('k', 'k_space_dense'),
-                ('v', 'v_space_dense'), ('rst', 'rst_space_dense')):
-            sharded[route_key] = dense_factory(
-                max_chunk_size=chunks[pool],
-                **_factory_supported_kwargs(
-                    dense_factory,
-                    pool_kwargs('qk' if pool in ('q', 'k') else pool)))
+        if kernel_profile == 'production' and not analysis:
+            if (local_counts['q'] != local_counts['k']
+                    or chunks['q'] != chunks['k']):
+                raise ValueError(
+                    "v4174 fused Q/K execution requires equal local operator "
+                    "counts and chunk shapes")
+            attention_factory = getattr(
+                module, 'make_sharded_attention_space_dense_minimal', None)
+            rst_factory = getattr(
+                module, 'make_sharded_rst_space_dense_minimal', None)
+            if attention_factory is None or rst_factory is None:
+                raise RuntimeError(
+                    "v4174 production requires fused attention and RST "
+                    "dense executor factories")
+            common_fused = {
+                'mesh': mesh,
+                'operation_space_top_k':
+                    int(model_cfg['operation_space_top_k']),
+                'srw_composition_mode':
+                    str(model_cfg['srw_composition_mode']),
+                'heat_kernel_beta': float(model_cfg.get(
+                    'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)),
+                'soft_gate_effective_active_eps': 1.0e-6,
+                # Full-layer remat is canonical for production. Preserve the
+                # previous inner-remat policy for uncheckpointed experiments.
+                'remat_chunks': not bool(
+                    model_cfg.get('gradient_checkpointing', False)),
+            }
+            sharded['attention_space_dense'] = attention_factory(
+                max_chunk_size_qk=chunks['q'],
+                max_chunk_size_v=chunks['v'],
+                admission_den_power_qk=float(
+                    model_cfg['admission_den_power_qk']),
+                admission_den_power_v=float(
+                    model_cfg['admission_den_power_v']),
+                **common_fused)
+            sharded['rst_space_dense'] = rst_factory(
+                max_chunk_size=chunks['rst'],
+                admission_den_power=float(
+                    model_cfg['admission_den_power_rst']),
+                **common_fused)
+        else:
+            dense_factory_name = (
+                'make_sharded_space_dense_diagnostics'
+                if (kernel_profile == 'production_diagnostics' or analysis)
+                else 'make_sharded_space_dense_minimal')
+            dense_factory = getattr(module, dense_factory_name, None)
+            if dense_factory is None:
+                raise RuntimeError(
+                    "v4174 multi-space config requires "
+                    f"{dense_factory_name}")
+            for pool, route_key in (
+                    ('q', 'q_space_dense'), ('k', 'k_space_dense'),
+                    ('v', 'v_space_dense'), ('rst', 'rst_space_dense')):
+                sharded[route_key] = dense_factory(
+                    max_chunk_size=chunks[pool],
+                    **_factory_supported_kwargs(
+                        dense_factory,
+                        pool_kwargs('qk' if pool in ('q', 'k') else pool)))
     if (version == V4173_MODEL_VERSION
             and kernel_profile == 'trajectory'):
         sharded['attn_qk_paired_trajectory_minimal'] = sharded[
@@ -16200,6 +16311,7 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             compute_logit_stats=(
                 (for_eval or kernel_profile == 'production_diagnostics')
                 if _is_v417x_version(version) else True),
+            throughput_bf16_f32=(version == V4174_MODEL_VERSION),
         )
         if (_is_v417x_version(version)
                 and kernel_profile == 'production'):
@@ -16208,7 +16320,8 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                 logical_vocab_size=logical_vocab,
                 vocab_size_padded=padded_vocab,
                 token_chunk_size=int(training_cfg.get(
-                    'ce_token_chunk_size', 32768)))
+                    'ce_token_chunk_size', 32768)),
+                throughput_bf16_f32=(version == V4174_MODEL_VERSION))
     return sharded
 
 
@@ -20140,6 +20253,8 @@ def main():
             _vp_vocab_size_padded = int(
                 cfg['model']['vocab_size_padded'])
             _vp_is_v417x = _is_v417x_version(model_version_cfg)
+            _vp_is_v4174 = (
+                str(model_version_cfg) == V4174_MODEL_VERSION)
             if _vp_vocab_size_padded % int(mesh_model) != 0:
                 raise ValueError(
                     "model.vocab_size_padded must be divisible by "
@@ -20154,20 +20269,23 @@ def main():
                 token_chunk_size=ce_token_chunk_size,
                 compute_accuracy=(
                     False if _vp_is_v417x else train_compute_accuracy),
-                compute_logit_stats=not _vp_is_v417x)
+                compute_logit_stats=not _vp_is_v417x,
+                throughput_bf16_f32=_vp_is_v4174)
             _vp_vocab_ce_train_loss = (
                 make_vocab_parallel_ce_loss(
                     mesh,
                     logical_vocab_size=_vp_logical_vocab_size,
                     vocab_size_padded=_vp_vocab_size_padded,
-                    token_chunk_size=ce_token_chunk_size)
+                    token_chunk_size=ce_token_chunk_size,
+                    throughput_bf16_f32=_vp_is_v4174)
                 if _vp_is_v417x else None)
             _vp_vocab_ce_eval = make_vocab_parallel_ce(
                 mesh,
                 logical_vocab_size=_vp_logical_vocab_size,
                 vocab_size_padded=_vp_vocab_size_padded,
                 token_chunk_size=ce_token_chunk_size,
-                compute_accuracy=True)
+                compute_accuracy=True,
+                throughput_bf16_f32=_vp_is_v4174)
             _sharded_fns['vocab_parallel_embedding'] = _vp_vocab_embed
             _sharded_fns['vocab_ce'] = _vp_vocab_ce_train
             if _vp_vocab_ce_train_loss is not None:
@@ -21396,6 +21514,9 @@ def main():
 
     train_start_time = time.time()
     total_micro_steps = num_epochs * steps_per_epoch
+    _post_jit_step_ema = None
+    _post_jit_step_samples = 0
+    _last_train_step_seconds = 0.0
     val_interval = int(cfg['training'].get('val_interval', 5000))
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
@@ -21454,6 +21575,7 @@ def main():
         _win_correct_jax = jnp.int32(0)
         _win_valid_jax = jnp.int32(0)
         _regular_cap_window_jax = _init_update_cap_window_stats()
+        _win_train_step_seconds = 0.0
         win_count = 0
         win_start_time = time.time()
 
@@ -21495,6 +21617,7 @@ def main():
             _upcoming_is_regular = (
                 step_after_update % LOG_REGULAR == 0
                 or _upcoming_is_early_log)
+            _train_step_t0 = time.time()
             new_params, new_opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, labels, attention_mask, step_rng,
@@ -21586,10 +21709,24 @@ def main():
             # Per-step NaN check on total_loss only. A single scalar sync
             # catches loss explosions immediately; the full 6-key check runs
             # at log boundary on already-materialized window averages.
-            _m_total_for_nan = float(metrics['total_loss'])
-            if not np.isfinite(_m_total_for_nan):
-                raise ValueError(
-                    f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
+            if str(model_version_cfg) == V4174_MODEL_VERSION:
+                jax.block_until_ready(metrics['total_loss'])
+            else:
+                _m_total_for_nan = float(metrics['total_loss'])
+                if not np.isfinite(_m_total_for_nan):
+                    raise ValueError(
+                        "NaN/INF total_loss at epoch "
+                        f"{epoch}, step {global_step + 1}")
+            _last_train_step_seconds = time.time() - _train_step_t0
+            _win_train_step_seconds += _last_train_step_seconds
+            if step_after_update > 1:
+                _post_jit_step_samples += 1
+                if _post_jit_step_ema is None:
+                    _post_jit_step_ema = _last_train_step_seconds
+                else:
+                    _post_jit_step_ema = (
+                        0.9 * _post_jit_step_ema
+                        + 0.1 * _last_train_step_seconds)
             if _rst_final_backend_enabled:
                 _rst_final_guard = jax.device_get({
                     'all_processed': metrics.get(
@@ -21651,12 +21788,23 @@ def main():
                 _raw_step_time_window = time.time() - win_start_time
                 _regular_logging_t0 = time.time()
                 # One TPU-to-CPU sync for the whole window.
-                _win_vals = jax.device_get({
+                _window_device_values = {
                     'loss': _win_loss_jax, 'ce': _win_ce_jax,
                     'aux': _win_aux_jax, 'tau_reg': _win_tau_reg_jax,
                     'orth': _win_orth_jax, 'div': _win_div_jax,
                     'correct': _win_correct_jax, 'valid': _win_valid_jax,
-                })
+                }
+                if str(model_version_cfg) == V4174_MODEL_VERSION:
+                    _regular_device_values = jax.device_get({
+                        'window': _window_device_values,
+                        'metrics': metrics,
+                    })
+                    _win_vals = _regular_device_values['window']
+                    _materialized_regular_metrics = (
+                        _regular_device_values['metrics'])
+                else:
+                    _win_vals = jax.device_get(_window_device_values)
+                    _materialized_regular_metrics = metrics
                 _win_correct_py = int(_win_vals['correct'])
                 _win_valid_py = int(_win_vals['valid'])
                 _vdiv = _win_valid_py if _win_valid_py > 0 else 1
@@ -21682,7 +21830,7 @@ def main():
                         f"NaN/INF window averages at epoch {epoch}, step {global_step}")
 
                 if is_host0:
-                    _regular_metrics = metrics
+                    _regular_metrics = _materialized_regular_metrics
                     _elapsed = time.time() - win_start_time
                     _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
                     _opt_step = global_step // grad_accum_steps
@@ -21691,13 +21839,24 @@ def main():
                     _epoch_elapsed = time.time() - epoch_start
                     _progress = (global_step / total_micro_steps * 100
                                  if total_micro_steps > 0 else 0.0)
-                    _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
-                    # ETA based on absolute epoch position so resume mid-epoch
-                    # doesn't over-estimate (epoch_steps counts only this
-                    # run's steps; epoch_step_counter starts from
-                    # start_step_in_epoch).
-                    _remaining = max(steps_per_epoch - epoch_step_counter, 0)
-                    _eta = _s_per_it * _remaining
+                    if str(model_version_cfg) == V4174_MODEL_VERSION:
+                        _s_per_it = (
+                            _post_jit_step_ema
+                            if _post_jit_step_ema is not None
+                            else _last_train_step_seconds)
+                        _remaining = max(total_micro_steps - global_step, 0)
+                        _eta = (
+                            _s_per_it * _remaining
+                            if (global_step >= 5
+                                and _post_jit_step_samples >= 3)
+                            else None)
+                    else:
+                        _s_per_it = (
+                            _epoch_elapsed / epoch_steps
+                            if epoch_steps > 0 else 0.0)
+                        _remaining = max(
+                            steps_per_epoch - epoch_step_counter, 0)
+                        _eta = _s_per_it * _remaining
                     _opspace_load_smoothing_ctx = training_config.get(
                         'operation_space_load_smoothing', {})
                     if not isinstance(_opspace_load_smoothing_ctx, dict):
@@ -21781,11 +21940,11 @@ def main():
                             _regular_metrics, win_avgs, ctx,
                             global_step, epoch,
                             sec_per_it=(
-                                _elapsed / win_count
+                                _win_train_step_seconds / win_count
                                 if win_count > 0 else 0.0),
                             tokens_per_sec=(
-                                _win_valid_py / _elapsed
-                                if _elapsed > 0.0 else 0.0))
+                                _win_valid_py / _win_train_step_seconds
+                                if _win_train_step_seconds > 0.0 else 0.0))
                         _print_minimal_pretraining_record(rec)
                         regular_jsonl_rec = rec
                     else:
@@ -21830,6 +21989,7 @@ def main():
                 _win_correct_jax = jnp.int32(0)
                 _win_valid_jax = jnp.int32(0)
                 _regular_cap_window_jax = _init_update_cap_window_stats()
+                _win_train_step_seconds = 0.0
                 win_count = 0
                 win_start_time = time.time()
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----

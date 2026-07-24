@@ -281,6 +281,79 @@ def _linear(params: Mapping[str, jax.Array], state: jax.Array) -> jax.Array:
     return state @ params["kernel"] + params.get("bias", 0.0)
 
 
+def throughput_dot_bf16_f32(
+        lhs: jax.Array,
+        rhs: jax.Array, *,
+        dimension_numbers,
+        precision=jax.lax.Precision.DEFAULT) -> jax.Array:
+    """Run a throughput dot with BF16 operands and an FP32 result."""
+    return jax.lax.dot_general(
+        jnp.asarray(lhs).astype(jnp.bfloat16),
+        jnp.asarray(rhs).astype(jnp.bfloat16),
+        dimension_numbers=dimension_numbers,
+        precision=precision,
+        preferred_element_type=jnp.float32)
+
+
+def control_dot_f32(
+        lhs: jax.Array,
+        rhs: jax.Array, *,
+        dimension_numbers) -> jax.Array:
+    """Run a routing/control dot entirely in FP32."""
+    return jax.lax.dot_general(
+        jnp.asarray(lhs, dtype=jnp.float32),
+        jnp.asarray(rhs, dtype=jnp.float32),
+        dimension_numbers=dimension_numbers,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32)
+
+
+def _throughput_einsum_bf16_f32(
+        equation: str,
+        lhs: jax.Array,
+        rhs: jax.Array) -> jax.Array:
+    return jnp.einsum(
+        equation,
+        jnp.asarray(lhs).astype(jnp.bfloat16),
+        jnp.asarray(rhs).astype(jnp.bfloat16),
+        precision=jax.lax.Precision.DEFAULT,
+        preferred_element_type=jnp.float32)
+
+
+def _control_einsum_f32(
+        equation: str,
+        lhs: jax.Array,
+        rhs: jax.Array) -> jax.Array:
+    return jnp.einsum(
+        equation,
+        jnp.asarray(lhs, dtype=jnp.float32),
+        jnp.asarray(rhs, dtype=jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32)
+
+
+def _throughput_linear_bf16_f32(
+        params: Mapping[str, jax.Array],
+        state: jax.Array) -> jax.Array:
+    result = throughput_dot_bf16_f32(
+        state, params["kernel"],
+        dimension_numbers=(
+            ((state.ndim - 1,), (0,)),
+            ((), ())))
+    return result + jnp.asarray(params.get("bias", 0.0), dtype=jnp.float32)
+
+
+def _control_linear_f32(
+        params: Mapping[str, jax.Array],
+        state: jax.Array) -> jax.Array:
+    result = control_dot_f32(
+        state, params["kernel"],
+        dimension_numbers=(
+            ((state.ndim - 1,), (0,)),
+            ((), ())))
+    return result + jnp.asarray(params.get("bias", 0.0), dtype=jnp.float32)
+
+
 def forward_unit_direction(value: jax.Array) -> jax.Array:
     """Forward-normalize a state/read tensor in FP32."""
     return _shared_forward_unit_direction(jnp.asarray(value, dtype=jnp.float32))
@@ -300,12 +373,14 @@ def _compute_space_routing(
         space_read_vectors: jax.Array,
         operation_space_top_k: int) -> dict[str, jax.Array]:
     """Direct cosine routing with hard top-k ReLU-squared non-softmax gates."""
-    route_state = jnp.asarray(flat_state, jnp.float32) @ jnp.asarray(
-        space_route_kernel, jnp.float32)
+    route_state = control_dot_f32(
+        flat_state, space_route_kernel,
+        dimension_numbers=(((1,), (0,)), ((), ())))
     normalized_state = forward_unit_direction(route_state)
     normalized_reads = forward_unit_direction(space_read_vectors)
-    space_scores = jnp.einsum(
-        "tr,mr->tm", normalized_state, normalized_reads)
+    space_scores = control_dot_f32(
+        normalized_state, normalized_reads,
+        dimension_numbers=(((1,), (1,)), ((), ())))
     gate_values = _space_gate_from_scores(
         space_scores, operation_space_top_k)
     return {
@@ -510,6 +585,30 @@ def _space_routing_metrics(
         for key, value in values.items()}
 
 
+def _compact_space_routing_metrics(
+        routing: Mapping[str, jax.Array],
+        prefix: str) -> dict[str, jax.Array]:
+    """Return only scalar routing metrics used by regular training."""
+    gate = routing["space_gate"].astype(jnp.float32)
+    mass = routing["space_gate_mass"][..., 0].astype(jnp.float32)
+    selected_ids = routing["selected_ids"]
+    n_spaces = int(gate.shape[-1])
+    top1_usage = jax.nn.one_hot(
+        selected_ids[..., 0], n_spaces, dtype=jnp.float32
+    ).reshape((-1, n_spaces)).mean(axis=0)
+    values = {
+        f"{prefix}_space_gate_mass_mean": mass.mean(),
+        f"{prefix}_space_active_count_mean": (
+            (gate > 0.0).astype(jnp.float32).sum(axis=-1).mean()),
+        f"{prefix}_space_zero_gate_frac": (
+            mass <= 0.0).astype(jnp.float32).mean(),
+        f"{prefix}_space_top1_rate": top1_usage.max(),
+    }
+    return {
+        key: jax.lax.stop_gradient(value)
+        for key, value in values.items()}
+
+
 def _aggregate_operator_diagnostics(
         diagnostics_values: tuple[jax.Array, ...],
         n_operators_per_space: int,
@@ -554,10 +653,36 @@ def _aggregate_operator_diagnostics(
 
 def _canonical_regular_operator_metrics(
         metrics: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
-    """Retain dashboard-only QK aggregates without sharing execution."""
+    """Map compact native route scalars to the stable regular-log schema."""
     qk = lambda suffix: jnp.float32(0.5) * (
         metrics[f"q_operator_{suffix}"] + metrics[f"k_operator_{suffix}"])
+    source_suffixes = {
+        "active_tau_frac": "active_tau_frac",
+        "active_tau_count": "active_tau_count",
+        "gate_mass": "gate_mass_mean",
+        "gate_den": "gate_den_mean",
+        "depth_active": "depth_active_mean",
+        "gate_eff_n": "gate_eff_n_mean",
+        "top1_gate_frac": "top1_gate_frac_mean",
+        "den_floor_frac": "den_floor_frac",
+        "tau_mean": "tau_mean",
+    }
+    prefixes = {
+        "q": "attn_q",
+        "k": "attn_k",
+        "v": "attn_v",
+        "rst": "rst",
+    }
     out = {
+        f"{prefix}_{destination}": metrics[f"{route}_operator_{source}"]
+        for route, prefix in prefixes.items()
+        for destination, source in source_suffixes.items()
+    }
+    for destination in source_suffixes:
+        out[f"attn_qk_{destination}"] = jnp.float32(0.5) * (
+            out[f"attn_q_{destination}"]
+            + out[f"attn_k_{destination}"])
+    out.update({
         "attn_qk_admission_mass_mean": qk("gate_mass_mean"),
         "attn_v_admission_mass_mean": metrics["v_operator_gate_mass_mean"],
         "rst_admission_mass_mean": metrics["rst_operator_gate_mass_mean"],
@@ -573,7 +698,7 @@ def _canonical_regular_operator_metrics(
             metrics["q_route_output_norm"] + metrics["k_route_output_norm"]),
         "attn_v_pool_scaled_srw_out_norm": metrics["v_route_output_norm"],
         "rst_pool_scaled_srw_out_norm": metrics["rst_route_update_norm"],
-    }
+    })
     return {
         key: jax.lax.stop_gradient(value)
         for key, value in out.items()}
@@ -691,13 +816,18 @@ def _causal_attention_core(
         value: jax.Array,
         dropout_rate: float,
         deterministic: bool,
-        dropout_rng: jax.Array) -> jax.Array:
+        dropout_rng: jax.Array, *,
+        throughput_bf16: bool = False) -> jax.Array:
     """Production causal attention with FP32 score/softmax semantics."""
     d_head = int(query.shape[-1])
     sequence_length = int(query.shape[-2])
-    scores = jnp.einsum(
-        "bhsd,bhtd->bhst", query, key
-    ) / jnp.sqrt(jnp.float32(d_head))
+    if throughput_bf16:
+        scores = _throughput_einsum_bf16_f32(
+            "bhsd,bhtd->bhst", query, key)
+    else:
+        scores = jnp.einsum(
+            "bhsd,bhtd->bhst", query, key)
+    scores = scores.astype(jnp.float32) / jnp.sqrt(jnp.float32(d_head))
     causal = jnp.tril(jnp.ones(
         (sequence_length, sequence_length), dtype=jnp.bool_))
     scores = jnp.where(
@@ -705,7 +835,11 @@ def _causal_attention_core(
     weights = jax.nn.softmax(scores, axis=-1)
     weights = _shared_safe_dropout(
         weights, dropout_rate, deterministic, dropout_rng)
-    return jnp.einsum("bhst,bhtd->bhsd", weights, value)
+    if throughput_bf16:
+        return _throughput_einsum_bf16_f32(
+            "bhst,bhtd->bhsd", weights, value).astype(jnp.float32)
+    return jnp.einsum(
+        "bhst,bhtd->bhsd", weights, value).astype(jnp.float32)
 
 
 class DAWN_SRW_V4174(nn.Module):
@@ -919,6 +1053,37 @@ class DAWN_SRW_V4174(nn.Module):
             self.make_rng("dropout"), self.n_layers)
         diagnostics_enabled = (
             minimal_runtime_profile == "diagnostics" or analysis)
+        attention_dense = (
+            sharded_fns.get("attention_space_dense")
+            if isinstance(sharded_fns, dict) else None)
+        rst_dense = (
+            sharded_fns.get("rst_space_dense")
+            if isinstance(sharded_fns, dict) else None)
+        fused_production = (
+            not diagnostics_enabled
+            and attention_dense is not None)
+        if fused_production and rst_dense is None:
+            raise ValueError(
+                "v4174 production requires both attention_space_dense and "
+                "rst_space_dense executors")
+        fused_throughput_precision = (
+            getattr(
+                attention_dense, "_v4174_throughput_precision", None)
+            if fused_production else None)
+        if fused_production and fused_throughput_precision not in (
+                "bf16_operands_f32_accum", "fp32_reference"):
+            raise ValueError(
+                "v4174 fused attention executor is missing its static "
+                "throughput precision contract")
+        if (fused_production
+                and getattr(
+                    rst_dense, "_v4174_throughput_precision", None)
+                != fused_throughput_precision):
+            raise ValueError(
+                "v4174 attention/RST executors require identical static "
+                "throughput precision")
+        fused_throughput_bf16 = (
+            fused_throughput_precision == "bf16_operands_f32_accum")
         regular_lists: dict[str, list[jax.Array]] = {}
         analysis_lists: dict[str, list[jax.Array]] = {}
         last_local_input = None
@@ -952,7 +1117,7 @@ class DAWN_SRW_V4174(nn.Module):
                 heat_kernel_beta=self.heat_kernel_beta,
                 execution_prune_eps=execution_prune_eps,
                 max_chunk_size=route_chunks[route],
-                diagnostics=diagnostics_enabled)
+                diagnostics=True)
 
         def route_and_local(flat_state, router_params):
             routing = _compute_space_routing(
@@ -978,33 +1143,64 @@ class DAWN_SRW_V4174(nn.Module):
                 block_params["norm1"]["bias"])
             batch_size, sequence_length = normalized.shape[:2]
             flat_attention_state = normalized.reshape((-1, self.d_model))
-            attention_routing, attention_local = route_and_local(
-                flat_attention_state, router_params)
-            attention_tau = {
-                route: _linear(
-                    router_params[f"{route}_operator_tau_proj"],
-                    attention_local)
-                for route in ("q", "k", "v")}
-            route_outputs = {}
-            for route in ("q", "k", "v"):
-                route_result = execute(
-                    route, attention_local, attention_tau[route],
-                    pool_params)
-                if diagnostics_enabled:
-                    local_output = route_result[0]
-                    scalar, arrays = _aggregate_operator_diagnostics(
-                        route_result, route_counts[route] // n_spaces,
-                        route, composition_mode)
-                    regular_metrics.update(scalar)
-                    if analysis:
-                        analysis_metrics.update(arrays)
-                else:
-                    local_output = route_result
-                route_outputs[route] = _space_weighted_writeback(
-                    local_output,
-                    attention_routing["dense_space_weights"],
-                    router_params["space_state_writeback"],
-                    route_scales[route]).reshape(normalized.shape)
+            attention_routing = None
+            if fused_production:
+                q_output, k_output, v_output, attention_metrics = (
+                    attention_dense(
+                        flat_attention_state,
+                        router_params["space_route_proj"]["kernel"],
+                        router_params["space_read_vectors"],
+                        router_params["space_state_proj"],
+                        router_params["space_state_writeback"],
+                        router_params["q_operator_tau_proj"]["kernel"],
+                        router_params["q_operator_tau_proj"]["bias"],
+                        router_params["k_operator_tau_proj"]["kernel"],
+                        router_params["k_operator_tau_proj"]["bias"],
+                        router_params["v_operator_tau_proj"]["kernel"],
+                        router_params["v_operator_tau_proj"]["bias"],
+                        pool_params["q_read_vectors"],
+                        pool_params["q_write_vectors"],
+                        pool_params["k_read_vectors"],
+                        pool_params["k_write_vectors"],
+                        pool_params["v_read_vectors"],
+                        pool_params["v_write_vectors"],
+                        temperatures["q"], temperatures["v"],
+                        soft_gate_boundary_power, execution_prune_eps,
+                        route_scales["q"], route_scales["v"]))
+                route_outputs = {
+                    "q": q_output.reshape(normalized.shape),
+                    "k": k_output.reshape(normalized.shape),
+                    "v": v_output.reshape(normalized.shape),
+                }
+                regular_metrics.update(attention_metrics)
+            else:
+                attention_routing, attention_local = route_and_local(
+                    flat_attention_state, router_params)
+                attention_tau = {
+                    route: _linear(
+                        router_params[f"{route}_operator_tau_proj"],
+                        attention_local)
+                    for route in ("q", "k", "v")}
+                route_outputs = {}
+                for route in ("q", "k", "v"):
+                    route_result = execute(
+                        route, attention_local, attention_tau[route],
+                        pool_params)
+                    if isinstance(route_result, tuple):
+                        local_output = route_result[0]
+                        scalar, arrays = _aggregate_operator_diagnostics(
+                            route_result, route_counts[route] // n_spaces,
+                            route, composition_mode)
+                        regular_metrics.update(scalar)
+                        if analysis:
+                            analysis_metrics.update(arrays)
+                    else:
+                        local_output = route_result
+                    route_outputs[route] = _space_weighted_writeback(
+                        local_output,
+                        attention_routing["dense_space_weights"],
+                        router_params["space_state_writeback"],
+                        route_scales[route]).reshape(normalized.shape)
 
             d_head = self.d_model // self.n_heads
             query = route_outputs["q"].reshape(
@@ -1018,12 +1214,16 @@ class DAWN_SRW_V4174(nn.Module):
             ).transpose(0, 2, 1, 3)
             attention_output = _causal_attention_core(
                 query, key, value, self.dropout_rate,
-                deterministic, rng_attn)
+                deterministic, rng_attn,
+                throughput_bf16=fused_throughput_bf16)
             attention_output = attention_output.transpose(
                 0, 2, 1, 3).reshape(
                     batch_size, sequence_length, self.d_model)
-            attention_output = _linear(
-                block_params["attn"]["expand_O"], attention_output)
+            attention_output = (
+                _throughput_linear_bf16_f32(
+                    block_params["attn"]["expand_O"], attention_output)
+                if fused_throughput_bf16 else _linear(
+                    block_params["attn"]["expand_O"], attention_output))
             current_state = current_state + _shared_safe_dropout(
                 attention_output, self.dropout_rate, deterministic, rng)
 
@@ -1032,57 +1232,79 @@ class DAWN_SRW_V4174(nn.Module):
                 block_params["norm2"]["scale"],
                 block_params["norm2"]["bias"])
             flat_rst_state = rst_normalized.reshape((-1, self.d_model))
-            rst_routing, rst_local = route_and_local(
-                flat_rst_state, router_params)
-            rst_tau = _linear(
-                router_params["rst_operator_tau_proj"], rst_local)
-            rst_result = execute(
-                "rst", rst_local, rst_tau, pool_params)
-            if diagnostics_enabled:
-                rst_space_output = rst_result[0]
-                scalar, arrays = _aggregate_operator_diagnostics(
-                    rst_result, route_counts["rst"] // n_spaces,
-                    "rst", composition_mode)
-                regular_metrics.update(scalar)
-                if analysis:
-                    analysis_metrics.update(arrays)
+            rst_routing = None
+            if fused_production:
+                rst_flat_update, rst_metrics = rst_dense(
+                    flat_rst_state,
+                    router_params["space_route_proj"]["kernel"],
+                    router_params["space_read_vectors"],
+                    router_params["space_state_proj"],
+                    router_params["space_state_writeback"],
+                    router_params["rst_operator_tau_proj"]["kernel"],
+                    router_params["rst_operator_tau_proj"]["bias"],
+                    pool_params["rst_read_vectors"],
+                    pool_params["rst_write_vectors"],
+                    temperatures["rst"], soft_gate_boundary_power,
+                    execution_prune_eps, route_scales["rst"])
+                rst_route_update = rst_flat_update.reshape(
+                    rst_normalized.shape)
+                regular_metrics.update(rst_metrics)
             else:
-                rst_space_output = rst_result
-            rst_route_update = _space_weighted_writeback(
-                rst_space_output,
-                rst_routing["dense_space_weights"],
-                router_params["space_state_writeback"],
-                route_scales["rst"]).reshape(rst_normalized.shape)
+                rst_routing, rst_local = route_and_local(
+                    flat_rst_state, router_params)
+                rst_tau = _linear(
+                    router_params["rst_operator_tau_proj"], rst_local)
+                rst_result = execute(
+                    "rst", rst_local, rst_tau, pool_params)
+                if isinstance(rst_result, tuple):
+                    rst_space_output = rst_result[0]
+                    scalar, arrays = _aggregate_operator_diagnostics(
+                        rst_result, route_counts["rst"] // n_spaces,
+                        "rst", composition_mode)
+                    regular_metrics.update(scalar)
+                    if analysis:
+                        analysis_metrics.update(arrays)
+                else:
+                    rst_space_output = rst_result
+                rst_route_update = _space_weighted_writeback(
+                    rst_space_output,
+                    rst_routing["dense_space_weights"],
+                    router_params["space_state_writeback"],
+                    route_scales["rst"]).reshape(rst_normalized.shape)
             current_state = current_state + _shared_safe_dropout(
                 rst_route_update, self.dropout_rate, deterministic, rng_rst)
 
-            regular_metrics.update(_space_routing_metrics(
-                attention_routing, "attention"))
-            regular_metrics.update(_space_routing_metrics(
-                rst_routing, "rst"))
-            if diagnostics_enabled:
-                regular_metrics.update({
-                    "attn_out_norm": jnp.linalg.norm(
-                        attention_output.astype(jnp.float32),
-                        axis=-1).mean(),
-                    "rst_out_norm": jnp.linalg.norm(
-                        rst_route_update.astype(jnp.float32),
-                        axis=-1).mean(),
-                    "residual_norm": jnp.linalg.norm(
-                        current_state.astype(jnp.float32), axis=-1).mean(),
-                    "q_route_output_norm": jnp.linalg.norm(
-                        route_outputs["q"].astype(jnp.float32),
-                        axis=-1).mean(),
-                    "k_route_output_norm": jnp.linalg.norm(
-                        route_outputs["k"].astype(jnp.float32),
-                        axis=-1).mean(),
-                    "v_route_output_norm": jnp.linalg.norm(
-                        route_outputs["v"].astype(jnp.float32),
-                        axis=-1).mean(),
-                    "rst_route_update_norm": jnp.linalg.norm(
-                        rst_route_update.astype(jnp.float32),
-                        axis=-1).mean(),
-                })
+            if not fused_production:
+                routing_metric_fn = (
+                    _space_routing_metrics
+                    if diagnostics_enabled
+                    else _compact_space_routing_metrics)
+                regular_metrics.update(routing_metric_fn(
+                    attention_routing, "attention"))
+                regular_metrics.update(routing_metric_fn(
+                    rst_routing, "rst"))
+            regular_metrics.update({
+                "attn_out_norm": jnp.linalg.norm(
+                    attention_output.astype(jnp.float32),
+                    axis=-1).mean(),
+                "rst_out_norm": jnp.linalg.norm(
+                    rst_route_update.astype(jnp.float32),
+                    axis=-1).mean(),
+                "residual_norm": jnp.linalg.norm(
+                    current_state.astype(jnp.float32), axis=-1).mean(),
+                "q_route_output_norm": jnp.linalg.norm(
+                    route_outputs["q"].astype(jnp.float32),
+                    axis=-1).mean(),
+                "k_route_output_norm": jnp.linalg.norm(
+                    route_outputs["k"].astype(jnp.float32),
+                    axis=-1).mean(),
+                "v_route_output_norm": jnp.linalg.norm(
+                    route_outputs["v"].astype(jnp.float32),
+                    axis=-1).mean(),
+                "rst_route_update_norm": jnp.linalg.norm(
+                    rst_route_update.astype(jnp.float32),
+                    axis=-1).mean(),
+            })
             layer_aux = {"regular": regular_metrics}
             if analysis:
                 layer_aux.update({
@@ -1188,8 +1410,10 @@ class DAWN_SRW_V4174(nn.Module):
         for key, values in regular_lists.items():
             result[key] = jnp.stack(values).mean()
         result.update(scanned_regular_metrics)
-        if diagnostics_enabled:
+        operator_metric_sentinel = "q_operator_active_tau_frac"
+        if operator_metric_sentinel in result:
             result.update(_canonical_regular_operator_metrics(result))
+        if diagnostics_enabled:
             result["heat_kernel_beta"] = jnp.float32(self.heat_kernel_beta)
         if analysis:
             for key, values in analysis_lists.items():
@@ -1671,6 +1895,532 @@ def make_sharded_space_dense_diagnostics(
         soft_gate_effective_active_eps, admission_den_power,
         admission_den_grad_scale, srw_composition_mode,
         heat_kernel_beta, diagnostics=True)
+
+
+_FUSED_OPERATOR_METRIC_SUFFIXES = (
+    "active_tau_frac",
+    "active_tau_count",
+    "tau_mean",
+    "gate_mass_mean",
+    "gate_den_mean",
+    "depth_active_mean",
+    "gate_eff_n_mean",
+    "top1_gate_frac_mean",
+    "den_floor_frac",
+)
+
+
+def _dense_rw_routes_sharded(
+        local_f32: jax.Array,
+        local_norm: jax.Array,
+        token_valid: jax.Array,
+        read_vectors: jax.Array,
+        write_vectors: jax.Array,
+        raw_tau: jax.Array, *,
+        max_chunk_size: int,
+        soft_gate_temperature: jax.Array,
+        soft_gate_boundary_power: jax.Array,
+        execution_prune_eps: jax.Array,
+        srw_composition_mode: str,
+        heat_kernel_beta: float,
+        effective_active_eps: float,
+        remat_chunks: bool,
+        throughput_bf16: bool):
+    """Compute model-local RW state for one or more independent routes."""
+    n_routes, n_spaces, token_capacity, d_route = map(
+        int, (read_vectors.shape[0], local_f32.shape[0],
+              local_f32.shape[1], local_f32.shape[2]))
+    n_local = int(read_vectors.shape[2])
+    chunk_size = min(max(1, int(max_chunk_size)), n_local)
+    n_chunks = math.ceil(n_local / chunk_size)
+    n_padded = n_chunks * chunk_size
+    pad_n = n_padded - n_local
+    pad_spec = ((0, 0), (0, 0), (0, pad_n), (0, 0))
+    reads = jnp.pad(read_vectors, pad_spec)
+    writes = jnp.pad(write_vectors, pad_spec)
+    valid_rows = jnp.arange(n_padded) < n_local
+    read_unit_f32 = forward_unit_direction(reads)
+    write_unit_f32 = forward_unit_direction(writes)
+    tau = _shared_tau_from_param(raw_tau)
+    aggregate_shape = (n_routes, n_spaces, token_capacity, 1)
+    carry = (
+        jnp.zeros(
+            (n_routes, n_spaces, token_capacity, d_route),
+            dtype=jnp.float32),
+        jnp.zeros(aggregate_shape, dtype=jnp.float32),
+        jnp.zeros(aggregate_shape, dtype=jnp.float32),
+        jnp.zeros(aggregate_shape, dtype=jnp.float32),
+        jnp.zeros(aggregate_shape, dtype=jnp.float32),
+        jnp.zeros(aggregate_shape, dtype=jnp.float32),
+    )
+    beta = jnp.float32(heat_kernel_beta)
+    active_eps = jnp.float32(effective_active_eps)
+    rw_dot = (
+        _throughput_einsum_bf16_f32
+        if throughput_bf16 else _control_einsum_f32)
+
+    def step(carry_value, chunk_index):
+        (raw_out, gate_mass, gate_sq, gate_max,
+        active_count, depth_sum) = carry_value
+        start = chunk_index * chunk_size
+        read = jax.lax.dynamic_slice_in_dim(
+            read_unit_f32, start, chunk_size, axis=2)
+        write = jax.lax.dynamic_slice_in_dim(
+            write_unit_f32, start, chunk_size, axis=2)
+        row_valid = jax.lax.dynamic_slice_in_dim(
+            valid_rows, start, chunk_size, axis=0)
+        valid = (
+            token_valid[None, :, :, None]
+            & row_valid[None, None, None, :])
+        read_value = rw_dot(
+            "mtr,amnr->amtn", local_f32, read).astype(jnp.float32)
+        rho = jnp.clip(read_value / local_norm[None, ...], -1.0, 1.0)
+        rho_compute = jnp.where(valid, rho, tau)
+        margin, gate, depth, execution_weight, _ = (
+            _shared_compute_admission_drive(
+                rho_compute, tau, soft_gate_temperature,
+                boundary_power=soft_gate_boundary_power,
+                effective_active_eps=active_eps,
+                execution_prune_eps=execution_prune_eps,
+                srw_composition_mode=srw_composition_mode,
+                heat_kernel_beta=beta))
+        gate = jnp.where(valid, gate, 0.0)
+        depth = jnp.where(valid, depth, 0.0)
+        execution_weight = jnp.where(valid, execution_weight, 0.0)
+        chunk_out = rw_dot(
+            "amtn,amnr->amtr",
+            execution_weight * read_value,
+            write).astype(jnp.float32)
+        return (
+            raw_out + chunk_out,
+            gate_mass + gate.sum(axis=-1, keepdims=True),
+            gate_sq + jnp.square(gate).sum(axis=-1, keepdims=True),
+            jnp.maximum(gate_max, gate.max(axis=-1, keepdims=True)),
+            active_count + ((margin > 0.0) & valid).sum(
+                axis=-1, keepdims=True).astype(jnp.float32),
+            depth_sum + depth.sum(axis=-1, keepdims=True),
+        ), None
+
+    scan_step = jax.checkpoint(step) if remat_chunks else step
+    (raw_out, gate_mass, gate_sq, gate_max,
+     active_count, depth_sum), _ = jax.lax.scan(
+         scan_step, carry, jnp.arange(n_chunks))
+    return (
+        raw_out,
+        active_count,
+        gate_mass,
+        gate_sq,
+        gate_max,
+        depth_sum,
+        tau,
+    )
+
+
+def _reduce_dense_rw_routes_sharded(
+        local_stats: tuple[jax.Array, ...],
+        admission_den_power: jax.Array,
+        srw_composition_mode: str) -> tuple[jax.Array, ...]:
+    """Reduce a grouped route batch with three model-axis collectives."""
+    (raw_out, active_count, gate_mass, gate_sq,
+     gate_max, depth_sum, tau) = local_stats
+    additive_stats = jax.lax.psum(
+        jnp.stack(
+            (active_count, gate_mass, gate_sq, depth_sum), axis=0),
+        "model")
+    active_count, gate_mass, gate_sq, depth_sum = additive_stats
+    gate_den = _shared_composition_den(
+        gate_mass, admission_den_power, srw_composition_mode)
+    space_results = jax.lax.psum(
+        (raw_out / gate_den).astype(jnp.float32),
+        "model")
+    return (
+        space_results,
+        active_count,
+        gate_mass,
+        gate_sq,
+        jax.lax.pmax(jax.lax.stop_gradient(gate_max), "model"),
+        depth_sum,
+        tau,
+        gate_den,
+    )
+
+
+def _sharded_operator_scalar_metrics(
+        route_stats: tuple[jax.Array, ...],
+        n_operators_per_space: int,
+        route: str,
+        srw_composition_mode: str) -> dict[str, jax.Array]:
+    """Reduce a route's internal ``[M,T,1]`` statistics to scalars."""
+    (_, active_count, gate_mass, gate_sq, gate_max,
+     depth_sum, tau, gate_den) = route_stats
+    local_positions = jnp.float32(
+        int(active_count.shape[0]) * int(active_count.shape[1]))
+    global_positions = jax.lax.psum(local_positions, "data")
+
+    def global_mean(value):
+        return (
+            jax.lax.psum(value.astype(jnp.float32).sum(), "data")
+            / jnp.maximum(global_positions, jnp.float32(1.0)))
+
+    floor_mass = _shared_composition_den_floor_mass(srw_composition_mode)
+    floor_compare = (
+        jnp.less if srw_composition_mode == "linear_angular"
+        else jnp.less_equal)
+    values = {
+        f"{route}_operator_active_tau_frac": (
+            global_mean(active_count) / float(n_operators_per_space)),
+        f"{route}_operator_active_tau_count": global_mean(active_count),
+        f"{route}_operator_tau_mean": global_mean(tau),
+        f"{route}_operator_gate_mass_mean": global_mean(gate_mass),
+        f"{route}_operator_gate_den_mean": global_mean(gate_den),
+        f"{route}_operator_depth_active_mean": global_mean(
+            depth_sum / jnp.maximum(active_count, 1.0)),
+        f"{route}_operator_gate_eff_n_mean": global_mean(
+            jnp.square(gate_mass) / jnp.maximum(gate_sq, 1.0e-8)),
+        f"{route}_operator_top1_gate_frac_mean": global_mean(
+            gate_max / jnp.maximum(gate_mass, 1.0e-8)),
+        f"{route}_operator_den_floor_frac": global_mean(
+            floor_compare(gate_mass, floor_mass).astype(jnp.float32)),
+    }
+    return {
+        key: jax.lax.stop_gradient(value)
+        for key, value in values.items()}
+
+
+def _sharded_compact_space_metrics(
+        routing: Mapping[str, jax.Array],
+        prefix: str) -> dict[str, jax.Array]:
+    """Reduce routing state across the data mesh and return four scalars."""
+    gate = routing["space_gate"].astype(jnp.float32)
+    mass = routing["space_gate_mass"][..., 0].astype(jnp.float32)
+    selected_ids = routing["selected_ids"]
+    n_spaces = int(gate.shape[-1])
+    local_tokens = jnp.float32(gate.shape[0])
+    global_tokens = jax.lax.psum(local_tokens, "data")
+
+    def token_mean_sum(value):
+        return (
+            jax.lax.psum(value.astype(jnp.float32).sum(), "data")
+            / jnp.maximum(global_tokens, jnp.float32(1.0)))
+
+    top1_counts = jax.nn.one_hot(
+        selected_ids[..., 0], n_spaces, dtype=jnp.float32).sum(axis=0)
+    top1_rate = (
+        jax.lax.psum(top1_counts, "data")
+        / jnp.maximum(global_tokens, jnp.float32(1.0))).max()
+    values = {
+        f"{prefix}_space_gate_mass_mean": token_mean_sum(mass),
+        f"{prefix}_space_active_count_mean": token_mean_sum(
+            (gate > 0.0).astype(jnp.float32).sum(axis=-1)),
+        f"{prefix}_space_zero_gate_frac": token_mean_sum(
+            (mass <= 0.0).astype(jnp.float32)),
+        f"{prefix}_space_top1_rate": top1_rate,
+    }
+    return {
+        key: jax.lax.stop_gradient(value)
+        for key, value in values.items()}
+
+
+def _route_stats_at(
+        stats: tuple[jax.Array, ...],
+        route_index: int) -> tuple[jax.Array, ...]:
+    return tuple(value[route_index] for value in stats)
+
+
+def _make_sharded_attention_space_dense(
+        mesh, *,
+        max_chunk_size_qk: int,
+        max_chunk_size_v: int,
+        operation_space_top_k: int,
+        admission_den_power_qk: float,
+        admission_den_power_v: float,
+        srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
+        soft_gate_effective_active_eps: float = 1.0e-6,
+        remat_chunks: bool = False,
+        throughput_bf16: bool):
+    """Create the single-boundary production Q/K/V dense executor."""
+    composition_mode = str(srw_composition_mode)
+    top_k = int(operation_space_top_k)
+    model_axis_size = int(mesh.shape["model"])
+    metric_names = tuple(
+        f"{route}_operator_{suffix}"
+        for route in ("q", "k", "v")
+        for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
+    ) + tuple(
+        f"attention_space_{suffix}"
+        for suffix in (
+            "gate_mass_mean", "active_count_mean",
+            "zero_gate_frac", "top1_rate"))
+
+    def attention_core(
+            flat_state,
+            space_route_kernel, space_read_vectors,
+            space_state_proj, space_state_writeback,
+            q_tau_kernel, q_tau_bias,
+            k_tau_kernel, k_tau_bias,
+            v_tau_kernel, v_tau_bias,
+            q_read, q_write, k_read, k_write, v_read, v_write,
+            qk_temperature, v_temperature,
+            boundary_power, execution_prune_eps,
+            qk_scale, v_scale):
+        routing = _compute_space_routing(
+            flat_state, space_route_kernel, space_read_vectors, top_k)
+        if throughput_bf16:
+            local = jnp.swapaxes(
+                throughput_dot_bf16_f32(
+                    flat_state, space_state_proj,
+                    dimension_numbers=(
+                        ((1,), (1,)),
+                        ((), ()))),
+                0, 1)
+        else:
+            local = _control_einsum_f32(
+                "td,mdr->mtr", flat_state, space_state_proj)
+        local = local.astype(jnp.float32)
+        local_norm = jnp.maximum(
+            jnp.linalg.norm(local, axis=-1, keepdims=True),
+            jnp.float32(RW_FORWARD_NORM_EPS))
+        token_valid = jnp.ones(local.shape[:2], dtype=jnp.bool_)
+        qk_tau_kernel = jnp.stack((q_tau_kernel, k_tau_kernel), axis=0)
+        qk_tau_bias = jnp.stack((q_tau_bias, k_tau_bias), axis=0)
+        qk_raw_tau = (
+            _control_einsum_f32(
+                "mtr,ari->amti", local, qk_tau_kernel)
+            + qk_tau_bias[:, None, None, :])
+        qk_local_stats = _dense_rw_routes_sharded(
+            local, local_norm, token_valid,
+            jnp.stack((q_read, k_read), axis=0),
+            jnp.stack((q_write, k_write), axis=0),
+            qk_raw_tau,
+            max_chunk_size=max_chunk_size_qk,
+            soft_gate_temperature=qk_temperature,
+            soft_gate_boundary_power=boundary_power,
+            execution_prune_eps=execution_prune_eps,
+            srw_composition_mode=composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            effective_active_eps=soft_gate_effective_active_eps,
+            remat_chunks=remat_chunks,
+            throughput_bf16=throughput_bf16)
+        v_raw_tau = (
+            _control_einsum_f32(
+                "mtr,ri->mti", local, v_tau_kernel)
+            + v_tau_bias)
+        v_local_stats = _dense_rw_routes_sharded(
+            local, local_norm, token_valid,
+            v_read[None, ...], v_write[None, ...],
+            v_raw_tau[None, ...],
+            max_chunk_size=max_chunk_size_v,
+            soft_gate_temperature=v_temperature,
+            soft_gate_boundary_power=boundary_power,
+            execution_prune_eps=execution_prune_eps,
+            srw_composition_mode=composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            effective_active_eps=soft_gate_effective_active_eps,
+            remat_chunks=remat_chunks,
+            throughput_bf16=throughput_bf16)
+        grouped_local_stats = tuple(
+            jnp.concatenate((qk_value, v_value), axis=0)
+            for qk_value, v_value in zip(qk_local_stats, v_local_stats))
+        grouped_stats = _reduce_dense_rw_routes_sharded(
+            grouped_local_stats,
+            jnp.asarray(
+                (
+                    admission_den_power_qk,
+                    admission_den_power_qk,
+                    admission_den_power_v,
+                ),
+                dtype=jnp.float32).reshape((3, 1, 1, 1)),
+            composition_mode)
+        space_weights = jnp.swapaxes(
+            routing["dense_space_weights"], 0, 1)[None, ..., None]
+        route_scales = jnp.asarray(
+            (qk_scale, qk_scale, v_scale), dtype=jnp.float32
+        ).reshape((3, 1, 1, 1))
+        writeback_dot = (
+            _throughput_einsum_bf16_f32
+            if throughput_bf16 else _control_einsum_f32)
+        grouped_output = writeback_dot(
+            "amtr,mrd->atd",
+            grouped_stats[0] * space_weights * route_scales,
+            space_state_writeback).astype(jnp.float32)
+        q_per_space = int(q_read.shape[1]) * model_axis_size
+        k_per_space = int(k_read.shape[1]) * model_axis_size
+        v_per_space = int(v_read.shape[1]) * model_axis_size
+        metrics = {}
+        metrics.update(_sharded_operator_scalar_metrics(
+            _route_stats_at(grouped_stats, 0), q_per_space, "q",
+            composition_mode))
+        metrics.update(_sharded_operator_scalar_metrics(
+            _route_stats_at(grouped_stats, 1), k_per_space, "k",
+            composition_mode))
+        metrics.update(_sharded_operator_scalar_metrics(
+            _route_stats_at(grouped_stats, 2), v_per_space, "v",
+            composition_mode))
+        metrics.update(_sharded_compact_space_metrics(
+            routing, "attention"))
+        return (
+            grouped_output[0], grouped_output[1], grouped_output[2], metrics)
+
+    kernel = shard_map(
+        attention_core,
+        mesh=mesh,
+        in_specs=(
+            P("data", None),
+            P(), P(), P(), P(),
+            P(), P(), P(), P(), P(), P(),
+            P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
+            P(), P(), P(), P(), P(), P(),
+        ),
+        out_specs=(
+            P("data", None), P("data", None), P("data", None),
+            {name: P() for name in metric_names}),
+        check_rep=False)
+    kernel._v4174_kernel_profile = "production"
+    kernel._v4174_dense_grouped_execution = "attention_qkv"
+    kernel._v4174_qk_paired = True
+    kernel._v4174_inner_chunk_remat = bool(remat_chunks)
+    kernel._v4174_throughput_precision = (
+        "bf16_operands_f32_accum"
+        if throughput_bf16 else "fp32_reference")
+    kernel._v4174_output_contract = ("q[T,D]", "k[T,D]", "v[T,D]", "scalars")
+    return kernel
+
+
+def make_sharded_attention_space_dense_minimal(mesh, **kwargs):
+    """Create the canonical mixed-precision production attention executor."""
+    return _make_sharded_attention_space_dense(
+        mesh, throughput_bf16=True, **kwargs)
+
+
+def make_sharded_attention_space_dense_fp32_reference(mesh, **kwargs):
+    """Create a fused FP32 executor for structural/numerical tests only."""
+    return _make_sharded_attention_space_dense(
+        mesh, throughput_bf16=False, **kwargs)
+
+
+def _make_sharded_rst_space_dense(
+        mesh, *,
+        max_chunk_size: int,
+        operation_space_top_k: int,
+        admission_den_power: float,
+        srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
+        soft_gate_effective_active_eps: float = 1.0e-6,
+        remat_chunks: bool = False,
+        throughput_bf16: bool):
+    """Create the end-to-end production RST dense executor."""
+    composition_mode = str(srw_composition_mode)
+    top_k = int(operation_space_top_k)
+    model_axis_size = int(mesh.shape["model"])
+    metric_names = tuple(
+        f"rst_operator_{suffix}"
+        for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
+    ) + tuple(
+        f"rst_space_{suffix}"
+        for suffix in (
+            "gate_mass_mean", "active_count_mean",
+            "zero_gate_frac", "top1_rate"))
+
+    def rst_core(
+            flat_state,
+            space_route_kernel, space_read_vectors,
+            space_state_proj, space_state_writeback,
+            tau_kernel, tau_bias,
+            read_vectors, write_vectors,
+            temperature, boundary_power, execution_prune_eps,
+            route_scale):
+        routing = _compute_space_routing(
+            flat_state, space_route_kernel, space_read_vectors, top_k)
+        if throughput_bf16:
+            local = jnp.swapaxes(
+                throughput_dot_bf16_f32(
+                    flat_state, space_state_proj,
+                    dimension_numbers=(
+                        ((1,), (1,)),
+                        ((), ()))),
+                0, 1)
+        else:
+            local = _control_einsum_f32(
+                "td,mdr->mtr", flat_state, space_state_proj)
+        local = local.astype(jnp.float32)
+        local_norm = jnp.maximum(
+            jnp.linalg.norm(local, axis=-1, keepdims=True),
+            jnp.float32(RW_FORWARD_NORM_EPS))
+        raw_tau = (
+            _control_einsum_f32(
+                "mtr,ri->mti", local, tau_kernel)
+            + tau_bias)
+        local_stats = _dense_rw_routes_sharded(
+            local, local_norm,
+            jnp.ones(local.shape[:2], dtype=jnp.bool_),
+            read_vectors[None, ...], write_vectors[None, ...],
+            raw_tau[None, ...],
+            max_chunk_size=max_chunk_size,
+            soft_gate_temperature=temperature,
+            soft_gate_boundary_power=boundary_power,
+            execution_prune_eps=execution_prune_eps,
+            srw_composition_mode=composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            effective_active_eps=soft_gate_effective_active_eps,
+            remat_chunks=remat_chunks,
+            throughput_bf16=throughput_bf16)
+        stats = _reduce_dense_rw_routes_sharded(
+            local_stats, jnp.float32(admission_den_power),
+            composition_mode)
+        weighted = (
+            stats[0][0]
+            * jnp.swapaxes(
+                routing["dense_space_weights"], 0, 1)[..., None]
+            * jnp.asarray(route_scale))
+        writeback_dot = (
+            _throughput_einsum_bf16_f32
+            if throughput_bf16 else _control_einsum_f32)
+        update = writeback_dot(
+            "mtr,mrd->td", weighted,
+            space_state_writeback).astype(jnp.float32)
+        n_per_space = int(read_vectors.shape[1]) * model_axis_size
+        metrics = _sharded_operator_scalar_metrics(
+            _route_stats_at(stats, 0), n_per_space, "rst",
+            composition_mode)
+        metrics.update(_sharded_compact_space_metrics(routing, "rst"))
+        return update, metrics
+
+    kernel = shard_map(
+        rst_core,
+        mesh=mesh,
+        in_specs=(
+            P("data", None),
+            P(), P(), P(), P(), P(), P(),
+            P(None, "model", None), P(None, "model", None),
+            P(), P(), P(), P(),
+        ),
+        out_specs=(
+            P("data", None),
+            {name: P() for name in metric_names}),
+        check_rep=False)
+    kernel._v4174_kernel_profile = "production"
+    kernel._v4174_dense_grouped_execution = "rst_end_to_end"
+    kernel._v4174_inner_chunk_remat = bool(remat_chunks)
+    kernel._v4174_throughput_precision = (
+        "bf16_operands_f32_accum"
+        if throughput_bf16 else "fp32_reference")
+    kernel._v4174_output_contract = ("rst[T,D]", "scalars")
+    return kernel
+
+
+def make_sharded_rst_space_dense_minimal(mesh, **kwargs):
+    """Create the canonical mixed-precision production RST executor."""
+    return _make_sharded_rst_space_dense(
+        mesh, throughput_bf16=True, **kwargs)
+
+
+def make_sharded_rst_space_dense_fp32_reference(mesh, **kwargs):
+    """Create a fused FP32 RST executor for numerical tests only."""
+    return _make_sharded_rst_space_dense(
+        mesh, throughput_bf16=False, **kwargs)
 
 
 def _validate_v4174_sharded_fns(

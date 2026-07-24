@@ -99,12 +99,13 @@ def test_regular_record_uses_train_step_scalars_without_diagnostics():
         "tau_update_v_max_abs": jnp.float32(0.02),
         "tau_update_rst_max_abs": jnp.float32(0.03),
         **{
-            key: jnp.float32(index + 1)
-            for index, key in enumerate(
-                train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
+            key: jnp.float32(0.5)
+            for key in (
+                *train_jax.LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+                *train_jax.V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+                *train_jax.V4174_SELECTOR_METRIC_NAMES)
         },
         "diagnostic_loss": jnp.float32(99.0),
-        "attention_space_gate_mass_mean": jnp.float32(0.5),
     }
     win_avgs = {
         "loss": 2.0,
@@ -118,6 +119,10 @@ def test_regular_record_uses_train_step_scalars_without_diagnostics():
     ctx = {
         "current_lr": 1.0e-3,
         "model_version": train_jax.V4174_MODEL_VERSION,
+        "total_micro_steps": 100,
+        "progress": 5.0,
+        "total_elapsed": 10.0,
+        "eta": None,
     }
 
     record = train_jax._build_minimal_pretraining_record(
@@ -132,7 +137,10 @@ def test_regular_record_uses_train_step_scalars_without_diagnostics():
     assert set(record) <= allowed
     assert set(train_jax.MINIMAL_PRETRAINING_REQUIRED_LOG_KEYS) <= set(record)
     assert "diagnostic_loss" not in record
-    assert "attention_space_gate_mass_mean" not in record
+    assert "attention_space_gate_mass_mean" in record
+    assert not any(
+        key in record
+        for key in train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
     assert record["loss"] == 2.0
     assert record["tokens_per_sec"] == 2048.0
     assert all(
