@@ -175,15 +175,26 @@ def test_v4174_dynamic_metric_source_contract():
     assert "remat_chunks" not in builder_source
     assert '_v4174_chunk_remat_policy = "always"' in attention_source
     assert '_v4174_chunk_remat_policy = "always"' in rst_source
+    assert "@partial(jax.jit, donate_argnums=(0, 1))" in trainer_source
     assert "static_argnames" not in trainer_source
     assert "collect_train_metrics=True" in trainer_source
     assert "step_after_update in (1, 5, 10, 20, 50)" in main_source
     assert "_upcoming_is_regular" in main_source
     assert "train_metrics_collected != 1.0" in main_source
-    assert "False -> True -> False" in main_source
-    assert "true_cache_size = _train_step_cache_size()" in main_source
-    assert "final_cache_size = _train_step_cache_size()" in main_source
-    assert "created a second train_step executable" not in main_source
+    assert "del variables" in main_source
+    assert "del dummy_input" in main_source
+    assert "Scratch init cleanup:" in main_source
+    assert "def _clear_startup_only_jax_caches():" in main_source
+    assert "lowered_train_step = train_step_fn.lower(" in main_source
+    assert "train_step_fn = lowered_train_step.compile()" in main_source
+    compile_only_source = main_source.split(
+        "# train_step donates params/opt_state.", 1)[1].split(
+            "def _train_step_cache_size", 1)[0]
+    assert "train_step_fn(" not in compile_only_source
+    assert "donated state, compile-only" in compile_only_source
+    assert "startup does not consume donated params/opt_state" in (
+        compile_only_source)
+    assert "if str(model_version) != V4174_MODEL_VERSION:" in main_source
 
 
 def test_regular_record_uses_train_step_scalars_without_diagnostics():

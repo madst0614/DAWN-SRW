@@ -16825,6 +16825,7 @@ def main():
     parser.add_argument('--speed-check', action='store_true',
                         help=('Run the startup step-time/profiling check '
                               '(disabled by default; implies --oom-check; '
+                              'v4174 defers timing to real donated steps; '
                               'can also set training.speed_check: true).'))
     parser.add_argument('--resume-from', '--resume', dest='resume_from',
                         type=str, default=None,
@@ -19968,8 +19969,21 @@ def main():
                 "  Resume restore cleanup: released abstract Orbax target "
                 "trees before train_step JIT.",
                 flush=True)
-    elif is_host0:
-        print(f"  Orbax checkpoints: {_join(checkpoint_dir, 'checkpoints')}")
+    else:
+        # params/opt_state now point at their final mesh-sharded buffers.
+        # Release the scratch-only model.init tree so the original unsharded
+        # parameter buffers cannot remain live beside the training state.
+        jax.block_until_ready((params, opt_state, rng))
+        del variables
+        del dummy_input
+        gc.collect()
+        if is_host0:
+            print(f"  Orbax checkpoints: "
+                  f"{_join(checkpoint_dir, 'checkpoints')}")
+            print(
+                "  Scratch init cleanup: released model.init variables and "
+                "dummy input before train_step JIT.",
+                flush=True)
 
     # Fail-fast check: global_step must match across hosts after restore.
     if n_hosts > 1:
@@ -20700,6 +20714,22 @@ def main():
             'rst_op_key': z,
         }
 
+    _startup_cache_cleanup_pending = True
+
+    def _clear_startup_only_jax_caches():
+        nonlocal _startup_cache_cleanup_pending
+        if not _startup_cache_cleanup_pending:
+            return
+        gc.collect()
+        jax.clear_caches()
+        gc.collect()
+        _startup_cache_cleanup_pending = False
+        if is_host0:
+            print(
+                "  Startup cache cleanup: released initialization "
+                "executables before first train_step compilation.",
+                flush=True)
+
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
     # ----------------------------------------------------------
@@ -20732,6 +20762,53 @@ def main():
             _dummy_op_key_snap = _drift_snap(params)
         else:
             _dummy_op_key_snap = _dummy_drift_snap()
+
+        _clear_startup_only_jax_caches()
+
+        if str(model_version) == V4174_MODEL_VERSION:
+            # train_step donates params/opt_state. Compile and load the exact
+            # donated executable without executing a dummy optimizer update
+            # or consuming the live training state.
+            jit_start = time.time()
+            lowered_train_step = train_step_fn.lower(
+                params, opt_state, dummy_ids, dummy_labels, dummy_mask,
+                dummy_step_rng,
+                _dummy_op_key_snap, jnp.asarray(0, jnp.int32),
+                jnp.asarray(False, dtype=jnp.bool_))
+            train_step_fn = lowered_train_step.compile()
+            del lowered_train_step
+            jit_time = time.time() - jit_start
+            if is_host0:
+                print(
+                    f"  JIT compile/load: {jit_time:.1f}s "
+                    "(donated state, compile-only)",
+                    flush=True)
+                if run_speed_check:
+                    print(
+                        "  Speed check deferred to real training steps; "
+                        "startup does not consume donated params/opt_state.",
+                        flush=True)
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    if mem:
+                        used = mem.get('bytes_in_use', 0) / 1e9
+                        peak = mem.get('peak_bytes_in_use', 0) / 1e9
+                        limit = mem.get('bytes_limit', 0) / 1e9
+                        print(
+                            f"  HBM: {used:.2f}G / {limit:.2f}G "
+                            f"(peak={peak:.2f}G, free={limit - used:.2f}G)",
+                            flush=True)
+                except Exception:
+                    pass
+            del dummy_ids, dummy_mask, dummy_labels
+            del dummy_step_rng, _dummy_op_key_snap
+            gc.collect()
+            if is_host0:
+                print(
+                    "=== OOM check passed (compiled without consuming "
+                    "training state) ===\n",
+                    flush=True)
+            raise _SkipStartupCheck()
 
         def _train_step_cache_size():
             cache_size = getattr(train_step_fn, '_cache_size', None)
@@ -21365,9 +21442,11 @@ def main():
                 print(f"  Breakdown failed: {e}", flush=True)
                 traceback.print_exc()
 
-        # Clear XLA compilation cache and free profiling memory
+        # Preserve the v4174 compile-only train executable for the real loop.
+        # Legacy breakdown probes retain their previous cache-release policy.
         gc.collect()
-        jax.clear_caches()
+        if str(model_version) != V4174_MODEL_VERSION:
+            jax.clear_caches()
 
         if is_host0 and run_speed_check:
             # Estimate total training time
@@ -21649,6 +21728,11 @@ def main():
         _prev_op_key_snap = _drift_snap(params)
     else:
         _prev_op_key_snap = _dummy_drift_snap()
+
+    # With startup checks disabled, this is the last point before the real
+    # donated train_step is compiled. If the compile-only OOM check already
+    # loaded it, the one-shot cleanup is a no-op.
+    _clear_startup_only_jax_caches()
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
