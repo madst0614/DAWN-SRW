@@ -1,11 +1,9 @@
 import inspect
 from pathlib import Path
 
-from flax import serialization
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 import yaml
 
@@ -15,7 +13,7 @@ from models import dawn_srw_v4174 as v4174
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_CONFIG = (
     ROOT / "configs" /
-    "train_config_v4174_400M_c4_40B_v4_64_space8_top2_kernel_field.yaml")
+    "train_config_v4174_400M_c4_40B_v4_64_space8_top2_direct_read.yaml")
 
 
 def _model_config(**updates):
@@ -29,19 +27,17 @@ def _model_config(**updates):
         "max_seq_len": 16,
         "n_operation_spaces": 4,
         "operation_space_top_k": 2,
-        "operator_key_mode": v4174.OPERATOR_KEY_MODE,
-        "n_qk": 32,
+        "n_q": 32,
+        "n_k": 32,
         "n_v": 32,
         "n_rst": 32,
-        "space_kernel_beta_qk": 9.0,
-        "space_kernel_beta_v": 12.0,
-        "space_kernel_beta_rst": 16.0,
         "admission_den_power": 1.0,
         "admission_den_power_qk": 0.5,
         "admission_den_power_v": 1.0,
         "admission_den_power_rst": 1.2,
         "srw_composition_mode": "linear_angular",
-        "tau_init_attn_qk": 0.0,
+        "tau_init_attn_q": 0.0,
+        "tau_init_attn_k": 0.0,
         "tau_init_attn_v": 0.0,
         "tau_init_rst": 0.0,
     }
@@ -59,22 +55,19 @@ def _model(**updates):
         n_heads=config["n_heads"],
         max_seq_len=config["max_seq_len"],
         dropout_rate=0.0,
-        router_dropout=0.0,
-        n_qk=config["n_qk"],
+        n_q=config["n_q"],
+        n_k=config["n_k"],
         n_v=config["n_v"],
         n_rst=config["n_rst"],
         n_operation_spaces=config["n_operation_spaces"],
         operation_space_top_k=config["operation_space_top_k"],
-        space_kernel_beta_qk=config["space_kernel_beta_qk"],
-        space_kernel_beta_v=config["space_kernel_beta_v"],
-        space_kernel_beta_rst=config["space_kernel_beta_rst"],
-        operator_key_mode=config["operator_key_mode"],
         admission_den_power=config["admission_den_power"],
         admission_den_power_qk=config["admission_den_power_qk"],
         admission_den_power_v=config["admission_den_power_v"],
         admission_den_power_rst=config["admission_den_power_rst"],
         srw_composition_mode=config["srw_composition_mode"],
-        tau_init_attn_qk=config["tau_init_attn_qk"],
+        tau_init_attn_q=config["tau_init_attn_q"],
+        tau_init_attn_k=config["tau_init_attn_k"],
         tau_init_attn_v=config["tau_init_attn_v"],
         tau_init_rst=config["tau_init_rst"],
     )
@@ -84,9 +77,13 @@ def _variables(model=None, seed=0):
     model = model or _model()
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
     variables = model.init(
-        {"params": jax.random.PRNGKey(seed),
-         "dropout": jax.random.PRNGKey(seed + 1)},
-        tokens, deterministic=True)
+        {
+            "params": jax.random.PRNGKey(seed),
+            "dropout": jax.random.PRNGKey(seed + 1),
+        },
+        tokens,
+        deterministic=True,
+    )
     return model, tokens, variables
 
 
@@ -94,367 +91,431 @@ def _count(tree):
     return sum(int(value.size) for value in jax.tree.leaves(tree))
 
 
-def test_architecture_has_one_shared_state_basis_and_canonical_tree():
-    _, _, variables = _variables()
-    router = variables["params"]["router"]
-    assert set(router) == {
-        "space_state_proj", "space_state_writeback",
-        "q_operator_query_proj", "k_operator_query_proj",
-        "v_operator_query_proj", "rst_operator_query_proj",
-        "q_operator_tau_proj", "k_operator_tau_proj",
-        "v_operator_tau_proj", "rst_operator_tau_proj",
+def _path(tree, *parts):
+    value = tree
+    for part in parts:
+        value = value[part]
+    return value
+
+
+def _execution_kwargs():
+    return {
+        "soft_gate_temperature": 0.07,
+        "soft_gate_boundary_power": 2.0,
+        "admission_den_power": 1.0,
+        "srw_composition_mode": "linear_angular",
+        "heat_kernel_beta": 4.0,
     }
+
+
+def test_config_validation_rejects_noncanonical_and_removed_schema():
+    config = _model_config()
+    assert v4174.resolve_operation_space_config(config) == (4, 2)
+    assert v4174.materialize_operation_space_config(dict(config))[
+        "n_operation_spaces"] == 4
+    invalid = (
+        {"d_model": 12},
+        {"operation_space_top_k": 5},
+        {"n_operation_spaces": 5},
+        {"n_q": 30},
+        {"n_k": 30},
+        {"n_v": 30},
+        {"n_rst": 30},
+        {"n_qk": 64},
+        {"space_kernel_beta_qk": 4.0},
+        {"router_dropout": 0.0},
+    )
+    for update in invalid:
+        with pytest.raises(ValueError):
+            v4174.materialize_operation_space_config({
+                **config, **update})
+
+
+def test_parameter_tree_is_exact_direct_read_schema():
+    _, _, variables = _variables()
+    params = variables["params"]
+    router = params["router"]
+    assert set(router) == {
+        "space_route_proj",
+        "space_read_vectors",
+        "space_state_proj",
+        "space_state_writeback",
+        "q_operator_tau_proj",
+        "k_operator_tau_proj",
+        "v_operator_tau_proj",
+        "rst_operator_tau_proj",
+    }
+    assert router["space_route_proj"]["kernel"].shape == (16, 4)
+    assert router["space_read_vectors"].shape == (4, 4)
     assert router["space_state_proj"].shape == (4, 16, 4)
     assert router["space_state_writeback"].shape == (4, 4, 16)
     np.testing.assert_allclose(
         router["space_state_writeback"],
-        jnp.swapaxes(router["space_state_proj"], -1, -2), atol=0, rtol=0)
-    pool = variables["params"]["neuron_pool"]
-    assert pool["qk_read_vectors"].shape == (4, 8, 4)
-    assert pool["v_read_vectors"].shape == (4, 8, 4)
-    assert pool["rst_read_vectors"].shape == (4, 8, 4)
+        jnp.swapaxes(router["space_state_proj"], -1, -2),
+        atol=0,
+        rtol=0,
+    )
+    space_read_gram = (
+        router["space_read_vectors"] @ router["space_read_vectors"].T)
+    np.testing.assert_allclose(
+        space_read_gram, np.eye(4), atol=2e-5, rtol=2e-5)
+
+    pool = params["neuron_pool"]
+    assert set(pool) == {
+        f"{route}_{kind}_vectors"
+        for route in ("q", "k", "v", "rst")
+        for kind in ("read", "write")
+    }
+    assert all(value.shape == (4, 8, 4) for value in pool.values())
+    forbidden = (
+        "qk_", "operator_key_", "operator_query_",
+        "space_kernel_beta", "kernel_sketch")
+    paths = (
+        "/".join(str(part.key) for part in path)
+        for path, _ in jax.tree_util.tree_flatten_with_path(params)[0])
+    assert not any(
+        marker in path for path in paths for marker in forbidden)
 
 
-def test_stacked_projection_is_full_rank_orthogonal_and_decoder_is_not_tied():
-    _, _, variables = _variables()
-    router = variables["params"]["router"]
-    projection = router["space_state_proj"]
-    stacked = jnp.swapaxes(projection, -1, -2).reshape(16, 16)
-    singular = np.asarray(jnp.linalg.svd(stacked, compute_uv=False))
-    np.testing.assert_allclose(singular, np.ones(16), atol=2e-5, rtol=2e-5)
-    assert int(jnp.linalg.matrix_rank(stacked)) == 16
-    diagnostics = v4174._space_geometry_diagnostics(
-        projection, router["space_state_writeback"])
-    assert float(diagnostics["stacked_projection_effective_rank"]) > 15.99
-    assert float(diagnostics["encoder_writeback_init_error"]) == 0.0
-    changed_encoder = projection.at[0, 0, 0].add(0.25)
-    assert not np.allclose(
-        np.asarray(router["space_state_writeback"]),
-        np.asarray(jnp.swapaxes(changed_encoder, -1, -2)))
-
-
-def test_all_routes_share_the_single_projected_local_state():
-    state = jax.random.normal(jax.random.PRNGKey(3), (7, 16))
-    projection = jax.random.normal(jax.random.PRNGKey(4), (4, 16, 4))
+def test_projection_and_direct_read_shapes_and_equivalence():
+    state = jax.random.normal(jax.random.PRNGKey(1), (7, 16))
+    projection = jax.random.normal(
+        jax.random.PRNGKey(2), (4, 16, 4))
     local = v4174._project_space_local_states(state, projection)
-    expected = jnp.einsum("td,mdr->mtr", state, projection)
     assert local.shape == (4, 7, 4)
-    np.testing.assert_allclose(local, expected)
-    source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
-    assert source.count("_project_space_local_states(") == 1
-    assert inspect.getsource(v4174._qk_shared_read_compose).count(
-        "_space_read_scalar(") == 1
+    reads = jax.random.normal(jax.random.PRNGKey(3), (4, 8, 4))
+    read_value, rho_reused, local_norm = v4174._direct_read_match(
+        local, reads)
+    assert read_value.shape == (4, 7, 8)
+    assert rho_reused.shape == (4, 7, 8)
+    assert local_norm.shape == (4, 7, 1)
+    rho_direct = jnp.einsum(
+        "mtr,mnr->mtn",
+        v4174.forward_unit_direction(local),
+        v4174.forward_unit_direction(reads),
+    )
+    np.testing.assert_allclose(
+        rho_reused, rho_direct, atol=6e-3, rtol=6e-3)
 
 
-def test_exact_kernel_field_is_masked_log_mean_exp():
-    query = jnp.array([[1.0, 0.0], [0.0, 1.0]])
-    keys = jnp.array([
-        [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
-        [[0.0, 1.0], [1.0, 0.0], [0.0, -1.0]],
+def test_space_gate_is_fixed_nonsoftmax_topk_relu_squared_gate():
+    scores = jnp.array([
+        [0.1, 2.0, -1.0, 1.0],
+        [-4.0, -3.0, -2.0, -1.0],
     ])
-    valid = jnp.array([[True, True, False], [True, False, False]])
-    beta = 2.5
-    actual = v4174._exact_space_log_field(query, keys, beta, valid)
-    cosine = jnp.einsum("tr,mnr->tmn", query, keys)
-    expected = []
-    for token in range(2):
-        row = []
-        for space in range(2):
-            values = beta * (cosine[token, space, valid[space]] - 1.0)
-            row.append(jax.scipy.special.logsumexp(values) - jnp.log(values.size))
-        expected.append(row)
-    np.testing.assert_allclose(actual, jnp.asarray(expected), atol=1e-6)
+    routing = v4174._space_gate_from_scores(scores, 2)
+    gate = routing["space_gate"]
+    weights = routing["dense_space_weights"]
+    np.testing.assert_array_equal(
+        np.asarray(gate[0] == 0.0),
+        np.asarray([True, False, True, False]))
+    assert float(gate[1].sum()) == 0.0
+    assert float(weights[1].sum()) == 0.0
+    assert not np.isclose(float(weights[0].sum()), 1.0)
+    assert bool(jnp.all(jnp.isfinite(weights)))
+    source = inspect.getsource(v4174._space_gate_from_scores)
+    assert "softmax" not in source
+    assert "top_k" in source
+    assert "relu" in source
+    assert "sqrt" in source
+
+    local_output = jnp.ones((4, 2, 3))
+    writeback = jnp.ones((4, 3, 5))
+    zero_route = v4174._space_weighted_writeback(
+        local_output,
+        jnp.zeros((2, 4)),
+        writeback,
+        1.0,
+    )
+    np.testing.assert_array_equal(zero_route, np.zeros((2, 5)))
 
 
-def test_positive_features_and_live_space_sketch_contract():
-    _, _, variables = _variables()
-    pool = variables["params"]["neuron_pool"]
-    keys = v4174._pool_operator_keys(pool)
-    sketches = v4174._build_space_kernel_sketches(
-        keys, {"qk": 9.0, "v": 12.0, "rst": 16.0})
-    features = v4174._build_positive_kernel_features(
-        keys["qk_operator_keys"], 9.0)
-    assert features.shape[-1] == 2 * 4
-    assert bool(jnp.all(jnp.isfinite(features)))
-    assert bool(jnp.all(features > 0))
-    assert sketches["qk_space_kernel_sketch"].shape == (4, 8)
-    norms = jnp.linalg.norm(sketches["qk_space_kernel_sketch"], axis=-1)
-    assert not np.allclose(np.asarray(norms), np.ones(4))
-    assert not any("kernel_sketch" in path
-                   for path, _ in jax.tree_util.tree_flatten_with_path(pool)[0])
-
-
-def test_initialized_exact_vs_sketch_guard_before_and_after_rw_update():
-    _, tokens, variables = _variables(_model(n_qk=128, n_v=128, n_rst=128))
+def test_qk_banks_and_execution_are_fully_separate():
+    paired_factories = (
+        "make_sharded_srw_paired",
+        "make_sharded_srw_paired_minimal",
+        "make_sharded_srw_paired_diagnostics_minimal",
+        "make_sharded_srw_paired_retention_minimal",
+        "make_sharded_srw_paired_suppression_minimal",
+        "make_sharded_srw_paired_trajectory_minimal",
+    )
+    assert not any(hasattr(v4174, name) for name in paired_factories)
+    _, _, variables = _variables(seed=7)
     params = variables["params"]
-    attention_state, _ = v4174._sampled_layer_states(params, tokens, 16)
-
-    def guard(current_pool):
-        keys = v4174._pool_operator_keys(current_pool)
-        sketches = v4174._build_space_kernel_sketches(
-            keys, {"qk": 9.0, "v": 12.0, "rst": 16.0})
-        query = v4174._shared_forward_unit_direction(v4174._linear(
-            params["router"]["q_operator_query_proj"], attention_state))
-        return v4174._kernel_sketch_reference_metrics(
-            query, keys["qk_operator_keys"],
-            sketches["qk_space_kernel_sketch"], 9.0, 2)
-
-    initial = guard(params["neuron_pool"])
-    assert float(initial["top1_agreement"]) >= 0.95
-    assert float(initial["topk_set_agreement"]) >= 0.90
-    assert bool(jnp.isfinite(initial["pearson"]))
-
-    def sketch_loss(read_vectors):
-        changed = dict(params["neuron_pool"])
-        changed["qk_read_vectors"] = read_vectors
-        keys = v4174._pool_operator_keys(changed)
-        sketch = v4174._build_space_kernel_sketches(
-            keys, {"qk": 9.0, "v": 12.0, "rst": 16.0})
-        return sketch["qk_space_kernel_sketch"].sum()
-
-    read = params["neuron_pool"]["qk_read_vectors"]
-    read = read - 1e-6 * jax.grad(sketch_loss)(read)
-    changed_pool = dict(params["neuron_pool"])
-    changed_pool["qk_read_vectors"] = read
-    updated = guard(changed_pool)
-    assert float(updated["top1_agreement"]) >= 0.95
-    assert float(updated["topk_set_agreement"]) >= 0.90
+    pool = params["neuron_pool"]
+    assert "q_read_vectors" in pool and "k_read_vectors" in pool
+    assert "q_write_vectors" in pool and "k_write_vectors" in pool
+    assert not np.array_equal(
+        np.asarray(pool["q_read_vectors"]),
+        np.asarray(pool["k_read_vectors"]))
+    assert not np.array_equal(
+        np.asarray(pool["q_write_vectors"]),
+        np.asarray(pool["k_write_vectors"]))
+    local = jax.random.normal(jax.random.PRNGKey(8), (4, 6, 4))
+    router = params["router"]
+    q_tau = v4174._linear(router["q_operator_tau_proj"], local)
+    k_tau = v4174._linear(router["k_operator_tau_proj"], local)
+    q_output = v4174._rw_compose_space_dense(
+        local, pool["q_read_vectors"], pool["q_write_vectors"],
+        q_tau, **_execution_kwargs())
+    k_output = v4174._rw_compose_space_dense(
+        local, pool["k_read_vectors"], pool["k_write_vectors"],
+        k_tau, **_execution_kwargs())
+    assert q_output.shape == k_output.shape == (4, 6, 4)
+    assert not np.allclose(q_output, k_output)
+    source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
+    assert "_qk_shared_read" not in source
+    assert 'bank_values[route]' in source
 
 
-def test_hard_topk_has_exact_zero_nonselected_weights_and_no_ste():
-    scores = jnp.array([[0.1, 2.0, -1.0, 1.0], [4.0, 3.0, 2.0, 1.0]])
-    ids, weights = v4174._select_operation_spaces(scores, 2)
-    dense = v4174._dense_space_weights(ids, weights, 4)
-    np.testing.assert_allclose(weights.sum(axis=-1), 1.0, atol=1e-7)
-    np.testing.assert_allclose(dense.sum(axis=-1), 1.0, atol=1e-7)
-    assert int((dense == 0).sum()) == 4
-    gradient = jax.grad(lambda value: (
-        v4174._select_operation_spaces(value, 2)[1]
-        * jnp.array([[1.0, -1.0], [1.0, -1.0]])).sum())(scores)
-    assert bool(jnp.all(jnp.isfinite(gradient)))
-    assert float(jnp.linalg.norm(gradient)) > 0.0
-
-
-def test_rw_read_uses_local_state_and_qk_routes_have_independent_gates():
-    key = jax.random.PRNGKey(10)
-    local = jax.random.normal(key, (2, 3, 4))
-    read = jax.random.normal(jax.random.PRNGKey(11), (2, 4, 4))
-    write = jax.random.normal(jax.random.PRNGKey(12), (2, 4, 4))
-    operator_keys = jax.random.normal(jax.random.PRNGKey(13), (2, 4, 4))
-    query_q = jax.random.normal(jax.random.PRNGKey(14), (3, 4))
-    query_k = jax.random.normal(jax.random.PRNGKey(15), (3, 4))
-    tau_q = jnp.zeros((2, 3, 1))
-    tau_k = jnp.full((2, 3, 1), -0.2)
-    kwargs = dict(
-        soft_gate_temperature=0.07, soft_gate_boundary_power=2.0,
-        admission_den_power=1.0, srw_composition_mode="linear_angular",
-        heat_kernel_beta=4.0)
-    q_out, k_out = v4174._qk_shared_read_compose(
-        query_q, query_k, operator_keys, tau_q, tau_k, local,
-        read, write, **kwargs)
-    q_changed, _ = v4174._qk_shared_read_compose(
-        query_q, query_k, operator_keys, tau_q, tau_k, local + 0.3,
-        read, write, **kwargs)
-    assert not np.allclose(q_out, k_out)
-    assert not np.allclose(q_out, q_changed)
-
-    def both_route_loss(read_vectors):
-        q_value, k_value = v4174._qk_shared_read_compose(
-            query_q, query_k, operator_keys, tau_q, tau_k, local,
-            read_vectors, write, **kwargs)
-        return q_value.sum() + 0.7 * k_value.sum()
-
-    gradient = jax.grad(both_route_loss)(read)
-    assert bool(jnp.all(jnp.isfinite(gradient)))
-    assert float(jnp.linalg.norm(gradient)) > 0.0
-
-
-def test_forward_loss_gradients_and_one_optimizer_update_are_finite():
-    model, tokens, variables = _variables()
+def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
+    _, _, variables = _variables(seed=9)
     params = variables["params"]
+    router = params["router"]
+    pool = params["neuron_pool"]
+    state_before = jax.random.normal(jax.random.PRNGKey(10), (8, 16))
+    state_after = state_before + jnp.linspace(
+        -0.4, 0.5, state_before.size).reshape(state_before.shape)
+
+    def rst_values(state):
+        routing = v4174._compute_space_routing(
+            state,
+            router["space_route_proj"]["kernel"],
+            router["space_read_vectors"],
+            2,
+        )
+        local = v4174._project_space_local_states(
+            state, router["space_state_proj"])
+        tau = v4174._linear(router["rst_operator_tau_proj"], local)
+        output = v4174._rw_compose_space_dense(
+            local,
+            pool["rst_read_vectors"],
+            pool["rst_write_vectors"],
+            tau,
+            **_execution_kwargs(),
+        )
+        return routing["space_scores"], local, tau, output
+
+    before = rst_values(state_before)
+    after = rst_values(state_after)
+    assert all(
+        not np.allclose(left, right)
+        for left, right in zip(before, after))
+    source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
+    assert "flat_rst_state" in source
+    assert "rst_routing, rst_local = route_and_local(flat_rst_state)" in source
+    assert "execute(\"rst\", rst_local, rst_tau)" in source
+
+
+def test_forward_loss_gradient_jit_diagnostics_and_analysis_smoke():
+    model, tokens, variables = _variables(seed=12)
+    params = variables["params"]
+    eager = model.apply(
+        {"params": params},
+        tokens,
+        deterministic=True,
+        rngs={"dropout": jax.random.PRNGKey(13)},
+    )
+    assert eager["logits"].shape == (1, 16, 64)
 
     def loss_fn(current):
         result = model.apply(
-            {"params": current}, tokens, labels=tokens,
-            deterministic=True, minimal_runtime_profile="diagnostics",
-            rngs={"dropout": jax.random.PRNGKey(21)})
+            {"params": current},
+            tokens,
+            labels=tokens,
+            deterministic=True,
+            minimal_runtime_profile="diagnostics",
+            rngs={"dropout": jax.random.PRNGKey(14)},
+        )
         return result["loss"], result
 
-    (loss, result), gradients = jax.value_and_grad(
+    (loss, diagnostics), gradients = jax.value_and_grad(
         loss_fn, has_aux=True)(params)
     assert bool(jnp.isfinite(loss))
-    assert all(bool(jnp.all(jnp.isfinite(value)))
-               for value in jax.tree.leaves(gradients))
+    assert all(
+        bool(jnp.all(jnp.isfinite(value)))
+        for value in jax.tree.leaves(gradients))
     required_paths = (
+        ("router", "space_route_proj", "kernel"),
+        ("router", "space_read_vectors"),
         ("router", "space_state_proj"),
         ("router", "space_state_writeback"),
-        ("router", "q_operator_query_proj", "kernel"),
-        ("neuron_pool", "operator_key_read_probe"),
-        ("neuron_pool", "operator_key_write_probe"),
-        ("neuron_pool", "qk_read_vectors"),
-        ("neuron_pool", "qk_write_vectors"),
+        ("neuron_pool", "q_read_vectors"),
+        ("neuron_pool", "q_write_vectors"),
+        ("neuron_pool", "k_read_vectors"),
+        ("neuron_pool", "k_write_vectors"),
         ("neuron_pool", "v_read_vectors"),
+        ("neuron_pool", "v_write_vectors"),
+        ("neuron_pool", "rst_read_vectors"),
         ("neuron_pool", "rst_write_vectors"),
+        ("router", "q_operator_tau_proj", "kernel"),
+        ("router", "k_operator_tau_proj", "kernel"),
+        ("router", "v_operator_tau_proj", "kernel"),
+        ("router", "rst_operator_tau_proj", "kernel"),
     )
     for path in required_paths:
-        value = gradients
-        for name in path:
-            value = value[name]
-        assert float(jnp.linalg.norm(value.astype(jnp.float32))) > 0.0, path
-    assert result["q_space_usage_max"] >= result["q_space_usage_min"]
-    optimizer = optax.adamw(1e-4)
-    state = optimizer.init(params)
-    updates, state = optimizer.update(gradients, state, params)
-    changed = optax.apply_updates(params, updates)
-    assert all(bool(jnp.all(jnp.isfinite(value)))
-               for value in jax.tree.leaves(changed))
+        gradient = _path(gradients, *path).astype(jnp.float32)
+        assert float(jnp.linalg.norm(gradient)) > 0.0, path
 
-
-def test_symbolic_count_matches_initialized_tree_and_canonical_reference():
-    _, _, variables = _variables()
-    assert v4174.symbolic_parameter_count(_model_config())["total"] == _count(
-        variables["params"])
-    canonical = yaml.safe_load(CANONICAL_CONFIG.read_text(encoding="utf-8"))
-    counts = v4174.symbolic_parameter_count(canonical["model"])
-    assert counts["total"] == 216_204_292
-    assert counts["learned_key_tables"] == 0
-    assert canonical["model"]["n_qk"] == 12_320
-    assert canonical["model"]["n_v"] == 38_832
-    assert canonical["model"]["n_rst"] == 78_496
-    for name in ("n_qk", "n_v", "n_rst"):
-        assert canonical["model"][name] % 16 == 0
-
-
-def test_active_count_matching_and_beta_calibration_formula():
-    canonical = yaml.safe_load(CANONICAL_CONFIG.read_text(encoding="utf-8"))[
-        "model"]
-    expected = {
-        "qk": 415.0,
-        "v": 784.8,
-        "rst": 528.64,
-    }
-    for pool, target in expected.items():
-        count = canonical[f"n_{pool}"]
-        fraction = canonical[f"tau_init_target_{pool}_frac"]
-        actual = (canonical["operation_space_top_k"]
-                  * (count / canonical["n_operation_spaces"]) * fraction)
-        assert actual == pytest.approx(target, rel=0, abs=1e-9)
-
-    scores = {
-        "q": jnp.linspace(-0.8, 0.9, 400).reshape(2, 10, 20),
-        "k": jnp.linspace(-0.7, 0.95, 400).reshape(2, 10, 20),
-        "v": jnp.linspace(-0.9, 0.8, 400).reshape(2, 10, 20),
-        "rst": jnp.linspace(-0.95, 0.7, 400).reshape(2, 10, 20),
-    }
-    betas = v4174.calibrate_space_kernel_betas(
-        scores, target_qk_frac=0.1, target_v_frac=0.08,
-        target_rst_frac=0.04)
-    assert set(betas) == {
-        "space_kernel_beta_qk", "space_kernel_beta_v",
-        "space_kernel_beta_rst"}
-    assert all(np.isfinite(value) and value > 0.0 for value in betas.values())
-
-
-def test_config_validation_and_fresh_checkpoint_round_trip(tmp_path: Path):
-    from scripts import train_jax
-
-    config = _model_config()
-    assert v4174.resolve_operation_space_config(config) == (4, 2)
-    materialized = v4174.materialize_operation_space_config(dict(config))
-    assert materialized["n_operation_spaces"] == 4
-    with pytest.raises(ValueError):
-        v4174.resolve_operation_space_config({"operation_space_top_k": 2})
-    with pytest.raises(ValueError):
-        v4174.materialize_operation_space_config({
-            **config, "d_model": 12})
-
-    _, _, variables = _variables()
-    payload = serialization.to_bytes(variables["params"])
-    restored = serialization.from_bytes(variables["params"], payload)
-    assert jax.tree.structure(restored) == jax.tree.structure(
-        variables["params"])
-    for expected, actual in zip(
-            jax.tree.leaves(variables["params"]), jax.tree.leaves(restored)):
-        np.testing.assert_array_equal(expected, actual)
-
-    optimizer = optax.adam(1e-3)
-    opt_state = optimizer.init(variables["params"])
-    full_config = {
-        "model": config,
-        "training": {"mesh_data": 1, "mesh_model": 1},
-    }
-    manager = train_jax._create_orbax_checkpoint_manager(
-        str(tmp_path / "checkpoints"), checkpoint_interval=1, keep_last=1)
-    try:
-        saved = train_jax.save_orbax_checkpoint(
-            manager, variables["params"], opt_state,
-            jax.random.PRNGKey(41), epoch=0, global_step=1,
-            step_in_epoch=1, steps_per_epoch=2, best_val_loss=1.0,
-            model_config=config, training_config=full_config["training"],
-            full_config=full_config, raw_config=full_config,
-            config_path="fresh-v4174.yaml", run_id="v4174-fresh-roundtrip",
-            checkpoint_kind="latest", train_loss=1.0, wait=True)
-        assert saved
-        target = train_jax._build_orbax_state(
-            variables["params"], opt_state, jax.random.PRNGKey(41),
-            epoch=0, global_step=1, step_in_epoch=1, steps_per_epoch=2,
-            best_val_loss=1.0, training_config=full_config["training"],
-            full_config=full_config, model_config=config)
-        restored_state, metadata = train_jax._restore_orbax_state(
-            manager, 1, target)
-    finally:
-        manager.close()
-
-    assert metadata["model_config"]["model_version"] == v4174.MODEL_VERSION
-    assert metadata["model_config"]["space_kernel_beta_qk"] == 9.0
-    for expected, actual in zip(
-            jax.tree.leaves(variables["params"]),
-            jax.tree.leaves(restored_state["params"])):
-        np.testing.assert_array_equal(expected, actual)
-
-
-def test_analysis_geometry_and_operator_field_outputs_are_finite():
-    model, tokens, variables = _variables()
-    result = model.apply(
-        variables, tokens, deterministic=True, analysis=True,
-        minimal_runtime_profile="diagnostics",
-        rngs={"dropout": jax.random.PRNGKey(31)})
-    assert int(result["stacked_projection_rank"]) == 16
-    assert result["space_local_state_norm"].shape == (4,)
-    assert result["qk_operator_key_covariance_effective_rank"].shape == (4,)
+    for stage in ("attention", "rst"):
+        for suffix in (
+                "gate_mass_mean", "gate_den_mean",
+                "active_count_mean", "zero_gate_frac",
+                "top1_rate", "usage_min", "usage_max", "usage_std"):
+            assert bool(jnp.isfinite(
+                diagnostics[f"{stage}_space_{suffix}"]))
     for route in ("q", "k", "v", "rst"):
-        assert bool(jnp.isfinite(result[f"{route}_kernel_sketch_pearson"]))
-        assert result[f"{route}_kernel_sketch_top1_agreement"] >= 0.95
-        assert result[f"{route}_kernel_sketch_topk_set_agreement"] >= 0.90
+        assert bool(jnp.isfinite(
+            diagnostics[f"{route}_operator_gate_mass_mean"]))
+
+    jitted = jax.jit(lambda current, ids: model.apply(
+        {"params": current},
+        ids,
+        deterministic=True,
+        rngs={"dropout": jax.random.PRNGKey(15)},
+    ))(params, tokens)
+    assert jitted["logits"].shape == (1, 16, 64)
+
+    analysis = v4174.analysis_forward(
+        params, _model_config(), tokens)
+    assert analysis["space_read_norm"].shape == (4,)
+    assert analysis["q_read_vector_covariance_effective_rank"].shape == (4,)
+    assert bool(jnp.all(jnp.isfinite(
+        analysis["space_read_pairwise_cosine"])))
 
 
-def test_model_info_states_canonical_geometry_and_dense_execution():
-    info = "\n".join(_model().get_model_info())
-    assert "D=16, M=4, R=4" in info
-    assert "same global route query" in info
-    assert "all-space dense" in info
-    assert "shared writeback" in info
+def test_symbolic_count_matches_tree_and_canonical_budget():
+    _, _, variables = _variables()
+    tiny = v4174.symbolic_parameter_count(_model_config())
+    assert tiny["total"] == _count(variables["params"])
+    assert tiny["learned_key_tables"] == 0
+    assert tiny["bilinear_probe_matrices"] == 0
+    assert tiny["operator_query_projections"] == 0
+
+    canonical = yaml.safe_load(
+        CANONICAL_CONFIG.read_text(encoding="utf-8"))["model"]
+    counts = v4174.symbolic_parameter_count(canonical)
+    assert counts["total"] == 214_502_404
+    assert canonical["n_q"] == canonical["n_k"] == 6_160
+    assert canonical["n_q"] + canonical["n_k"] == 12_320
+    for name in ("n_q", "n_k", "n_v", "n_rst"):
+        assert canonical[name] % canonical["n_operation_spaces"] == 0
 
 
-def test_trainer_diagnostics_accept_only_canonical_pool_shapes():
+def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     from scripts import train_jax
 
-    model, _, variables = _variables()
-    params = variables["params"]
-    geometry = train_jax.create_geometry_step(
-        max_sample=32, model_version=v4174.MODEL_VERSION)(params)
-    pool_diagnostics = train_jax._pool_param_diagnostics(
-        {"neuron_pool": params["neuron_pool"]}, full=True, model=model)
-    pool_grads = jax.tree.map(jnp.ones_like, params["neuron_pool"])
-    key_grad_norms = train_jax._canonical_pool_op_key_grad_norms(
-        pool_grads, v4174.MODEL_VERSION)
-    probe_grad_norms = train_jax._shared_probe_gradient_diagnostics(
-        params["neuron_pool"], pool_grads, v4174.MODEL_VERSION)
+    model_cfg = _model_config()
+    cfg = {
+        "model": model_cfg,
+        "training": {
+            "n_chunks_q": 1,
+            "n_chunks_k": 1,
+            "n_chunks_v": 1,
+            "n_chunks_rst": 1,
+            "tau_lr_mult": 0.001,
+        },
+    }
+    kwargs = train_jax._dawn_srw_kwargs(cfg)
+    assert kwargs["n_q"] == 32 and kwargs["n_k"] == 32
+    assert "n_qk" not in kwargs
+    assert "n_know" not in kwargs
+    assert "operator_key_mode" not in kwargs
+    assert "router_dropout" not in kwargs
+    built = train_jax.build_model_from_config(cfg)
+    assert isinstance(built, v4174.DAWN_SRW_V4174)
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]).reshape((1, 1)),
+        ("data", "model"),
+    )
+    sharded = train_jax.build_canonical_sharded_fns(cfg, mesh)
+    assert all(
+        name in sharded
+        for name in (
+            "q_space_dense", "k_space_dense",
+            "v_space_dense", "rst_space_dense"))
+    assert not any("qk" in name for name in sharded)
+    assert all(
+        getattr(sharded[f"{route}_space_dense"],
+                "_v4174_direct_read_matmuls") == 1
+        for route in ("q", "k", "v", "rst"))
+    sharded_source = inspect.getsource(
+        v4174._make_sharded_space_dense_direct)
+    assert sharded_source.count('"mtr,mnr->mtn"') == 1
 
+    _, tokens, variables = _variables()
+    params = variables["params"]
+    local = jax.random.normal(jax.random.PRNGKey(21), (4, 6, 4))
+    raw_tau = v4174._linear(
+        params["router"]["q_operator_tau_proj"], local)
+    direct_sharded = sharded["q_space_dense"](
+        local,
+        raw_tau,
+        jnp.ones(local.shape[:2], dtype=jnp.bool_),
+        params["neuron_pool"]["q_read_vectors"],
+        params["neuron_pool"]["q_write_vectors"],
+        0.07, 0.07, 2.0, 2.0, 0.0,
+    )
+    direct_reference = v4174._rw_compose_space_dense(
+        local,
+        params["neuron_pool"]["q_read_vectors"],
+        params["neuron_pool"]["q_write_vectors"],
+        raw_tau,
+        soft_gate_temperature=0.07,
+        soft_gate_boundary_power=2.0,
+        admission_den_power=0.5,
+        srw_composition_mode="linear_angular",
+        heat_kernel_beta=v4174.DEFAULT_HEAT_KERNEL_BETA,
+    )
+    np.testing.assert_allclose(
+        direct_sharded, direct_reference, atol=1e-5, rtol=1e-5)
+    sharded_forward = built.apply(
+        {"params": params},
+        tokens,
+        deterministic=True,
+        sharded_fns=sharded,
+        rngs={"dropout": jax.random.PRNGKey(22)},
+    )
+    assert sharded_forward["logits"].shape == (1, 16, 64)
+    diagnostics_fns = train_jax.build_canonical_sharded_fns(
+        cfg, mesh, for_eval=True,
+        kernel_profile="production_diagnostics")
+    sharded_diagnostics = built.apply(
+        {"params": params},
+        tokens,
+        labels=tokens,
+        deterministic=True,
+        sharded_fns=diagnostics_fns,
+        minimal_runtime_profile="diagnostics",
+        rngs={"dropout": jax.random.PRNGKey(23)},
+    )
+    assert bool(jnp.isfinite(
+        sharded_diagnostics["q_operator_gate_mass_mean"]))
+    assert bool(jnp.isfinite(
+        sharded_diagnostics["attention_space_gate_mass_mean"]))
+    geometry = train_jax.create_geometry_step(
+        max_sample=32,
+        model_version=v4174.MODEL_VERSION,
+    )(variables["params"])
+    pool_diagnostics = train_jax._pool_param_diagnostics(
+        {"neuron_pool": variables["params"]["neuron_pool"]},
+        full=True,
+        model=built,
+    )
     assert geometry
     assert pool_diagnostics
-    assert set(key_grad_norms) == {"attn_qk", "attn_v", "rst"}
-    assert all(bool(jnp.all(jnp.isfinite(value)))
-               for value in (*geometry.values(), *pool_diagnostics.values(),
-                             *key_grad_norms.values(),
-                             *probe_grad_norms.values()))
+    assert any(key.startswith("attn_q_read_") for key in pool_diagnostics)
+    assert any(key.startswith("attn_k_read_") for key in pool_diagnostics)
+
+
+def test_model_info_describes_only_canonical_architecture():
+    info = "\n".join(_model().get_model_info())
+    assert "D=16, M=4, R=4" in info
+    assert "explicit space read vectors" in info
+    assert "non-softmax" in info
+    assert "read vector itself is the operator key" in info
+    assert "Q/K/V/RST are fully separate" in info
+    assert "RST recomputes routing after attention" in info
+    assert "physical all-space dense" in info
+    assert "kernel sketch" not in info
+    assert "generalized" not in info

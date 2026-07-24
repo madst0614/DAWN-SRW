@@ -139,13 +139,11 @@ from models.dawn_srw_v4173 import (
 )
 from models.dawn_srw_v4174 import (
     DAWN_SRW_V4174,
-    _pool_operator_keys as _v4174_pool_operator_keys,
-    _query_geometry_diagnostics as _v4174_query_geometry_diagnostics,
+    _direct_read_geometry_diagnostics as
+        _v4174_direct_read_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4174_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4174_tau_init_calibration_scores,
     _validate_v4174_sharded_fns,
-    calibrate_space_kernel_betas as _v4174_calibrate_space_kernel_betas,
-    generalized_bilinear_operator_key_diagnostics as _v4174_operator_key_diagnostics,
     initialization_diagnostics_from_params as _v4174_initialization_diagnostics,
     materialize_operation_space_config as _materialize_v4174_operation_space_config,
     resolve_operation_space_config as _resolve_v4174_operation_space_config,
@@ -400,7 +398,7 @@ V417X_MODEL_VERSIONS = (
     V4171_MODEL_VERSION, V4172_MODEL_VERSION, V4173_MODEL_VERSION,
     V4174_MODEL_VERSION)
 GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS = (
-    V4172_MODEL_VERSION, V4173_MODEL_VERSION, V4174_MODEL_VERSION)
+    V4172_MODEL_VERSION, V4173_MODEL_VERSION)
 V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS = (
     V4169_MODEL_VERSION, V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS)
 DIRECT_STATE_QUERY_MODEL_VERSIONS = (
@@ -486,9 +484,8 @@ MODEL_REGISTRY = {
         'module': 'models.dawn_srw_v4174',
         'raw_tau_init_from_cosine_tau': _v4174_raw_tau_init_from_cosine_tau,
         'tau_init_calibration_scores': _v4174_tau_init_calibration_scores,
-        'pool_operator_keys': _v4174_pool_operator_keys,
-        'query_geometry_diagnostics': _v4174_query_geometry_diagnostics,
-        'operator_key_diagnostics': _v4174_operator_key_diagnostics,
+        'query_geometry_diagnostics':
+            _v4174_direct_read_geometry_diagnostics,
         'symbolic_parameter_count': _v4174_symbolic_parameter_count,
     },
 }
@@ -1305,27 +1302,19 @@ V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES = (
     'local_write_grad',
 )
 
-V4174_SPACE_METRIC_NAMES = tuple(
-    f'{route}_{suffix}'
-    for route in ('q', 'k', 'v', 'rst')
+V4174_SELECTOR_METRIC_NAMES = tuple(
+    f'{stage}_space_{suffix}'
+    for stage in ('attention', 'rst')
     for suffix in (
-        'dominant_space_id',
-        'space_top1_rate',
-        'space_usage_min',
-        'space_usage_max',
-        'space_usage_std',
-        'space_selected_weight_top1',
-        'space_selected_entropy',
-        'space_dead_frac',
+        'gate_mass_mean',
+        'gate_den_mean',
+        'active_count_mean',
+        'zero_gate_frac',
+        'top1_rate',
+        'usage_min',
+        'usage_max',
+        'usage_std',
     ))
-V4174_SELECTOR_METRIC_NAMES = (
-    *V4174_SPACE_METRIC_NAMES,
-    'qk_dominant_space_agreement', 'qk_topk_set_agreement',
-    'qv_dominant_space_agreement', 'qv_topk_set_agreement',
-    'v_rst_dominant_space_agreement', 'v_rst_topk_set_agreement',
-    'topk_pair_concentration',
-    'hub_excluded_second_slot_entropy',
-)
 
 V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
     'heat_kernel_beta',
@@ -1344,7 +1333,6 @@ V4174_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES,
-    *V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
 )
 V4174_COMPACT_REGULAR_JSONL_KEYS = (
@@ -1357,7 +1345,38 @@ V4173_RESUME_REQUIRED_FIELDS = (
 )
 
 V4174_RESUME_REQUIRED_FIELDS = (
-    *V4171_RESUME_REQUIRED_FIELDS,
+    ('model', 'model_version'),
+    ('model', 'd_model'),
+    ('model', 'n_layers'),
+    ('model', 'n_heads'),
+    ('model', 'max_seq_len'),
+    ('model', 'd_route'),
+    ('model', 'n_q'),
+    ('model', 'n_k'),
+    ('model', 'n_v'),
+    ('model', 'n_rst'),
+    ('model', 'n_operation_spaces'),
+    ('model', 'operation_space_top_k'),
+    ('model', 'admission_den_power'),
+    ('data', 'max_train_tokens'),
+    ('training', 'batch_size'),
+    ('training', 'num_epochs'),
+    ('training', 'mesh_model'),
+    ('training', 'mesh_data'),
+    ('training', 'gradient_accumulation_steps'),
+    ('training', 'lr'),
+    ('training', 'warmup_ratio'),
+    ('training', 'weight_decay'),
+    ('training', 'checkpoint_interval'),
+    ('training', 'val_interval'),
+    ('training', 'log_interval'),
+    ('training', 'log_analysis_multiplier'),
+    ('training', 'heavy_geometry_multiplier'),
+    ('training', 'n_chunks_q'),
+    ('training', 'n_chunks_k'),
+    ('training', 'n_chunks_v'),
+    ('training', 'n_chunks_rst'),
+    ('training', 'tau_lr_mult'),
 )
 
 V4168_OPSPACE_RESUME_REQUIRED_FIELDS = (
@@ -1571,16 +1590,6 @@ def _validate_v4171_resume_compatibility(
                 "v4174 checkpoint operation-space schema mismatch: "
                 f"requested={requested_spaces}, checkpoint={checkpoint_spaces}. "
                 "Automatic space replication or migration is disabled.")
-        for field in (
-                'space_kernel_beta_qk', 'space_kernel_beta_v',
-                'space_kernel_beta_rst'):
-            requested_value = requested_model_cfg.get(field)
-            checkpoint_value = checkpoint_model_cfg.get(field)
-            if requested_value != checkpoint_value:
-                raise RuntimeError(
-                    "v4174 checkpoint kernel-field calibration mismatch: "
-                    f"model.{field} requested={requested_value}, "
-                    f"checkpoint={checkpoint_value}")
     requested_den_powers = _v4171_checkpoint_den_powers(
         requested_model_cfg,
         missing_message=(
@@ -2072,6 +2081,8 @@ def _v4164_tau_init_config(cfg):
     """Parse and validate v4164 explicit or quantile tau init."""
     model_cfg = cfg['model']
     training_cfg = cfg['training']
+    is_v4174 = (
+        str(model_cfg.get('model_version')) == V4174_MODEL_VERSION)
 
     def _cfg_get(name, default=None):
         if name in model_cfg:
@@ -2088,6 +2099,19 @@ def _v4164_tau_init_config(cfg):
 
     parsed = {'mode': mode}
     if mode == 'explicit':
+        if is_v4174:
+            explicit = {
+                'q': _cfg_get('tau_init_attn_q', None),
+                'k': _cfg_get('tau_init_attn_k', None),
+                'v': _cfg_get('tau_init_attn_v', None),
+                'rst': _cfg_get('tau_init_rst', None),
+            }
+            if any(value is None for value in explicit.values()):
+                raise ValueError(
+                    "v4174 requires explicit cosine-space "
+                    "tau_init_attn_q/k/v/rst.")
+            parsed['explicit'] = explicit
+            return parsed
         explicit = {
             'qk': _cfg_get('tau_init_attn_qk', None),
             'v': _cfg_get('tau_init_attn_v', None),
@@ -3070,23 +3094,24 @@ def _validate_v4171_model_config(model_cfg):
             den_power,
             model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
             context=f"{version} model config"))
-    expected_mode = (
-        OPERATOR_KEY_MODE_LEARNED
-        if version == V4171_MODEL_VERSION
-        else OPERATOR_KEY_MODE_GENERALIZED_BILINEAR)
-    mode = model_cfg.get('operator_key_mode', expected_mode)
-    if mode != expected_mode:
-        raise ValueError(
-            f"{version} requires model.operator_key_mode={expected_mode!r}, "
-            f"got {mode!r}")
-    query_mode = model_cfg.get(
-        'operator_query_mode', 'direct_state_projection')
-    if query_mode != 'direct_state_projection':
-        raise ValueError(
-            f"{version} requires model.operator_query_mode="
-            f"direct_state_projection, got {query_mode!r}")
-    model_cfg['operator_key_mode'] = mode
-    model_cfg['operator_query_mode'] = query_mode
+    if version != V4174_MODEL_VERSION:
+        expected_mode = (
+            OPERATOR_KEY_MODE_LEARNED
+            if version == V4171_MODEL_VERSION
+            else OPERATOR_KEY_MODE_GENERALIZED_BILINEAR)
+        mode = model_cfg.get('operator_key_mode', expected_mode)
+        if mode != expected_mode:
+            raise ValueError(
+                f"{version} requires model.operator_key_mode={expected_mode!r}, "
+                f"got {mode!r}")
+        query_mode = model_cfg.get(
+            'operator_query_mode', 'direct_state_projection')
+        if query_mode != 'direct_state_projection':
+            raise ValueError(
+                f"{version} requires model.operator_query_mode="
+                f"direct_state_projection, got {query_mode!r}")
+        model_cfg['operator_key_mode'] = mode
+        model_cfg['operator_query_mode'] = query_mode
     model_cfg['admission_den_power'] = den_power_value
     model_cfg['admission_den_power_qk'] = den_power_qk
     model_cfg['admission_den_power_v'] = den_power_v
@@ -3261,6 +3286,9 @@ def _v4170_compact_train_metrics(
             metrics.update({
                 key: result[key] for key in present_space_metrics})
         if str(model_version) == V4174_MODEL_VERSION:
+            metrics.update({
+                key: result[key]
+                for key in V4174_COMPOSITION_REGULAR_METRIC_NAMES})
             present_space_metrics = tuple(
                 key for key in V4174_SELECTOR_METRIC_NAMES if key in result)
             if present_space_metrics and len(present_space_metrics) != len(
@@ -3332,10 +3360,28 @@ def _dawn_srw_kwargs(cfg):
         _validate_v4170_model_config(m)
     if _is_v417x_version(version):
         _validate_v4171_model_config(m)
-    if 'n_rst' not in m and 'n_know' not in m:
-        raise ValueError("v4164 requires model.n_rst or model.n_know checkpoint alias.")
-    kw['n_rst'] = m.get('n_rst', m.get('n_know'))
-    kw['n_know'] = m.get('n_know', None)
+    if str(version) == V4174_MODEL_VERSION:
+        for removed_name in (
+                'n_qk', 'n_know', 'router_dropout',
+                'n_chunks_know', 'n_chunks_qk'):
+            kw.pop(removed_name, None)
+        kw.update({
+            'n_q': m['n_q'],
+            'n_k': m['n_k'],
+            'n_v': m['n_v'],
+            'n_chunks_q': t.get('n_chunks_q', 1),
+            'n_chunks_k': t.get('n_chunks_k', 1),
+        })
+    if str(version) == V4174_MODEL_VERSION:
+        if 'n_rst' not in m:
+            raise ValueError("v4174 requires model.n_rst")
+        kw['n_rst'] = m['n_rst']
+    else:
+        if 'n_rst' not in m and 'n_know' not in m:
+            raise ValueError(
+                "v4164 requires model.n_rst or model.n_know checkpoint alias.")
+        kw['n_rst'] = m.get('n_rst', m.get('n_know'))
+        kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
     opspace_cfg = t.get('operation_space', {})
     operation_space_tau_free_enabled = (
@@ -3350,9 +3396,15 @@ def _dawn_srw_kwargs(cfg):
     else:
         tau_init_cfg = _v4164_tau_init_config(cfg)
         if tau_init_cfg['mode'] == 'explicit':
-            kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
-            kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
-            kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
+            if str(version) == V4174_MODEL_VERSION:
+                kw['tau_init_attn_q'] = tau_init_cfg['explicit']['q']
+                kw['tau_init_attn_k'] = tau_init_cfg['explicit']['k']
+                kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
+                kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
+            else:
+                kw['tau_init_attn_qk'] = tau_init_cfg['explicit']['qk']
+                kw['tau_init_attn_v'] = tau_init_cfg['explicit']['v']
+                kw['tau_init_rst'] = tau_init_cfg['explicit']['rst']
         else:
             fixed_tau_values = {
                 'tau_init_attn_qk': t.get(
@@ -3372,6 +3424,13 @@ def _dawn_srw_kwargs(cfg):
                     and all(value is not None
                             for value in fixed_tau_values.values())):
                 kw.update(fixed_tau_values)
+            elif str(version) == V4174_MODEL_VERSION:
+                # Fresh quantile calibration overwrites all four biases before
+                # optimizer initialization.
+                kw['tau_init_attn_q'] = 0.0
+                kw['tau_init_attn_k'] = 0.0
+                kw['tau_init_attn_v'] = 0.0
+                kw['tau_init_rst'] = 0.0
             else:
                 # Fresh quantile starts overwrite these before optimizer init.
                 kw['tau_init_attn_qk'] = 0.0
@@ -3391,7 +3450,6 @@ def _dawn_srw_kwargs(cfg):
         })
     if _is_v417x_version(version):
         kw.update({
-            'operator_key_mode': m['operator_key_mode'],
             'admission_den_power': m['admission_den_power'],
             'admission_den_power_qk': m['admission_den_power_qk'],
             'admission_den_power_v': m['admission_den_power_v'],
@@ -3400,6 +3458,8 @@ def _dawn_srw_kwargs(cfg):
             'heat_kernel_beta': m.get(
                 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
         })
+        if str(version) != V4174_MODEL_VERSION:
+            kw['operator_key_mode'] = m['operator_key_mode']
     if str(version) == V4173_MODEL_VERSION:
         kw.update({
             'n_operation_spaces': m['n_operation_spaces'],
@@ -3409,9 +3469,6 @@ def _dawn_srw_kwargs(cfg):
         kw.update({
             'n_operation_spaces': m['n_operation_spaces'],
             'operation_space_top_k': m['operation_space_top_k'],
-            'space_kernel_beta_qk': m['space_kernel_beta_qk'],
-            'space_kernel_beta_v': m['space_kernel_beta_v'],
-            'space_kernel_beta_rst': m['space_kernel_beta_rst'],
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -3535,8 +3592,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
             'norm2': params['block_0']['norm2'],
         },
         'router': ({
-            name: value for name, value in params['router'].items()
-            if name.endswith('_operator_query_proj')
+            'space_state_proj': params['router']['space_state_proj'],
         } if str(version) == V4174_MODEL_VERSION else {
             'proj_attn': params['router']['proj_attn'],
             'proj_rst': params['router']['proj_rst'],
@@ -5988,26 +6044,26 @@ def _canonical_pool_schema(model_version):
     """Return version-specific parameter keys under canonical pool identities."""
     if str(model_version) == V4174_MODEL_VERSION:
         return {
-            'qk': {
-                'metric_prefix': 'attn_qk',
-                'read': 'qk_read_vectors',
-                'write': 'qk_write_vectors',
-                'operator_keys': 'qk_operator_keys',
+            'q': {
+                'metric_prefix': 'attn_q',
+                'read': 'q_read_vectors',
+                'write': 'q_write_vectors',
+            },
+            'k': {
+                'metric_prefix': 'attn_k',
+                'read': 'k_read_vectors',
+                'write': 'k_write_vectors',
             },
             'v': {
                 'metric_prefix': 'attn_v',
                 'read': 'v_read_vectors',
                 'write': 'v_write_vectors',
-                'operator_keys': 'v_operator_keys',
             },
             'rst': {
                 'metric_prefix': 'rst',
                 'read': 'rst_read_vectors',
                 'write': 'rst_write_vectors',
-                'operator_keys': 'rst_operator_keys',
             },
-            'read_probe': 'operator_key_read_probe',
-            'write_probe': 'operator_key_write_probe',
         }
     return {
         'qk': {
@@ -6042,6 +6098,19 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     if model_version is None and model_cfg is not None:
         model_version = model_cfg.get('model_version')
     pool_schema = _canonical_pool_schema(model_version)
+    if str(model_version) == V4174_MODEL_VERSION:
+        for route in ('q', 'k', 'v', 'rst'):
+            schema = pool_schema[route]
+            read = pool[schema['read']]
+            write = pool[schema['write']]
+            prefix = schema['metric_prefix']
+            out.update(_row_norm_stats(
+                read, f'{prefix}_read_norm', full))
+            out.update(_row_norm_stats(
+                write, f'{prefix}_write_norm', full))
+            out.update(_op_gain_stats(
+                read, write, f'{prefix}_op_gain', full))
+        return out
     v4170_op_keys = (
         _v4170_pool_operator_keys(pool)
         if str(model_version) == V4170_MODEL_VERSION else None)
@@ -6209,12 +6278,17 @@ def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
                 pool_schema['qk'], pool_schema['v'], pool_schema['rst'])
         }
     if str(model_version) == V4174_MODEL_VERSION:
+        schema = _canonical_pool_schema(model_version)
+        def _route_norm(route):
+            return jnp.sqrt(
+                jnp.square(_norm(schema[route]['read']))
+                + jnp.square(_norm(schema[route]['write'])))
         return {
-            entry['metric_prefix']: jnp.sqrt(
-                jnp.square(_norm(entry['read']))
-                + jnp.square(_norm(entry['write'])))
-            for entry in (
-                pool_schema['qk'], pool_schema['v'], pool_schema['rst'])
+            'attn_qk': jnp.sqrt(
+                jnp.square(_route_norm('q'))
+                + jnp.square(_route_norm('k'))),
+            'attn_v': _route_norm('v'),
+            'rst': _route_norm('rst'),
         }
     if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
         shared_probe_metrics = _shared_probe_gradient_diagnostics(
@@ -7496,9 +7570,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
                     names = (
-                        'q_operator_query_proj', 'k_operator_query_proj',
-                        'v_operator_query_proj', 'space_state_proj',
-                        'space_state_writeback')
+                        'space_route_proj', 'space_read_vectors',
+                        'space_state_proj', 'space_state_writeback')
                     return any(f'router/{name}' in ps for name in names)
                 return (('router/proj_attn' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
@@ -7513,8 +7586,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
                     names = (
-                        'rst_operator_query_proj', 'space_state_proj',
-                        'space_state_writeback')
+                        'space_route_proj', 'space_read_vectors',
+                        'space_state_proj', 'space_state_writeback')
                     return any(f'router/{name}' in ps for name in names)
                 return (('router/proj_rst' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
@@ -7529,6 +7602,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/attn_qk_op_key' in ps)
                     or ('neuron_pool/attn_qk_op_read_proj' in ps)
                     or ('neuron_pool/attn_qk_op_write_proj' in ps)
+                    or ('neuron_pool/q_read_vectors' in ps)
+                    or ('neuron_pool/q_write_vectors' in ps)
+                    or ('neuron_pool/k_read_vectors' in ps)
+                    or ('neuron_pool/k_write_vectors' in ps)
                     or ('neuron_pool/qk_read_vectors' in ps)
                     or ('neuron_pool/qk_write_vectors' in ps))
 
@@ -8008,14 +8085,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 grad_router_proj_attn = jnp.sqrt(sum(
                     jnp.square(_child_norm(_grouter, name))
                     for name in (
-                        'q_operator_query_proj', 'k_operator_query_proj',
-                        'v_operator_query_proj', 'space_state_proj',
-                        'space_state_writeback')))
+                        'space_route_proj', 'space_read_vectors',
+                        'space_state_proj', 'space_state_writeback')))
                 grad_router_proj_rst = jnp.sqrt(sum(
                     jnp.square(_child_norm(_grouter, name))
                     for name in (
-                        'rst_operator_query_proj', 'space_state_proj',
-                        'space_state_writeback')))
+                        'space_route_proj', 'space_read_vectors',
+                        'space_state_proj', 'space_state_writeback')))
             if str(_model_version) == V4173_MODEL_VERSION:
                 grad_router_proj_attn = jnp.sqrt(
                     jnp.square(grad_router_proj_attn)
@@ -8049,20 +8125,38 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
         grad_pool_attn_qk_op_key = _pool_op_key_grad_norms['attn_qk']
-        grad_pool_attn_qk_read = _pool_partition_norm(
-            _gpool, 'attn_qk', 'read')
-        grad_pool_attn_qk_write = _pool_partition_norm(
-            _gpool, 'attn_qk', 'write')
         grad_pool_attn_v_emb = _child_norm(_gpool, 'attn_v_emb')
         grad_pool_attn_v_op_key = _pool_op_key_grad_norms['attn_v']
-        grad_pool_attn_v_read = _pool_partition_norm(
-            _gpool, 'attn_v', 'read')
-        grad_pool_attn_v_write = _pool_partition_norm(
-            _gpool, 'attn_v', 'write')
         grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
         grad_pool_rst_op_key = _pool_op_key_grad_norms['rst']
-        grad_pool_rst_read = _pool_partition_norm(_gpool, 'rst', 'read')
-        grad_pool_rst_write = _pool_partition_norm(_gpool, 'rst', 'write')
+        if str(_model_version) == V4174_MODEL_VERSION:
+            grad_pool_attn_qk_read = jnp.sqrt(
+                jnp.square(_child_norm(_gpool, 'q_read_vectors'))
+                + jnp.square(_child_norm(_gpool, 'k_read_vectors')))
+            grad_pool_attn_qk_write = jnp.sqrt(
+                jnp.square(_child_norm(_gpool, 'q_write_vectors'))
+                + jnp.square(_child_norm(_gpool, 'k_write_vectors')))
+            grad_pool_attn_v_read = _child_norm(
+                _gpool, 'v_read_vectors')
+            grad_pool_attn_v_write = _child_norm(
+                _gpool, 'v_write_vectors')
+            grad_pool_rst_read = _child_norm(
+                _gpool, 'rst_read_vectors')
+            grad_pool_rst_write = _child_norm(
+                _gpool, 'rst_write_vectors')
+        else:
+            grad_pool_attn_qk_read = _pool_partition_norm(
+                _gpool, 'attn_qk', 'read')
+            grad_pool_attn_qk_write = _pool_partition_norm(
+                _gpool, 'attn_qk', 'write')
+            grad_pool_attn_v_read = _pool_partition_norm(
+                _gpool, 'attn_v', 'read')
+            grad_pool_attn_v_write = _pool_partition_norm(
+                _gpool, 'attn_v', 'write')
+            grad_pool_rst_read = _pool_partition_norm(
+                _gpool, 'rst', 'read')
+            grad_pool_rst_write = _pool_partition_norm(
+                _gpool, 'rst', 'write')
         if False:
             grad_token_emb = _tree_norm(_path_tree(grads, 'token_emb'))
             grad_pos_emb = _tree_norm(_path_tree(grads, 'pos_emb'))
@@ -8211,17 +8305,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _cur_qk = _v4170_keys['attn_qk_op_key']
                 _cur_v = _v4170_keys['attn_v_op_key']
                 _cur_rst = _v4170_keys['rst_op_key']
+            elif str(_model_version) == V4174_MODEL_VERSION:
+                _cur_qk = jnp.concatenate((
+                    _drift_unit(_pool['q_read_vectors']).reshape(
+                        (-1, _pool['q_read_vectors'].shape[-1])),
+                    _drift_unit(_pool['k_read_vectors']).reshape(
+                        (-1, _pool['k_read_vectors'].shape[-1]))), axis=0)
+                _cur_v = _drift_unit(_pool['v_read_vectors'])
+                _cur_rst = _drift_unit(_pool['rst_read_vectors'])
             elif _is_v417x_version(_model_version):
                 _v417x_keys = _pool_operator_keys_for_version(
                     _model_version)(_pool)
-                if str(_model_version) == V4174_MODEL_VERSION:
-                    _cur_qk = _v417x_keys['qk_operator_keys']
-                    _cur_v = _v417x_keys['v_operator_keys']
-                    _cur_rst = _v417x_keys['rst_operator_keys']
-                else:
-                    _cur_qk = _v417x_keys['attn_qk_op_key']
-                    _cur_v = _v417x_keys['attn_v_op_key']
-                    _cur_rst = _v417x_keys['rst_op_key']
+                _cur_qk = _v417x_keys['attn_qk_op_key']
+                _cur_v = _v417x_keys['attn_v_op_key']
+                _cur_rst = _v417x_keys['rst_op_key']
             elif ('attn_qk_read_global' in _pool
                     or 'attn_qk_read_shared' in _pool):
                 def _flat_partitioned_op_key(prefix):
@@ -10075,20 +10172,17 @@ def create_geometry_step(max_sample=512, model_version=None):
             if str(model_version) == V4170_MODEL_VERSION else None)
         v417x_keys = (
             _pool_operator_keys_for_version(model_version)(pool)
-            if _is_v417x_version(model_version) else None)
+            if (_is_v417x_version(model_version)
+                and str(model_version) != V4174_MODEL_VERSION)
+            else None)
         if str(model_version) == V4174_MODEL_VERSION:
             pool_schema = _canonical_pool_schema(model_version)
-            for route, name in (('qk', 'attn_qk'), ('v', 'attn_v'),
-                                ('rst', 'rst')):
+            for route, name in (
+                    ('q', 'attn_q'), ('k', 'attn_k'),
+                    ('v', 'attn_v'), ('rst', 'rst')):
                 schema = pool_schema[route]
-                operator_keys = v417x_keys[schema['operator_keys']]
-                operator_rows = operator_keys.reshape(
-                    (-1, operator_keys.shape[-1]))
                 read_vectors = pool[schema['read']]
                 write_vectors = pool[schema['write']]
-                out.update(_v417x_operator_key_geometry(
-                    operator_rows, name, learned_embedding=False))
-                out.update(_geom_one(operator_rows, f'{name}_op_key'))
                 out.update(_geom_one(
                     read_vectors.reshape((-1, read_vectors.shape[-1])),
                     f'{name}_read'))
@@ -10267,9 +10361,8 @@ def get_param_shardings(params, mesh, model_version=None,
             else:
                 return replicated
         if version == V4174_MODEL_VERSION and path_str.startswith('router/'):
-            # Space keys/query projections and space-local projection or
-            # writeback matrices are intentionally replicated.  This explicit
-            # branch prevents accidental reliance on the default policy.
+            # Explicit space reads, the shared D->R routing projection, and
+            # the P_m/U_m coordinate system are intentionally replicated.
             return replicated
         return replicated
 
@@ -13942,22 +14035,20 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
             f"std={float(rec['space_usage_std']):.3f}] "
             f"dead={float(rec['space_dead_frac']):.3f}")
     if (str(ctx.get('model_version')) == V4174_MODEL_VERSION
-            and all(name in rec for name in V4174_SPACE_METRIC_NAMES)):
-        def _space_route(route, label):
+            and all(name in rec for name in V4174_SELECTOR_METRIC_NAMES)):
+        def _space_stage(stage, label):
             return (
-                f"{label}[top1={float(rec[f'{route}_space_top1_usage_max']):.3f} "
-                f"w1={float(rec[f'{route}_space_weight_top1_mean']):.3f} "
-                f"H={float(rec[f'{route}_space_weight_entropy_mean']):.3f} "
-                f"use={float(rec[f'{route}_space_usage_min']):.3f}/"
-                f"{float(rec[f'{route}_space_usage_max']):.3f}"
-                f"±{float(rec[f'{route}_space_usage_std']):.3f} "
-                f"dead={float(rec[f'{route}_space_dead_frac']):.3f}]")
+                f"{label}[mass={float(rec[f'{stage}_space_gate_mass_mean']):.3f} "
+                f"den={float(rec[f'{stage}_space_gate_den_mean']):.3f} "
+                f"active={float(rec[f'{stage}_space_active_count_mean']):.3f} "
+                f"zero={float(rec[f'{stage}_space_zero_gate_frac']):.3f} "
+                f"top1={float(rec[f'{stage}_space_top1_rate']):.3f} "
+                f"use={float(rec[f'{stage}_space_usage_min']):.3f}/"
+                f"{float(rec[f'{stage}_space_usage_max']):.3f}"
+                f"±{float(rec[f'{stage}_space_usage_std']):.3f}]")
         log_message(
-            "  space " + _space_route('q', 'q') + " "
-            + _space_route('k', 'k'))
-        log_message(
-            "        " + _space_route('v', 'v') + " "
-            + _space_route('rst', 'r'))
+            "  space " + _space_stage('attention', 'attn') + " "
+            + _space_stage('rst', 'rst'))
     if str(ctx.get('model_version')) in (
             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
         log_message(
@@ -15466,6 +15557,8 @@ def create_canonical_optimizer(params, training_cfg, total_optimizer_steps,
         'attn_qk_emb', 'attn_v_emb', 'rst_emb',
         'attn_qk_op_key', 'attn_v_op_key', 'rst_op_key',
         'rw_key_read_probe', 'rw_key_write_probe',
+        'q_read_vectors', 'q_write_vectors',
+        'k_read_vectors', 'k_write_vectors',
         'qk_read_vectors', 'qk_write_vectors',
         'v_read_vectors', 'v_write_vectors',
         'rst_read_vectors', 'rst_write_vectors',
@@ -15594,13 +15687,21 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             f"{version} registry resolved the wrong sharded factory module: "
             f"module={entry['module']!r}, "
             f"module_version={getattr(module, 'MODEL_VERSION', None)!r}")
-    single_factory = module.make_sharded_srw
-    paired_factory = getattr(module, 'make_sharded_srw_paired', None)
-    if paired_factory is None:
+    single_factory = (
+        None if version == V4174_MODEL_VERSION
+        else module.make_sharded_srw)
+    paired_factory = (
+        None if version == V4174_MODEL_VERSION
+        else getattr(module, 'make_sharded_srw_paired', None))
+    if paired_factory is None and version != V4174_MODEL_VERSION:
         raise RuntimeError(
             f"{version} module is missing make_sharded_srw_paired")
     n_operation_spaces = int(model_cfg.get('n_operation_spaces', 1))
-    for key in ('n_qk', 'n_v', 'n_rst'):
+    pool_count_keys = (
+        ('n_q', 'n_k', 'n_v', 'n_rst')
+        if version == V4174_MODEL_VERSION
+        else ('n_qk', 'n_v', 'n_rst'))
+    for key in pool_count_keys:
         value = int(model_cfg.get(key, model_cfg.get('n_know', 0)))
         divisor = (
             mesh_model * n_operation_spaces
@@ -15613,23 +15714,28 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                 f"model.{key}={value} must be positive and divisible by "
                 f"{divisor} (mesh_model={mesh_model}, "
                 f"n_operation_spaces={n_operation_spaces})")
-    local_counts = {
-        'qk': int(model_cfg['n_qk']) // (
-            mesh_model * n_operation_spaces
-            if version == V4174_MODEL_VERSION else mesh_model),
-        'v': int(model_cfg['n_v']) // (
-            mesh_model * n_operation_spaces
-            if version == V4174_MODEL_VERSION else mesh_model),
-        'rst': int(model_cfg.get(
-            'n_rst', model_cfg.get('n_know'))) // (
-                mesh_model * n_operation_spaces),
-    }
+    if version == V4174_MODEL_VERSION:
+        local_counts = {
+            pool: int(model_cfg[f'n_{pool}']) // (
+                mesh_model * n_operation_spaces)
+            for pool in ('q', 'k', 'v', 'rst')}
+    else:
+        local_counts = {
+            'qk': int(model_cfg['n_qk']) // mesh_model,
+            'v': int(model_cfg['n_v']) // mesh_model,
+            'rst': int(model_cfg.get(
+                'n_rst', model_cfg.get('n_know'))) // (
+                    mesh_model * n_operation_spaces),
+        }
+    chunk_pools = (
+        ('q', 'k', 'v', 'rst')
+        if version == V4174_MODEL_VERSION else ('qk', 'v', 'rst'))
     chunks = {
         pool: max(1, math.ceil(
             local_counts[pool] / max(1, int(training_cfg.get(
                 f'n_chunks_{pool}',
                 training_cfg.get('n_chunks_know', 1))))))
-        for pool in ('qk', 'v', 'rst')
+        for pool in chunk_pools
     }
     base_kwargs = {'mesh': mesh, **_v4164_sharded_kwargs(cfg)}
     if analysis and 'analysis' in inspect.signature(
@@ -15646,24 +15752,28 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
     if training_cfg.get('max_chunk_size') is not None:
         chunks = {
             pool: int(training_cfg['max_chunk_size'])
-            for pool in ('qk', 'v', 'rst')
+            for pool in chunk_pools
         }
-    single_v = single_factory(
-        max_chunk_size=chunks['v'],
-        **_factory_supported_kwargs(single_factory, pool_kwargs('v')))
-    single_rst = single_factory(
-        max_chunk_size=chunks['rst'],
-        **_factory_supported_kwargs(single_factory, pool_kwargs('rst')))
-    paired_qk = paired_factory(
-        max_chunk_size=chunks['qk'],
-        **_factory_supported_kwargs(paired_factory, pool_kwargs('qk')))
-    sharded = {
-        'single': single_v,
-        'attn_v_single': single_v,
-        'rst_single': single_rst,
-        'paired': paired_qk,
-        'attn_qk_paired': paired_qk,
-    }
+    if version == V4174_MODEL_VERSION:
+        sharded = {}
+    else:
+        single_v = single_factory(
+            max_chunk_size=chunks['v'],
+            **_factory_supported_kwargs(single_factory, pool_kwargs('v')))
+        single_rst = single_factory(
+            max_chunk_size=chunks['rst'],
+            **_factory_supported_kwargs(single_factory, pool_kwargs('rst')))
+        paired_qk = paired_factory(
+            max_chunk_size=chunks['qk'],
+            **_factory_supported_kwargs(
+                paired_factory, pool_kwargs('qk')))
+        sharded = {
+            'single': single_v,
+            'attn_v_single': single_v,
+            'rst_single': single_rst,
+            'paired': paired_qk,
+            'attn_qk_paired': paired_qk,
+        }
     minimal_factory_names = {
         'production': (
             'make_sharded_srw_minimal',
@@ -15682,16 +15792,22 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             'make_sharded_srw_paired_trajectory_minimal'),
     }
     single_min_name, paired_min_name = minimal_factory_names[kernel_profile]
-    single_min = getattr(module, single_min_name, None)
+    single_min = (
+        None if version == V4174_MODEL_VERSION
+        else getattr(module, single_min_name, None))
     if single_min is not None:
-        for pool, name in (
-                ('qk', 'attn_qk_single_minimal'),
-                ('v', 'attn_v_single_minimal'),
-                ('rst', 'rst_single_minimal')):
+        minimal_pools = (
+            ('qk', 'attn_qk_single_minimal'),
+            ('v', 'attn_v_single_minimal'),
+            ('rst', 'rst_single_minimal'))
+        for pool, name in minimal_pools:
             sharded[name] = single_min(
                 max_chunk_size=chunks[pool],
-                **_factory_supported_kwargs(single_min, pool_kwargs(pool)))
-    paired_min = getattr(module, paired_min_name, None)
+                **_factory_supported_kwargs(
+                    single_min, pool_kwargs(pool)))
+    paired_min = (
+        None if version == V4174_MODEL_VERSION
+        else getattr(module, paired_min_name, None))
     if paired_min is not None:
         sharded['attn_qk_paired_minimal'] = paired_min(
             max_chunk_size=chunks['qk'],
@@ -15713,32 +15829,24 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             max_chunk_size=chunks['rst'],
             **_factory_supported_kwargs(
                 dense_factory, pool_kwargs('rst')))
-    if version == V4174_MODEL_VERSION and n_operation_spaces > 1:
+    if version == V4174_MODEL_VERSION:
         dense_factory_name = (
             'make_sharded_space_dense_diagnostics'
-            if kernel_profile == 'production_diagnostics'
+            if (kernel_profile == 'production_diagnostics' or analysis)
             else 'make_sharded_space_dense_minimal')
-        paired_space_factory_name = (
-            'make_sharded_qk_space_dense_diagnostics'
-            if kernel_profile == 'production_diagnostics'
-            else 'make_sharded_qk_space_dense_minimal')
         dense_factory = getattr(module, dense_factory_name, None)
-        paired_space_factory = getattr(
-            module, paired_space_factory_name, None)
-        if dense_factory is None or paired_space_factory is None:
+        if dense_factory is None:
             raise RuntimeError(
                 "v4174 multi-space config requires "
-                f"{dense_factory_name} and {paired_space_factory_name}")
-        sharded['qk_space_dense'] = paired_space_factory(
-            max_chunk_size=chunks['qk'],
-            **_factory_supported_kwargs(
-                paired_space_factory, pool_kwargs('qk')))
+                f"{dense_factory_name}")
         for pool, route_key in (
+                ('q', 'q_space_dense'), ('k', 'k_space_dense'),
                 ('v', 'v_space_dense'), ('rst', 'rst_space_dense')):
             sharded[route_key] = dense_factory(
                 max_chunk_size=chunks[pool],
                 **_factory_supported_kwargs(
-                    dense_factory, pool_kwargs(pool)))
+                    dense_factory,
+                    pool_kwargs('qk' if pool in ('q', 'k') else pool)))
     if (version == V4173_MODEL_VERSION
             and kernel_profile == 'trajectory'):
         sharded['attn_qk_paired_trajectory_minimal'] = sharded[
@@ -15748,7 +15856,8 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
         sharded['rst_single_trajectory_minimal'] = sharded[
             'rst_single_minimal']
     if _is_v417x_version(version):
-        if single_min is None or paired_min is None:
+        if (version != V4174_MODEL_VERSION
+                and (single_min is None or paired_min is None)):
             raise RuntimeError(
                 f"{version} is missing factories for static kernel profile "
                 f"{kernel_profile!r}")
@@ -18135,28 +18244,45 @@ def main():
             for label, key in breakdown_labels:
                 print(f"  {label}: {symbolic_counts[key]:,}")
 
-            reference_cfg = deepcopy(cfg['model'])
-            reference_cfg.update({
-                'operator_key_mode': OPERATOR_KEY_MODE_LEARNED,
-            })
-            official_400m_shape = (
-                int(reference_cfg.get('d_model', 0)) == 2304
-                and int(reference_cfg.get('d_route', 0)) == 256
-                and int(reference_cfg.get('n_layers', 0)) == 18
-                and int(reference_cfg.get('n_heads', 0)) == 36
-                and int(reference_cfg.get('max_seq_len', 0)) == 512
-                and int(reference_cfg.get(
-                    'logical_vocab_size', reference_cfg.get(
-                        'vocab_size', 0))) == 30522)
-            if official_400m_shape:
+            if str(model_version_cfg) == V4174_MODEL_VERSION:
+                official_400m_shape = False
+                d_model = int(cfg['model']['d_model'])
+                d_route = int(cfg['model']['d_route'])
+                n_spaces = int(cfg['model']['n_operation_spaces'])
+                removed_architecture_delta = (
+                    3 * d_model * d_route
+                    + 2 * d_route * d_route
+                    - n_spaces * d_route)
+                v4171_reference_total = (
+                    int(symbolic_counts['total'])
+                    + removed_architecture_delta)
+            else:
+                reference_cfg = deepcopy(cfg['model'])
                 reference_cfg.update({
-                    'n_qk': 3798,
-                    'n_v': 11824,
-                    'n_rst': 30474,
+                    'operator_key_mode': OPERATOR_KEY_MODE_LEARNED,
                 })
-            v4171_reference_total = _v417x_symbolic_parameter_count(
-                reference_cfg)['total']
-            print(f"Operator key mode: {cfg['model']['operator_key_mode']}")
+                official_400m_shape = (
+                    int(reference_cfg.get('d_model', 0)) == 2304
+                    and int(reference_cfg.get('d_route', 0)) == 256
+                    and int(reference_cfg.get('n_layers', 0)) == 18
+                    and int(reference_cfg.get('n_heads', 0)) == 36
+                    and int(reference_cfg.get('max_seq_len', 0)) == 512
+                    and int(reference_cfg.get(
+                        'logical_vocab_size', reference_cfg.get(
+                            'vocab_size', 0))) == 30522)
+                if official_400m_shape:
+                    reference_cfg.update({
+                        'n_qk': 3798,
+                        'n_v': 11824,
+                        'n_rst': 30474,
+                    })
+                v4171_reference_total = _v417x_symbolic_parameter_count(
+                    reference_cfg)['total']
+            print(
+                "Operator key mode: "
+                + ("direct_normalized_read_vector"
+                   if str(model_version_cfg) == V4174_MODEL_VERSION
+                   else str(cfg['model']['operator_key_mode'])))
             print("Operator key probe scope: "
                   + ("shared_across_qk_v_rst"
                      if str(model_version_cfg)
@@ -18181,8 +18307,13 @@ def main():
                 ("Abstract target params: " if _has_resume_checkpoint
                  else "Actual initialized params: ")
                 + str(n_params))
-            print("Parameter-match delta vs v4171: "
-                  f"{int(symbolic_counts['total']) - int(v4171_reference_total)}")
+            print(
+                ("Parameter delta vs removed v4174 operator-field: "
+                 if str(model_version_cfg) == V4174_MODEL_VERSION
+                 else "Parameter-match delta vs v4171: ")
+                + str(
+                    int(symbolic_counts['total'])
+                    - int(v4171_reference_total)))
             if (str(model_version_cfg) == V4172_MODEL_VERSION
                     and official_400m_shape):
                 expected_reference_parameters = 393_804_804
@@ -18931,44 +19062,6 @@ def main():
             for _line in _v4164_tau_init_summary_lines(tau_init_summary):
                 print(_line, flush=True)
 
-    space_kernel_beta_summary = None
-    if (str(model_version_cfg) == V4174_MODEL_VERSION
-            and not _has_resume_checkpoint):
-        if len(train_loader) <= 0:
-            raise ValueError(
-                "v4174 space-kernel calibration requires one training batch")
-        _space_beta_json = None
-        if is_host0:
-            calibration_input_ids, _ = next(iter(train_loader))
-            score_tables = _v4174_tau_init_calibration_scores(
-                params, calibration_input_ids, max_tokens=128)
-            space_kernel_beta_summary = _v4174_calibrate_space_kernel_betas(
-                score_tables,
-                target_qk_frac=float(
-                    cfg['model']['tau_init_target_qk_frac']),
-                target_v_frac=float(
-                    cfg['model']['tau_init_target_v_frac']),
-                target_rst_frac=float(
-                    cfg['model']['tau_init_target_rst_frac']))
-            _space_beta_json = json.dumps(
-                space_kernel_beta_summary,
-                ensure_ascii=False, separators=(',', ':'))
-        _space_beta_json = _broadcast_str_from_host0(
-            _space_beta_json, max_len=4096)
-        if not _space_beta_json:
-            raise RuntimeError("Failed to broadcast v4174 kernel beta payload")
-        space_kernel_beta_summary = json.loads(_space_beta_json)
-        cfg['model'].update({
-            key: float(value)
-            for key, value in space_kernel_beta_summary.items()})
-        model = build_model_from_config(cfg)
-        if is_host0:
-            print("\n=== Operation-space kernel beta calibration ===", flush=True)
-            for key in sorted(space_kernel_beta_summary):
-                print(
-                    f"  {key}: {float(space_kernel_beta_summary[key]):.8g}",
-                    flush=True)
-
     raw_config_snapshot = _safe_config_snapshot(raw_cfg_snapshot)
     if _has_resume_checkpoint:
         full_config_snapshot = _safe_config_snapshot(saved_full_config)
@@ -19111,53 +19204,86 @@ def main():
     if _is_active_srw_version(model_version_cfg):
         target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
         n_rst = cfg['model'].get('n_rst', cfg['model'].get('n_know', 25200))
-        n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
         n_v = cfg['model'].get('n_v', 2600)
-        if str(model_version_cfg) == V4167_MODEL_VERSION:
-            shard_checks = []
-            for _name, _N in (
-                    ('n_qk_global', cfg['model']['n_qk_global']),
-                    ('n_qk_stage', cfg['model']['n_qk_stage']),
-                    ('n_qk_local', cfg['model']['n_qk_local']),
-                    ('n_v_global', cfg['model']['n_v_global']),
-                    ('n_v_stage', cfg['model']['n_v_stage']),
-                    ('n_v_local', cfg['model']['n_v_local']),
-                    ('n_rst_global', cfg['model']['n_rst_global']),
-                    ('n_rst_stage', cfg['model']['n_rst_stage']),
-                    ('n_rst_local', cfg['model']['n_rst_local'])):
-                if int(_N) > 0:
-                    shard_checks.append((_name, _N))
-            chunk_n_qk = cfg['model']['qk_visible_n']
-            chunk_n_v = cfg['model']['v_visible_n']
-            chunk_n_rst = cfg['model']['rst_visible_n']
+        if str(model_version_cfg) == V4174_MODEL_VERSION:
+            n_q = cfg['model']['n_q']
+            n_k = cfg['model']['n_k']
+            shard_checks = [
+                ('n_q', n_q), ('n_k', n_k),
+                ('n_v', n_v), ('n_rst', n_rst)]
+            for _name, _N in shard_checks:
+                if _N % mesh_model != 0:
+                    raise ValueError(
+                        f"{_name}={_N} must be divisible by "
+                        f"mesh_model={mesh_model} for model-axis sharding.")
+            nq_local = n_q // mesh_model
+            nk_local = n_k // mesh_model
+            nv_local = n_v // mesh_model
+            nrst_local = n_rst // mesh_model
+            n_chunks_q = cfg['training'].get(
+                'n_chunks_q', auto_n_chunks(nq_local, target_chunk_gb))
+            n_chunks_k = cfg['training'].get(
+                'n_chunks_k', auto_n_chunks(nk_local, target_chunk_gb))
+            n_chunks_v = cfg['training'].get(
+                'n_chunks_v', auto_n_chunks(nv_local, target_chunk_gb))
+            n_chunks_rst = cfg['training'].get(
+                'n_chunks_rst', auto_n_chunks(nrst_local, target_chunk_gb))
+            attn_q_max_chunk = _chunk_size_from_count(
+                'attn_q', nq_local, n_chunks_q)
+            attn_k_max_chunk = _chunk_size_from_count(
+                'attn_k', nk_local, n_chunks_k)
+            attn_v_max_chunk = _chunk_size_from_count(
+                'attn_v', nv_local, n_chunks_v)
+            rst_max_chunk = _chunk_size_from_count(
+                'rst', nrst_local, n_chunks_rst)
         else:
-            shard_checks = [('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)]
-            chunk_n_qk = n_qk
-            chunk_n_v = n_v
-            chunk_n_rst = n_rst
-        for _name, _N in shard_checks:
-            if _N % mesh_model != 0:
-                raise ValueError(
-                    f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
-                    "for model-axis sharding.")
-        # N_local = visible_N / mesh_model (each chip's share).
-        nrst_local = chunk_n_rst // mesh_model
-        nqk_local = chunk_n_qk // mesh_model
-        nv_local = chunk_n_v // mesh_model
+            n_qk = cfg['model'].get('n_qk', 1580)
+            if str(model_version_cfg) == V4167_MODEL_VERSION:
+                shard_checks = []
+                for _name, _N in (
+                        ('n_qk_global', cfg['model']['n_qk_global']),
+                        ('n_qk_stage', cfg['model']['n_qk_stage']),
+                        ('n_qk_local', cfg['model']['n_qk_local']),
+                        ('n_v_global', cfg['model']['n_v_global']),
+                        ('n_v_stage', cfg['model']['n_v_stage']),
+                        ('n_v_local', cfg['model']['n_v_local']),
+                        ('n_rst_global', cfg['model']['n_rst_global']),
+                        ('n_rst_stage', cfg['model']['n_rst_stage']),
+                        ('n_rst_local', cfg['model']['n_rst_local'])):
+                    if int(_N) > 0:
+                        shard_checks.append((_name, _N))
+                chunk_n_qk = cfg['model']['qk_visible_n']
+                chunk_n_v = cfg['model']['v_visible_n']
+                chunk_n_rst = cfg['model']['rst_visible_n']
+            else:
+                shard_checks = [
+                    ('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)]
+                chunk_n_qk = n_qk
+                chunk_n_v = n_v
+                chunk_n_rst = n_rst
+            for _name, _N in shard_checks:
+                if _N % mesh_model != 0:
+                    raise ValueError(
+                        f"{_name}={_N} must be divisible by "
+                        f"mesh_model={mesh_model} for model-axis sharding.")
+            # N_local = visible_N / mesh_model (each chip's share).
+            nrst_local = chunk_n_rst // mesh_model
+            nqk_local = chunk_n_qk // mesh_model
+            nv_local = chunk_n_v // mesh_model
 
-        n_chunks_rst = cfg['training'].get(
-            'n_chunks_rst', auto_n_chunks(nrst_local, target_chunk_gb))
-        n_chunks_qk = cfg['training'].get(
-            'n_chunks_qk', auto_n_chunks(nqk_local, target_chunk_gb))
-        n_chunks_v = cfg['training'].get(
-            'n_chunks_v', auto_n_chunks(nv_local, target_chunk_gb))
+            n_chunks_rst = cfg['training'].get(
+                'n_chunks_rst', auto_n_chunks(nrst_local, target_chunk_gb))
+            n_chunks_qk = cfg['training'].get(
+                'n_chunks_qk', auto_n_chunks(nqk_local, target_chunk_gb))
+            n_chunks_v = cfg['training'].get(
+                'n_chunks_v', auto_n_chunks(nv_local, target_chunk_gb))
 
-        attn_qk_max_chunk = _chunk_size_from_count(
-            'attn_qk', nqk_local, n_chunks_qk)
-        attn_v_max_chunk = _chunk_size_from_count(
-            'attn_v', nv_local, n_chunks_v)
-        rst_max_chunk = _chunk_size_from_count(
-            'rst', nrst_local, n_chunks_rst)
+            attn_qk_max_chunk = _chunk_size_from_count(
+                'attn_qk', nqk_local, n_chunks_qk)
+            attn_v_max_chunk = _chunk_size_from_count(
+                'attn_v', nv_local, n_chunks_v)
+            rst_max_chunk = _chunk_size_from_count(
+                'rst', nrst_local, n_chunks_rst)
     else:
         n_rst = n_qk = n_v = 0
         nrst_local = nqk_local = nv_local = 0
@@ -19168,8 +19294,16 @@ def main():
         print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
         if _is_active_srw_version(model_version_cfg):
-            print(f"  Chunks: rst={n_chunks_rst} (cs={nrst_local // max(n_chunks_rst,1)}), "
-                  f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
+            if str(model_version_cfg) == V4174_MODEL_VERSION:
+                print(
+                    f"  Chunks: rst={n_chunks_rst} "
+                    f"(cs={nrst_local // max(n_chunks_rst, 1)}), "
+                    f"q={n_chunks_q}, k={n_chunks_k}, v={n_chunks_v}")
+            else:
+                print(
+                    f"  Chunks: rst={n_chunks_rst} "
+                    f"(cs={nrst_local // max(n_chunks_rst, 1)}), "
+                    f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
             chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
             print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
         elif is_baseline and mesh_model > 1:
@@ -20161,15 +20295,19 @@ def main():
             }
 
         pool = p['neuron_pool']
+        if str(model_version_cfg) == V4174_MODEL_VERSION:
+            return {
+                'attn_qk_op_key': jnp.concatenate((
+                    _unit(pool['q_read_vectors']).reshape(
+                        (-1, pool['q_read_vectors'].shape[-1])),
+                    _unit(pool['k_read_vectors']).reshape(
+                        (-1, pool['k_read_vectors'].shape[-1]))), axis=0),
+                'attn_v_op_key': _unit(pool['v_read_vectors']),
+                'rst_op_key': _unit(pool['rst_read_vectors']),
+            }
         if _is_v417x_version(model_version_cfg):
             operator_keys = _pool_operator_keys_for_version(
                 model_version_cfg)(pool)
-            if str(model_version_cfg) == V4174_MODEL_VERSION:
-                return {
-                    'attn_qk_op_key': operator_keys['qk_operator_keys'],
-                    'attn_v_op_key': operator_keys['v_operator_keys'],
-                    'rst_op_key': operator_keys['rst_operator_keys'],
-                }
             return operator_keys
         if str(model_version_cfg) == V4170_MODEL_VERSION:
             return _v4170_pool_operator_keys(pool)
@@ -20347,7 +20485,7 @@ def main():
                 raise _SkipBreakdown("baseline has no SRW layer breakdown")
             if str(model_version) == V4174_MODEL_VERSION:
                 raise _SkipBreakdown(
-                    "v4.1.7.4 uses the canonical kernel-field execution graph")
+                    "v4.1.7.4 uses the canonical direct-read execution graph")
             if operation_space_tau_free_enabled:
                 raise _SkipBreakdown(
                     "operation-space tau-free path disables legacy DirectTau "
@@ -20923,6 +21061,12 @@ def main():
                         f"M={cfg['model']['n_operation_spaces']} "
                         f"K={cfg['model']['operation_space_top_k']} "
                         f"d_space=d_route={cfg['model']['d_route']}")
+                    log_message(
+                        "Addressing: projected local state directly matches "
+                        "normalized read vectors; Q/K/V/RST banks are separate")
+                    log_message(
+                        "Space gate: hard top-k ReLU^2, non-softmax, "
+                        "sqrt-mass denominator; RST routing is post-attention")
                 elif str(model_version_cfg) == V4173_MODEL_VERSION:
                     log_message("DAWN spatial-r1-v4.1.7.3")
                     log_message(
