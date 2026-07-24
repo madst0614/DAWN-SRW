@@ -144,7 +144,6 @@ from models.dawn_srw_v4174 import (
     _raw_tau_init_from_cosine_tau as _v4174_raw_tau_init_from_cosine_tau,
     _tau_init_calibration_scores as _v4174_tau_init_calibration_scores,
     _validate_v4174_sharded_fns,
-    initialization_diagnostics_from_params as _v4174_initialization_diagnostics,
     materialize_operation_space_config as _materialize_v4174_operation_space_config,
     resolve_operation_space_config as _resolve_v4174_operation_space_config,
     symbolic_parameter_count as _v4174_symbolic_parameter_count,
@@ -18201,18 +18200,6 @@ def main():
         raise RuntimeError(
             "v417x symbolic/parameter-tree mismatch: "
             f"expected={symbolic_counts['total']} actual={n_params}")
-    if (not _has_resume_checkpoint
-            and str(model_version_cfg) == V4174_MODEL_VERSION):
-        space_init_diagnostics = _v4174_initialization_diagnostics(
-            params, dummy_input,
-            int(cfg['model']['operation_space_top_k']))
-        if is_host0:
-            print("v4174 operation-space initialization diagnostics:", flush=True)
-            for key in sorted(space_init_diagnostics):
-                print(
-                    f"  {key}: {space_init_diagnostics[key]:.8g}",
-                    flush=True)
-
     if is_host0:
         if _has_resume_checkpoint:
             print(
@@ -18553,20 +18540,31 @@ def main():
         print(f"  Module path: {_model_registry_entry(model_version_cfg)['module']}")
         if _is_rw_key_srw_version(model_version_cfg):
             if _is_v417x_version(model_version_cfg):
-                _operator_key_mode = cfg['model']['operator_key_mode']
                 print(f"DAWN-SRW {model_version_cfg}")
                 print("Operator address:")
-                print(f"  mode={_operator_key_mode}")
                 print(f"  d_route={cfg['model']['d_route']}")
-                if _operator_key_mode == OPERATOR_KEY_MODE_LEARNED:
-                    print("  independent_per_operator=true")
+                if str(model_version_cfg) == V4174_MODEL_VERSION:
+                    print("  projected_local_state_direct_read=true")
+                    print("  read_vector_is_operator_key=true")
+                    print("  q_k_v_rst_banks=fully_separate")
+                    print("  separate_operator_query=false")
+                    print("  space_route=hard_top_k_relu_squared")
                 else:
-                    print("  probe_scope=shared_across_qk_v_rst")
+                    _operator_key_mode = cfg['model']['operator_key_mode']
+                    print(f"  mode={_operator_key_mode}")
+                    if _operator_key_mode == OPERATOR_KEY_MODE_LEARNED:
+                        print("  independent_per_operator=true")
+                    else:
+                        print("  probe_scope=shared_across_qk_v_rst")
                 print("  live_gradient=true")
                 print("  full_rw_execution=true")
                 print("Selection:")
-                if _operator_key_mode == OPERATOR_KEY_MODE_LEARNED:
-                    print("  cosine(direct state query, learned operator embedding)")
+                if str(model_version_cfg) == V4174_MODEL_VERSION:
+                    print("  cosine(projected local state, normalized read vector)")
+                elif _operator_key_mode == OPERATOR_KEY_MODE_LEARNED:
+                    print(
+                        "  cosine(direct state query, "
+                        "learned operator embedding)")
                 else:
                     print("  cosine(direct state query, live bilinear RW key)")
                 print("Execution:")
@@ -18611,7 +18609,9 @@ def main():
                     f"{cfg['model']['heat_kernel_beta']:g}")
                 print(
                     "  runtime_source="
-                    "model.pool_specific_with_legacy_fallback")
+                    + ("v4174.direct_read"
+                       if str(model_version_cfg) == V4174_MODEL_VERSION
+                       else "model.pool_specific_with_legacy_fallback"))
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 _read_role_dim = int(cfg['model']['rw_role_read_dim'])
                 _write_role_dim = int(cfg['model']['rw_role_write_dim'])
@@ -18735,11 +18735,21 @@ def main():
                 print(f"[{_linear_family_label}] active definition: rho > tau "
                       "(pre-prune angular visibility)")
                 if is_v417x_cfg:
-                    print(f"[opspace] key={cfg['model']['operator_key_mode']} "
-                          "query=direct_state_projection "
-                          "tau=calibrated_slow_learned_radius "
-                          "gate=linear_angular_depth "
-                          "den=unpruned_admission_pow_custom_live_gradient")
+                    if str(model_version_cfg) == V4174_MODEL_VERSION:
+                        print(
+                            "[opspace] key=normalized_read_vector "
+                            "query=projected_local_state "
+                            "tau=calibrated_slow_learned_radius "
+                            "gate=linear_angular_depth "
+                            "den=unpruned_admission_pow_custom_live_gradient")
+                    else:
+                        print(
+                            f"[opspace] "
+                            f"key={cfg['model']['operator_key_mode']} "
+                            "query=direct_state_projection "
+                            "tau=calibrated_slow_learned_radius "
+                            "gate=linear_angular_depth "
+                            "den=unpruned_admission_pow_custom_live_gradient")
                     print("tau policy: token-wise bounded DirectTau as local "
                           "operation-space radius")
                     print("tau init: fresh quantile calibration")
