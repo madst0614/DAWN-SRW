@@ -1,14 +1,15 @@
 # DAWN-SRW v4.1.7.4 canonical explicit-read operation spaces.
 #
-# Parameter comparison against the previous v4174 operator-field config:
-#   previous v4174 actual: 216,204,292
-#   direct-read v4174 actual: 214,502,404
-#   absolute / relative difference: -1,701,888 / -0.787%
+# Parameter-matched horizontal expansion with fixed D=2048 and R=256:
+#   target:              393,810,000
+#   direct-read v4174:   393,755,652
+#   absolute / relative difference: -54,348 / -0.014%
 #
-# Q and K split the previous shared-QK row budget explicitly.  Every pool
-# count is divisible by M * mesh_model = 16:
-#   totals:    Q=6,160  K=6,160  V=38,832  RST=78,496
-#   per-space: Q=770    K=770    V=4,854   RST=9,812
+# Capacity is added horizontally through 24 independent local coordinate
+# systems. Every pool count is divisible by M * mesh_model = 48:
+#   totals:    Q=21,504 K=21,504 V=134,016 RST=269,952
+#   per-space: Q=896    K=896    V=5,584   RST=11,248
+#   per-shard: Q=448    K=448    V=2,792   RST=5,624
 #
 # Q and K use independent direct-read score tables and independent tau maps.
 
@@ -34,21 +35,21 @@ model:
   dropout: 0.0
   gradient_checkpointing: true
 
-  n_operation_spaces: 8
+  n_operation_spaces: 24
   operation_space_top_k: 2
 
-  n_q: 6160
-  n_k: 6160
-  n_v: 38832
-  n_rst: 78496
+  n_q: 21504
+  n_k: 21504
+  n_v: 134016
+  n_rst: 269952
 
   tau_init_mode: quantile_frac
   tau_init_min: -0.95
   tau_init_max: 0.95
   # f_r = A_ref * M / (K * N_r); therefore K*(N_r/M)*f_r = A_ref.
-  tau_init_target_qk_frac: 0.2694805194805195
-  tau_init_target_v_frac: 0.08084054388133498
-  tau_init_target_rst_frac: 0.026938442723196086
+  tau_init_target_qk_frac: 0.23158482142857142
+  tau_init_target_v_frac: 0.07027220630372492
+  tau_init_target_rst_frac: 0.023499288762446658
 
   srw_composition_mode: linear_angular
   admission_den_power: 1.0
@@ -80,5 +81,5 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_40B_v4_64_space8_top2_direct_read
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4174_400M_c4_40B_v4_64_space8_top2_direct_read
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_40B_v4_64_space24_top2_direct_read
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4174_400M_c4_40B_v4_64_space24_top2_direct_read

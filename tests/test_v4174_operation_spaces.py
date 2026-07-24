@@ -14,7 +14,7 @@ from models import dawn_srw_v4174 as v4174
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_CONFIG = (
     ROOT / "configs" /
-    "train_config_v4174_400M_c4_40B_v4_64_space8_top2_direct_read.yaml")
+    "train_config_v4174_400M_c4_40B_v4_64_space24_top2_direct_read.yaml")
 
 
 def _model_config(**updates):
@@ -116,8 +116,20 @@ def test_config_validation_rejects_noncanonical_and_removed_schema():
     assert v4174.resolve_operation_space_config(config) == (4, 2)
     assert v4174.materialize_operation_space_config(dict(config))[
         "n_operation_spaces"] == 4
+    nonfactorized = {
+        **config,
+        "n_operation_spaces": 3,
+        "n_q": 30,
+        "n_k": 30,
+        "n_v": 30,
+        "n_rst": 30,
+    }
+    assert nonfactorized["d_model"] != (
+        nonfactorized["n_operation_spaces"] * nonfactorized["d_route"])
+    assert v4174.materialize_operation_space_config(
+        dict(nonfactorized))["n_operation_spaces"] == 3
     invalid = (
-        {"d_model": 12},
+        {"d_route": 20},
         {"operation_space_top_k": 5},
         {"n_operation_spaces": 5},
         {"n_q": 30},
@@ -132,6 +144,36 @@ def test_config_validation_rejects_noncanonical_and_removed_schema():
         with pytest.raises(ValueError):
             v4174.materialize_operation_space_config({
                 **config, **update})
+
+
+def test_nonfactorized_operation_spaces_initialize_independent_coordinates():
+    model = _model(
+        n_operation_spaces=3,
+        n_q=30,
+        n_k=30,
+        n_v=30,
+        n_rst=30,
+    )
+    _, _, variables = _variables(model=model, seed=5)
+    projection = variables["params"]["router"]["space_state_proj"]
+    assert projection.shape == (3, 16, 4)
+    gram = jnp.einsum("mdr,mds->mrs", projection, projection)
+    np.testing.assert_allclose(
+        gram,
+        np.broadcast_to(np.eye(4), (3, 4, 4)),
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    assert not np.allclose(projection[0], projection[1])
+    counts = v4174.symbolic_parameter_count({
+        **_model_config(),
+        "n_operation_spaces": 3,
+        "n_q": 30,
+        "n_k": 30,
+        "n_v": 30,
+        "n_rst": 30,
+    })
+    assert counts["total"] == _count(variables["params"])
 
 
 def test_parameter_tree_is_exact_direct_read_schema():
@@ -583,18 +625,30 @@ def test_symbolic_count_matches_tree_and_canonical_budget():
     canonical = canonical_config["model"]
     training = canonical_config["training"]
     counts = v4174.symbolic_parameter_count(canonical)
-    assert counts["total"] == 214_502_404
+    assert counts["total"] == 393_755_652
     assert canonical["d_model"] == 2048
     assert canonical["d_route"] == 256
     assert canonical["n_layers"] == 18
     assert canonical["n_heads"] == 32
     assert canonical["gradient_checkpointing"] is True
-    assert canonical["n_operation_spaces"] == 8
+    assert canonical["n_operation_spaces"] == 24
     assert canonical["operation_space_top_k"] == 2
-    assert canonical["n_q"] == canonical["n_k"] == 6_160
-    assert canonical["n_q"] + canonical["n_k"] == 12_320
-    assert canonical["n_v"] == 38_832
-    assert canonical["n_rst"] == 78_496
+    assert canonical["n_q"] == canonical["n_k"] == 21_504
+    assert canonical["n_q"] + canonical["n_k"] == 43_008
+    assert canonical["n_v"] == 134_016
+    assert canonical["n_rst"] == 269_952
+    assert (
+        canonical["n_q"] // canonical["n_operation_spaces"],
+        canonical["n_k"] // canonical["n_operation_spaces"],
+        canonical["n_v"] // canonical["n_operation_spaces"],
+        canonical["n_rst"] // canonical["n_operation_spaces"],
+    ) == (896, 896, 5_584, 11_248)
+    assert (
+        canonical["n_q"] // canonical["n_operation_spaces"] // 2,
+        canonical["n_k"] // canonical["n_operation_spaces"] // 2,
+        canonical["n_v"] // canonical["n_operation_spaces"] // 2,
+        canonical["n_rst"] // canonical["n_operation_spaces"] // 2,
+    ) == (448, 448, 2_792, 5_624)
     assert training["batch_size"] == 1_024
     assert training["mesh_data"] == 16
     assert training["mesh_model"] == 2
@@ -913,6 +967,8 @@ def test_model_info_describes_only_canonical_architecture():
     assert "Q/K/V/RST are fully separate" in info
     assert "RST recomputes routing after attention" in info
     assert "physical all-space dense" in info
+    assert "independent D->R coordinates" in info
+    assert "D=M*R" not in info
     assert "lax.scan" in info
     assert v4174.ATTENTION_CORE_NAME in info
     assert "kernel sketch" not in info

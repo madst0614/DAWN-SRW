@@ -91,10 +91,10 @@ def materialize_operation_space_config(
     n_spaces, top_k = resolve_operation_space_config(model_cfg)
     d_model = _positive_int("d_model", model_cfg.get("d_model"))
     d_route = _positive_int("d_route", model_cfg.get("d_route"))
-    if d_model != n_spaces * d_route:
+    if d_route > d_model:
         raise ValueError(
-            "v4174 requires model.d_model == model.n_operation_spaces * "
-            f"model.d_route, got {d_model} != {n_spaces} * {d_route}")
+            "v4174 requires the local route dimension to be no larger than "
+            f"the model dimension, got d_route={d_route} > d_model={d_model}")
     if n_spaces > d_route:
         raise ValueError(
             "v4174 orthogonal space reads require "
@@ -162,17 +162,23 @@ def symbolic_parameter_count(model_cfg: Mapping[str, Any]) -> dict[str, int]:
     return counts
 
 
-def _orthogonal_space_projection_init(
+def _independent_space_projection_init(
         key: jax.Array, shape: tuple[int, ...],
         dtype=jnp.float32) -> jax.Array:
-    """Initialize ``[M,D,R]`` from row blocks of one orthogonal ``[D,D]``."""
+    """Initialize distinct semi-orthogonal ``D -> R`` maps for every space."""
     n_spaces, d_model, d_route = map(int, shape)
-    if n_spaces * d_route != d_model:
-        raise ValueError("orthogonal block initialization requires M * R == D")
-    orthogonal = nn.initializers.orthogonal(scale=1.0)(
-        key, (d_model, d_model), jnp.float32)
-    blocks = orthogonal.T.reshape((n_spaces, d_route, d_model))
-    return jnp.swapaxes(blocks, -1, -2).astype(dtype)
+    if d_route > d_model:
+        raise ValueError(
+            "space projection initialization requires d_route <= d_model")
+    basis_key, sign_key = jax.random.split(key)
+    base = nn.initializers.orthogonal(scale=1.0)(
+        basis_key, (d_model, d_route), jnp.float32)
+    signs = jnp.where(
+        jax.random.bernoulli(
+            sign_key, shape=(n_spaces, d_model, 1)),
+        jnp.float32(1.0),
+        jnp.float32(-1.0))
+    return (base[None, :, :] * signs).astype(dtype)
 
 
 def _orthogonal_space_read_init(
@@ -251,7 +257,7 @@ class OperationSpaceRouter(nn.Module):
             "space_read_vectors", _orthogonal_space_read_init,
             (n_spaces, d_route))
         self.space_state_proj = self.param(
-            "space_state_proj", _orthogonal_space_projection_init,
+            "space_state_proj", _independent_space_projection_init,
             (n_spaces, d_model, d_route))
         self.space_state_writeback = self.param(
             "space_state_writeback",
@@ -1203,7 +1209,8 @@ class DAWN_SRW_V4174(nn.Module):
             "routing: one shared D->R projection directly matches explicit "
             "space read vectors",
             f"canonical geometry: D={self.d_model}, M={n_spaces}, "
-            f"R={self.d_route}; D=M*R, top_k={self.operation_space_top_k}",
+            f"R={self.d_route}; independent D->R coordinates, "
+            f"top_k={self.operation_space_top_k}",
             "space gate: hard top-k ReLU^2, non-softmax, sqrt-mass "
             "composition denominator",
             "local execution: z_m directly matches each pool's read vectors; "
