@@ -659,6 +659,38 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
         for name in train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
 
 
+def test_rare_analysis_step_uses_model_geometry_contract():
+    from scripts import train_jax
+
+    model, tokens, variables = _variables(seed=51)
+    assert inspect.signature(
+        v4174._direct_read_geometry_diagnostics
+    ).parameters["max_tokens"].default == 128
+    analysis_step = train_jax.create_analysis_step(
+        model,
+        total_training_steps=2,
+        soft_gate_schedule_active=True,
+        soft_gate_t_start=0.09,
+        soft_gate_t_final=0.07,
+        boundary_power_schedule_active=True,
+        soft_gate_boundary_power_start=2.0,
+        soft_gate_boundary_power_mid=2.0,
+        soft_gate_boundary_power_final=2.0,
+        admission_den_power=model.admission_den_power,
+    )
+    result = analysis_step(
+        variables["params"],
+        tokens,
+        jnp.ones_like(tokens, dtype=jnp.bool_),
+        jnp.int32(0),
+    )
+    jax.block_until_ready(result["q_direct_read_score_mean"])
+    for route in ("q", "k", "v", "rst"):
+        for statistic in ("mean", "std", "max"):
+            assert bool(jnp.isfinite(
+                result[f"{route}_direct_read_score_{statistic}"]))
+
+
 def test_model_info_describes_only_canonical_architecture():
     info = "\n".join(_model().get_model_info())
     assert "D=16, M=4, R=4" in info

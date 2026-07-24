@@ -10008,6 +10008,19 @@ def create_analysis_step(model, sharded_fns=None,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v417x_model = _is_v417x_version(_model_version)
+    _v4174_geometry_base_kwargs = None
+    if str(_model_version) == V4174_MODEL_VERSION:
+        _v4174_geometry_base_kwargs = {
+            'max_tokens': 128,
+            'n_heads': int(model.n_heads),
+            'n_layers': int(model.n_layers),
+            'operation_space_top_k': int(model.operation_space_top_k),
+            'admission_den_power': float(model.admission_den_power),
+            'admission_den_power_qk': model.admission_den_power_qk,
+            'admission_den_power_v': model.admission_den_power_v,
+            'srw_composition_mode': str(model.srw_composition_mode),
+            'heat_kernel_beta': float(model.heat_kernel_beta),
+        }
     _srw_composition_mode = None
     _heat_kernel_beta = None
     if _is_v417x_model:
@@ -10144,7 +10157,23 @@ def create_analysis_step(model, sharded_fns=None,
                     'query_geometry_diagnostics')
                 if _is_v417x_version(getattr(model, '__version__', ''))
                 else _v4170_query_geometry_diagnostics)
-            result.update(query_geometry(params, input_ids, max_tokens=4096))
+            if _v4174_geometry_base_kwargs is not None:
+                geometry_kwargs = dict(_v4174_geometry_base_kwargs)
+                geometry_kwargs.update({
+                    'soft_gate_temperature': extra_kw.get(
+                        'soft_gate_temperature', jnp.float32(0.07)),
+                    'soft_gate_T_qk': extra_kw.get(
+                        'soft_gate_T_qk', jnp.float32(0.07)),
+                    'soft_gate_T_v': extra_kw.get(
+                        'soft_gate_T_v', jnp.float32(0.07)),
+                    'soft_gate_boundary_power': extra_kw.get(
+                        'soft_gate_boundary_power', jnp.float32(2.0)),
+                })
+                result.update(query_geometry(
+                    params, input_ids, **geometry_kwargs))
+            else:
+                result.update(query_geometry(
+                    params, input_ids, max_tokens=4096))
         return result
 
     return analysis_step

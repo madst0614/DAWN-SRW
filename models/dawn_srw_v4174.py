@@ -571,6 +571,18 @@ def _canonical_regular_operator_metrics(
         for key, value in out.items()}
 
 
+def _off_diagonal_entries(value: jax.Array) -> jax.Array:
+    """Return the leading square matrix's off-diagonal entries JIT-safely."""
+    size = int(value.shape[0])
+    if size <= 1:
+        return value.reshape((size * size,) + value.shape[2:])[:0]
+    flat_index = jnp.arange(size * (size - 1), dtype=jnp.int32)
+    row = flat_index // (size - 1)
+    column = flat_index % (size - 1)
+    column = column + (column >= row)
+    return value[row, column]
+
+
 def _space_geometry_diagnostics(
         space_state_proj: jax.Array,
         space_state_writeback: jax.Array,
@@ -591,13 +603,13 @@ def _space_geometry_diagnostics(
     frobenius = jnp.einsum("mdr,ndr->mn", projection, projection)
     diagonal = jnp.sqrt(jnp.maximum(jnp.diag(frobenius), 1.0e-8))
     overlap = frobenius / (diagonal[:, None] * diagonal[None, :])
-    mask = ~jnp.eye(projection.shape[0], dtype=jnp.bool_)
     out = {
         "stacked_projection_singular_values": singular,
         "stacked_projection_rank": jnp.linalg.matrix_rank(stacked),
         "stacked_projection_effective_rank": effective_rank,
-        "space_projection_pairwise_overlap": overlap[mask],
-        "space_subspace_principal_angles": principal_angles[mask],
+        "space_projection_pairwise_overlap": _off_diagonal_entries(overlap),
+        "space_subspace_principal_angles": _off_diagonal_entries(
+            principal_angles),
         "encoder_writeback_init_error": jnp.max(jnp.abs(
             jnp.swapaxes(projection, -1, -2) - space_state_writeback)),
     }
@@ -612,7 +624,8 @@ def _space_geometry_diagnostics(
             covariance_diag[:, None] * covariance_diag[None, :])
         variance = jnp.var(local, axis=1).sum(axis=-1)
         out.update({
-            "space_local_state_covariance_overlap": covariance_overlap[mask],
+            "space_local_state_covariance_overlap": _off_diagonal_entries(
+                covariance_overlap),
             "space_local_state_norm": jnp.linalg.norm(
                 local, axis=-1).mean(axis=-1),
             "space_explained_variance": variance / jnp.maximum(
@@ -628,9 +641,8 @@ def _read_bank_geometry_diagnostics(
     """Direct-read geometry for explicit space reads and all four RW pools."""
     space_reads = forward_unit_direction(space_read_vectors)
     pairwise = space_reads @ space_reads.T
-    mask = ~jnp.eye(space_reads.shape[0], dtype=jnp.bool_)
     out = {
-        "space_read_pairwise_cosine": pairwise[mask],
+        "space_read_pairwise_cosine": _off_diagonal_entries(pairwise),
         "space_read_norm": jnp.linalg.norm(
             space_read_vectors.astype(jnp.float32), axis=-1),
         "space_route_state_norm": jnp.linalg.norm(
@@ -651,11 +663,10 @@ def _read_bank_geometry_diagnostics(
         sampled = read[:, :sample_count]
         cross = jnp.einsum("mir,njr->mnij", sampled, sampled)
         cross_nearest = cross.max(axis=(-2, -1))
-        cross_mask = ~jnp.eye(read.shape[0], dtype=jnp.bool_)
         out.update({
             f"{pool}_read_vector_covariance_effective_rank": effective_rank,
             f"{pool}_cross_space_nearest_read_similarity": (
-                cross_nearest[cross_mask]),
+                _off_diagonal_entries(cross_nearest)),
             f"{pool}_read_norm": jnp.linalg.norm(
                 pool_params[f"{pool}_read_vectors"].astype(jnp.float32),
                 axis=-1).mean(axis=-1),
@@ -812,18 +823,21 @@ class DAWN_SRW_V4174(nn.Module):
                 if self.admission_den_power_rst is not None
                 else self.admission_den_power),
         }
-        temp_qk = float(
+        temp_qk = jnp.asarray(
             soft_gate_temperature
-            if soft_gate_T_qk is None else soft_gate_T_qk)
+            if soft_gate_T_qk is None else soft_gate_T_qk,
+            dtype=jnp.float32)
         temperatures = {
             "q": temp_qk,
             "k": temp_qk,
-            "v": float(
+            "v": jnp.asarray(
                 soft_gate_temperature
-                if soft_gate_T_v is None else soft_gate_T_v),
-            "rst": float(
+                if soft_gate_T_v is None else soft_gate_T_v,
+                dtype=jnp.float32),
+            "rst": jnp.asarray(
                 soft_gate_temperature
-                if soft_gate_T_rst is None else soft_gate_T_rst),
+                if soft_gate_T_rst is None else soft_gate_T_rst,
+                dtype=jnp.float32),
         }
         positions = jnp.arange(input_ids.shape[1])[None, :]
         vocab_embed = (
@@ -1131,6 +1145,7 @@ def _sampled_layer_states(
         params, input_ids, max_tokens, *,
         n_heads=6, n_layers=12, operation_space_top_k=2,
         soft_gate_temperature=0.07, soft_gate_boundary_power=2.0,
+        soft_gate_T_qk=None, soft_gate_T_v=None,
         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
         admission_den_power_qk=None, admission_den_power_v=None,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
@@ -1179,6 +1194,13 @@ def _sampled_layer_states(
     route_scales = {"q": qk_scale, "k": qk_scale, "v": v_scale}
     route_outputs = {}
     for route in ("q", "k", "v"):
+        route_temperature = (
+            soft_gate_T_qk
+            if route in ("q", "k") and soft_gate_T_qk is not None
+            else (
+                soft_gate_T_v
+                if route == "v" and soft_gate_T_v is not None
+                else soft_gate_temperature))
         raw_tau = _linear(
             router[f"{route}_operator_tau_proj"], local)
         local_output = _rw_compose_space_dense(
@@ -1186,7 +1208,7 @@ def _sampled_layer_states(
             pool[f"{route}_read_vectors"],
             pool[f"{route}_write_vectors"],
             raw_tau,
-            soft_gate_temperature=soft_gate_temperature,
+            soft_gate_temperature=route_temperature,
             soft_gate_boundary_power=soft_gate_boundary_power,
             admission_den_power=den_qk if route in ("q", "k") else den_v,
             srw_composition_mode=srw_composition_mode,
@@ -1296,9 +1318,9 @@ def calibrate_operator_tau_per_space(
 
 
 def _direct_read_geometry_diagnostics(
-        params, input_ids, max_tokens=4096):
+        params, input_ids, max_tokens=128, **production_kwargs):
     scores = _tau_init_calibration_scores(
-        params, input_ids, max_tokens)
+        params, input_ids, max_tokens, **production_kwargs)
     return {
         f"{route}_direct_read_score_{name}": value
         for route, route_scores in scores.items()
