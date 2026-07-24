@@ -156,13 +156,12 @@ def _fp32_rw_reference(
     )
 
 
-def _fp32_fused_sharded(mesh, *, remat_chunks=False):
+def _fp32_fused_sharded(mesh):
     common = {
         "operation_space_top_k": 2,
         "srw_composition_mode": "linear_angular",
         "heat_kernel_beta": v4174.DEFAULT_HEAT_KERNEL_BETA,
         "soft_gate_effective_active_eps": 1.0e-6,
-        "remat_chunks": remat_chunks,
     }
     return {
         "attention_space_dense":
@@ -820,8 +819,8 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert attention_dense._v4174_dense_grouped_execution == "attention_qkv"
     assert rst_dense._v4174_dense_grouped_execution == "rst_end_to_end"
     assert rst_dense._v4174_dynamic_metric_flag is True
-    assert attention_dense._v4174_inner_chunk_remat is False
-    assert rst_dense._v4174_inner_chunk_remat is True
+    assert attention_dense._v4174_chunk_remat_policy == "multi_chunk_only"
+    assert rst_dense._v4174_chunk_remat_policy == "multi_chunk_only"
     assert attention_dense._v4174_throughput_precision == (
         "bf16_operands_f32_accum")
     assert rst_dense._v4174_throughput_precision == (

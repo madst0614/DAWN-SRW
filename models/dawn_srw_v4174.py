@@ -2000,15 +2000,15 @@ def _dense_rw_output_sharded(
         srw_composition_mode: str,
         heat_kernel_beta: float,
         effective_active_eps: float,
-        remat_chunks: bool,
         throughput_bf16: bool) -> tuple[jax.Array, jax.Array]:
-    """Compute the differentiable production RW output outside metric control."""
+    """Compute production RW output with multi-chunk backward remat."""
     n_routes, n_spaces, token_capacity, d_route = map(
         int, (read_vectors.shape[0], local_f32.shape[0],
               local_f32.shape[1], local_f32.shape[2]))
     n_local = int(read_vectors.shape[2])
     chunk_size = min(max(1, int(max_chunk_size)), n_local)
     n_chunks = math.ceil(n_local / chunk_size)
+    use_chunk_remat = n_chunks > 1
     n_padded = n_chunks * chunk_size
     pad_n = n_padded - n_local
     pad_spec = ((0, 0), (0, 0), (0, pad_n), (0, 0))
@@ -2065,7 +2065,7 @@ def _dense_rw_output_sharded(
 
     scan_step = (
         jax.checkpoint(production_step, prevent_cse=False)
-        if remat_chunks else production_step)
+        if use_chunk_remat else production_step)
     (raw_out, gate_mass), _ = jax.lax.scan(
         scan_step, carry, jnp.arange(n_chunks))
     return raw_out, gate_mass
@@ -2283,7 +2283,6 @@ def _make_sharded_attention_space_dense(
         srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
         soft_gate_effective_active_eps: float = 1.0e-6,
-        remat_chunks: bool = False,
         throughput_bf16: bool):
     """Create the single-boundary production Q/K/V dense executor."""
     composition_mode = str(srw_composition_mode)
@@ -2346,7 +2345,6 @@ def _make_sharded_attention_space_dense(
             srw_composition_mode=composition_mode,
             heat_kernel_beta=heat_kernel_beta,
             effective_active_eps=soft_gate_effective_active_eps,
-            remat_chunks=remat_chunks,
             throughput_bf16=throughput_bf16)
 
         v_raw_tau = (
@@ -2364,7 +2362,6 @@ def _make_sharded_attention_space_dense(
             srw_composition_mode=composition_mode,
             heat_kernel_beta=heat_kernel_beta,
             effective_active_eps=soft_gate_effective_active_eps,
-            remat_chunks=remat_chunks,
             throughput_bf16=throughput_bf16)
         grouped_local_output = tuple(
             jnp.concatenate((qk_value, v_value), axis=0)
@@ -2508,7 +2505,7 @@ def _make_sharded_attention_space_dense(
     kernel._v4174_dense_grouped_execution = "attention_qkv"
     kernel._v4174_qk_paired = True
     kernel._v4174_dynamic_metric_flag = True
-    kernel._v4174_inner_chunk_remat = bool(remat_chunks)
+    kernel._v4174_chunk_remat_policy = "multi_chunk_only"
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -2536,7 +2533,6 @@ def _make_sharded_rst_space_dense(
         srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
         soft_gate_effective_active_eps: float = 1.0e-6,
-        remat_chunks: bool = False,
         throughput_bf16: bool):
     """Create the end-to-end production RST dense executor."""
     composition_mode = str(srw_composition_mode)
@@ -2592,7 +2588,6 @@ def _make_sharded_rst_space_dense(
             srw_composition_mode=composition_mode,
             heat_kernel_beta=heat_kernel_beta,
             effective_active_eps=soft_gate_effective_active_eps,
-            remat_chunks=remat_chunks,
             throughput_bf16=throughput_bf16)
         space_results = _reduce_dense_rw_output_sharded(
             local_output, jnp.float32(admission_den_power),
@@ -2692,7 +2687,7 @@ def _make_sharded_rst_space_dense(
     kernel._v4174_kernel_profile = "production"
     kernel._v4174_dense_grouped_execution = "rst_end_to_end"
     kernel._v4174_dynamic_metric_flag = True
-    kernel._v4174_inner_chunk_remat = bool(remat_chunks)
+    kernel._v4174_chunk_remat_policy = "multi_chunk_only"
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")

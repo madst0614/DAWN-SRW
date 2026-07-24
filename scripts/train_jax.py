@@ -16240,18 +16240,11 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                     model_cfg['admission_den_power_qk']),
                 admission_den_power_v=float(
                     model_cfg['admission_den_power_v']),
-                # Q/K/V remain on the faster grouped path. Their production
-                # chunk intermediates fit without an inner remat schedule.
-                remat_chunks=False,
                 **common_fused)
             sharded['rst_space_dense'] = rst_factory(
                 max_chunk_size=chunks['rst'],
                 admission_den_power=float(
                     model_cfg['admission_den_power_rst']),
-                # Canonical RST has eight chunks. Recompute one chunk at a
-                # time in backward instead of retaining all score/gate
-                # intermediates across the scan.
-                remat_chunks=True,
                 **common_fused)
         else:
             dense_factory_name = (
