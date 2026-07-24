@@ -816,8 +816,10 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     fp32_attention_dense = fp32_sharded["attention_space_dense"]
     fp32_rst_dense = fp32_sharded["rst_space_dense"]
     assert attention_dense._v4174_qk_paired is True
+    assert attention_dense._v4174_dynamic_metric_flag is True
     assert attention_dense._v4174_dense_grouped_execution == "attention_qkv"
     assert rst_dense._v4174_dense_grouped_execution == "rst_end_to_end"
+    assert rst_dense._v4174_dynamic_metric_flag is True
     assert attention_dense._v4174_inner_chunk_remat is False
     assert rst_dense._v4174_inner_chunk_remat is False
     assert attention_dense._v4174_throughput_precision == (
@@ -852,11 +854,35 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         pool["q_read_vectors"], pool["q_write_vectors"],
         pool["k_read_vectors"], pool["k_write_vectors"],
         pool["v_read_vectors"], pool["v_write_vectors"],
-        0.07, 0.07, 2.0, 0.0, qk_scale, v_scale)
+        0.07, 0.07, 2.0, 0.0, qk_scale, v_scale,
+        jnp.asarray(True, dtype=jnp.bool_))
     q_output, k_output, v_output, attention_metrics = attention_dense(
         *attention_args)
+    (q_output_minimal, k_output_minimal, v_output_minimal,
+     attention_metrics_minimal) = attention_dense(
+         *attention_args[:-1], jnp.asarray(False, dtype=jnp.bool_))
     (q_output_fp32, k_output_fp32, v_output_fp32,
      attention_metrics_fp32) = fp32_attention_dense(*attention_args)
+    for minimal, collected in zip(
+            (q_output_minimal, k_output_minimal, v_output_minimal),
+            (q_output, k_output, v_output)):
+        np.testing.assert_array_equal(minimal, collected)
+    def causal_output(q_value, k_value, v_value):
+        def heads(value):
+            return value.reshape(1, 6, 4, 4).transpose(0, 2, 1, 3)
+
+        return v4174._causal_attention_core(
+            heads(q_value), heads(k_value), heads(v_value),
+            0.0, True, jax.random.PRNGKey(24),
+            throughput_bf16=True)
+
+    np.testing.assert_array_equal(
+        causal_output(
+            q_output_minimal, k_output_minimal, v_output_minimal),
+        causal_output(q_output, k_output, v_output))
+    assert all(
+        float(value) == 0.0
+        for value in attention_metrics_minimal.values())
     assert q_output.shape == k_output.shape == v_output.shape == (6, 16)
     assert all(value.shape == () for value in attention_metrics.values())
     assert all(
@@ -967,9 +993,16 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         router["rst_operator_tau_proj"]["kernel"],
         router["rst_operator_tau_proj"]["bias"],
         pool["rst_read_vectors"], pool["rst_write_vectors"],
-        0.07, 2.0, 0.0, rst_scale)
+        0.07, 2.0, 0.0, rst_scale,
+        jnp.asarray(True, dtype=jnp.bool_))
     rst_output, rst_metrics = rst_dense(*rst_args)
+    rst_output_minimal, rst_metrics_minimal = rst_dense(
+        *rst_args[:-1], jnp.asarray(False, dtype=jnp.bool_))
     rst_output_fp32, rst_metrics_fp32 = fp32_rst_dense(*rst_args)
+    np.testing.assert_array_equal(rst_output_minimal, rst_output)
+    assert all(
+        float(value) == 0.0
+        for value in rst_metrics_minimal.values())
     assert rst_output.shape == (6, 16)
     assert all(value.shape == () for value in rst_metrics.values())
     assert rst_output.dtype == rst_output_fp32.dtype == jnp.float32
@@ -1197,6 +1230,173 @@ def test_v4174_precision_partition_and_vocab_ce_contract():
     assert float(
         jnp.abs(mixed_loss - fp32_loss)
         / jnp.maximum(jnp.abs(fp32_loss), 1.0e-8)) <= 0.002
+
+
+def test_dynamic_metric_flag_preserves_logits_loss_gradients_and_jit_cache():
+    from scripts import train_jax
+
+    model, tokens, variables = _variables(seed=87)
+    params = variables["params"]
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]).reshape((1, 1)),
+        ("data", "model"),
+    )
+    sharded = _fp32_fused_sharded(mesh)
+    dropout_key = jax.random.PRNGKey(88)
+
+    @jax.jit
+    def forward_logits(current, collect_metrics):
+        return model.apply(
+            {"params": current},
+            tokens,
+            deterministic=True,
+            sharded_fns=sharded,
+            collect_train_metrics=collect_metrics,
+            rngs={"dropout": dropout_key},
+        )["logits"]
+
+    @jax.jit
+    def train_math(current, collect_metrics):
+        def loss_fn(candidate):
+            result = model.apply(
+                {"params": candidate},
+                tokens,
+                labels=tokens,
+                deterministic=True,
+                sharded_fns=sharded,
+                compute_accuracy=False,
+                collect_train_metrics=collect_metrics,
+                rngs={"dropout": dropout_key},
+            )
+            return result["loss"], result
+
+        (loss, result), grads = jax.value_and_grad(
+            loss_fn, has_aux=True)(current)
+        return loss, result, grads
+
+    false_flag = jnp.asarray(False, dtype=jnp.bool_)
+    true_flag = jnp.asarray(True, dtype=jnp.bool_)
+    false_logits = forward_logits(params, false_flag)
+    true_logits = forward_logits(params, true_flag)
+    np.testing.assert_allclose(
+        false_logits, true_logits, atol=0.0, rtol=0.0)
+
+    calls = [
+        train_math(params, flag)
+        for flag in (false_flag, true_flag, false_flag, true_flag)
+    ]
+    jax.block_until_ready(calls[-1][0])
+    false_loss, false_result, false_grads = calls[0]
+    true_loss, true_result, true_grads = calls[1]
+    assert abs(float(false_loss - true_loss)) <= 1.0e-6
+
+    def tree_cosine(left_tree, right_tree):
+        dot = sum(
+            jnp.sum(left.astype(jnp.float32) * right.astype(jnp.float32))
+            for left, right in zip(
+                jax.tree.leaves(left_tree),
+                jax.tree.leaves(right_tree)))
+        left_sq = sum(
+            jnp.sum(jnp.square(value.astype(jnp.float32)))
+            for value in jax.tree.leaves(left_tree))
+        right_sq = sum(
+            jnp.sum(jnp.square(value.astype(jnp.float32)))
+            for value in jax.tree.leaves(right_tree))
+        return dot / jnp.sqrt(jnp.maximum(left_sq * right_sq, 1.0e-12))
+
+    assert float(tree_cosine(false_grads, true_grads)) >= 0.9999
+
+    optimizer = optax.sgd(1.0e-3)
+    opt_state = optimizer.init(params)
+    false_updates, _ = optimizer.update(
+        false_grads, opt_state, params)
+    true_updates, _ = optimizer.update(
+        true_grads, opt_state, params)
+    false_params = optax.apply_updates(params, false_updates)
+    true_params = optax.apply_updates(params, true_updates)
+    for false_value, true_value in zip(
+            jax.tree.leaves(false_params),
+            jax.tree.leaves(true_params)):
+        np.testing.assert_allclose(
+            false_value, true_value, atol=1.0e-9, rtol=1.0e-7)
+
+    optional_metrics = (
+        *train_jax.LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+        *train_jax.V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+        *train_jax.V4174_SELECTOR_METRIC_NAMES,
+    )
+    assert float(false_result["train_metrics_collected"]) == 0.0
+    assert all(float(false_result[name]) == 0.0 for name in optional_metrics)
+    assert float(true_result["train_metrics_collected"]) == 1.0
+    assert all(
+        value.shape == () and bool(jnp.isfinite(value))
+        for name in optional_metrics
+        for value in (true_result[name],))
+    if hasattr(train_math, "_cache_size"):
+        assert train_math._cache_size() == 1
+    if hasattr(forward_logits, "_cache_size"):
+        assert forward_logits._cache_size() == 1
+    train_hlo = train_math.lower(
+        params, false_flag).compiler_ir(
+            dialect="hlo").as_hlo_text().lower()
+    assert "conditional" in train_hlo
+
+    mixed_cfg = {
+        "model": _model_config(),
+        "training": {
+            "n_chunks_q": 1,
+            "n_chunks_k": 1,
+            "n_chunks_v": 1,
+            "n_chunks_rst": 1,
+            "tau_lr_mult": 0.001,
+        },
+    }
+    mixed_sharded = train_jax.build_canonical_sharded_fns(
+        mixed_cfg, mesh)
+
+    @jax.jit
+    def mixed_logits(current, collect_metrics):
+        return model.apply(
+            {"params": current},
+            tokens,
+            deterministic=True,
+            sharded_fns=mixed_sharded,
+            collect_train_metrics=collect_metrics,
+            rngs={"dropout": dropout_key},
+        )["logits"]
+
+    @jax.jit
+    def mixed_train_math(current, collect_metrics):
+        def loss_fn(candidate):
+            result = model.apply(
+                {"params": candidate},
+                tokens,
+                labels=tokens,
+                deterministic=True,
+                sharded_fns=mixed_sharded,
+                compute_accuracy=False,
+                collect_train_metrics=collect_metrics,
+                rngs={"dropout": dropout_key},
+            )
+            return result["loss"]
+
+        return jax.value_and_grad(loss_fn)(current)
+
+    mixed_false_logits = mixed_logits(params, false_flag)
+    mixed_true_logits = mixed_logits(params, true_flag)
+    mixed_output_max_abs_diff = jnp.max(jnp.abs(
+        mixed_false_logits.astype(jnp.float32)
+        - mixed_true_logits.astype(jnp.float32)))
+    assert float(mixed_output_max_abs_diff) <= 1.0e-6
+    mixed_false_loss, mixed_false_grads = mixed_train_math(
+        params, false_flag)
+    mixed_true_loss, mixed_true_grads = mixed_train_math(
+        params, true_flag)
+    assert abs(float(mixed_false_loss - mixed_true_loss)) <= 1.0e-6
+    assert float(tree_cosine(
+        mixed_false_grads, mixed_true_grads)) >= 0.9999
+    if hasattr(mixed_train_math, "_cache_size"):
+        assert mixed_train_math._cache_size() == 1
 
 
 def test_v4174_mixed_precision_20_step_trajectory_is_stable():
@@ -1430,6 +1630,7 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
         jax.random.PRNGKey(42),
         dummy_drift,
         jnp.int32(0),
+        jnp.asarray(True, dtype=jnp.bool_),
     )
     jax.block_until_ready(metrics["total_loss"])
     assert all(
@@ -1461,6 +1662,51 @@ def test_actual_create_train_step_updates_with_complete_compact_schema():
     assert all(
         name in metrics
         for name in train_jax.LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES)
+    assert float(metrics["train_metrics_collected"]) == 1.0
+
+    stable_train_step = train_jax.create_canonical_train_step(
+        model, optimizer, cfg, sharded, mesh, total_training_steps=4)
+    newer_params, newer_opt_state, minimal_metrics = stable_train_step(
+        new_params,
+        new_opt_state,
+        tokens,
+        tokens,
+        jnp.ones_like(tokens, dtype=jnp.bool_),
+        jax.random.PRNGKey(43),
+        dummy_drift,
+        jnp.int32(1),
+        jnp.asarray(False, dtype=jnp.bool_),
+    )
+    jax.block_until_ready(minimal_metrics["total_loss"])
+    assert jax.tree.leaves(newer_params)
+    assert jax.tree.leaves(newer_opt_state)
+    assert float(minimal_metrics["train_metrics_collected"]) == 0.0
+    assert all(
+        float(minimal_metrics[name]) == 0.0
+        for name in (
+            *train_jax.LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
+            *train_jax.V4174_COMPOSITION_REGULAR_METRIC_NAMES,
+            *train_jax.V4174_SELECTOR_METRIC_NAMES))
+    for step_index, collect_metrics in enumerate(
+            (True, False, True), start=2):
+        newer_params, newer_opt_state, alternating_metrics = (
+            stable_train_step(
+                newer_params,
+                newer_opt_state,
+                tokens,
+                tokens,
+                jnp.ones_like(tokens, dtype=jnp.bool_),
+                jax.random.PRNGKey(43 + step_index),
+                dummy_drift,
+                jnp.int32(step_index),
+                jnp.asarray(collect_metrics, dtype=jnp.bool_),
+            ))
+        jax.block_until_ready(alternating_metrics["total_loss"])
+        assert float(
+            alternating_metrics["train_metrics_collected"]
+        ) == float(collect_metrics)
+    if hasattr(stable_train_step, "_cache_size"):
+        assert stable_train_step._cache_size() == 1
 
 
 def test_rare_analysis_step_uses_model_geometry_contract():

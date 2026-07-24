@@ -89,7 +89,64 @@ def test_v417x_train_model_call_contract_is_explicit():
     assert "extra_kw['minimal_train'] = True" in source
     assert "extra_kw['minimal_runtime_profile'] = 'training'" in source
     assert "extra_kw['compute_accuracy'] = _train_compute_accuracy" in source
+    assert "extra_kw['collect_train_metrics'] = jnp.asarray(" in source
+    assert "static_argnames" not in source
     assert "v417x training requires production kernels" in source
+
+
+def test_v4174_dynamic_metric_source_contract():
+    from models import dawn_srw_v4174 as v4174
+
+    model_source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
+    rw_source = inspect.getsource(v4174._dense_rw_routes_sharded)
+    reduce_source = inspect.getsource(
+        v4174._reduce_dense_rw_routes_sharded)
+    packed_source = inspect.getsource(
+        v4174._sharded_packed_scalar_metrics)
+    attention_source = inspect.getsource(
+        v4174._make_sharded_attention_space_dense)
+    rst_source = inspect.getsource(v4174._make_sharded_rst_space_dense)
+    trainer_source = inspect.getsource(train_jax.create_train_step)
+    main_source = inspect.getsource(train_jax.main)
+
+    assert "collect_train_metrics=True" in model_source
+    assert "collect_regular_metrics" in model_source
+    assert "jax.lax.cond(" in model_source
+    assert "collect_metrics: jax.Array" in rw_source
+    assert "jax.lax.cond(" in rw_source
+    minimal_step_source = rw_source.split(
+        "def minimal_step", 1)[1].split("def metric_step", 1)[0]
+    assert "jnp.square" not in minimal_step_source
+    assert "gate.max" not in minimal_step_source
+    assert "margin >" not in minimal_step_source
+    assert "depth.sum" not in minimal_step_source
+    assert "raw_out, gate_mass = carry_value" in minimal_step_source
+    metric_step_source = rw_source.split(
+        "def metric_step", 1)[1].split("def run_minimal", 1)[0]
+    assert "jnp.square" in metric_step_source
+    assert "gate.max" in metric_step_source
+    assert "margin >" in metric_step_source
+    assert "depth.sum" in metric_step_source
+
+    minimal_reduce_source = reduce_source.split(
+        "def reduce_minimal", 1)[1].split("def reduce_metrics", 1)[0]
+    assert "pmax" not in minimal_reduce_source
+    assert "gate_sq" not in minimal_reduce_source
+    assert "depth_sum" not in minimal_reduce_source
+    assert "jax.lax.psum(gate_mass, \"model\")" in minimal_reduce_source
+    assert reduce_source.count("jax.lax.pmax(") == 1
+    assert packed_source.count("jax.lax.psum(") == 1
+    assert "packed_metrics" in packed_source
+    assert "jax.nn.one_hot" in packed_source
+    assert "jax.lax.cond(" in attention_source
+    assert "jax.lax.cond(" in rst_source
+    assert "collect_metrics" in attention_source
+    assert "collect_metrics" in rst_source
+    assert "static_argnames" not in trainer_source
+    assert "collect_train_metrics=True" in trainer_source
+    assert "step_after_update in (1, 5, 10, 20, 50)" in main_source
+    assert "_upcoming_is_regular" in main_source
+    assert "train_metrics_collected != 1.0" in main_source
 
 
 def test_regular_record_uses_train_step_scalars_without_diagnostics():

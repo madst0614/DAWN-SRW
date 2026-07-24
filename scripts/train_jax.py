@@ -1348,6 +1348,7 @@ V4174_COMPACT_TRAIN_METRIC_NAMES = (
     'grad_norm',
     'tau_lr_mult',
     *V4170_TAU_UPDATE_METRIC_NAMES,
+    'train_metrics_collected',
     *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
@@ -3286,6 +3287,7 @@ def _v4170_compact_train_metrics(
         })
         if str(model_version) == V4174_MODEL_VERSION:
             required = (
+                'train_metrics_collected',
                 *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
                 *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
                 *V4174_SELECTOR_METRIC_NAMES,
@@ -5661,6 +5663,16 @@ def _model_accepts_compute_accuracy(model):
         return False
 
 
+def _model_accepts_collect_train_metrics(model):
+    """Return True if model.__call__ accepts the dynamic train metric flag."""
+    import inspect as _inspect
+    try:
+        return 'collect_train_metrics' in _inspect.signature(
+            model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _scalar0(x):
     return jnp.asarray(x, dtype=jnp.float32).reshape(())
 
@@ -6772,6 +6784,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_training_tokens_kw = _model_accepts_training_tokens(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
     _pass_compute_accuracy_kw = _model_accepts_compute_accuracy(model)
+    _pass_collect_train_metrics_kw = (
+        _model_accepts_collect_train_metrics(model))
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _is_v4170_model = str(_model_version) in (
@@ -6785,6 +6799,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         if not _pass_minimal_runtime_profile_kw:
             raise RuntimeError(
                 "v417x training requires minimal_runtime_profile support")
+        if (str(_model_version) == V4174_MODEL_VERSION
+                and not _pass_collect_train_metrics_kw):
+            raise RuntimeError(
+                "v4174 training requires collect_train_metrics support")
         if isinstance(sharded_fns, dict):
             kernel_profile = sharded_fns.get(
                 _v417x_kernel_profile_key(_model_version))
@@ -6911,7 +6929,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
     @partial(jax.jit, donate_argnums=(0, 1))
     def train_step(params, opt_state, input_ids, labels, attention_mask,
-                   dropout_key, prev_op_key_snap, step):
+                   dropout_key, prev_op_key_snap, step,
+                   collect_train_metrics=True):
 
         def loss_fn(params):
             extra_kw = {}
@@ -7007,6 +7026,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['ce_token_chunk_size'] = _ce_token_chunk_size
             if _pass_compute_accuracy_kw:
                 extra_kw['compute_accuracy'] = _train_compute_accuracy
+            if (str(_model_version) == V4174_MODEL_VERSION
+                    and _pass_collect_train_metrics_kw):
+                extra_kw['collect_train_metrics'] = jnp.asarray(
+                    collect_train_metrics, dtype=jnp.bool_).reshape(())
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -7529,6 +7552,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                         key: result[key]
                         for key in (
                             'correct', 'valid_count',
+                            'train_metrics_collected',
                             *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
                             *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
                             *V4174_SELECTOR_METRIC_NAMES)}
@@ -20718,7 +20742,8 @@ def main():
         _dp, _do, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_labels, dummy_mask,
             dummy_step_rng,
-            _dummy_op_key_snap, jnp.asarray(0, jnp.int32))
+            _dummy_op_key_snap, jnp.asarray(0, jnp.int32),
+            jnp.asarray(False, dtype=jnp.bool_))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -20736,7 +20761,8 @@ def main():
             _dp2, _do2, dummy_metrics2 = train_step_fn(
                 params, opt_state, dummy_ids, dummy_labels, dummy_mask,
                 dummy_step_rng2,
-                _dummy_op_key_snap, jnp.asarray(0, jnp.int32))
+                _dummy_op_key_snap, jnp.asarray(0, jnp.int32),
+                jnp.asarray(False, dtype=jnp.bool_))
             jax.block_until_ready(dummy_metrics2['total_loss'])
             step_time = time.time() - step_start
         else:
@@ -21622,7 +21648,10 @@ def main():
                 params, opt_state,
                 input_ids, labels, attention_mask, step_rng,
                 _prev_op_key_snap,
-                jnp.asarray(global_step, jnp.int32))
+                jnp.asarray(global_step, jnp.int32),
+                jnp.asarray(
+                    _upcoming_is_regular,
+                    dtype=jnp.bool_))
 
             params, opt_state = new_params, new_opt_state
 
@@ -21802,6 +21831,19 @@ def main():
                     _win_vals = _regular_device_values['window']
                     _materialized_regular_metrics = (
                         _regular_device_values['metrics'])
+                    if not _upcoming_is_regular:
+                        raise RuntimeError(
+                            "v4174 regular logging reached a non-log step")
+                    _train_metrics_collected = float(
+                        _materialized_regular_metrics[
+                            'train_metrics_collected'])
+                    if _train_metrics_collected != 1.0:
+                        raise RuntimeError(
+                            "v4174 log step did not collect compact train "
+                            "metrics: "
+                            f"step={step_after_update} "
+                            f"train_metrics_collected="
+                            f"{_train_metrics_collected!r}")
                 else:
                     _win_vals = jax.device_get(_window_device_values)
                     _materialized_regular_metrics = metrics
