@@ -4,6 +4,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 import yaml
 
@@ -175,6 +176,74 @@ def test_parameter_tree_is_exact_direct_read_schema():
         for path, _ in jax.tree_util.tree_flatten_with_path(params)[0])
     assert not any(
         marker in path for path in paths for marker in forbidden)
+    for route in ("q", "k", "v", "rst"):
+        np.testing.assert_array_equal(
+            router[f"{route}_operator_tau_proj"]["kernel"],
+            np.zeros((4, 1), dtype=np.float32))
+
+
+def test_tau_calibration_bias_attains_each_route_target():
+    from scripts import train_jax
+
+    _, tokens, variables = _variables(seed=31)
+    params = variables["params"]
+    targets = {"qk": 0.25, "v": 0.375, "rst": 0.50}
+    cfg = {
+        "model": {
+            **_model_config(),
+            "tau_init_mode": "quantile_frac",
+            "tau_init_min": -0.95,
+            "tau_init_max": 0.95,
+            "tau_init_target_qk_frac": targets["qk"],
+            "tau_init_target_v_frac": targets["v"],
+            "tau_init_target_rst_frac": targets["rst"],
+            "tau_init_calibration_tokens": 16,
+        },
+        "training": {
+            "soft_gate_t_start": 0.07,
+            "soft_gate_boundary_power_start": 2.0,
+        },
+    }
+    tau_cfg = train_jax._v4164_tau_init_config(cfg)
+    summary = train_jax._compute_srw_quantile_tau_init(
+        params, tokens, cfg, tau_cfg)
+    calibrated = train_jax._set_srw_quantile_tau_biases(
+        params, summary, model_version=v4174.MODEL_VERSION)
+    _, _, _, score_kwargs = train_jax._srw_selection_score_setup(
+        calibrated, cfg, 16)
+    scores = v4174._tau_init_calibration_scores(
+        calibrated, tokens, **score_kwargs)
+    attention_state, rst_state = v4174._sampled_layer_states(
+        calibrated, tokens, **score_kwargs)
+    router = calibrated["router"]
+    for route, target in (
+            ("q", targets["qk"]),
+            ("k", targets["qk"]),
+            ("v", targets["v"]),
+            ("rst", targets["rst"])):
+        np.testing.assert_array_equal(
+            router[f"{route}_operator_tau_proj"]["kernel"],
+            np.zeros((4, 1), dtype=np.float32))
+        state = rst_state if route == "rst" else attention_state
+        local = v4174._project_space_local_states(
+            state, router["space_state_proj"])
+        actual_tau = v4174._shared_tau_from_param(v4174._linear(
+            router[f"{route}_operator_tau_proj"], local))
+        active = float(jnp.mean(scores[route] > actual_tau))
+        tolerance = max(0.02, 2.0 / scores[route].size)
+        assert abs(active - target) <= tolerance, (
+            route, active, target, tolerance)
+
+    embedding_state = (
+        calibrated["token_emb"]["embedding"][tokens]
+        + calibrated["pos_emb"]["embedding"][
+            jnp.arange(tokens.shape[1])[None, :]])
+    naive_rst = v4174._shared_layer_norm(
+        embedding_state,
+        calibrated["block_0"]["norm2"]["scale"],
+        calibrated["block_0"]["norm2"]["bias"],
+    ).reshape(rst_state.shape)
+    assert not np.allclose(rst_state, naive_rst)
 
 
 def test_projection_and_direct_read_shapes_and_equivalence():
@@ -276,6 +345,12 @@ def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
     state_before = jax.random.normal(jax.random.PRNGKey(10), (8, 16))
     state_after = state_before + jnp.linspace(
         -0.4, 0.5, state_before.size).reshape(state_before.shape)
+    learned_tau = {
+        "kernel": jax.random.normal(
+            jax.random.PRNGKey(11),
+            router["rst_operator_tau_proj"]["kernel"].shape) * 0.1,
+        "bias": router["rst_operator_tau_proj"]["bias"],
+    }
 
     def rst_values(state):
         routing = v4174._compute_space_routing(
@@ -286,7 +361,7 @@ def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
         )
         local = v4174._project_space_local_states(
             state, router["space_state_proj"])
-        tau = v4174._linear(router["rst_operator_tau_proj"], local)
+        tau = v4174._linear(learned_tau, local)
         output = v4174._rw_compose_space_dense(
             local,
             pool["rst_read_vectors"],
@@ -506,6 +581,64 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert pool_diagnostics
     assert any(key.startswith("attn_q_read_") for key in pool_diagnostics)
     assert any(key.startswith("attn_k_read_") for key in pool_diagnostics)
+
+
+def test_actual_create_train_step_updates_with_complete_compact_schema():
+    from scripts import train_jax
+
+    model, tokens, variables = _variables(seed=41)
+    params = variables["params"]
+    optimizer = optax.adam(1.0e-3)
+    opt_state = optimizer.init(params)
+    cfg = {
+        "model": _model_config(),
+        "training": {
+            "batch_size": 1,
+            "weight_decay": 0.0,
+            "pool_weight_decay": 0.0,
+            "inactive_aux_enabled": False,
+            "soft_gate_t_start": 0.07,
+            "soft_gate_t_final": 0.07,
+            "soft_gate_boundary_power_start": 2.0,
+            "soft_gate_boundary_power_mid": 2.0,
+            "soft_gate_boundary_power_final": 2.0,
+        },
+    }
+    train_step = train_jax.create_canonical_train_step(
+        model, optimizer, cfg, None, None, total_training_steps=2)
+    token_embedding_before = np.array(
+        params["token_emb"]["embedding"], copy=True)
+    dummy_drift = {
+        "attn_qk_op_key": jnp.float32(0.0),
+        "attn_v_op_key": jnp.float32(0.0),
+        "rst_op_key": jnp.float32(0.0),
+    }
+    new_params, new_opt_state, metrics = train_step(
+        params,
+        opt_state,
+        tokens,
+        tokens,
+        jnp.ones_like(tokens, dtype=jnp.bool_),
+        jax.random.PRNGKey(42),
+        dummy_drift,
+        jnp.int32(0),
+    )
+    jax.block_until_ready(metrics["total_loss"])
+    assert bool(jnp.isfinite(metrics["total_loss"]))
+    assert all(
+        bool(jnp.all(jnp.isfinite(value)))
+        for value in jax.tree.leaves(new_params))
+    assert jax.tree.leaves(new_opt_state)
+    assert not np.array_equal(
+        token_embedding_before,
+        np.asarray(new_params["token_emb"]["embedding"]))
+    assert set(metrics) == set(train_jax.V4174_COMPACT_TRAIN_METRIC_NAMES)
+    assert all(
+        bool(jnp.isfinite(metrics[name]))
+        for name in train_jax.V4174_DIRECT_RW_GRADIENT_METRIC_NAMES)
+    assert not any(
+        name in metrics
+        for name in train_jax.V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
 
 
 def test_model_info_describes_only_canonical_architecture():

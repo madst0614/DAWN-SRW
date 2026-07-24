@@ -820,6 +820,17 @@ V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES = (
     'grad_ratio_pool_shared_write_probe',
 )
 
+V4174_DIRECT_RW_GRADIENT_METRIC_NAMES = (
+    'grad_pool_q_read',
+    'grad_pool_q_write',
+    'grad_pool_k_read',
+    'grad_pool_k_write',
+    'grad_pool_v_read',
+    'grad_pool_v_write',
+    'grad_pool_rst_read',
+    'grad_pool_rst_write',
+)
+
 V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES = (
     'grad_pool_attn_qk_op_key',
     'grad_pool_attn_v_op_key',
@@ -1328,10 +1339,26 @@ V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
         )),
 )
 
+V4174_COMPACT_TRAIN_METRIC_NAMES = (
+    'total_loss',
+    'ce_loss',
+    'aux_loss',
+    'tau_reg',
+    'orth_loss',
+    'div_loss',
+    'correct',
+    'valid_count',
+    'grad_norm',
+    'tau_lr_mult',
+    *V4170_TAU_UPDATE_METRIC_NAMES,
+    *V4174_DIRECT_RW_GRADIENT_METRIC_NAMES,
+    *V4174_SELECTOR_METRIC_NAMES,
+)
+
 V4174_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
-    *V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES,
+    *V4174_DIRECT_RW_GRADIENT_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
 )
 V4174_COMPACT_REGULAR_JSONL_KEYS = (
@@ -3239,7 +3266,7 @@ def _v4170_compact_train_metrics(
         result, *, total_loss, ce_loss, aux_loss, tau_reg, orth_loss,
         div_loss, grad_norm, tau_lr_mult, tau_update_qk_max_abs,
         tau_update_v_max_abs, tau_update_rst_max_abs,
-        model_version=None, operator_key_gradient_metrics=None):
+        model_version=None, pool_gradient_metrics=None):
     """Build the exact payload; tau_update_* are raw_tau parameter updates."""
     metrics = {
         'total_loss': total_loss,
@@ -3260,20 +3287,23 @@ def _v4170_compact_train_metrics(
             'tau_update_v_max_abs': tau_update_v_max_abs,
             'tau_update_rst_max_abs': tau_update_rst_max_abs,
         })
-        if operator_key_gradient_metrics is None:
+        if pool_gradient_metrics is None:
             raise RuntimeError(
-                "v417x fast train metrics require operator-key gradient "
-                "scalars")
+                "v417x fast train metrics require pool-gradient scalars")
+        gradient_metric_names = (
+            V4174_DIRECT_RW_GRADIENT_METRIC_NAMES
+            if str(model_version) == V4174_MODEL_VERSION
+            else V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
         metrics.update({
-            key: operator_key_gradient_metrics[key]
-            for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
+            key: pool_gradient_metrics[key]
+            for key in gradient_metric_names})
         if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
-                key: operator_key_gradient_metrics[key]
+                key: pool_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
         if str(model_version) == V4173_MODEL_VERSION:
             metrics.update({
-                key: operator_key_gradient_metrics[key]
+                key: pool_gradient_metrics[key]
                 for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
             present_space_metrics = tuple(
                 key for key in V4173_OPERATION_SPACE_METRIC_NAMES
@@ -3285,17 +3315,19 @@ def _v4170_compact_train_metrics(
             metrics.update({
                 key: result[key] for key in present_space_metrics})
         if str(model_version) == V4174_MODEL_VERSION:
-            metrics.update({
-                key: result[key]
-                for key in V4174_COMPOSITION_REGULAR_METRIC_NAMES})
-            present_space_metrics = tuple(
-                key for key in V4174_SELECTOR_METRIC_NAMES if key in result)
-            if present_space_metrics and len(present_space_metrics) != len(
-                    V4174_SELECTOR_METRIC_NAMES):
+            missing_space_metrics = tuple(
+                key for key in V4174_SELECTOR_METRIC_NAMES
+                if key not in result)
+            if missing_space_metrics:
                 raise RuntimeError(
-                    "v4174 operation-space train metrics are incomplete")
+                    "v4174 operation-space train metrics are incomplete: "
+                    + ", ".join(missing_space_metrics))
             metrics.update({
-                key: result[key] for key in present_space_metrics})
+                key: result[key] for key in V4174_SELECTOR_METRIC_NAMES})
+            if tuple(metrics) != V4174_COMPACT_TRAIN_METRIC_NAMES:
+                raise RuntimeError(
+                    "v4174 compact train metric schema drift: "
+                    f"actual={tuple(metrics)}")
         return metrics
     metrics.update({
         key: result[key]
@@ -3311,20 +3343,20 @@ def _v4170_compact_train_metrics(
     if is_v4171:
         metrics.update({
             key: result[key] for key in V4171_COMPOSITION_METRIC_NAMES})
-        if operator_key_gradient_metrics is None:
+        if pool_gradient_metrics is None:
             raise RuntimeError(
                 "v417x compact train metrics require operator-key gradient "
                 "diagnostics")
         metrics.update({
-            key: operator_key_gradient_metrics[key]
+            key: pool_gradient_metrics[key]
             for key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES})
         if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
             metrics.update({
-                key: operator_key_gradient_metrics[key]
+                key: pool_gradient_metrics[key]
                 for key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES})
         if str(model_version) == V4173_MODEL_VERSION:
             metrics.update({
-                key: operator_key_gradient_metrics[key]
+                key: pool_gradient_metrics[key]
                 for key in V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES})
     v4172_alias_names = (
         V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES
@@ -3598,6 +3630,22 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
         }),
         'neuron_pool': pool_params,
     }
+    if str(version) == V4174_MODEL_VERSION:
+        score_params['block_0']['attn'] = {
+            'expand_O': params['block_0']['attn']['expand_O'],
+        }
+        score_params['router'].update({
+            'space_route_proj': params['router']['space_route_proj'],
+            'space_read_vectors': params['router']['space_read_vectors'],
+            'space_state_writeback':
+                params['router']['space_state_writeback'],
+            'q_operator_tau_proj':
+                params['router']['q_operator_tau_proj'],
+            'k_operator_tau_proj':
+                params['router']['k_operator_tau_proj'],
+            'v_operator_tau_proj':
+                params['router']['v_operator_tau_proj'],
+        })
     if (_is_rw_key_srw_version(version)
             and str(version) not in DIRECT_STATE_QUERY_MODEL_VERSIONS):
         score_params['router'].update({
@@ -3613,6 +3661,29 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     score_kwargs = {
         'max_tokens': int(max_tokens),
     }
+    if str(version) == V4174_MODEL_VERSION:
+        model_cfg = cfg['model']
+        training_cfg = cfg.get('training', {})
+        score_kwargs.update({
+            'n_heads': int(model_cfg['n_heads']),
+            'n_layers': int(model_cfg['n_layers']),
+            'operation_space_top_k':
+                int(model_cfg['operation_space_top_k']),
+            'soft_gate_temperature': float(training_cfg.get(
+                'soft_gate_t_start', 1.5)),
+            'soft_gate_boundary_power': float(training_cfg.get(
+                'soft_gate_boundary_power_start', 3.0)),
+            'admission_den_power':
+                float(model_cfg['admission_den_power']),
+            'admission_den_power_qk':
+                model_cfg.get('admission_den_power_qk'),
+            'admission_den_power_v':
+                model_cfg.get('admission_den_power_v'),
+            'srw_composition_mode': str(model_cfg.get(
+                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE)),
+            'heat_kernel_beta': float(model_cfg.get(
+                'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)),
+        })
     return version, score_impl, score_params, score_kwargs
 
 
@@ -3771,7 +3842,6 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
     scores, sampled, page_stats = _sample_srw_selection_scores(
         params, input_ids, cfg, tau_init_cfg['calibration_tokens'])
-    per_space_v4174 = str(version) == V4174_MODEL_VERSION
     per_space_rst = (
         str(version) == V4173_MODEL_VERSION
         and np.asarray(scores['rst']).ndim == 2)
@@ -3785,9 +3855,7 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     for pool in ('qk', 'v', 'rst'):
         target = tau_init_cfg['targets'][pool]
         meta = page_stats[pool]
-        if ((pool == 'rst' and per_space_rst)
-                or (per_space_v4174
-                    and np.asarray(scores[pool]).ndim == 2)):
+        if pool == 'rst' and per_space_rst:
             if bool(meta.get('pages_enabled', False)):
                 raise ValueError(
                     "per-space operator tau calibration requires the full "
@@ -3834,31 +3902,48 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         tau_calibration[pool] = _tau_calibration_diag(
             pool, scores[pool], meta, target, local_target, quantile_tau)
 
-    if per_space_v4174:
-        # Q and K use the same target but their independent projection score
-        # distributions produce independent per-address quantiles.
+    if str(version) == V4174_MODEL_VERSION:
+        # Each route owns one shared R->1 tau projection.  Calibrate its scalar
+        # zero-kernel bias from the full all-space score population.
         qk_target = float(tau_init_cfg['targets']['qk'])
         for route in ('q', 'k'):
             route_scores = np.asarray(scores[route], dtype=np.float32)
-            route_tau = np.asarray([
-                float(np.clip(
-                    _array_quantile(values, 1.0 - qk_target),
-                    tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
-                for values in route_scores], dtype=np.float32)
-            tau[route] = route_tau.tolist()
-            route_active = np.mean(
-                route_scores > route_tau[:, None], axis=1).tolist()
+            route_tau = float(np.clip(
+                _array_quantile(route_scores, 1.0 - qk_target),
+                tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+            tau[route] = route_tau
+            route_active = float(np.mean(route_scores > route_tau))
             estimated_active[route] = route_active
             estimated_active_local[route] = route_active
             estimated_active_pool[route] = route_active
-            tau_calibration[route] = [
-                _tau_calibration_diag(
-                    f'{route}[{space_id}]', values,
-                    page_stats[route], qk_target, qk_target,
-                    float(route_tau[space_id]))
-                for space_id, values in enumerate(route_scores)]
-        tau['qk'] = (
-            0.5 * (np.asarray(tau['q']) + np.asarray(tau['k']))).tolist()
+            tau_calibration[route] = _tau_calibration_diag(
+                route, route_scores, page_stats[route],
+                qk_target, qk_target, route_tau)
+
+        # RST observes Norm2(state + production attention).  Re-run its score
+        # sample after applying the calibrated Q/K/V biases so the measured
+        # post-attention state is exactly the one used by the final fresh init.
+        attention_calibrated_params = _set_srw_quantile_tau_biases(
+            params,
+            {'tau_init_quantile_tau': tau},
+            model_version=version)
+        rerun_scores, _, rerun_page_stats = _sample_srw_selection_scores(
+            attention_calibrated_params, input_ids, cfg,
+            tau_init_cfg['calibration_tokens'])
+        rst_scores = np.asarray(rerun_scores['rst'], dtype=np.float32)
+        rst_target = float(tau_init_cfg['targets']['rst'])
+        rst_tau = float(np.clip(
+            _array_quantile(rst_scores, 1.0 - rst_target),
+            tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+        rst_active = float(np.mean(rst_scores > rst_tau))
+        tau['rst'] = rst_tau
+        target_local['rst'] = rst_target
+        estimated_active['rst'] = rst_active
+        estimated_active_local['rst'] = rst_active
+        estimated_active_pool['rst'] = rst_active
+        tau_calibration['rst'] = _tau_calibration_diag(
+            'rst', rst_scores, rerun_page_stats['rst'],
+            rst_target, rst_target, rst_tau)
 
     return {
         'type': 'tau_init',
@@ -3886,26 +3971,29 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         'tau_init_est_active_local_rst': estimated_active_local['rst'],
         'tau_init_est_active_q': (
             float(np.mean(scores['q'] > (
-                np.asarray(tau['q'])[:, None] if per_space_v4174
+                tau['q'] if str(version) == V4174_MODEL_VERSION
                 else tau['qk'])))
             * float(page_stats['q'].get('candidate_frac', 1.0))),
         'tau_init_est_active_k': (
             float(np.mean(scores['k'] > (
-                np.asarray(tau['k'])[:, None] if per_space_v4174
+                tau['k'] if str(version) == V4174_MODEL_VERSION
                 else tau['qk'])))
             * float(page_stats['k'].get('candidate_frac', 1.0))),
         'tau_init_est_active_local_q': float(
             np.mean(scores['q'] > (
-                np.asarray(tau['q'])[:, None] if per_space_v4174
+                tau['q'] if str(version) == V4174_MODEL_VERSION
                 else tau['qk']))),
         'tau_init_est_active_local_k': float(
             np.mean(scores['k'] > (
-                np.asarray(tau['k'])[:, None] if per_space_v4174
+                tau['k'] if str(version) == V4174_MODEL_VERSION
                 else tau['qk']))),
         'tau_calibration': tau_calibration,
         'tau_init_calibration': {
             'batch': 'first_train_batch_host0',
-            'token_sampling': 'evenly_spaced_flat',
+            'token_sampling': (
+                'production_attention_batch_prefix'
+                if str(version) == V4174_MODEL_VERSION
+                else 'evenly_spaced_flat'),
             'tokens': int(np.asarray(sampled.get(
                 'tokens', np.asarray(sampled['q']).shape[0]))),
             'neurons_qk': int(page_stats['qk']['full_pool_size']),
@@ -6263,6 +6351,22 @@ def _shared_probe_gradient_diagnostics(
     }
 
 
+def _v4174_direct_rw_gradient_diagnostics(pool_grads):
+    """Return native read/write gradient norms for all direct RW banks."""
+    def _norm(name):
+        if name not in pool_grads:
+            raise RuntimeError(
+                f"v4174 direct RW gradient is missing {name!r}")
+        return jax.lax.stop_gradient(_global_norm_array(pool_grads[name]))
+
+    return {
+        f'grad_pool_{route}_{kind}':
+            _norm(f'{route}_{kind}_vectors')
+        for route in ('q', 'k', 'v', 'rst')
+        for kind in ('read', 'write')
+    }
+
+
 def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
     """Return version-canonical operator-key gradient norms by pool."""
     pool_schema = _canonical_pool_schema(model_version)
@@ -7409,7 +7513,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             )
             result_payload = result
             if _is_v4170_compact_train:
-                if _is_v417x_model:
+                if str(_model_version) == V4174_MODEL_VERSION:
+                    result_payload = {
+                        key: result[key]
+                        for key in (
+                            'correct', 'valid_count',
+                            *V4174_SELECTOR_METRIC_NAMES)}
+                elif _is_v417x_model:
                     result_payload = {
                         key: result[key]
                         for key in ('correct', 'valid_count')}
@@ -8015,8 +8125,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         _gpool = grads.get('neuron_pool', {})
         _ppool = params.get('neuron_pool', {})
-        _shared_probe_metrics = _shared_probe_gradient_diagnostics(
-            _ppool, _gpool, _model_version)
+        if str(_model_version) == V4174_MODEL_VERSION:
+            _shared_probe_metrics = {}
+            _direct_rw_gradient_metrics = (
+                _v4174_direct_rw_gradient_diagnostics(_gpool))
+        else:
+            _shared_probe_metrics = _shared_probe_gradient_diagnostics(
+                _ppool, _gpool, _model_version)
+            _direct_rw_gradient_metrics = {}
         _grouter = grads.get('router', {})
         if str(_model_version) == V4173_MODEL_VERSION:
             up_proj_grad = jnp.sqrt(sum(
@@ -8030,16 +8146,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             local_write_grad = jnp.float32(0.0)
         grad_norm = _tree_norm(grads)
         if _is_v4170_compact_train:
-            compact_operator_key_metrics = dict(_shared_probe_metrics)
+            compact_pool_gradient_metrics = (
+                dict(_direct_rw_gradient_metrics)
+                if str(_model_version) == V4174_MODEL_VERSION
+                else dict(_shared_probe_metrics))
             if str(_model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
-                compact_operator_key_metrics.update({
+                compact_pool_gradient_metrics.update({
                     'grad_pool_attn_qk_op_key': _shared_probe_metrics[
                         'grad_pool_shared_key_probe'],
                     'grad_pool_attn_v_op_key': jnp.float32(0.0),
                     'grad_pool_rst_op_key': jnp.float32(0.0),
                 })
             if str(_model_version) == V4173_MODEL_VERSION:
-                compact_operator_key_metrics.update({
+                compact_pool_gradient_metrics.update({
                     'up_proj_grad': up_proj_grad,
                     'local_write_grad': local_write_grad,
                 })
@@ -8057,8 +8176,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 tau_update_v_max_abs=tau_update_v_max_abs,
                 tau_update_rst_max_abs=tau_update_rst_max_abs,
                 model_version=_model_version,
-                operator_key_gradient_metrics=
-                    compact_operator_key_metrics)
+                pool_gradient_metrics=compact_pool_gradient_metrics)
             return new_params, new_opt_state, metrics
         _pool_op_key_grad_norms = (
             {
@@ -12886,6 +13004,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'grad_ratio_pool_shared_read_probe', 0.0)),
         'grad_ratio_pool_shared_write_probe': float(m.get(
             'grad_ratio_pool_shared_write_probe', 0.0)),
+        **{
+            key: float(m.get(key, 0.0))
+            for key in V4174_DIRECT_RW_GRADIENT_METRIC_NAMES
+        },
         'grad_pool_attn_qk_emb': float(m.get('grad_pool_attn_qk_emb', 0.0)),
         'grad_pool_attn_qk_op_key': float(m.get(
             'grad_pool_attn_qk_op_key', 0.0)),
@@ -14912,7 +15034,11 @@ def _build_analysis_record(base, metrics, ctx):
                                m.get(f'{_src}_{_part}_grad_ratio', 0.0)))
             rec[f'{_dst}_{_part}_grad_ratio'] = _val
             rec[f'{_dst}_{_part}_update_ratio'] = _lr * _val
-    for _key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES:
+    _gradient_metric_names = (
+        V4174_DIRECT_RW_GRADIENT_METRIC_NAMES
+        if str(ctx.get('model_version')) == V4174_MODEL_VERSION
+        else V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
+    for _key in _gradient_metric_names:
         rec[_key] = float(m.get(_key, 0.0))
     for _key in V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES:
         if _key in m:
@@ -22008,7 +22134,11 @@ def main():
                                     _key = f'{_pool}_{_part}_grad_ratio'
                                     analysis_payload[_key] = metrics.get(
                                         _key, jnp.float32(0.0))
-                            for _key in V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES:
+                            _analysis_gradient_names = (
+                                V4174_DIRECT_RW_GRADIENT_METRIC_NAMES
+                                if str(model_version) == V4174_MODEL_VERSION
+                                else V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES)
+                            for _key in _analysis_gradient_names:
                                 analysis_payload[_key] = metrics.get(
                                     _key, jnp.float32(0.0))
                             if str(model_version) in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:

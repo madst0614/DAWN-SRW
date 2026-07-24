@@ -265,7 +265,7 @@ class OperationSpaceRouter(nn.Module):
         for route in ROUTES:
             setattr(self, f"{route}_operator_tau_proj", nn.Dense(
                 1, name=f"{route}_operator_tau_proj",
-                kernel_init=nn.initializers.normal(stddev=0.02),
+                kernel_init=nn.initializers.zeros,
                 bias_init=_constant_tau_bias(tau_values[route])))
 
 
@@ -688,7 +688,7 @@ class DAWN_SRW_V4174(nn.Module):
     heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA
     n_q: int = 792
     n_k: int = 792
-    n_v: int = 2600
+    n_v: int = 2601
     n_rst: int = 25200
     n_operation_spaces: int = 3
     operation_space_top_k: int = 2
@@ -1127,16 +1127,26 @@ class DAWN_SRW_V4174(nn.Module):
         ]
 
 
-def _sampled_layer_states(params, input_ids, max_tokens):
+def _sampled_layer_states(
+        params, input_ids, max_tokens, *,
+        n_heads=6, n_layers=12, operation_space_top_k=2,
+        soft_gate_temperature=0.07, soft_gate_boundary_power=2.0,
+        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
+        admission_den_power_qk=None, admission_den_power_v=None,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Sample block-0 Norm1 and production post-attention Norm2 states."""
     max_tokens = _positive_int("max_tokens", int(max_tokens))
     input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
     if input_ids.ndim != 2:
         raise ValueError("input_ids must be [batch, sequence]")
-    token_count = min(max_tokens, int(input_ids.size))
-    token_index = (
-        jnp.arange(token_count) * int(input_ids.size) // token_count)
-    positions = token_index % input_ids.shape[1]
-    token_ids = input_ids.reshape(-1)[token_index]
+    sequence_length = min(int(input_ids.shape[1]), max_tokens)
+    batch_count = min(
+        int(input_ids.shape[0]), max(1, max_tokens // sequence_length))
+    batch_index = (
+        jnp.arange(batch_count) * int(input_ids.shape[0]) // batch_count)
+    token_ids = input_ids[batch_index, :sequence_length]
+    positions = jnp.arange(sequence_length)[None, :]
     state = (
         params["token_emb"]["embedding"][token_ids]
         + params["pos_emb"]["embedding"][positions]
@@ -1144,15 +1154,88 @@ def _sampled_layer_states(params, input_ids, max_tokens):
     block = params["block_0"]
     attention_state = _shared_layer_norm(
         state, block["norm1"]["scale"], block["norm1"]["bias"])
+    flat_attention_state = attention_state.reshape(
+        (-1, attention_state.shape[-1]))
+    router = params["router"]
+    pool = params["neuron_pool"]
+    routing = _compute_space_routing(
+        flat_attention_state,
+        router["space_route_proj"]["kernel"],
+        router["space_read_vectors"],
+        operation_space_top_k)
+    local = _project_space_local_states(
+        flat_attention_state, router["space_state_proj"])
+    den_qk = (
+        admission_den_power
+        if admission_den_power_qk is None else admission_den_power_qk)
+    den_v = (
+        admission_den_power
+        if admission_den_power_v is None else admission_den_power_v)
+    qk_scale, v_scale, _ = _shared_pool_output_scales(
+        int(attention_state.shape[-1]), int(n_layers))
+    route_scales = {"q": qk_scale, "k": qk_scale, "v": v_scale}
+    route_outputs = {}
+    for route in ("q", "k", "v"):
+        raw_tau = _linear(
+            router[f"{route}_operator_tau_proj"], local)
+        local_output = _rw_compose_space_dense(
+            local,
+            pool[f"{route}_read_vectors"],
+            pool[f"{route}_write_vectors"],
+            raw_tau,
+            soft_gate_temperature=soft_gate_temperature,
+            soft_gate_boundary_power=soft_gate_boundary_power,
+            admission_den_power=den_qk if route in ("q", "k") else den_v,
+            srw_composition_mode=srw_composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            max_chunk_size=int(pool[f"{route}_read_vectors"].shape[1]))
+        route_outputs[route] = _space_weighted_writeback(
+            local_output,
+            routing["dense_space_weights"],
+            router["space_state_writeback"],
+            route_scales[route]).reshape(attention_state.shape)
+
+    d_model = int(attention_state.shape[-1])
+    n_heads = _positive_int("n_heads", int(n_heads))
+    if d_model % n_heads:
+        raise ValueError("calibration d_model must be divisible by n_heads")
+    d_head = d_model // n_heads
+
+    def split_heads(value):
+        return value.reshape(
+            batch_count, sequence_length, n_heads, d_head
+        ).transpose(0, 2, 1, 3)
+
+    query = split_heads(route_outputs["q"])
+    key = split_heads(route_outputs["k"])
+    value = split_heads(route_outputs["v"])
+    attention_scores = jnp.einsum(
+        "bhsd,bhtd->bhst", query, key
+    ) / jnp.sqrt(jnp.float32(d_head))
+    causal = jnp.tril(jnp.ones(
+        (sequence_length, sequence_length), dtype=jnp.bool_))
+    attention_scores = jnp.where(
+        causal, attention_scores, jnp.finfo(attention_scores.dtype).min)
+    attention_weights = jax.nn.softmax(attention_scores, axis=-1)
+    attention_output = jnp.einsum(
+        "bhst,bhtd->bhsd", attention_weights, value)
+    attention_output = attention_output.transpose(0, 2, 1, 3).reshape(
+        batch_count, sequence_length, d_model)
+    attention_output = _linear(
+        block["attn"]["expand_O"], attention_output)
+    post_attention_state = state + attention_output
     rst_state = _shared_layer_norm(
-        state, block["norm2"]["scale"], block["norm2"]["bias"])
-    return attention_state, rst_state
+        post_attention_state,
+        block["norm2"]["scale"],
+        block["norm2"]["bias"])
+    return flat_attention_state, rst_state.reshape((-1, d_model))
 
 
-def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
+def _tau_init_calibration_scores(
+        params, input_ids, max_tokens=128, **production_kwargs):
     """Return direct-read per-route ``[M,T,N]`` cosine tables."""
     attention_state, rst_state = _sampled_layer_states(
-        params, input_ids, max_tokens)
+        params, input_ids, max_tokens, **production_kwargs)
     router = params["router"]
     pool = params["neuron_pool"]
 
