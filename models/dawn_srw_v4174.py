@@ -2008,7 +2008,6 @@ def _dense_rw_output_sharded(
     n_local = int(read_vectors.shape[2])
     chunk_size = min(max(1, int(max_chunk_size)), n_local)
     n_chunks = math.ceil(n_local / chunk_size)
-    use_chunk_remat = n_chunks > 1
     n_padded = n_chunks * chunk_size
     pad_n = n_padded - n_local
     pad_spec = ((0, 0), (0, 0), (0, pad_n), (0, 0))
@@ -2063,9 +2062,7 @@ def _dense_rw_output_sharded(
             gate_mass + gate.sum(axis=-1, keepdims=True),
         ), None
 
-    scan_step = (
-        jax.checkpoint(production_step, prevent_cse=False)
-        if use_chunk_remat else production_step)
+    scan_step = jax.checkpoint(production_step, prevent_cse=False)
     (raw_out, gate_mass), _ = jax.lax.scan(
         scan_step, carry, jnp.arange(n_chunks))
     return raw_out, gate_mass
@@ -2505,7 +2502,7 @@ def _make_sharded_attention_space_dense(
     kernel._v4174_dense_grouped_execution = "attention_qkv"
     kernel._v4174_qk_paired = True
     kernel._v4174_dynamic_metric_flag = True
-    kernel._v4174_chunk_remat_policy = "multi_chunk_only"
+    kernel._v4174_chunk_remat_policy = "always"
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -2687,7 +2684,7 @@ def _make_sharded_rst_space_dense(
     kernel._v4174_kernel_profile = "production"
     kernel._v4174_dense_grouped_execution = "rst_end_to_end"
     kernel._v4174_dynamic_metric_flag = True
-    kernel._v4174_chunk_remat_policy = "multi_chunk_only"
+    kernel._v4174_chunk_remat_policy = "always"
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")

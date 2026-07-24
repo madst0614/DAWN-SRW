@@ -819,8 +819,8 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert attention_dense._v4174_dense_grouped_execution == "attention_qkv"
     assert rst_dense._v4174_dense_grouped_execution == "rst_end_to_end"
     assert rst_dense._v4174_dynamic_metric_flag is True
-    assert attention_dense._v4174_chunk_remat_policy == "multi_chunk_only"
-    assert rst_dense._v4174_chunk_remat_policy == "multi_chunk_only"
+    assert attention_dense._v4174_chunk_remat_policy == "always"
+    assert rst_dense._v4174_chunk_remat_policy == "always"
     assert attention_dense._v4174_throughput_precision == (
         "bf16_operands_f32_accum")
     assert rst_dense._v4174_throughput_precision == (

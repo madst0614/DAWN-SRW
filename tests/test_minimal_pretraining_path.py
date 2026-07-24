@@ -127,9 +127,8 @@ def test_v4174_dynamic_metric_source_contract():
     assert "gate.max" not in output_source
     assert "margin >" not in output_source
     assert "depth.sum" not in output_source
-    assert "use_chunk_remat = n_chunks > 1" in output_source
     assert "jax.checkpoint(production_step, prevent_cse=False)" in output_source
-    assert "if use_chunk_remat else production_step" in output_source
+    assert "use_chunk_remat" not in output_source
     assert "remat_chunks" not in output_source
     production_step_source = output_source.split(
         "def production_step", 1)[1].split("scan_step =", 1)[0]
@@ -174,8 +173,8 @@ def test_v4174_dynamic_metric_source_contract():
     assert "remat_chunks" not in attention_source
     assert "remat_chunks" not in rst_source
     assert "remat_chunks" not in builder_source
-    assert '"multi_chunk_only"' in attention_source
-    assert '"multi_chunk_only"' in rst_source
+    assert '_v4174_chunk_remat_policy = "always"' in attention_source
+    assert '_v4174_chunk_remat_policy = "always"' in rst_source
     assert "static_argnames" not in trainer_source
     assert "collect_train_metrics=True" in trainer_source
     assert "step_after_update in (1, 5, 10, 20, 50)" in main_source
