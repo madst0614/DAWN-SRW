@@ -2036,7 +2036,7 @@ _FUSED_OPERATOR_METRIC_SUFFIXES = (
 )
 _BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME = "v4174_bundle_rw_raw_out"
 _BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME = "v4174_bundle_rw_gate_mass"
-_EXACT_SPACE_BACKWARD_BUCKET_CAPACITY = 4096
+_EXACT_SPACE_BACKWARD_BUCKET_CAPACITY = 3072
 _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE = 4
 _BUNDLE_BLOCK_CHECKPOINT_POLICY = (
     jax.checkpoint_policies.save_from_both_policies(
@@ -3936,7 +3936,7 @@ def _make_sharded_attention_space_bundle_dense(
     kernel._v4174_backward_overflow_task_group_size = (
         _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
     kernel._v4174_backward_packed_entry_capacity = (
-        "n_spaces*min(T,4096) + compact exact overflow tasks")
+        "n_spaces*min(T,3072) + compact exact overflow tasks")
     kernel._v4174_qkv_shared_projection_vjp = True
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
@@ -4747,7 +4747,7 @@ def _make_sharded_rst_space_bundle_dense(
     kernel._v4174_backward_overflow_task_group_size = (
         _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
     kernel._v4174_backward_packed_entry_capacity = (
-        "n_spaces*min(T,4096) + compact exact overflow tasks")
+        "n_spaces*min(T,3072) + compact exact overflow tasks")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
