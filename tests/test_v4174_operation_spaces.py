@@ -16,7 +16,7 @@ from models import dawn_srw_v4174 as v4174
 ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_CONFIG = (
     ROOT / "configs" /
-    "train_config_v4174_400M_c4_40B_v4_64_space24_top2_direct_read.yaml")
+    "train_config_v4174_400M_c4_20B_v4_64.yaml")
 
 
 def _model_config(**updates):

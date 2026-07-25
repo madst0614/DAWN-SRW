@@ -1,14 +1,24 @@
-# DAWN-SRW v4.1.7.4 compact fixed-four-space production execution.
+# DAWN-SRW v4.1.7.4 accepted 400M production configuration.
 #
-# This is parameter-identical to the canonical direct-read v4174 config.
-# Only the physical operation-space executor and output locations differ.
+# Accepted execution at model commit 8187c00d:
+#   forward: bundle4
+#   backward: exact selected-top-2 spaces
+#   bucket capacity: 3072 with compact exact overflow
+#
+# Parameter-matched horizontal expansion with fixed D=2048 and R=256:
+#   target:          393,810,000
+#   v4174:           393,755,652
+#   difference:          -54,348 (-0.014%)
+#
+# The 40B C4 source remains unchanged; max_train_tokens selects its first 20B
+# tokens, yielding 38,146 full global batches at batch=1024 and seq=512.
 
 seed: 1
 
 data:
   bin_train: gs://dawn-tpu-data-c4/c4_train_40B
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
-  max_train_tokens: 40000000000
+  max_train_tokens: 20000000000
   max_val_tokens: 10000000
   local_cache_dir: /tmp/data
 
@@ -73,5 +83,5 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_40B_v4_64_space24_top2_bundle4
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4174_400M_c4_40B_v4_64_space24_top2_bundle4
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_20B_v4_64
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4174_400M_c4_20B_v4_64

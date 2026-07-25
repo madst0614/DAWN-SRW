@@ -5,13 +5,13 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: keep the accepted exact selected-top-2 dense backward training from the canonical checkpoint after closing the end-to-end P-RW-U rematerialization screen.
-- Publication state: branch `codex/v4167-poc`, GitHub HEAD `0fa80a9a8f2dbd75f32f46a38e0097d3d9a325a4`; rejected exact-owner source remains preserved at `4cacfe39`, rejected P-RW-U source at `fd7e5e32`, and the accepted model at `8187c00d`.
-- Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices. The accepted measurements below are from-scratch speed checks or benchmarks with no restored checkpoint.
+- Current goal: publish one unambiguous 20B v4174 400M production config using the accepted exact selected-top-2 dense backward model; the user will perform the TPU run replacement.
+- Publication state: branch `codex/v4167-poc`, source parent `7316b5b2e4a0472d6f4528cc33873cdf12d8edd1`; this entry and its associated change commit restore the accepted model blob from `8187c00d`, remove both superseded 40B configs, and add the canonical 20B config.
+- Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices, 38,146 full global steps. The accepted performance measurements below remain from-scratch speed checks or benchmarks with no restored checkpoint.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
 - Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. End-to-end `nothing_saveable` P-RW-U rematerialization improved the isolated two-layer QKV+RST forward/backward total by 3.60%, but the matched full train-step was unchanged (accepted 10.7882 s vs candidate 10.7895 s), runtime HBM was unchanged, and candidate compilation regressed; it is rejected.
-- Current blocker: none in the control path. The final accepted run restored step 1681 consistently across all eight hosts and is compiling its first post-restore train step.
-- Next experiment: verify the final accepted run reaches step 1700, publish this experiment record, and leave `tmux train`/`~/train.log` running on `spatial-se-400m`.
+- Current blocker: no implementation blocker. Per user instruction, no TPU process or GCS checkpoint was changed in the 20B canonicalization. A plain resume from the existing 40B run retains its checkpoint `full_config` and therefore does not by itself convert the schedule to 20B.
+- Next experiment: user-owned launch handoff for the canonical 20B config, with an explicit fresh-run or checkpoint-migration decision; verify the selected runtime reaches a real optimizer step before calling the 20B run active.
 
 ## Fixed Context
 
@@ -371,6 +371,17 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: the explicit boundary changes the isolated custom-VJP schedule, but its small gain disappears inside the complete 18-layer optimizer graph and does not reduce observed runtime HBM. Runtime telemetry is not XLA program-memory evidence, so no program-HBM reduction is claimed.
 - Decision/next: do not promote the P-RW-U candidate. Preserve it at `fd7e5e32`/`1ff2e57b`, retain `8187c00d` as the accepted fallback, and resume the canonical step-1681 training run.
 - Evidence: `/home/madst0614/train.v4174_p_rw_u_gate_accepted_001c2c27_20260726T041649KST.log`; `/home/madst0614/train.v4174_p_rw_u_gate_candidate_1ff2e57b_20260726T042523KST.log`; `/home/madst0614/train.v4174_p_rw_u_trainstep_candidate_1ff2e57b_20260726T043455KST.log`; `/home/madst0614/train.v4174_p_rw_u_trainstep_accepted_001c2c27_20260726T044420KST.log`; matching JSONL directories under `/home/madst0614/DAWN-SRW/benchmark_runs/`.
+
+#### #14 — Consolidate the accepted v4174 400M run into one 20B config
+
+- Status: accepted configuration change; local validation passed; TPU execution not requested.
+- Hypothesis/change: replacing the direct-read and bundle4-named 40B YAMLs with one canonical `train_config_v4174_400M_c4_20B_v4_64.yaml`, explicitly selecting bundle4 execution, and restoring the exact accepted model source should remove launch ambiguity while halving the requested token budget without changing topology, parameters, precision, grouped execution, or checkpoint schema.
+- Run identity: branch `codex/v4167-poc`; source parent `7316b5b2e4a0472d6f4528cc33873cdf12d8edd1`; model Git blob `bfbe6eef04d1047d43625b68e0a2e3976da064e2`, identical to `8187c00d4b767a743c3178a5bcb8caac1c6124c5:models/dawn_srw_v4174.py`; config SHA-256 `31a4a57f0044aef100c66e8519a9386ad4122289920805412e82d57b697679df`; batch 1024, sequence 512, mesh `16x2`/32 devices; local Python 3.12.7, JAX 0.6.2, Flax 0.10.7.
+- Result: the canonical config retains `gs://dawn-tpu-data-c4/c4_train_40B` as the source but caps it at 20,000,000,000 tokens, yielding 38,146 full batches of 524,288 tokens, 19,999,490,048 consumed tokens, and a 509,952-token dropped remainder. It selects `bundle_dense`, bundle size 4, token block 2048, exact selected-top-2 backward with bucket capacity 3072 from the accepted model, and 393,755,652 symbolic parameters. Checkpoints and logs now use `dawn_srw_v4174_400M_c4_20B_v4_64`; both superseded 40B config files were removed.
+- Validation: `.venv-jax062` loaded the YAML and model, checked the 20B step arithmetic, accepted execution fields, parameter count, and checkpoint suffix; the working model Git blob matched the accepted `8187c00d` blob; `git diff --check` passed. No TPU command, GCS write, runtime step, or performance measurement was performed.
+- Lesson: renaming the checkpoint base does not migrate the existing step-1681 run, and the strict resume path intentionally uses checkpoint `full_config`; passing the old 40B run to `--resume-from` would retain the 40B schedule. A 20B continuation therefore needs an explicit migration/fork mechanism or a fresh run rather than an implicit config override.
+- Decision/next: publish only the repository change as requested and leave the current `spatial-se-400m` process untouched. The user will perform the execution replacement and choose the runtime checkpoint transition.
+- Evidence: `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`; accepted model blob identity above; local validation output from 2026-07-26 KST.
 
 ## Backfill Boundary
 
