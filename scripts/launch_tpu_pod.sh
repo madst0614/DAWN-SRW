@@ -9,19 +9,15 @@
 # Usage:
 #   bash scripts/launch_tpu_pod.sh --tpu spatial-analysis1 --config configs/v4_8.yaml
 #   bash scripts/launch_tpu_pod.sh --tpu dawn-400m-v4-64 --branch main --config configs/v4_64.yaml
-#   bash scripts/launch_tpu_pod.sh  # uses defaults (v4-64 settings)
 #
 # Prerequisites:
-#   1. TPU VM or queued resource created separately:
-#      gcloud compute tpus tpu-vm create dawn-400m-v4-64 \
-#        --zone=us-central2-b --accelerator-type=v4-64 \
-#        --version=tpu-vm-v4-base --spot
+#   1. An existing TPU VM explicitly named with --tpu.
 # =============================================================================
 
 set -euo pipefail
 
 # Defaults
-TPU_NAME="dawn-400m-v4-64"
+TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
 REMOTE_USER="madst0614"
@@ -53,12 +49,12 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--script TRAIN_SCRIPT] [--token GH_TOKEN] [--from-scratch] [--resume-from RUN_FOLDER_OR_ORBAX_STEP] [--debug [N]]"
+            echo "Usage: $0 --tpu NAME [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--script TRAIN_SCRIPT] [--token GH_TOKEN] [--from-scratch] [--resume-from RUN_FOLDER_OR_ORBAX_STEP] [--debug [N]]"
             echo ""
             echo "Supports single-host TPU VMs such as v4-8 and multi-host TPU pods such as v4-64/v4-128."
             echo "The TPU VM or queued resource must already exist; this script only launches setup/training."
             echo ""
-            echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
+            echo "  --tpu      Existing TPU VM name (required; no default)"
             echo "  --zone     GCP zone            (default: $ZONE)"
             echo "  --project  GCP project          (default: $PROJECT)"
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
@@ -76,6 +72,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -z "$TPU_NAME" ]]; then
+    echo "ERROR: --tpu must explicitly name an existing TPU resource." >&2
+    exit 1
+fi
 
 echo "============================================"
 echo "Launching TPU VM/Pod training"

@@ -340,6 +340,16 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Decision/next: publish the fail-loud cleanup sequence, relaunch accepted training, and require one real restored step before the fusion gate.
 - Evidence: `/home/madst0614/train.log` on the fixed-user retry; live `lsof` and lock ownership inspection on all workers; `scripts/launch_tpu_pod.sh`; `scripts/launch_srw_benchmark_tpu_pod.sh`.
 
+#### #11 — Make the bounded v4174 backward gate a first-class launcher path
+
+- Status: implemented and locally shell-validated; TPU execution pending completion of the accepted-resume control.
+- Hypothesis/change: the existing benchmark launcher should carry `--backward-profile` and `--detailed-profile-layers` directly, accept the canonical v4174 model identity, and require an explicit existing TPU name instead of retaining a default resource target. The training launcher now also rejects a missing `--tpu`.
+- Run identity: branch `codex/v4167-poc`; source parent `521be1be9c2eb4de53fdc1f12d9dae34265f0fd5`; no model/config/checkpoint execution in this implementation entry.
+- Result: Git Bash `bash -n` passed for both launchers and `git diff --check` passed. No Python model test was added or run.
+- Lesson: a bounded TPU profile must be expressible through the same fixed-user, `tmux train`, `~/train.log`, fail-loud cleanup path as training; an implicit resource target is incompatible with explicit experiment identity.
+- Decision/next: publish this launcher path, then run the fusion candidate with `--fast --backward-profile --detailed-profile-layers 2 --no-xla-dump`.
+- Evidence: `scripts/launch_tpu_pod.sh`; `scripts/launch_srw_benchmark_tpu_pod.sh`; local shell validation on 2026-07-26 KST.
+
 ## Backfill Boundary
 
 - The initial notebook covered evidence-backed work from 2026-07-21 through the step-1500 resume attempt.

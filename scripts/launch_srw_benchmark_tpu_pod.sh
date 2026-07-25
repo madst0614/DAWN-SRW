@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-TPU_NAME="dawn-400m-v4-64"
+TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
 REMOTE_USER="madst0614"
@@ -26,6 +26,8 @@ WARMUP_STEPS_SET="0"
 FORWARD_PROFILE_STEPS_SET="0"
 MODULE_PROFILE_STEPS_SET="0"
 FAST_ONLY="0"
+BACKWARD_PROFILE="0"
+DETAILED_PROFILE_LAYERS="0"
 OUTPUT_DIR=""
 XLA_DUMP_ENABLED="1"
 XLA_DUMP_BASE=""
@@ -46,6 +48,8 @@ Options:
   --forward-profile-steps N     Forward-only profile steps per config (default: 1)
   --module-profile-steps N      Split-module profile steps per config (default: 1)
   --fast, --fast-only           Run quick real-data detailed forward diagnosis
+  --backward-profile            With --fast, include v4174 QKV/RST backward profiles
+  --detailed-profile-layers N   Limit v4174 detailed profiling to first N layers
   --model-version VERSION        Optional expected version check
   --allow-model-version-override Allow --model-version to override config
   --output-dir DIR               Remote artifact root for XLA dumps only
@@ -101,6 +105,8 @@ while [[ $# -gt 0 ]]; do
         --forward-profile-steps) FORWARD_PROFILE_STEPS="$2"; FORWARD_PROFILE_STEPS_SET="1"; shift 2 ;;
         --module-profile-steps) MODULE_PROFILE_STEPS="$2"; MODULE_PROFILE_STEPS_SET="1"; shift 2 ;;
         --fast|--fast-only) FAST_ONLY="1"; shift ;;
+        --backward-profile) BACKWARD_PROFILE="1"; shift ;;
+        --detailed-profile-layers) DETAILED_PROFILE_LAYERS="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --xla-dump)
             XLA_DUMP_ENABLED="1"
@@ -128,14 +134,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -z "$TPU_NAME" ]]; then
+    echo "ERROR: --tpu must explicitly name an existing TPU resource." >&2
+    exit 1
+fi
 if [[ "${#CONFIGS[@]}" -eq 0 ]]; then
     echo "ERROR: at least one --config is required." >&2
     exit 1
 fi
 if [[ -n "$MODEL_VERSION" &&
       "$MODEL_VERSION" != "spatial-r1-v4.1.6.6" &&
-      "$MODEL_VERSION" != "spatial-r1-v4.1.6.8" ]]; then
-    echo "ERROR: --model-version must be spatial-r1-v4.1.6.6 or spatial-r1-v4.1.6.8." >&2
+      "$MODEL_VERSION" != "spatial-r1-v4.1.6.8" &&
+      "$MODEL_VERSION" != "spatial-r1-v4.1.7.4" ]]; then
+    echo "ERROR: unsupported --model-version: $MODEL_VERSION." >&2
     exit 1
 fi
 if ! is_nonnegative_int "$STEPS"; then
@@ -156,6 +167,14 @@ if ! is_nonnegative_int "$FORWARD_PROFILE_STEPS"; then
 fi
 if ! is_nonnegative_int "$MODULE_PROFILE_STEPS"; then
     echo "ERROR: --module-profile-steps must be an integer >= 0." >&2
+    exit 1
+fi
+if ! is_nonnegative_int "$DETAILED_PROFILE_LAYERS"; then
+    echo "ERROR: --detailed-profile-layers must be an integer >= 0." >&2
+    exit 1
+fi
+if [[ "$BACKWARD_PROFILE" = "1" && "$FAST_ONLY" != "1" ]]; then
+    echo "ERROR: --backward-profile requires --fast." >&2
     exit 1
 fi
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -204,10 +223,11 @@ for config in "${CONFIGS[@]}"; do
 done
 echo "  Model version:  $MODEL_VERSION_LABEL"
 if [[ "$FAST_ONLY" = "1" ]]; then
-    echo "  Mode:           quick detailed forward diagnosis"
+    echo "  Mode:           quick detailed v4174 diagnosis"
     echo "  Train steps:    skipped"
     echo "  Forward profile:1"
-    echo "  Detailed profile:1"
+    echo "  Backward profile:$BACKWARD_PROFILE"
+    echo "  Detailed layers:$DETAILED_PROFILE_LAYERS (0=all)"
     echo "  Module profile: 0"
 else
     echo "  Mode:           train benchmark + profiles"
@@ -322,6 +342,8 @@ WARMUP_STEPS_SET_Q="$(shell_quote "$WARMUP_STEPS_SET")"
 FORWARD_PROFILE_STEPS_SET_Q="$(shell_quote "$FORWARD_PROFILE_STEPS_SET")"
 MODULE_PROFILE_STEPS_SET_Q="$(shell_quote "$MODULE_PROFILE_STEPS_SET")"
 FAST_ONLY_Q="$(shell_quote "$FAST_ONLY")"
+BACKWARD_PROFILE_Q="$(shell_quote "$BACKWARD_PROFILE")"
+DETAILED_PROFILE_LAYERS_Q="$(shell_quote "$DETAILED_PROFILE_LAYERS")"
 XLA_DUMP_ENABLED_Q="$(shell_quote "$XLA_DUMP_ENABLED")"
 XLA_DUMP_BASE_Q="$(shell_quote "$XLA_DUMP_BASE")"
 OUTPUT_DIR_Q="$(shell_quote "$OUTPUT_DIR")"
@@ -346,6 +368,8 @@ WARMUP_STEPS_SET=${WARMUP_STEPS_SET_Q}
 FORWARD_PROFILE_STEPS_SET=${FORWARD_PROFILE_STEPS_SET_Q}
 MODULE_PROFILE_STEPS_SET=${MODULE_PROFILE_STEPS_SET_Q}
 FAST_ONLY=${FAST_ONLY_Q}
+BACKWARD_PROFILE=${BACKWARD_PROFILE_Q}
+DETAILED_PROFILE_LAYERS=${DETAILED_PROFILE_LAYERS_Q}
 XLA_DUMP_ENABLED=${XLA_DUMP_ENABLED_Q}
 XLA_DUMP_BASE=${XLA_DUMP_BASE_Q}
 OUTPUT_DIR=${OUTPUT_DIR_Q}
@@ -379,6 +403,10 @@ if [ -n "\$CONFIG_REST" ]; then
 fi
 if [ "\$FAST_ONLY" = "1" ]; then
     BENCH_ARGS="\$BENCH_ARGS --fast"
+    if [ "\$BACKWARD_PROFILE" = "1" ]; then
+        BENCH_ARGS="\$BENCH_ARGS --backward-profile"
+    fi
+    BENCH_ARGS="\$BENCH_ARGS --detailed-profile-layers \$DETAILED_PROFILE_LAYERS"
     if [ "\$STEPS_SET" = "1" ]; then
         BENCH_ARGS="\$BENCH_ARGS --steps \$STEPS"
     fi
