@@ -6,12 +6,12 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 ## Current State
 
 - Current goal: screen end-to-end P-RW-U rematerialization inside the accepted exact selected-top-2 dense backward without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V execution, or the accepted precision boundary.
-- Publication state: branch `codex/v4167-poc`, GitHub HEAD `4cacfe3987e881c21881373f49fcb5903ee9c916`; that commit preserves the rejected exact-owner implementation and bounded profiler for reproducibility. The working candidate restores the model source from accepted commit `8187c00d` and adds only the P-RW-U rematerialization boundary; it is not accepted until TPU measurement.
+- Publication state: branch `codex/v4167-poc`, GitHub HEAD `fd7e5e32f6c45ea421df19ecb0df18feb207f1a4`; rejected exact-owner source remains preserved at commit `4cacfe39`, while this HEAD restores accepted model commit `8187c00d` and adds only the P-RW-U rematerialization boundary. The candidate is not accepted until TPU measurement.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices. The accepted measurements below are from-scratch speed checks or benchmarks with no restored checkpoint.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
 - Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. Exact operator sparsity did not translate into TPU speed: dual-owner XLA tasks were extremely slow, Mosaic Pallas could not lower the required indirect gathers/reductions, static grouped XLA was slower still, and saving read scores duplicated enough metadata traffic to regress both QKV and RST.
-- Current blocker: the P-RW-U candidate is locally syntax/import validated but its compile time, HBM, detailed backward time, and train-step time are not yet measured on TPU.
-- Next experiment: require a bounded one-to-two-layer TPU detailed-profile gate against `8187c00d`, then a short training window only if the gate is competitive; reject the candidate on a material regression and leave the accepted checkpoint training resumed afterward.
+- Current blocker: the first accepted-resume launch inherited the Windows caller name `MADST` instead of remote user `madst0614`, so TPU driver logs failed with `Permission denied`; a fixed-user launcher/watcher change is locally shell-validated but not yet relaunched.
+- Next experiment: relaunch the accepted checkpoint as `madst0614`, confirm one completed restored step, then require a bounded one-to-two-layer fusion detailed-profile gate against `8187c00d`; reject the candidate on a material regression and leave accepted checkpoint training resumed afterward.
 
 ## Fixed Context
 
@@ -319,6 +319,16 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: this candidate changes residual lifetime only. It does not introduce active-edge packing, indirect gather, a new parameter/config field, or a claim that XLA emits one physical kernel.
 - Decision/next: publish the exact source, run the bounded TPU detailed-profile gate, and continue to a short training screen only if compile/runtime are competitive with `8187c00d`.
 - Evidence: `models/dawn_srw_v4174.py`; this notebook entry.
+
+#### #09 — Pin the required remote SSH user in training and benchmark control paths
+
+- Status: root cause confirmed; local launcher validation passed, corrected relaunch pending.
+- Hypothesis/change: the launcher, benchmark launcher, watcher, and failure grep must address `madst0614@<TPU>` explicitly instead of allowing gcloud to infer the Windows caller name.
+- Run identity: existing TPU `spatial-se-400m`; failed accepted-resume source commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5`; local control source parent `fd7e5e32f6c45ea421df19ecb0df18feb207f1a4`; bundle4 config; requested resume checkpoint step `1681`; eight hosts/32 devices.
+- Result: the first launch started all eight processes as UID 2002 user `MADST`, while `/tmp/tpu_logs` and the canonical home/checkpoint environment belonged to UID 2001 `madst0614`. Every host repeated `Could not open ... /tmp/tpu_logs/...MADST...: Permission denied`; no restored optimizer step completed. Fixed-user edits in `launch_tpu_pod.sh`, `launch_srw_benchmark_tpu_pod.sh`, `watch_tpu_logs.sh`, and `grep_tpu_logs.sh` passed Git Bash `bash -n` and `git diff --check`.
+- Lesson: supplying `madst0614@` in ad hoc inspection commands is insufficient when the launcher and watcher internally call gcloud with a bare TPU name; the user identity must be fixed at every current training/benchmark control boundary.
+- Decision/next: preserve the failed log, terminate only the UID 2002 run, publish the control-path fix, and relaunch the accepted branch as UID 2001 before any fusion benchmark.
+- Evidence: bad-user logs under `/home/MADST/train.log`; UID/ownership inspection on worker 0 at 2026-07-26 KST; the four launcher/watcher files above.
 
 ## Backfill Boundary
 

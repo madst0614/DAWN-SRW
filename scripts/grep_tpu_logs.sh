@@ -7,6 +7,7 @@ TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT=""
 WORKERS=8
+readonly REMOTE_USER="madst0614"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -39,7 +40,7 @@ REMOTE_GREP='grep -nE "minimal-stage|entering barrier|passed barrier|FAILED barr
 
 for worker in $(seq 0 $((WORKERS - 1))); do
     echo "===== worker $worker ====="
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
         --zone="$ZONE" \
         "${PROJECT_ARG[@]}" \
         --worker="$worker" \

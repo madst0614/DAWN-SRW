@@ -6,6 +6,7 @@ set -euo pipefail
 TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
+readonly REMOTE_USER="madst0614"
 readonly REMOTE_LOG="~/train.log"
 readonly PANE_TARGET="train"
 SOURCE="auto"
@@ -276,7 +277,7 @@ build_status_cmd() {
 run_worker_command() {
     local worker="$1"
     local command="$2"
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --worker="$worker" \

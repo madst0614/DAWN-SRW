@@ -24,6 +24,7 @@ set -euo pipefail
 TPU_NAME="dawn-400m-v4-64"
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
+REMOTE_USER="madst0614"
 BRANCH="main"
 CONFIG="configs/train_config_v17_1_tpu_400M_c4_5B_v4_64.yaml"
 GH_TOKEN=""
@@ -129,7 +130,7 @@ fi
 run_worker_command() {
     local worker="$1"
     local command="$2"
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --worker="$worker" \
@@ -264,7 +265,7 @@ echo "  Primary pane:    bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $
 echo "  Attach primary:  bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --attach"
 echo "  Primary summary: bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --summary"
 echo "  All summary:     bash scripts/watch_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --all --summary"
-echo "  Literal worker 0 log: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tail -f ~/train.log'"
-echo "  Attach literal worker 0: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=0 --command='tmux attach -t train'"
-echo "  Kill:    gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --worker=all --command='tmux kill-session -t train'"
+echo "  Literal worker 0 log: gcloud compute tpus tpu-vm ssh $REMOTE_USER@$TPU_NAME --zone=$ZONE --worker=0 --command='tail -f ~/train.log'"
+echo "  Attach literal worker 0: gcloud compute tpus tpu-vm ssh $REMOTE_USER@$TPU_NAME --zone=$ZONE --worker=0 --command='tmux attach -t train'"
+echo "  Kill:    gcloud compute tpus tpu-vm ssh $REMOTE_USER@$TPU_NAME --zone=$ZONE --worker=all --command='tmux kill-session -t train'"
 echo "  First failure grep: bash scripts/grep_tpu_logs.sh --tpu $TPU_NAME --zone $ZONE --project $PROJECT --workers $WORKER_COUNT"

@@ -13,6 +13,7 @@ set -euo pipefail
 TPU_NAME="dawn-400m-v4-64"
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
+REMOTE_USER="madst0614"
 BRANCH="main"
 CONFIGS=()
 MODEL_VERSION=""
@@ -261,7 +262,7 @@ fi
 run_worker_command() {
     local worker="$1"
     local command="$2"
-    gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --worker="$worker" \
