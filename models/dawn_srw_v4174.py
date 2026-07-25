@@ -205,8 +205,8 @@ def _isotropic_unit_init(
 
 
 def _constant_tau_bias(cosine_tau: float) -> Callable:
-    value = float(_raw_tau_init_from_cosine_tau(
-        min(max(float(cosine_tau), -0.9998), 0.9998)))
+    value = _raw_tau_init_from_cosine_tau(
+        min(max(float(cosine_tau), -0.9998), 0.9998))
 
     def initialize(key, shape, dtype=jnp.float32):
         del key
