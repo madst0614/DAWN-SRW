@@ -2073,10 +2073,20 @@ def _global_dense_rw_den_sharded(
         admission_den_power: jax.Array,
         srw_composition_mode: str) -> tuple[jax.Array, jax.Array]:
     """Form the live global denominator without reducing the RW numerator."""
-    global_gate_mass = jax.lax.psum(gate_mass, "model")
+    global_gate_mass = jax.lax.psum(
+        gate_mass.astype(jnp.float32), "model")
     gate_den = _shared_composition_den(
         global_gate_mass, admission_den_power, srw_composition_mode)
     return global_gate_mass, gate_den
+
+
+def _psum_dense_rw_representation_sharded(
+        local_output: jax.Array,
+        collective_bf16: bool) -> jax.Array:
+    """Reduce a completed representation update at the configured boundary."""
+    collective_dtype = jnp.bfloat16 if collective_bf16 else jnp.float32
+    return jax.lax.psum(
+        local_output.astype(collective_dtype), "model").astype(jnp.float32)
 
 
 def _dense_rw_metric_stats_sharded(
@@ -2278,7 +2288,8 @@ def _make_sharded_attention_space_dense(
         srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
         soft_gate_effective_active_eps: float = 1.0e-6,
-        throughput_bf16: bool):
+        throughput_bf16: bool,
+        output_collective_bf16: bool):
     """Create the single-boundary production Q/K/V dense executor."""
     composition_mode = str(srw_composition_mode)
     top_k = int(operation_space_top_k)
@@ -2389,7 +2400,8 @@ def _make_sharded_attention_space_dense(
             "amtr,mrd->atd",
             local_grouped_space_results * space_weights * route_scales,
             space_state_writeback).astype(jnp.float32)
-        grouped_output = jax.lax.psum(local_grouped_output, "model")
+        grouped_output = _psum_dense_rw_representation_sharded(
+            local_grouped_output, output_collective_bf16)
 
         q_per_space = int(q_read.shape[1]) * model_axis_size
         k_per_space = int(k_read.shape[1]) * model_axis_size
@@ -2509,6 +2521,8 @@ def _make_sharded_attention_space_dense(
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
+    kernel._v4174_output_collective_dtype = (
+        "bf16" if output_collective_bf16 else "fp32")
     kernel._v4174_output_contract = ("q[T,D]", "k[T,D]", "v[T,D]", "scalars")
     return kernel
 
@@ -2516,13 +2530,20 @@ def _make_sharded_attention_space_dense(
 def make_sharded_attention_space_dense_minimal(mesh, **kwargs):
     """Create the canonical mixed-precision production attention executor."""
     return _make_sharded_attention_space_dense(
-        mesh, throughput_bf16=True, **kwargs)
+        mesh, throughput_bf16=True, output_collective_bf16=True, **kwargs)
+
+
+def make_sharded_attention_space_dense_fp32_collective_reference(
+        mesh, **kwargs):
+    """Keep production GEMMs while reducing the final representation in FP32."""
+    return _make_sharded_attention_space_dense(
+        mesh, throughput_bf16=True, output_collective_bf16=False, **kwargs)
 
 
 def make_sharded_attention_space_dense_fp32_reference(mesh, **kwargs):
     """Create a fused FP32 executor for structural/numerical tests only."""
     return _make_sharded_attention_space_dense(
-        mesh, throughput_bf16=False, **kwargs)
+        mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
 
 
 def _make_sharded_rst_space_dense(
@@ -2533,7 +2554,8 @@ def _make_sharded_rst_space_dense(
         srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
         soft_gate_effective_active_eps: float = 1.0e-6,
-        throughput_bf16: bool):
+        throughput_bf16: bool,
+        output_collective_bf16: bool):
     """Create the end-to-end production RST dense executor."""
     composition_mode = str(srw_composition_mode)
     top_k = int(operation_space_top_k)
@@ -2605,7 +2627,8 @@ def _make_sharded_rst_space_dense(
         local_update = writeback_dot(
             "mtr,mrd->td", local_weighted,
             space_state_writeback).astype(jnp.float32)
-        update = jax.lax.psum(local_update, "model")
+        update = _psum_dense_rw_representation_sharded(
+            local_update, output_collective_bf16)
         n_per_space = int(read_vectors.shape[1]) * model_axis_size
         route_specs = (("rst", n_per_space),)
         metric_local = jax.lax.stop_gradient(local)
@@ -2694,6 +2717,8 @@ def _make_sharded_rst_space_dense(
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
+    kernel._v4174_output_collective_dtype = (
+        "bf16" if output_collective_bf16 else "fp32")
     kernel._v4174_output_contract = ("rst[T,D]", "scalars")
     return kernel
 
@@ -2701,13 +2726,19 @@ def _make_sharded_rst_space_dense(
 def make_sharded_rst_space_dense_minimal(mesh, **kwargs):
     """Create the canonical mixed-precision production RST executor."""
     return _make_sharded_rst_space_dense(
-        mesh, throughput_bf16=True, **kwargs)
+        mesh, throughput_bf16=True, output_collective_bf16=True, **kwargs)
+
+
+def make_sharded_rst_space_dense_fp32_collective_reference(mesh, **kwargs):
+    """Keep production GEMMs while reducing the final representation in FP32."""
+    return _make_sharded_rst_space_dense(
+        mesh, throughput_bf16=True, output_collective_bf16=False, **kwargs)
 
 
 def make_sharded_rst_space_dense_fp32_reference(mesh, **kwargs):
     """Create a fused FP32 RST executor for numerical tests only."""
     return _make_sharded_rst_space_dense(
-        mesh, throughput_bf16=False, **kwargs)
+        mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
 
 
 def _validate_v4174_sharded_fns(

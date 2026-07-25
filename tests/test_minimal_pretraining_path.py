@@ -101,6 +101,8 @@ def test_v4174_dynamic_metric_source_contract():
     output_source = inspect.getsource(v4174._dense_rw_output_sharded)
     den_source = inspect.getsource(
         v4174._global_dense_rw_den_sharded)
+    representation_reduce_source = inspect.getsource(
+        v4174._psum_dense_rw_representation_sharded)
     metric_scan_source = inspect.getsource(
         v4174._dense_rw_metric_stats_sharded)
     metric_vector_source = inspect.getsource(
@@ -113,6 +115,14 @@ def test_v4174_dynamic_metric_source_contract():
     attention_source = inspect.getsource(
         v4174._make_sharded_attention_space_dense)
     rst_source = inspect.getsource(v4174._make_sharded_rst_space_dense)
+    attention_minimal_source = inspect.getsource(
+        v4174.make_sharded_attention_space_dense_minimal)
+    attention_fp32_collective_source = inspect.getsource(
+        v4174.make_sharded_attention_space_dense_fp32_collective_reference)
+    rst_minimal_source = inspect.getsource(
+        v4174.make_sharded_rst_space_dense_minimal)
+    rst_fp32_collective_source = inspect.getsource(
+        v4174.make_sharded_rst_space_dense_fp32_collective_reference)
     trainer_source = inspect.getsource(train_jax.create_train_step)
     builder_source = inspect.getsource(train_jax.build_canonical_sharded_fns)
     main_source = inspect.getsource(train_jax.main)
@@ -137,10 +147,16 @@ def test_v4174_dynamic_metric_source_contract():
         assert required in production_step_source
 
     assert "jax.lax.cond(" not in den_source
-    assert "jax.lax.psum(gate_mass, \"model\")" in den_source
+    assert "gate_mass.astype(jnp.float32)" in den_source
+    assert '"model"' in den_source
     assert "_shared_composition_den(" in den_source
     assert "return global_gate_mass, gate_den" in den_source
     assert "raw_out" not in den_source
+    assert "jnp.bfloat16 if collective_bf16 else jnp.float32" in (
+        representation_reduce_source)
+    assert "local_output.astype(collective_dtype)" in (
+        representation_reduce_source)
+    assert '"model").astype(jnp.float32)' in representation_reduce_source
     assert "write_vectors" not in metric_scan_source
     assert "\"amtn,amnr->amtr\"" not in metric_scan_source
     assert "raw_out" not in metric_scan_source
@@ -178,24 +194,33 @@ def test_v4174_dynamic_metric_source_contract():
     assert "grouped_output" in attention_source
     assert attention_production_source.count(
         "_global_dense_rw_den_sharded(") == 1
-    assert attention_production_source.count("jax.lax.psum(") == 1
+    assert attention_production_source.count(
+        "_psum_dense_rw_representation_sharded(") == 1
+    assert "jax.lax.psum(" not in attention_production_source
     assert attention_production_source.index(
         'writeback_dot(\n            "amtr,mrd->atd"') < (
             attention_production_source.index(
-                'jax.lax.psum(local_grouped_output, "model")'))
+                "_psum_dense_rw_representation_sharded("))
     assert "local_space_result" in rst_production_source
     assert "local_update" in rst_production_source
     assert rst_production_source.count(
         "_global_dense_rw_den_sharded(") == 1
-    assert rst_production_source.count("jax.lax.psum(") == 1
+    assert rst_production_source.count(
+        "_psum_dense_rw_representation_sharded(") == 1
+    assert "jax.lax.psum(" not in rst_production_source
     assert rst_production_source.index(
         'writeback_dot(\n            "mtr,mrd->td"') < (
             rst_production_source.index(
-                'jax.lax.psum(local_update, "model")'))
+                "_psum_dense_rw_representation_sharded("))
     assert "_reduce_dense_rw_output_sharded" not in attention_source
     assert "_reduce_dense_rw_output_sharded" not in rst_source
     assert "stop_gradient" not in attention_production_source
     assert "stop_gradient" not in rst_production_source
+    assert "output_collective_bf16=True" in attention_minimal_source
+    assert "output_collective_bf16=True" in rst_minimal_source
+    assert "output_collective_bf16=False" in (
+        attention_fp32_collective_source)
+    assert "output_collective_bf16=False" in rst_fp32_collective_source
     assert "remat_chunks" not in attention_source
     assert "remat_chunks" not in rst_source
     assert "remat_chunks" not in builder_source

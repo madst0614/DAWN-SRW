@@ -182,6 +182,58 @@ def _fp32_fused_sharded(mesh):
     }
 
 
+def _mixed_fp32_collective_sharded(mesh):
+    common = {
+        "operation_space_top_k": 2,
+        "srw_composition_mode": "linear_angular",
+        "heat_kernel_beta": v4174.DEFAULT_HEAT_KERNEL_BETA,
+        "soft_gate_effective_active_eps": 1.0e-6,
+    }
+    return {
+        "attention_space_dense":
+            v4174.make_sharded_attention_space_dense_fp32_collective_reference(
+                mesh,
+                max_chunk_size_qk=8,
+                max_chunk_size_v=8,
+                admission_den_power_qk=0.5,
+                admission_den_power_v=1.0,
+                **common),
+        "rst_space_dense":
+            v4174.make_sharded_rst_space_dense_fp32_collective_reference(
+                mesh,
+                max_chunk_size=8,
+                admission_den_power=1.2,
+                **common),
+        "_v4174_kernel_profile": "production",
+    }
+
+
+def _mixed_production_sharded(mesh):
+    common = {
+        "operation_space_top_k": 2,
+        "srw_composition_mode": "linear_angular",
+        "heat_kernel_beta": v4174.DEFAULT_HEAT_KERNEL_BETA,
+        "soft_gate_effective_active_eps": 1.0e-6,
+    }
+    return {
+        "attention_space_dense":
+            v4174.make_sharded_attention_space_dense_minimal(
+                mesh,
+                max_chunk_size_qk=8,
+                max_chunk_size_v=8,
+                admission_den_power_qk=0.5,
+                admission_den_power_v=1.0,
+                **common),
+        "rst_space_dense":
+            v4174.make_sharded_rst_space_dense_minimal(
+                mesh,
+                max_chunk_size=8,
+                admission_den_power=1.2,
+                **common),
+        "_v4174_kernel_profile": "production",
+    }
+
+
 def _fp32_separate_sharded(mesh):
     def make_route(den_power):
         def route_core(
@@ -847,6 +899,11 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
             "v_space_dense"))
     attention_dense = sharded["attention_space_dense"]
     rst_dense = sharded["rst_space_dense"]
+    mixed_fp32_collective_sharded = _mixed_fp32_collective_sharded(mesh)
+    mixed_fp32_collective_attention = (
+        mixed_fp32_collective_sharded["attention_space_dense"])
+    mixed_fp32_collective_rst = (
+        mixed_fp32_collective_sharded["rst_space_dense"])
     fp32_sharded = _fp32_fused_sharded(mesh)
     fp32_separate_sharded = _fp32_separate_sharded(mesh)
     fp32_attention_dense = fp32_sharded["attention_space_dense"]
@@ -862,9 +919,25 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         "bf16_operands_f32_accum")
     assert rst_dense._v4174_throughput_precision == (
         "bf16_operands_f32_accum")
+    assert attention_dense._v4174_output_collective_dtype == "bf16"
+    assert rst_dense._v4174_output_collective_dtype == "bf16"
+    assert (
+        mixed_fp32_collective_attention._v4174_throughput_precision
+        == "bf16_operands_f32_accum")
+    assert (
+        mixed_fp32_collective_rst._v4174_throughput_precision
+        == "bf16_operands_f32_accum")
+    assert (
+        mixed_fp32_collective_attention._v4174_output_collective_dtype
+        == "fp32")
+    assert (
+        mixed_fp32_collective_rst._v4174_output_collective_dtype
+        == "fp32")
     assert fp32_attention_dense._v4174_throughput_precision == (
         "fp32_reference")
     assert fp32_rst_dense._v4174_throughput_precision == "fp32_reference"
+    assert fp32_attention_dense._v4174_output_collective_dtype == "fp32"
+    assert fp32_rst_dense._v4174_output_collective_dtype == "fp32"
     assert attention_dense._v4174_output_contract == (
         "q[T,D]", "k[T,D]", "v[T,D]", "scalars")
     assert rst_dense._v4174_output_contract == ("rst[T,D]", "scalars")
@@ -1076,6 +1149,13 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         sharded_fns=sharded,
         rngs={"dropout": jax.random.PRNGKey(22)},
     )
+    collective_reference_forward = built.apply(
+        {"params": params},
+        tokens,
+        deterministic=True,
+        sharded_fns=mixed_fp32_collective_sharded,
+        rngs={"dropout": jax.random.PRNGKey(22)},
+    )
     reference_forward = built.apply(
         {"params": params},
         tokens,
@@ -1097,6 +1177,16 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     np.testing.assert_allclose(
         sharded_forward["logits"], reference_forward["logits"],
         atol=2e-2, rtol=2e-2)
+    production_logits = sharded_forward["logits"].astype(jnp.float32)
+    collective_reference_logits = collective_reference_forward[
+        "logits"].astype(jnp.float32)
+    logits_cosine = jnp.sum(
+        production_logits * collective_reference_logits) / jnp.sqrt(
+            jnp.maximum(
+                jnp.sum(jnp.square(production_logits))
+                * jnp.sum(jnp.square(collective_reference_logits)),
+                1.0e-12))
+    assert float(logits_cosine) >= 0.9999
 
     def model_loss(current, sharded_fns):
         return built.apply(
@@ -1117,6 +1207,10 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
                 current, fp32_separate_sharded)))(params)
     fused_loss, fused_grads = jax.jit(jax.value_and_grad(
         lambda current: model_loss(current, sharded)))(params)
+    collective_reference_loss, collective_reference_grads = jax.jit(
+        jax.value_and_grad(
+            lambda current: model_loss(
+                current, mixed_fp32_collective_sharded)))(params)
     assert bool(jnp.isfinite(reference_loss))
     assert bool(jnp.isfinite(fused_loss))
     assert abs(float(
@@ -1154,6 +1248,10 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert float(
         jnp.abs(fused_loss - reference_loss)
         / jnp.maximum(jnp.abs(reference_loss), 1.0e-8)) <= 0.002
+    assert float(
+        jnp.abs(fused_loss - collective_reference_loss)
+        / jnp.maximum(
+            jnp.abs(collective_reference_loss), 1.0e-8)) <= 0.002
     assert all(
         bool(jnp.all(jnp.isfinite(value)))
         for value in jax.tree.leaves(fused_grads))
@@ -1186,6 +1284,28 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         jnp.maximum(
             fused_gradient_sq * grad_reference_sq, 1.0e-12))
     assert float(gradient_cosine) >= 0.99
+    collective_gradient_dot = sum(
+        jnp.sum(
+            left.astype(jnp.float32) * right.astype(jnp.float32))
+        for left, right in zip(
+            jax.tree.leaves(fused_grads),
+            jax.tree.leaves(collective_reference_grads)))
+    collective_gradient_sq = sum(
+        jnp.sum(jnp.square(value.astype(jnp.float32)))
+        for value in jax.tree.leaves(collective_reference_grads))
+    collective_gradient_cosine = collective_gradient_dot / jnp.sqrt(
+        jnp.maximum(
+            fused_gradient_sq * collective_gradient_sq, 1.0e-12))
+    assert float(collective_gradient_cosine) >= 0.99
+    collective_updates, _ = fp32_optimizer.update(
+        collective_reference_grads, fp32_opt_state, params)
+    production_updates, _ = fp32_optimizer.update(
+        fused_grads, fp32_opt_state, params)
+    assert all(
+        bool(jnp.all(jnp.isfinite(value)))
+        for value in (
+            *jax.tree.leaves(collective_updates),
+            *jax.tree.leaves(production_updates)))
     diagnostics_fns = train_jax.build_canonical_sharded_fns(
         cfg, mesh, for_eval=True,
         kernel_profile="production_diagnostics")
@@ -1382,6 +1502,8 @@ def test_v4174_production_hlo_collective_shapes_and_kernel_partition_parity():
         devices.reshape((1, 2)), ("data", "model"))
     sharded_one = _fp32_fused_sharded(mesh_one)
     sharded_two = _fp32_fused_sharded(mesh_two)
+    production_two = _mixed_production_sharded(mesh_two)
+    collective_reference_two = _mixed_fp32_collective_sharded(mesh_two)
     _, _, variables = _variables(seed=106)
     params = variables["params"]
     router = params["router"]
@@ -1436,44 +1558,114 @@ def test_v4174_production_hlo_collective_shapes_and_kernel_partition_parity():
     np.testing.assert_allclose(
         rst_two, rst_one, atol=1.0e-5, rtol=1.0e-5)
 
-    def attention_outputs(*operands):
+    def attention_fp32_outputs(*operands):
         return sharded_two["attention_space_dense"](
             *operands, collect_metrics)[:3]
 
-    def rst_output(*operands):
+    def rst_fp32_output(*operands):
         return sharded_two["rst_space_dense"](
             *operands, collect_metrics)[0]
 
-    attention_hlo = jax.jit(attention_outputs).lower(
+    def attention_production_outputs(*operands):
+        return production_two["attention_space_dense"](
+            *operands, collect_metrics)[:3]
+
+    def attention_collective_reference_outputs(*operands):
+        return collective_reference_two["attention_space_dense"](
+            *operands, collect_metrics)[:3]
+
+    def rst_production_output(*operands):
+        return production_two["rst_space_dense"](
+            *operands, collect_metrics)[0]
+
+    def rst_collective_reference_output(*operands):
+        return collective_reference_two["rst_space_dense"](
+            *operands, collect_metrics)[0]
+
+    production_attention = attention_production_outputs(
+        *attention_operands)
+    collective_reference_attention = (
+        attention_collective_reference_outputs(*attention_operands))
+    for production_value, reference_value in zip(
+            production_attention, collective_reference_attention):
+        cosine = jnp.sum(production_value * reference_value) / jnp.sqrt(
+            jnp.maximum(
+                jnp.sum(jnp.square(production_value))
+                * jnp.sum(jnp.square(reference_value)),
+                1.0e-12))
+        assert float(cosine) >= 0.9999
+    production_rst = rst_production_output(*rst_operands)
+    collective_reference_rst = rst_collective_reference_output(*rst_operands)
+    rst_cosine = jnp.sum(production_rst * collective_reference_rst) / jnp.sqrt(
+        jnp.maximum(
+            jnp.sum(jnp.square(production_rst))
+            * jnp.sum(jnp.square(collective_reference_rst)),
+            1.0e-12))
+    assert float(rst_cosine) >= 0.9999
+
+    attention_fp32_hlo = jax.jit(attention_fp32_outputs).lower(
         *attention_operands).compiler_ir(
             dialect="hlo").as_hlo_text().lower()
-    rst_hlo = jax.jit(rst_output).lower(
+    rst_fp32_hlo = jax.jit(rst_fp32_output).lower(
         *rst_operands).compiler_ir(
             dialect="hlo").as_hlo_text().lower()
-    attention_collectives = [
-        line for line in attention_hlo.splitlines()
-        if "all-reduce" in line]
-    rst_collectives = [
-        line for line in rst_hlo.splitlines()
-        if "all-reduce" in line]
+    attention_production_hlo = jax.jit(
+        attention_production_outputs).lower(
+            *attention_operands).compiler_ir(
+                dialect="hlo").as_hlo_text().lower()
+    rst_production_hlo = jax.jit(rst_production_output).lower(
+        *rst_operands).compiler_ir(
+            dialect="hlo").as_hlo_text().lower()
+    attention_fp32_collectives = [
+        line for line in attention_fp32_hlo.splitlines()
+        if " all-reduce(" in line]
+    rst_fp32_collectives = [
+        line for line in rst_fp32_hlo.splitlines()
+        if " all-reduce(" in line]
+    attention_production_collectives = [
+        line for line in attention_production_hlo.splitlines()
+        if " all-reduce(" in line]
+    rst_production_collectives = [
+        line for line in rst_production_hlo.splitlines()
+        if " all-reduce(" in line]
     assert any(
         "f32[3,4,6,1]" in line
-        for line in attention_collectives)
+        for line in attention_fp32_collectives)
     assert any(
         "f32[3,6,16]" in line
-        for line in attention_collectives)
+        for line in attention_fp32_collectives)
     assert not any(
         "f32[3,4,6,4]" in line
-        for line in attention_collectives)
+        for line in attention_fp32_collectives)
     assert any(
         "f32[1,4,6,1]" in line
-        for line in rst_collectives)
+        for line in rst_fp32_collectives)
     assert any(
         "f32[6,16]" in line
-        for line in rst_collectives)
+        for line in rst_fp32_collectives)
     assert not any(
         "f32[1,4,6,4]" in line
-        for line in rst_collectives)
+        for line in rst_fp32_collectives)
+    assert any(
+        "f32[3,4,6,1]" in line
+        for line in attention_production_collectives)
+    assert any(
+        "bf16[3,6,16]" in line
+        for line in attention_production_collectives)
+    assert not any(
+        "f32[3,6,16]" in line
+        or "f32[3,4,6,4]" in line
+        for line in attention_production_collectives)
+    assert any(
+        "f32[1,4,6,1]" in line
+        for line in rst_production_collectives)
+    assert any(
+        "bf16[6,16]" in line
+        for line in rst_production_collectives)
+    assert not any(
+        "f32[6,16]" in line
+        or "f32[1,4,6,4]" in line
+        for line in rst_production_collectives)
 
 
 def test_v4174_precision_partition_and_vocab_ce_contract():
