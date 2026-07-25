@@ -2036,6 +2036,8 @@ _FUSED_OPERATOR_METRIC_SUFFIXES = (
 )
 _BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME = "v4174_bundle_rw_raw_out"
 _BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME = "v4174_bundle_rw_gate_mass"
+_EXACT_SPACE_BACKWARD_BUCKET_CAPACITY = 4096
+_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE = 4
 _BUNDLE_BLOCK_CHECKPOINT_POLICY = (
     jax.checkpoint_policies.save_from_both_policies(
         jax.checkpoint_policies.dots_saveable,
@@ -2342,6 +2344,168 @@ def _pack_top2_bundle_entries_sharded(
         "routing_weight": packed_weight,
         "token_valid": packed_valid,
     }, metrics)
+
+
+def _prefix_pack_top2_space_buckets(
+        selected_ids: jax.Array,
+        selected_weights: jax.Array, *,
+        operation_space_count: int,
+        bucket_capacity: int,
+        task_group_size: int) -> dict[str, jax.Array]:
+    """Pack exact pairs into primary buckets and compact overflow tasks."""
+    token_count = int(selected_ids.shape[0])
+    n_spaces = int(operation_space_count)
+    bucket_size = int(bucket_capacity)
+    group_size = int(task_group_size)
+    if selected_ids.shape != (token_count, 2):
+        raise ValueError("exact-space packing requires selected_ids[T,2]")
+    if selected_weights.shape != (token_count, 2):
+        raise ValueError("exact-space packing requires selected_weights[T,2]")
+    if n_spaces <= 0 or bucket_size <= 0 or group_size <= 0:
+        raise ValueError("exact-space packing requires positive capacities")
+
+    token_ids = jnp.arange(token_count, dtype=jnp.int32)
+    candidate_space = jnp.concatenate(
+        (selected_ids[:, 0], selected_ids[:, 1])).astype(jnp.int32)
+    candidate_token = jnp.concatenate((token_ids, token_ids))
+    candidate_weight = jnp.concatenate(
+        (selected_weights[:, 0], selected_weights[:, 1])
+    ).astype(jnp.float32)
+
+    space_onehot = jax.nn.one_hot(
+        candidate_space, n_spaces, dtype=jnp.int32)
+    rank_per_space = (
+        jnp.cumsum(space_onehot, axis=0, dtype=jnp.int32)
+        - space_onehot)
+    local_rank = jnp.sum(
+        rank_per_space * space_onehot, axis=1, dtype=jnp.int32)
+    counts = space_onehot.sum(axis=0, dtype=jnp.int32)
+
+    primary_valid = local_rank < bucket_size
+    primary_token = jnp.zeros(
+        (n_spaces, bucket_size), dtype=jnp.int32
+    ).at[candidate_space, local_rank].set(
+        candidate_token, mode="drop")
+    primary_weight = jnp.zeros(
+        (n_spaces, bucket_size), dtype=jnp.float32
+    ).at[candidate_space, local_rank].set(
+        candidate_weight, mode="drop")
+    primary_mask = jnp.zeros(
+        (n_spaces, bucket_size), dtype=jnp.bool_
+    ).at[candidate_space, local_rank].set(
+        primary_valid, mode="drop")
+
+    overflow_valid = ~primary_valid
+    overflow_counts = jnp.maximum(
+        counts - jnp.int32(bucket_size), jnp.int32(0))
+    max_chunks_per_space = max(
+        1, math.ceil(token_count / bucket_size) - 1)
+    raw_task_capacity = max(
+        1, math.ceil(2 * token_count / bucket_size))
+    task_capacity = (
+        math.ceil(raw_task_capacity / group_size) * group_size)
+    overflow_chunk = jnp.maximum(
+        local_rank // jnp.int32(bucket_size) - jnp.int32(1),
+        jnp.int32(0))
+    overflow_slot = local_rank % jnp.int32(bucket_size)
+    destination_chunk = jnp.where(
+        overflow_valid,
+        overflow_chunk,
+        jnp.int32(max_chunks_per_space))
+
+    space_chunk_token = jnp.zeros(
+        (n_spaces, max_chunks_per_space, bucket_size),
+        dtype=jnp.int32
+    ).at[
+        candidate_space, destination_chunk, overflow_slot
+    ].set(candidate_token, mode="drop")
+    space_chunk_weight = jnp.zeros(
+        (n_spaces, max_chunks_per_space, bucket_size),
+        dtype=jnp.float32
+    ).at[
+        candidate_space, destination_chunk, overflow_slot
+    ].set(candidate_weight, mode="drop")
+    space_chunk_valid = jnp.zeros(
+        (n_spaces, max_chunks_per_space, bucket_size),
+        dtype=jnp.bool_
+    ).at[
+        candidate_space, destination_chunk, overflow_slot
+    ].set(overflow_valid, mode="drop")
+
+    chunk_ids = jnp.arange(
+        max_chunks_per_space, dtype=jnp.int32)[None, :]
+    task_exists = (
+        chunk_ids * jnp.int32(bucket_size) < overflow_counts[:, None])
+    flat_task_exists = task_exists.reshape((-1,))
+    task_rank = (
+        jnp.cumsum(
+            flat_task_exists.astype(jnp.int32), dtype=jnp.int32)
+        - flat_task_exists.astype(jnp.int32))
+    task_destination = jnp.where(
+        flat_task_exists, task_rank, jnp.int32(task_capacity))
+    task_space_source = jnp.broadcast_to(
+        jnp.arange(n_spaces, dtype=jnp.int32)[:, None],
+        task_exists.shape).reshape((-1,))
+    task_chunk_source = jnp.broadcast_to(
+        jnp.arange(max_chunks_per_space, dtype=jnp.int32)[None, :],
+        task_exists.shape).reshape((-1,))
+    sentinel = jnp.int32(n_spaces)
+    task_space = jnp.full(
+        (task_capacity,), sentinel, dtype=jnp.int32
+    ).at[task_destination].set(task_space_source, mode="drop")
+    task_chunk = jnp.zeros(
+        (task_capacity,), dtype=jnp.int32
+    ).at[task_destination].set(task_chunk_source, mode="drop")
+    task_valid = task_space < sentinel
+    safe_task_space = jnp.minimum(task_space, n_spaces - 1)
+    task_token = space_chunk_token[safe_task_space, task_chunk]
+    task_weight = space_chunk_weight[safe_task_space, task_chunk]
+    task_mask = (
+        space_chunk_valid[safe_task_space, task_chunk]
+        & task_valid[:, None])
+    return {
+        "primary_token_id": primary_token,
+        "primary_routing_weight": primary_weight,
+        "primary_token_valid": primary_mask,
+        "overflow_task_space_id": task_space,
+        "overflow_task_token_id": task_token,
+        "overflow_task_routing_weight": task_weight,
+        "overflow_task_token_valid": task_mask,
+        "space_counts": counts,
+    }
+
+
+def _exact_space_bucket_weight_cotangents_to_dense(
+        packed: Mapping[str, jax.Array],
+        primary_weight_cotangent: jax.Array,
+        overflow_weight_cotangent: jax.Array, *,
+        token_count: int,
+        operation_space_count: int) -> jax.Array:
+    """Scatter exact packed-pair weight gradients to dense routing weights."""
+    n_spaces = int(operation_space_count)
+    primary_space = jnp.broadcast_to(
+        jnp.arange(n_spaces, dtype=jnp.int32)[:, None],
+        packed["primary_token_id"].shape)
+    dense_grad = jnp.zeros(
+        (int(token_count), int(operation_space_count)),
+        dtype=jnp.float32)
+    dense_grad = dense_grad.at[
+        packed["primary_token_id"], primary_space
+    ].add(
+        jnp.where(
+            packed["primary_token_valid"],
+            primary_weight_cotangent,
+            0.0),
+        mode="drop")
+    return dense_grad.at[
+        packed["overflow_task_token_id"],
+        packed["overflow_task_space_id"][:, None]
+    ].add(
+        jnp.where(
+            packed["overflow_task_token_valid"],
+            overflow_weight_cotangent,
+            0.0),
+        mode="drop")
 
 
 def _dense_rw_output_sharded(
@@ -3043,31 +3207,36 @@ def _make_sharded_attention_space_bundle_dense(
             "gate_mass_mean", "active_count_mean",
             "zero_gate_frac", "top1_rate"))
     bundle_metric_names = _bundle_packing_metric_names("attention")
+    projection_dot = (
+        _throughput_einsum_bf16_f32
+        if throughput_bf16 else _control_einsum_f32)
+    writeback_dot = projection_dot
+    den_powers = jnp.asarray(
+        (
+            admission_den_power_qk,
+            admission_den_power_qk,
+            admission_den_power_v,
+        ),
+        dtype=jnp.float32).reshape((3, 1, 1, 1))
 
-    def attention_core(
+    def bundle_execute(
             flat_state,
-            space_route_kernel, space_read_vectors,
-            space_state_proj, space_state_writeback,
-            q_tau_kernel, q_tau_bias,
-            k_tau_kernel, k_tau_bias,
-            v_tau_kernel, v_tau_bias,
-            q_read, q_write, k_read, k_write, v_read, v_write,
-            qk_temperature, v_temperature,
-            boundary_power, execution_prune_eps,
-            qk_scale, v_scale, collect_metrics):
-        routing = _compute_space_routing(
-            flat_state, space_route_kernel, space_read_vectors, top_k)
-        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
-            routing,
-            bundle_size=bundle_size,
-            token_block_size=token_block_size,
-            stage="attention")
+            state_params,
+            operator_params,
+            controls,
+            packing):
+        (space_state_proj, space_state_writeback,
+         q_tau_kernel, q_tau_bias,
+         k_tau_kernel, k_tau_bias,
+         v_tau_kernel, v_tau_bias) = state_params
+        (q_read, q_write, k_read, k_write,
+         v_read, v_write) = operator_params
+        (qk_temperature, v_temperature,
+         boundary_power, execution_prune_eps,
+         qk_scale, v_scale) = controls
         token_count = int(flat_state.shape[0])
         d_model = int(flat_state.shape[1])
         n_spaces = int(space_state_proj.shape[0])
-        if n_spaces % bundle_size:
-            raise ValueError(
-                "bundle_dense attention space count is not divisible by 4")
         n_bundles = n_spaces // bundle_size
         scan_blocks = (
             int(packing["token_id"].shape[0]) // token_block_size)
@@ -3077,20 +3246,9 @@ def _make_sharded_attention_space_bundle_dense(
             (q_tau_kernel, k_tau_kernel), axis=0)
         qk_tau_biases = jnp.stack(
             (q_tau_bias, k_tau_bias), axis=0)
-        den_powers = jnp.asarray(
-            (
-                admission_den_power_qk,
-                admission_den_power_qk,
-                admission_den_power_v,
-            ),
-            dtype=jnp.float32).reshape((3, 1, 1, 1))
         route_scales = jnp.asarray(
             (qk_scale, qk_scale, v_scale), dtype=jnp.float32
         ).reshape((3, 1, 1, 1))
-        projection_dot = (
-            _throughput_einsum_bf16_f32
-            if throughput_bf16 else _control_einsum_f32)
-        writeback_dot = projection_dot
         initial_output = jnp.zeros(
             (3, token_count, d_model), dtype=jnp.float32)
 
@@ -3207,8 +3365,400 @@ def _make_sharded_attention_space_bundle_dense(
             policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
         local_grouped_output, _ = jax.lax.scan(
             scan_step, initial_output, jnp.arange(scan_blocks))
-        grouped_output = _psum_dense_rw_representation_sharded(
+        return _psum_dense_rw_representation_sharded(
             local_grouped_output, output_collective_bf16)
+
+    def exact_space_execute(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packed_metadata,
+            primary_weight,
+            overflow_weight):
+        (space_state_proj, space_state_writeback,
+         q_tau_kernel, q_tau_bias,
+         k_tau_kernel, k_tau_bias,
+         v_tau_kernel, v_tau_bias) = state_params
+        (q_read, q_write, k_read, k_write,
+         v_read, v_write) = operator_params
+        (qk_temperature, v_temperature,
+         boundary_power, execution_prune_eps,
+         qk_scale, v_scale) = controls
+        token_count = int(flat_state.shape[0])
+        d_model = int(flat_state.shape[1])
+        n_spaces = int(space_state_proj.shape[0])
+        task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
+        task_capacity = int(
+            packed_metadata["overflow_task_space_id"].shape[0])
+        task_groups = task_capacity // task_group_size
+        qk_reads = jnp.stack((q_read, k_read), axis=0)
+        qk_writes = jnp.stack((q_write, k_write), axis=0)
+        qk_tau_kernels = jnp.stack(
+            (q_tau_kernel, k_tau_kernel), axis=0)
+        qk_tau_biases = jnp.stack(
+            (q_tau_bias, k_tau_bias), axis=0)
+        route_scales = jnp.asarray(
+            (qk_scale, qk_scale, v_scale), dtype=jnp.float32
+        ).reshape((3, 1, 1))
+        primary_token = packed_metadata["primary_token_id"]
+        primary_valid = packed_metadata["primary_token_valid"]
+        primary_state = flat_state[primary_token]
+        primary_local = projection_dot(
+            "mtd,mdr->mtr", primary_state, space_state_proj
+        ).astype(jnp.float32)
+        primary_local_norm = jnp.maximum(
+            jnp.linalg.norm(primary_local, axis=-1, keepdims=True),
+            jnp.float32(RW_FORWARD_NORM_EPS))
+
+        primary_qk_tau = (
+            _control_einsum_f32(
+                "mtr,ari->amti", primary_local, qk_tau_kernels)
+            + qk_tau_biases[:, None, None, :])
+        qk_raw_out, qk_gate_mass = _dense_rw_output_sharded(
+            primary_local,
+            primary_local_norm,
+            primary_valid,
+            qk_reads,
+            qk_writes,
+            primary_qk_tau,
+            max_chunk_size=max_chunk_size_qk,
+            soft_gate_temperature=qk_temperature,
+            soft_gate_boundary_power=boundary_power,
+            execution_prune_eps=execution_prune_eps,
+            srw_composition_mode=composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            effective_active_eps=soft_gate_effective_active_eps,
+            throughput_bf16=throughput_bf16)
+
+        primary_v_tau = (
+            _control_einsum_f32(
+                "mtr,ri->mti", primary_local, v_tau_kernel)
+            + v_tau_bias)
+        v_raw_out, v_gate_mass = _dense_rw_output_sharded(
+            primary_local,
+            primary_local_norm,
+            primary_valid,
+            v_read[None, ...],
+            v_write[None, ...],
+            primary_v_tau[None, ...],
+            max_chunk_size=max_chunk_size_v,
+            soft_gate_temperature=v_temperature,
+            soft_gate_boundary_power=boundary_power,
+            execution_prune_eps=execution_prune_eps,
+            srw_composition_mode=composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            effective_active_eps=soft_gate_effective_active_eps,
+            throughput_bf16=throughput_bf16)
+        grouped_raw_out = jnp.concatenate(
+            (qk_raw_out, v_raw_out), axis=0)
+        grouped_gate_mass = jnp.concatenate(
+            (qk_gate_mass, v_gate_mass), axis=0)
+        grouped_raw_out = ad_checkpoint.checkpoint_name(
+            grouped_raw_out,
+            name=_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME)
+        grouped_gate_mass = ad_checkpoint.checkpoint_name(
+            grouped_gate_mass,
+            name=_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)
+        _, grouped_gate_den = _global_dense_rw_den_sharded(
+            grouped_gate_mass, den_powers, composition_mode)
+        primary_results = (
+            grouped_raw_out / grouped_gate_den).astype(jnp.float32)
+        primary_block_output = writeback_dot(
+            "amtr,mrd->amtd",
+            primary_results
+            * primary_weight[None, ..., None]
+            * route_scales[:, None, ...],
+            space_state_writeback).astype(jnp.float32)
+        primary_block_output = jnp.where(
+            primary_valid[None, ..., None],
+            primary_block_output,
+            0.0)
+        initial_output = jnp.zeros(
+            (3, token_count, d_model), dtype=jnp.float32
+        ).at[:, primary_token, :].add(primary_block_output)
+
+        def task_group_step(local_output, group_index):
+            task_start = group_index * task_group_size
+            task_space = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_space_id"],
+                task_start, task_group_size, axis=0)
+            task_token = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_id"],
+                task_start, task_group_size, axis=0)
+            task_valid = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_valid"],
+                task_start, task_group_size, axis=0)
+            task_weight = jax.lax.dynamic_slice_in_dim(
+                overflow_weight,
+                task_start, task_group_size, axis=0)
+            safe_task_space = jnp.minimum(
+                task_space, jnp.int32(n_spaces - 1))
+
+            def execute_group(output_value):
+                packed_state = flat_state[task_token]
+                projection = space_state_proj[safe_task_space]
+                local = projection_dot(
+                    "gtd,gdr->gtr", packed_state, projection
+                ).astype(jnp.float32)
+                local_norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(RW_FORWARD_NORM_EPS))
+
+                qk_raw_tau = (
+                    _control_einsum_f32(
+                        "gtr,ari->agti", local, qk_tau_kernels)
+                    + qk_tau_biases[:, None, None, :])
+                task_qk_read = qk_reads[:, safe_task_space]
+                task_qk_write = qk_writes[:, safe_task_space]
+                qk_raw_out, qk_gate_mass = _dense_rw_output_sharded(
+                    local,
+                    local_norm,
+                    task_valid,
+                    task_qk_read,
+                    task_qk_write,
+                    qk_raw_tau,
+                    max_chunk_size=max_chunk_size_qk,
+                    soft_gate_temperature=qk_temperature,
+                    soft_gate_boundary_power=boundary_power,
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+
+                v_raw_tau = (
+                    _control_einsum_f32(
+                        "gtr,ri->gti", local, v_tau_kernel)
+                    + v_tau_bias)
+                task_v_read = v_read[safe_task_space]
+                task_v_write = v_write[safe_task_space]
+                v_raw_out, v_gate_mass = _dense_rw_output_sharded(
+                    local,
+                    local_norm,
+                    task_valid,
+                    task_v_read[None, ...],
+                    task_v_write[None, ...],
+                    v_raw_tau[None, ...],
+                    max_chunk_size=max_chunk_size_v,
+                    soft_gate_temperature=v_temperature,
+                    soft_gate_boundary_power=boundary_power,
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                grouped_raw_out = jnp.concatenate(
+                    (qk_raw_out, v_raw_out), axis=0)
+                grouped_gate_mass = jnp.concatenate(
+                    (qk_gate_mass, v_gate_mass), axis=0)
+                grouped_raw_out = ad_checkpoint.checkpoint_name(
+                    grouped_raw_out,
+                    name=_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME)
+                grouped_gate_mass = ad_checkpoint.checkpoint_name(
+                    grouped_gate_mass,
+                    name=_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)
+                _, grouped_gate_den = _global_dense_rw_den_sharded(
+                    grouped_gate_mass, den_powers, composition_mode)
+                local_results = (
+                    grouped_raw_out / grouped_gate_den).astype(jnp.float32)
+                writeback = space_state_writeback[safe_task_space]
+                block_output = writeback_dot(
+                    "agtr,grd->agtd",
+                    local_results
+                    * task_weight[None, ..., None]
+                    * route_scales[:, None, ...],
+                    writeback).astype(jnp.float32)
+                block_output = jnp.where(
+                    task_valid[None, ..., None], block_output, 0.0)
+                return output_value.at[
+                    :, task_token, :].add(block_output)
+
+            return jax.lax.cond(
+                jnp.any(task_valid),
+                execute_group,
+                lambda output_value: output_value,
+                local_output), None
+
+        scan_step = jax.checkpoint(
+            task_group_step,
+            prevent_cse=False,
+            policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
+        def execute_overflow(output_value):
+            return jax.lax.scan(
+                scan_step, output_value, jnp.arange(task_groups))[0]
+
+        local_grouped_output = jax.lax.cond(
+            jnp.any(packed_metadata["overflow_task_token_valid"]),
+            execute_overflow,
+            lambda output_value: output_value,
+            initial_output)
+        return _psum_dense_rw_representation_sharded(
+            local_grouped_output, output_collective_bf16)
+
+    @jax.custom_vjp
+    def execute_with_exact_space_backward(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packing,
+            selected_ids,
+            dense_space_weights):
+        del selected_ids, dense_space_weights
+        return bundle_execute(
+            flat_state, state_params, operator_params, controls, packing)
+
+    def execute_with_exact_space_backward_fwd(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packing,
+            selected_ids,
+            dense_space_weights):
+        grouped_output = bundle_execute(
+            flat_state, state_params, operator_params, controls, packing)
+        selected_weights = jnp.take_along_axis(
+            dense_space_weights, selected_ids, axis=1)
+        residual = (
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            selected_ids,
+            selected_weights,
+        )
+        return grouped_output, residual
+
+    def execute_with_exact_space_backward_bwd(
+            residual,
+            grouped_output_cotangent):
+        (flat_state,
+         state_params,
+         operator_params,
+         controls,
+         selected_ids,
+         selected_weights) = residual
+        token_count = int(flat_state.shape[0])
+        n_spaces = int(state_params[0].shape[0])
+        bucket_capacity = min(
+            _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY, token_count)
+        packed = _prefix_pack_top2_space_buckets(
+            selected_ids, selected_weights,
+            operation_space_count=n_spaces,
+            bucket_capacity=bucket_capacity,
+            task_group_size=_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
+        packed_metadata = {
+            "primary_token_id": packed["primary_token_id"],
+            "primary_token_valid": packed["primary_token_valid"],
+            "overflow_task_space_id": packed["overflow_task_space_id"],
+            "overflow_task_token_id": packed["overflow_task_token_id"],
+            "overflow_task_token_valid": packed[
+                "overflow_task_token_valid"],
+        }
+
+        def exact_primal(
+                exact_state,
+                exact_state_params,
+                exact_operator_params,
+                exact_controls,
+                exact_primary_weight,
+                exact_overflow_weight):
+            return exact_space_execute(
+                exact_state,
+                exact_state_params,
+                exact_operator_params,
+                exact_controls,
+                packed_metadata,
+                exact_primary_weight,
+                exact_overflow_weight)
+
+        _, pullback = jax.vjp(
+            exact_primal,
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packed["primary_routing_weight"],
+            packed["overflow_task_routing_weight"])
+        (flat_state_grad,
+         state_params_grad,
+         operator_params_grad,
+         controls_grad,
+         primary_weight_grad,
+         overflow_weight_grad) = pullback(grouped_output_cotangent)
+        dense_space_weights_grad = (
+            _exact_space_bucket_weight_cotangents_to_dense(
+                packed,
+                primary_weight_grad,
+                overflow_weight_grad,
+                token_count=token_count,
+                operation_space_count=n_spaces))
+        return (
+            flat_state_grad,
+            state_params_grad,
+            operator_params_grad,
+            controls_grad,
+            None,
+            None,
+            dense_space_weights_grad,
+        )
+
+    execute_with_exact_space_backward.defvjp(
+        execute_with_exact_space_backward_fwd,
+        execute_with_exact_space_backward_bwd)
+
+    def attention_core(
+            flat_state,
+            space_route_kernel, space_read_vectors,
+            space_state_proj, space_state_writeback,
+            q_tau_kernel, q_tau_bias,
+            k_tau_kernel, k_tau_bias,
+            v_tau_kernel, v_tau_bias,
+            q_read, q_write, k_read, k_write, v_read, v_write,
+            qk_temperature, v_temperature,
+            boundary_power, execution_prune_eps,
+            qk_scale, v_scale, collect_metrics):
+        routing = _compute_space_routing(
+            flat_state, space_route_kernel, space_read_vectors, top_k)
+        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
+            routing,
+            bundle_size=bundle_size,
+            token_block_size=token_block_size,
+            stage="attention")
+        token_count = int(flat_state.shape[0])
+        n_spaces = int(space_state_proj.shape[0])
+        if n_spaces % bundle_size:
+            raise ValueError(
+                "bundle_dense attention space count is not divisible by 4")
+        n_bundles = n_spaces // bundle_size
+        qk_reads = jnp.stack((q_read, k_read), axis=0)
+        qk_tau_kernels = jnp.stack(
+            (q_tau_kernel, k_tau_kernel), axis=0)
+        qk_tau_biases = jnp.stack(
+            (q_tau_bias, k_tau_bias), axis=0)
+        state_params = (
+            space_state_proj, space_state_writeback,
+            q_tau_kernel, q_tau_bias,
+            k_tau_kernel, k_tau_bias,
+            v_tau_kernel, v_tau_bias,
+        )
+        operator_params = (
+            q_read, q_write, k_read, k_write, v_read, v_write)
+        controls = (
+            qk_temperature, v_temperature,
+            boundary_power, execution_prune_eps,
+            qk_scale, v_scale,
+        )
+        grouped_output = execute_with_exact_space_backward(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packing,
+            routing["selected_ids"].astype(jnp.int32),
+            routing["dense_space_weights"].astype(jnp.float32))
 
         q_per_space = int(q_read.shape[1]) * model_axis_size
         k_per_space = int(k_read.shape[1]) * model_axis_size
@@ -3379,6 +3929,15 @@ def _make_sharded_attention_space_bundle_dense(
     kernel._v4174_chunk_remat_policy = "always"
     kernel._v4174_block_remat_policy = (
         "dots_and_compact_rw_outputs_saveable")
+    kernel._v4174_backward_execution_mode = (
+        "exact_top2_space_batched_dense_with_overflow")
+    kernel._v4174_backward_bucket_capacity = (
+        _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
+    kernel._v4174_backward_overflow_task_group_size = (
+        _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
+    kernel._v4174_backward_packed_entry_capacity = (
+        "n_spaces*min(T,4096) + compact exact overflow tasks")
+    kernel._v4174_qkv_shared_projection_vjp = True
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -3631,37 +4190,30 @@ def _make_sharded_rst_space_bundle_dense(
             "gate_mass_mean", "active_count_mean",
             "zero_gate_frac", "top1_rate"))
     bundle_metric_names = _bundle_packing_metric_names("rst")
+    den_power = jnp.float32(
+        admission_den_power).reshape((1, 1, 1, 1))
+    projection_dot = (
+        _throughput_einsum_bf16_f32
+        if throughput_bf16 else _control_einsum_f32)
+    writeback_dot = projection_dot
 
-    def rst_core(
+    def bundle_execute(
             flat_state,
-            space_route_kernel, space_read_vectors,
-            space_state_proj, space_state_writeback,
-            tau_kernel, tau_bias,
-            read_vectors, write_vectors,
-            temperature, boundary_power, execution_prune_eps,
-            route_scale, collect_metrics):
-        routing = _compute_space_routing(
-            flat_state, space_route_kernel, space_read_vectors, top_k)
-        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
-            routing,
-            bundle_size=bundle_size,
-            token_block_size=token_block_size,
-            stage="rst")
+            state_params,
+            operator_params,
+            controls,
+            packing):
+        (space_state_proj, space_state_writeback,
+         tau_kernel, tau_bias) = state_params
+        read_vectors, write_vectors = operator_params
+        (temperature, boundary_power,
+         execution_prune_eps, route_scale) = controls
         token_count = int(flat_state.shape[0])
         d_model = int(flat_state.shape[1])
         n_spaces = int(space_state_proj.shape[0])
-        if n_spaces % bundle_size:
-            raise ValueError(
-                "bundle_dense RST space count is not divisible by 4")
         n_bundles = n_spaces // bundle_size
         scan_blocks = (
             int(packing["token_id"].shape[0]) // token_block_size)
-        den_power = jnp.float32(
-            admission_den_power).reshape((1, 1, 1, 1))
-        projection_dot = (
-            _throughput_einsum_bf16_f32
-            if throughput_bf16 else _control_einsum_f32)
-        writeback_dot = projection_dot
         initial_output = jnp.zeros(
             (token_count, d_model), dtype=jnp.float32)
 
@@ -3752,8 +4304,315 @@ def _make_sharded_rst_space_bundle_dense(
             policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
         local_update, _ = jax.lax.scan(
             scan_step, initial_output, jnp.arange(scan_blocks))
-        update = _psum_dense_rw_representation_sharded(
+        return _psum_dense_rw_representation_sharded(
             local_update, output_collective_bf16)
+
+    def exact_space_execute(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packed_metadata,
+            primary_weight,
+            overflow_weight):
+        (space_state_proj, space_state_writeback,
+         tau_kernel, tau_bias) = state_params
+        read_vectors, write_vectors = operator_params
+        (temperature, boundary_power,
+         execution_prune_eps, route_scale) = controls
+        token_count = int(flat_state.shape[0])
+        d_model = int(flat_state.shape[1])
+        n_spaces = int(space_state_proj.shape[0])
+        task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
+        task_capacity = int(
+            packed_metadata["overflow_task_space_id"].shape[0])
+        task_groups = task_capacity // task_group_size
+        primary_token = packed_metadata["primary_token_id"]
+        primary_valid = packed_metadata["primary_token_valid"]
+        primary_state = flat_state[primary_token]
+        primary_local = projection_dot(
+            "mtd,mdr->mtr", primary_state, space_state_proj
+        ).astype(jnp.float32)
+        primary_local_norm = jnp.maximum(
+            jnp.linalg.norm(primary_local, axis=-1, keepdims=True),
+            jnp.float32(RW_FORWARD_NORM_EPS))
+        primary_tau = (
+            _control_einsum_f32(
+                "mtr,ri->mti", primary_local, tau_kernel)
+            + tau_bias)
+        raw_out, gate_mass = _dense_rw_output_sharded(
+            primary_local,
+            primary_local_norm,
+            primary_valid,
+            read_vectors[None, ...],
+            write_vectors[None, ...],
+            primary_tau[None, ...],
+            max_chunk_size=max_chunk_size,
+            soft_gate_temperature=temperature,
+            soft_gate_boundary_power=boundary_power,
+            execution_prune_eps=execution_prune_eps,
+            srw_composition_mode=composition_mode,
+            heat_kernel_beta=heat_kernel_beta,
+            effective_active_eps=soft_gate_effective_active_eps,
+            throughput_bf16=throughput_bf16)
+        raw_out = ad_checkpoint.checkpoint_name(
+            raw_out, name=_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME)
+        gate_mass = ad_checkpoint.checkpoint_name(
+            gate_mass, name=_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)
+        _, gate_den = _global_dense_rw_den_sharded(
+            gate_mass, den_power, composition_mode)
+        primary_results = (raw_out / gate_den).astype(jnp.float32)
+        primary_block_output = writeback_dot(
+            "mtr,mrd->mtd",
+            primary_results[0]
+            * primary_weight[..., None]
+            * jnp.asarray(route_scale, dtype=jnp.float32),
+            space_state_writeback).astype(jnp.float32)
+        primary_block_output = jnp.where(
+            primary_valid[..., None], primary_block_output, 0.0)
+        initial_output = jnp.zeros(
+            (token_count, d_model), dtype=jnp.float32
+        ).at[primary_token, :].add(primary_block_output)
+
+        def task_group_step(local_output, group_index):
+            task_start = group_index * task_group_size
+            task_space = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_space_id"],
+                task_start, task_group_size, axis=0)
+            task_token = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_id"],
+                task_start, task_group_size, axis=0)
+            task_valid = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_valid"],
+                task_start, task_group_size, axis=0)
+            task_weight = jax.lax.dynamic_slice_in_dim(
+                overflow_weight,
+                task_start, task_group_size, axis=0)
+            safe_task_space = jnp.minimum(
+                task_space, jnp.int32(n_spaces - 1))
+
+            def execute_group(output_value):
+                packed_state = flat_state[task_token]
+                projection = space_state_proj[safe_task_space]
+                local = projection_dot(
+                    "gtd,gdr->gtr", packed_state, projection
+                ).astype(jnp.float32)
+                local_norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(RW_FORWARD_NORM_EPS))
+                raw_tau = (
+                    _control_einsum_f32(
+                        "gtr,ri->gti", local, tau_kernel)
+                    + tau_bias)
+                task_read = read_vectors[safe_task_space]
+                task_write = write_vectors[safe_task_space]
+                raw_out, gate_mass = _dense_rw_output_sharded(
+                    local,
+                    local_norm,
+                    task_valid,
+                    task_read[None, ...],
+                    task_write[None, ...],
+                    raw_tau[None, ...],
+                    max_chunk_size=max_chunk_size,
+                    soft_gate_temperature=temperature,
+                    soft_gate_boundary_power=boundary_power,
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                raw_out = ad_checkpoint.checkpoint_name(
+                    raw_out, name=_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME)
+                gate_mass = ad_checkpoint.checkpoint_name(
+                    gate_mass, name=_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)
+                _, gate_den = _global_dense_rw_den_sharded(
+                    gate_mass, den_power, composition_mode)
+                local_results = (raw_out / gate_den).astype(jnp.float32)
+                writeback = space_state_writeback[safe_task_space]
+                block_output = writeback_dot(
+                    "gtr,grd->gtd",
+                    local_results[0]
+                    * task_weight[..., None]
+                    * jnp.asarray(route_scale, dtype=jnp.float32),
+                    writeback).astype(jnp.float32)
+                block_output = jnp.where(
+                    task_valid[..., None], block_output, 0.0)
+                return output_value.at[
+                    task_token, :].add(block_output)
+
+            return jax.lax.cond(
+                jnp.any(task_valid),
+                execute_group,
+                lambda output_value: output_value,
+                local_output), None
+
+        scan_step = jax.checkpoint(
+            task_group_step,
+            prevent_cse=False,
+            policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
+        def execute_overflow(output_value):
+            return jax.lax.scan(
+                scan_step, output_value, jnp.arange(task_groups))[0]
+
+        local_update = jax.lax.cond(
+            jnp.any(packed_metadata["overflow_task_token_valid"]),
+            execute_overflow,
+            lambda output_value: output_value,
+            initial_output)
+        return _psum_dense_rw_representation_sharded(
+            local_update, output_collective_bf16)
+
+    @jax.custom_vjp
+    def execute_with_exact_space_backward(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packing,
+            selected_ids,
+            dense_space_weights):
+        del selected_ids, dense_space_weights
+        return bundle_execute(
+            flat_state, state_params, operator_params, controls, packing)
+
+    def execute_with_exact_space_backward_fwd(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packing,
+            selected_ids,
+            dense_space_weights):
+        update = bundle_execute(
+            flat_state, state_params, operator_params, controls, packing)
+        selected_weights = jnp.take_along_axis(
+            dense_space_weights, selected_ids, axis=1)
+        residual = (
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            selected_ids,
+            selected_weights,
+        )
+        return update, residual
+
+    def execute_with_exact_space_backward_bwd(
+            residual,
+            update_cotangent):
+        (flat_state,
+         state_params,
+         operator_params,
+         controls,
+         selected_ids,
+         selected_weights) = residual
+        token_count = int(flat_state.shape[0])
+        n_spaces = int(state_params[0].shape[0])
+        bucket_capacity = min(
+            _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY, token_count)
+        packed = _prefix_pack_top2_space_buckets(
+            selected_ids, selected_weights,
+            operation_space_count=n_spaces,
+            bucket_capacity=bucket_capacity,
+            task_group_size=_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
+        packed_metadata = {
+            "primary_token_id": packed["primary_token_id"],
+            "primary_token_valid": packed["primary_token_valid"],
+            "overflow_task_space_id": packed["overflow_task_space_id"],
+            "overflow_task_token_id": packed["overflow_task_token_id"],
+            "overflow_task_token_valid": packed[
+                "overflow_task_token_valid"],
+        }
+
+        def exact_primal(
+                exact_state,
+                exact_state_params,
+                exact_operator_params,
+                exact_controls,
+                exact_primary_weight,
+                exact_overflow_weight):
+            return exact_space_execute(
+                exact_state,
+                exact_state_params,
+                exact_operator_params,
+                exact_controls,
+                packed_metadata,
+                exact_primary_weight,
+                exact_overflow_weight)
+
+        _, pullback = jax.vjp(
+            exact_primal,
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packed["primary_routing_weight"],
+            packed["overflow_task_routing_weight"])
+        (flat_state_grad,
+         state_params_grad,
+         operator_params_grad,
+         controls_grad,
+         primary_weight_grad,
+         overflow_weight_grad) = pullback(update_cotangent)
+        dense_space_weights_grad = (
+            _exact_space_bucket_weight_cotangents_to_dense(
+                packed,
+                primary_weight_grad,
+                overflow_weight_grad,
+                token_count=token_count,
+                operation_space_count=n_spaces))
+        return (
+            flat_state_grad,
+            state_params_grad,
+            operator_params_grad,
+            controls_grad,
+            None,
+            None,
+            dense_space_weights_grad,
+        )
+
+    execute_with_exact_space_backward.defvjp(
+        execute_with_exact_space_backward_fwd,
+        execute_with_exact_space_backward_bwd)
+
+    def rst_core(
+            flat_state,
+            space_route_kernel, space_read_vectors,
+            space_state_proj, space_state_writeback,
+            tau_kernel, tau_bias,
+            read_vectors, write_vectors,
+            temperature, boundary_power, execution_prune_eps,
+            route_scale, collect_metrics):
+        routing = _compute_space_routing(
+            flat_state, space_route_kernel, space_read_vectors, top_k)
+        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
+            routing,
+            bundle_size=bundle_size,
+            token_block_size=token_block_size,
+            stage="rst")
+        token_count = int(flat_state.shape[0])
+        n_spaces = int(space_state_proj.shape[0])
+        if n_spaces % bundle_size:
+            raise ValueError(
+                "bundle_dense RST space count is not divisible by 4")
+        n_bundles = n_spaces // bundle_size
+        state_params = (
+            space_state_proj, space_state_writeback,
+            tau_kernel, tau_bias,
+        )
+        operator_params = (read_vectors, write_vectors)
+        controls = (
+            temperature, boundary_power,
+            execution_prune_eps, route_scale,
+        )
+        update = execute_with_exact_space_backward(
+            flat_state,
+            state_params,
+            operator_params,
+            controls,
+            packing,
+            routing["selected_ids"].astype(jnp.int32),
+            routing["dense_space_weights"].astype(jnp.float32))
 
         n_per_space = int(read_vectors.shape[1]) * model_axis_size
         route_specs = (("rst", n_per_space),)
@@ -3881,6 +4740,14 @@ def _make_sharded_rst_space_bundle_dense(
     kernel._v4174_chunk_remat_policy = "always"
     kernel._v4174_block_remat_policy = (
         "dots_and_compact_rw_outputs_saveable")
+    kernel._v4174_backward_execution_mode = (
+        "exact_top2_space_batched_dense_with_overflow")
+    kernel._v4174_backward_bucket_capacity = (
+        _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
+    kernel._v4174_backward_overflow_task_group_size = (
+        _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
+    kernel._v4174_backward_packed_entry_capacity = (
+        "n_spaces*min(T,4096) + compact exact overflow tasks")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -3939,6 +4806,12 @@ def _validate_v4174_sharded_fns(
                     kernel, "_v4174_bundle_token_block_size", 0)) <= 0:
                 raise ValueError(
                     f"v4174 {name} bundle token block size must be positive")
+            if getattr(
+                    kernel, "_v4174_backward_execution_mode", None
+            ) != "exact_top2_space_batched_dense_with_overflow":
+                raise ValueError(
+                    f"v4174 {name} bundle executor requires exact top-2 "
+                    "space-batched dense backward with exact overflow")
 
 
 def get_model_version() -> str:
