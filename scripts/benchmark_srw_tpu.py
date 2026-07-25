@@ -204,6 +204,10 @@ def main():
                         action="store_true",
                         help=("Run a quick real-data forward bottleneck "
                               "diagnosis; skip train-step benchmark."))
+    parser.add_argument(
+        "--backward-profile", action="store_true",
+        help=("With --fast, also measure v4174 QKV and RST "
+              "forward+backward kernels."))
     parser.add_argument("--model-version", default=None,
                         help="Optional expected model version.")
     parser.add_argument("--allow-model-version-override", action="store_true",
@@ -245,6 +249,8 @@ def main():
         raise SystemExit("--forward-profile-steps must be >= 0")
     if args.module_profile_steps < 0:
         raise SystemExit("--module-profile-steps must be >= 0")
+    if args.backward_profile and not args.fast_only:
+        raise SystemExit("--backward-profile requires --fast")
     if args.model_version and args.model_version not in SUPPORTED_MODEL_VERSIONS:
         raise SystemExit(
             f"--model-version must be one of {SUPPORTED_MODEL_VERSIONS}")
@@ -2328,7 +2334,8 @@ def run_module_profile_pass(profile_fns, params, input_ids, rng, step,
     return records
 
 
-def create_v4174_detailed_profile_fns(cfg, sharded_fns):
+def create_v4174_detailed_profile_fns(
+        cfg, sharded_fns, *, include_backward=False):
     """Split the fused bundle path at its material execution boundaries."""
     module = importlib.import_module(MODEL_MODULES[V4174_MODEL_VERSION][0])
     m = cfg["model"]
@@ -2370,8 +2377,7 @@ def create_v4174_detailed_profile_fns(cfg, sharded_fns):
         return module._shared_layer_norm(
             x, block_params["norm1"]["scale"], block_params["norm1"]["bias"])
 
-    @jax.jit
-    def qkv_bundle_srw_step(pool_params, router_params, normed):
+    def qkv_bundle_srw(pool_params, router_params, normed):
         flat_state = normed.reshape((-1, d_model))
         q, k, v, _metrics = attention_dense(
             flat_state,
@@ -2403,6 +2409,33 @@ def create_v4174_detailed_profile_fns(cfg, sharded_fns):
             k.reshape(normed.shape),
             v.reshape(normed.shape))
 
+    qkv_bundle_srw_step = jax.jit(qkv_bundle_srw)
+
+    def gradient_checksum(grads):
+        leaves = jax.tree.leaves(grads)
+        return sum(
+            jnp.sum(jnp.square(leaf.astype(jnp.float32)))
+            for leaf in leaves)
+
+    if include_backward:
+        @jax.jit
+        def qkv_bundle_srw_fwd_bwd_step(
+                pool_params, router_params, normed):
+            def objective(exact_pool, exact_router, exact_normed):
+                q, k, v = qkv_bundle_srw(
+                    exact_pool, exact_router, exact_normed)
+                return (
+                    jnp.mean(q)
+                    + jnp.float32(0.5) * jnp.mean(k)
+                    + jnp.float32(0.25) * jnp.mean(v))
+
+            value, grads = jax.value_and_grad(
+                objective, argnums=(0, 1, 2))(
+                    pool_params, router_params, normed)
+            return value, gradient_checksum(grads)
+    else:
+        qkv_bundle_srw_fwd_bwd_step = None
+
     @jax.jit
     def attn_core_step(q, k, v, rng):
         batch_size, sequence_length = q.shape[:2]
@@ -2430,8 +2463,7 @@ def create_v4174_detailed_profile_fns(cfg, sharded_fns):
         return module._shared_layer_norm(
             x, block_params["norm2"]["scale"], block_params["norm2"]["bias"])
 
-    @jax.jit
-    def rst_bundle_srw_step(pool_params, router_params, normed, x):
+    def rst_bundle_srw(pool_params, router_params, normed, x):
         flat_state = normed.reshape((-1, d_model))
         update, _metrics = rst_dense(
             flat_state,
@@ -2449,6 +2481,24 @@ def create_v4174_detailed_profile_fns(cfg, sharded_fns):
             rst_scale,
             collect_metrics)
         return x + update.reshape(normed.shape)
+
+    rst_bundle_srw_step = jax.jit(rst_bundle_srw)
+
+    if include_backward:
+        @jax.jit
+        def rst_bundle_srw_fwd_bwd_step(
+                pool_params, router_params, normed, x):
+            def objective(exact_pool, exact_router, exact_normed):
+                update = rst_bundle_srw(
+                    exact_pool, exact_router, exact_normed, x)
+                return jnp.mean(update)
+
+            value, grads = jax.value_and_grad(
+                objective, argnums=(0, 1, 2))(
+                    pool_params, router_params, normed)
+            return value, gradient_checksum(grads)
+    else:
+        rst_bundle_srw_fwd_bwd_step = None
 
     @jax.jit
     def final_loss_step(norm_scale, norm_bias, embedding_matrix, x, labels):
@@ -2469,19 +2519,27 @@ def create_v4174_detailed_profile_fns(cfg, sharded_fns):
         "embed_step": embed_step,
         "attn_norm_step": attn_norm_step,
         "qkv_bundle_srw_step": qkv_bundle_srw_step,
+        "qkv_bundle_srw_fwd_bwd_step": qkv_bundle_srw_fwd_bwd_step,
         "attn_core_step": attn_core_step,
         "attn_out_proj_step": attn_out_proj_step,
         "rst_norm_step": rst_norm_step,
         "rst_bundle_srw_step": rst_bundle_srw_step,
+        "rst_bundle_srw_fwd_bwd_step": rst_bundle_srw_fwd_bwd_step,
         "final_loss_step": final_loss_step,
         "n_layers": n_layers,
+        "include_backward_profile": bool(include_backward),
     }
 
 
-def create_detailed_profile_fns(cfg, sharded_fns):
+def create_detailed_profile_fns(
+        cfg, sharded_fns, *, include_backward=False):
     version = str(cfg["model"].get("model_version", ""))
     if version == V4174_MODEL_VERSION:
-        return create_v4174_detailed_profile_fns(cfg, sharded_fns)
+        return create_v4174_detailed_profile_fns(
+            cfg, sharded_fns, include_backward=include_backward)
+    if include_backward:
+        raise RuntimeError(
+            "Detailed backward profile is currently defined for v4174 only.")
     module = importlib.import_module(MODEL_MODULES[version][0])
     t = cfg["training"]
     m = cfg["model"]
@@ -2815,6 +2873,18 @@ def run_v4174_detailed_profile_pass(
             f"layer_{layer_idx:02d}.qkv_bundle_srw", "qkv_bundle_srw",
             seconds, hbm_after, hbm_before, layer=layer_idx,
             note="routing + prefix-count bundle pack + Q/K/V SRW + writeback")
+        if profile_fns.get("include_backward_profile"):
+            hbm_before = hbm_after
+            (_qkv_grad_checksum, seconds) = profile_timed_call(
+                profile_fns["qkv_bundle_srw_fwd_bwd_step"],
+                pool_params, router_params, normed)
+            hbm_after = collect_hbm_stats()
+            add_record(
+                f"layer_{layer_idx:02d}.qkv_bundle_srw_fwd_bwd",
+                "qkv_bundle_srw_fwd_bwd",
+                seconds, hbm_after, hbm_before, layer=layer_idx,
+                note=("QKV forward plus exact custom-VJP backward; "
+                      "all gradients reduced to a device checksum"))
 
         hbm_before = hbm_after
         (context, seconds) = profile_timed_call(
@@ -2841,15 +2911,28 @@ def run_v4174_detailed_profile_pass(
             f"layer_{layer_idx:02d}.rst_norm", "rst_norm",
             seconds, hbm_after, hbm_before, layer=layer_idx)
 
+        rst_input = x
         hbm_before = hbm_after
         (x, seconds) = profile_timed_call(
             profile_fns["rst_bundle_srw_step"],
-            pool_params, router_params, normed, x)
+            pool_params, router_params, normed, rst_input)
         hbm_after = collect_hbm_stats()
         add_record(
             f"layer_{layer_idx:02d}.rst_bundle_srw", "rst_bundle_srw",
             seconds, hbm_after, hbm_before, layer=layer_idx,
             note="routing + prefix-count bundle pack + RST SRW + writeback")
+        if profile_fns.get("include_backward_profile"):
+            hbm_before = hbm_after
+            (_rst_grad_checksum, seconds) = profile_timed_call(
+                profile_fns["rst_bundle_srw_fwd_bwd_step"],
+                pool_params, router_params, normed, rst_input)
+            hbm_after = collect_hbm_stats()
+            add_record(
+                f"layer_{layer_idx:02d}.rst_bundle_srw_fwd_bwd",
+                "rst_bundle_srw_fwd_bwd",
+                seconds, hbm_after, hbm_before, layer=layer_idx,
+                note=("RST forward plus exact custom-VJP backward; "
+                      "all gradients reduced to a device checksum"))
 
     hbm_before = hbm_after
     (_loss_metrics, seconds) = profile_timed_call(
@@ -3427,8 +3510,13 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
 
     if fast_detailed_profile:
         try:
-            detailed_fns = create_detailed_profile_fns(cfg, sharded_fns)
-            _log("Compiling detailed split forward profile...")
+            detailed_fns = create_detailed_profile_fns(
+                cfg, sharded_fns,
+                include_backward=bool(args.backward_profile))
+            profile_kind = (
+                "forward/backward"
+                if args.backward_profile else "forward")
+            _log(f"Compiling detailed split {profile_kind} profile...")
             _batch, ids, _mask, _step_rng, step_no = next_profile_batch()
             (_compile_records, detailed_compile_seconds) = (
                 run_detailed_profile_pass(
