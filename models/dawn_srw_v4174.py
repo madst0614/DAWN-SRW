@@ -10,9 +10,9 @@ projected local state ``z_m = P_m x`` directly matches forward-normalized RW
 read vectors: the read vector itself is the operator key.  Q, K, V, and RST
 have fully separate read/write banks and tau projections.  Q/K/V share the
 attention space gate, while RST recomputes routing and local state after the
-attention residual update.  Semantic execution is hard top-k; physical
-operator execution remains all-space dense and writeback is fused without an
-``[M,T,D]`` intermediate.
+attention residual update.  Semantic execution is hard top-k.  The canonical
+dense executor remains available as a reference, while the production bundle
+executor compactly gathers tokens into fixed four-space physical blocks.
 
 This is the sole v4.1.7.4 architecture.  Earlier checkpoint, optimizer,
 parameter-path, and config schemas are intentionally unsupported.
@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+from jax import ad_checkpoint
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
@@ -55,6 +56,10 @@ ROUTES = ("q", "k", "v", "rst")
 POOLS = ROUTES
 ATTENTION_CORE_NAME = "causal_dot_product_fp32_softmax"
 LAYER_EXECUTION_NAME = "rematerialized"
+OPERATION_SPACE_EXECUTION_MODES = ("dense_all_space", "bundle_dense")
+BUNDLE_DENSE_SIZE = 4
+DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE = 1024
+_BUNDLE_PACKING_CHECKPOINT_NAME = "v4174_bundle_packing_metadata"
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -90,6 +95,46 @@ def materialize_operation_space_config(
             "v4174 does not accept removed model fields: "
             + ", ".join(forbidden))
     n_spaces, top_k = resolve_operation_space_config(model_cfg)
+    execution_mode = str(model_cfg.get(
+        "operation_space_execution_mode", "dense_all_space")).strip()
+    if execution_mode not in OPERATION_SPACE_EXECUTION_MODES:
+        raise ValueError(
+            "model.operation_space_execution_mode must be one of "
+            f"{OPERATION_SPACE_EXECUTION_MODES}, got {execution_mode!r}")
+    if execution_mode == "bundle_dense":
+        bundle_size = _positive_int(
+            "operation_space_bundle_size",
+            model_cfg.get("operation_space_bundle_size"))
+        token_block_size = _positive_int(
+            "operation_space_bundle_token_block_size",
+            model_cfg.get("operation_space_bundle_token_block_size"))
+        if bundle_size != BUNDLE_DENSE_SIZE:
+            raise ValueError(
+                "v4174 bundle_dense supports "
+                f"model.operation_space_bundle_size={BUNDLE_DENSE_SIZE} "
+                f"only, got {bundle_size}")
+        if n_spaces != 24:
+            raise ValueError(
+                "v4174 bundle_dense production requires "
+                f"model.n_operation_spaces=24, got {n_spaces}")
+        if n_spaces % bundle_size:
+            raise ValueError(
+                "model.n_operation_spaces must be divisible by "
+                "model.operation_space_bundle_size, got "
+                f"{n_spaces} % {bundle_size}")
+        if top_k != 2:
+            raise ValueError(
+                "v4174 bundle_dense requires "
+                f"model.operation_space_top_k=2, got {top_k}")
+        model_cfg["operation_space_bundle_size"] = bundle_size
+        model_cfg[
+            "operation_space_bundle_token_block_size"] = token_block_size
+    elif (
+            "operation_space_bundle_size" in model_cfg
+            or "operation_space_bundle_token_block_size" in model_cfg):
+        raise ValueError(
+            "model.operation_space_bundle_* fields require "
+            "model.operation_space_execution_mode='bundle_dense'")
     d_model = _positive_int("d_model", model_cfg.get("d_model"))
     d_route = _positive_int("d_route", model_cfg.get("d_route"))
     if d_route > d_model:
@@ -117,6 +162,7 @@ def materialize_operation_space_config(
             model_cfg[tau_name] = value
     model_cfg["n_operation_spaces"] = n_spaces
     model_cfg["operation_space_top_k"] = top_k
+    model_cfg["operation_space_execution_mode"] = execution_mode
     return model_cfg
 
 
@@ -869,6 +915,9 @@ class DAWN_SRW_V4174(nn.Module):
     n_rst: int = 25200
     n_operation_spaces: int = 3
     operation_space_top_k: int = 2
+    operation_space_execution_mode: str = "dense_all_space"
+    operation_space_bundle_size: Optional[int] = None
+    operation_space_bundle_token_block_size: Optional[int] = None
     n_chunks_rst: int = 1
     n_chunks_q: int = 1
     n_chunks_k: int = 1
@@ -894,11 +943,19 @@ class DAWN_SRW_V4174(nn.Module):
             "d_route": self.d_route,
             "n_operation_spaces": self.n_operation_spaces,
             "operation_space_top_k": self.operation_space_top_k,
+            "operation_space_execution_mode":
+                self.operation_space_execution_mode,
             "n_q": self.n_q,
             "n_k": self.n_k,
             "n_v": self.n_v,
             "n_rst": self.n_rst,
         }
+        if self.operation_space_bundle_size is not None:
+            config["operation_space_bundle_size"] = (
+                self.operation_space_bundle_size)
+        if self.operation_space_bundle_token_block_size is not None:
+            config["operation_space_bundle_token_block_size"] = (
+                self.operation_space_bundle_token_block_size)
         materialize_operation_space_config(config)
         tau_values = (
             self.tau_init_attn_q, self.tau_init_attn_k,
@@ -962,7 +1019,7 @@ class DAWN_SRW_V4174(nn.Module):
             ce_token_chunk_size=32768, compute_accuracy=True,
             collect_train_metrics=True,
             **analysis_kwargs):
-        """Run the sole all-space-dense v4174 architecture."""
+        """Run v4174 with the statically selected physical executor."""
         del (
             attention_mask, soft_gate_t_final,
             soft_gate_boundary_power_final, admission_den_power,
@@ -1089,6 +1146,26 @@ class DAWN_SRW_V4174(nn.Module):
             raise ValueError(
                 "v4174 attention/RST executors require identical static "
                 "throughput precision")
+        fused_execution_mode = (
+            getattr(
+                attention_dense, "_v4174_execution_mode",
+                "dense_all_space")
+            if fused_production else None)
+        if (fused_production
+                and getattr(
+                    rst_dense, "_v4174_execution_mode",
+                    "dense_all_space")
+                != fused_execution_mode):
+            raise ValueError(
+                "v4174 attention/RST executors require identical static "
+                "operation-space execution modes")
+        if (fused_production
+                and fused_execution_mode
+                != self.operation_space_execution_mode):
+            raise ValueError(
+                "v4174 configured/factory operation-space execution mode "
+                f"mismatch: {self.operation_space_execution_mode!r} != "
+                f"{fused_execution_mode!r}")
         fused_throughput_bf16 = (
             fused_throughput_precision == "bf16_operands_f32_accum")
         regular_lists: dict[str, list[jax.Array]] = {}
@@ -1351,8 +1428,12 @@ class DAWN_SRW_V4174(nn.Module):
 
         layer_impl = layer_forward
         if self.gradient_checkpointing:
-            layer_impl = jax.checkpoint(
-                layer_forward, prevent_cse=False)
+            checkpoint_kwargs = {"prevent_cse": False}
+            if self.operation_space_execution_mode == "bundle_dense":
+                checkpoint_kwargs["policy"] = (
+                    jax.checkpoint_policies.save_only_these_names(
+                        _BUNDLE_PACKING_CHECKPOINT_NAME))
+            layer_impl = jax.checkpoint(layer_forward, **checkpoint_kwargs)
 
         block_params = [
             params[f"block_{index}"] for index in range(self.n_layers)]
@@ -1482,8 +1563,16 @@ class DAWN_SRW_V4174(nn.Module):
             f"k={int(self.n_k)//n_spaces}, "
             f"v={int(self.n_v)//n_spaces}, "
             f"rst={int(self.n_rst)//n_spaces}",
-            "execution: semantic hard top-k, physical all-space dense, one "
-            "shared P_m/U_m coordinate system and fused writeback",
+            (
+                "execution: semantic hard top-k, physical compact fixed "
+                f"{self.operation_space_bundle_size}-space bundles with "
+                f"token blocks of "
+                f"{self.operation_space_bundle_token_block_size}"
+                if self.operation_space_execution_mode == "bundle_dense"
+                else (
+                    "execution: semantic hard top-k, physical all-space "
+                    "dense, one shared P_m/U_m coordinate system and fused "
+                    "writeback")),
             "layer execution: lax.scan with "
             + ("full-layer rematerialization"
                if self.gradient_checkpointing
@@ -1946,6 +2035,26 @@ _FUSED_OPERATOR_METRIC_SUFFIXES = (
     "den_floor_frac",
 )
 
+_BUNDLE_PACKING_METRIC_SUFFIXES = (
+    "valid_entries",
+    "entries_per_token",
+    "same_top2_frac",
+    "physical_spaces_per_token",
+    "dense_compute_fraction",
+    "padding_entries",
+    "padding_fraction",
+    "token_count_min",
+    "token_count_mean",
+    "token_count_max",
+    "token_drop_count",
+)
+
+
+def _bundle_packing_metric_names(stage: str) -> tuple[str, ...]:
+    return tuple(
+        f"{stage}_bundle_{suffix}"
+        for suffix in _BUNDLE_PACKING_METRIC_SUFFIXES)
+
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1))
 def _metric_only_cond(
@@ -1984,6 +2093,247 @@ def _metric_only_cond_bwd(
 _metric_only_cond.defvjp(
     _metric_only_cond_fwd,
     _metric_only_cond_bwd)
+
+
+def _prefix_pack_top2_bundle_arrays_impl(
+        selected_ids: jax.Array,
+        dense_weights: jax.Array,
+        bundle_size: int,
+        token_block_size: int):
+    """Build exact fixed-bundle packing with six prefix counters."""
+    token_count, n_spaces = map(int, dense_weights.shape)
+    n_bundles = n_spaces // bundle_size
+    selected_weights = jnp.take_along_axis(
+        dense_weights, selected_ids, axis=1)
+    bundle_ids = selected_ids // bundle_size
+    local_ids = selected_ids % bundle_size
+    same_bundle = bundle_ids[:, 0] == bundle_ids[:, 1]
+
+    local0 = jax.nn.one_hot(
+        local_ids[:, 0], bundle_size, dtype=jnp.float32)
+    local1 = jax.nn.one_hot(
+        local_ids[:, 1], bundle_size, dtype=jnp.float32)
+    membership0 = (
+        local0 + jnp.where(same_bundle[:, None], local1, 0.0)) > 0.0
+    membership1 = jnp.where(
+        same_bundle[:, None], 0.0, local1) > 0.0
+    weight0 = (
+        local0 * selected_weights[:, 0, None]
+        + jnp.where(
+            same_bundle[:, None],
+            local1 * selected_weights[:, 1, None],
+            0.0))
+    weight1 = jnp.where(
+        same_bundle[:, None],
+        0.0,
+        local1 * selected_weights[:, 1, None])
+
+    token_ids = jnp.arange(token_count, dtype=jnp.int32)
+    sentinel = jnp.int32(n_bundles)
+    candidate_bundle = jnp.concatenate((
+        bundle_ids[:, 0],
+        jnp.where(same_bundle, sentinel, bundle_ids[:, 1]),
+    ))
+    candidate_token = jnp.concatenate((token_ids, token_ids))
+    candidate_membership = jnp.concatenate(
+        (membership0, membership1), axis=0)
+    candidate_weight = jnp.concatenate((weight0, weight1), axis=0)
+    candidate_valid = candidate_bundle < sentinel
+
+    bundle_onehot = (
+        jax.nn.one_hot(
+            candidate_bundle, n_bundles, dtype=jnp.int32)
+        * candidate_valid[:, None].astype(jnp.int32))
+    rank_per_bundle = (
+        jnp.cumsum(bundle_onehot, axis=0, dtype=jnp.int32)
+        - bundle_onehot)
+    local_rank = jnp.sum(
+        rank_per_bundle * bundle_onehot, axis=1, dtype=jnp.int32)
+    counts = bundle_onehot.sum(axis=0, dtype=jnp.int32)
+    padded_counts = (
+        (counts + token_block_size - 1) // token_block_size
+        * token_block_size)
+    packed_offsets = jnp.concatenate((
+        jnp.zeros((1,), dtype=jnp.int32),
+        jnp.cumsum(padded_counts[:-1], dtype=jnp.int32),
+    ))
+    safe_bundle = jnp.minimum(candidate_bundle, n_bundles - 1)
+
+    entry_capacity = (
+        2 * token_count
+        + n_bundles * (token_block_size - 1))
+    scan_blocks = math.ceil(entry_capacity / token_block_size)
+    scan_capacity = scan_blocks * token_block_size
+    destination = packed_offsets[safe_bundle] + local_rank
+    destination = jnp.where(
+        candidate_valid, destination, jnp.int32(scan_capacity))
+
+    packed_bundle = jnp.full(
+        (scan_capacity,), sentinel, dtype=jnp.int32
+    ).at[destination].set(candidate_bundle, mode="drop")
+    packed_token = jnp.zeros(
+        (scan_capacity,), dtype=jnp.int32
+    ).at[destination].set(candidate_token, mode="drop")
+    packed_membership = jnp.zeros(
+        (scan_capacity, bundle_size), dtype=jnp.bool_
+    ).at[destination].set(candidate_membership, mode="drop")
+    packed_weight = jnp.zeros(
+        (scan_capacity, bundle_size), dtype=jnp.float32
+    ).at[destination].set(candidate_weight, mode="drop")
+    packed_valid = jnp.zeros(
+        (scan_capacity,), dtype=jnp.bool_
+    ).at[destination].set(candidate_valid, mode="drop")
+    return (
+        packed_bundle,
+        packed_token,
+        packed_membership,
+        packed_weight,
+        packed_valid,
+        counts,
+        padded_counts,
+        same_bundle,
+    )
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5))
+def _prefix_pack_top2_bundle_arrays(
+        selected_ids: jax.Array,
+        dense_weights: jax.Array,
+        bundle_size: int,
+        token_block_size: int,
+        operation_space_count: int,
+        token_count: int):
+    """Pack once and preserve compact routing metadata for its VJP."""
+    del operation_space_count, token_count
+    return _prefix_pack_top2_bundle_arrays_impl(
+        selected_ids, dense_weights, bundle_size, token_block_size)
+
+
+def _prefix_pack_top2_bundle_arrays_fwd(
+        selected_ids: jax.Array,
+        dense_weights: jax.Array,
+        bundle_size: int,
+        token_block_size: int,
+        operation_space_count: int,
+        token_count: int):
+    del operation_space_count, token_count
+    packed = _prefix_pack_top2_bundle_arrays_impl(
+        selected_ids, dense_weights, bundle_size, token_block_size)
+    residual = tuple(
+        ad_checkpoint.checkpoint_name(
+            packed[index], name=_BUNDLE_PACKING_CHECKPOINT_NAME)
+        for index in (0, 1, 2, 4)
+    )
+    return packed, residual
+
+
+def _prefix_pack_top2_bundle_arrays_bwd(
+        bundle_size: int,
+        token_block_size: int,
+        operation_space_count: int,
+        token_count: int,
+        residual,
+        cotangent):
+    del token_block_size
+    (packed_bundle, packed_token,
+     packed_membership, packed_valid) = residual
+    packed_weight_cotangent = jnp.asarray(
+        cotangent[3], dtype=jnp.float32)
+    packed_space_ids = (
+        packed_bundle[:, None] * int(bundle_size)
+        + jnp.arange(int(bundle_size), dtype=jnp.int32)[None, :])
+    valid_membership = packed_membership & packed_valid[:, None]
+    dense_grad = jnp.zeros(
+        (int(token_count),
+         int(operation_space_count)),
+        dtype=jnp.float32)
+    dense_grad = dense_grad.at[
+        packed_token[:, None], packed_space_ids
+    ].add(
+        jnp.where(
+            valid_membership, packed_weight_cotangent, 0.0),
+        mode="drop")
+    return None, dense_grad
+
+
+_prefix_pack_top2_bundle_arrays.defvjp(
+    _prefix_pack_top2_bundle_arrays_fwd,
+    _prefix_pack_top2_bundle_arrays_bwd)
+
+
+def _pack_top2_bundle_entries_sharded(
+        routing: Mapping[str, jax.Array], *,
+        bundle_size: int,
+        token_block_size: int,
+        stage: str) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+    """Prefix-pack one or two fixed-bundle entries for every routed token."""
+    selected_ids = routing["selected_ids"].astype(jnp.int32)
+    if selected_ids.ndim != 2 or int(selected_ids.shape[1]) != 2:
+        raise ValueError("bundle_dense routing requires selected_ids[T,2]")
+    dense_weights = routing["dense_space_weights"].astype(jnp.float32)
+    token_count, n_spaces = map(int, dense_weights.shape)
+    bundle_size = int(bundle_size)
+    token_block_size = int(token_block_size)
+    if bundle_size != BUNDLE_DENSE_SIZE:
+        raise ValueError(
+            f"bundle_dense supports bundle_size={BUNDLE_DENSE_SIZE} only")
+    if n_spaces % bundle_size:
+        raise ValueError("operation-space count must be divisible by bundle size")
+    n_bundles = n_spaces // bundle_size
+    (packed_bundle,
+     packed_token,
+     packed_membership,
+     packed_weight,
+     packed_valid,
+     counts,
+     padded_counts,
+     same_bundle) = _prefix_pack_top2_bundle_arrays(
+         selected_ids, dense_weights, bundle_size, token_block_size,
+         n_spaces, token_count)
+
+    requested_entries = counts.astype(jnp.float32).sum()
+    valid_entries = packed_valid.astype(jnp.float32).sum()
+    dropped_entries = jnp.maximum(
+        requested_entries - valid_entries, jnp.float32(0.0))
+    padding_entries = (
+        padded_counts.sum() - counts.sum()).astype(jnp.float32)
+    tokens_f32 = jnp.float32(token_count)
+    valid_mean = jax.lax.pmean(valid_entries, "data")
+    dropped_mean = jax.lax.pmean(dropped_entries, "data")
+    padding_mean = jax.lax.pmean(padding_entries, "data")
+    same_mean = jax.lax.pmean(
+        same_bundle.astype(jnp.float32).sum(), "data")
+    count_f32 = counts.astype(jnp.float32)
+    count_min = jax.lax.pmin(count_f32.min(), "data")
+    count_mean = jax.lax.pmean(count_f32.mean(), "data")
+    count_max = jax.lax.pmax(count_f32.max(), "data")
+    entries_per_token = valid_mean / tokens_f32
+    physical_spaces = jnp.float32(bundle_size) * entries_per_token
+    metric_values = (
+        valid_mean,
+        entries_per_token,
+        same_mean / tokens_f32,
+        physical_spaces,
+        physical_spaces / jnp.float32(n_spaces),
+        padding_mean,
+        padding_mean / jnp.maximum(
+            valid_mean + padding_mean, jnp.float32(1.0)),
+        count_min,
+        count_mean,
+        count_max,
+        dropped_mean,
+    )
+    metrics = {
+        name: jax.lax.stop_gradient(value)
+        for name, value in zip(
+            _bundle_packing_metric_names(stage), metric_values)}
+    return ({
+        "bundle_id": packed_bundle,
+        "token_id": packed_token,
+        "membership_mask": packed_membership,
+        "routing_weight": packed_weight,
+        "token_valid": packed_valid,
+    }, metrics)
 
 
 def _dense_rw_output_sharded(
@@ -2170,6 +2520,107 @@ def _dense_rw_metric_stats_sharded(
     metric_stats, _ = jax.lax.scan(
         metric_step, carry, jnp.arange(n_chunks))
     return (*metric_stats, tau)
+
+
+def _dense_rw_metric_operator_sums_sharded(
+        metric_stats: tuple[jax.Array, ...],
+        token_valid: jax.Array,
+        admission_den_powers: jax.Array,
+        srw_composition_mode: str) -> jax.Array:
+    """Collapse one four-space token block to the canonical operator sums."""
+    (gate_mass, gate_sq, gate_max,
+     active_count, depth_sum, tau) = metric_stats
+    additive = jax.lax.psum(
+        jnp.stack(
+            (active_count, gate_mass, gate_sq, depth_sum), axis=0),
+        "model")
+    active_count, gate_mass, gate_sq, depth_sum = additive
+    gate_max = jax.lax.pmax(
+        jax.lax.stop_gradient(gate_max), "model")
+    gate_den = _shared_composition_den(
+        gate_mass, admission_den_powers, srw_composition_mode)
+    floor_mass = _shared_composition_den_floor_mass(
+        srw_composition_mode)
+    floor_compare = (
+        jnp.less if srw_composition_mode == "linear_angular"
+        else jnp.less_equal)
+    valid = token_valid[None, ..., None].astype(jnp.float32)
+    tau = tau * valid
+    return jnp.stack((
+        active_count.astype(jnp.float32).sum(axis=(1, 2, 3)),
+        tau.astype(jnp.float32).sum(axis=(1, 2, 3)),
+        gate_mass.astype(jnp.float32).sum(axis=(1, 2, 3)),
+        (gate_den * valid).astype(jnp.float32).sum(axis=(1, 2, 3)),
+        (depth_sum / jnp.maximum(active_count, 1.0)).astype(
+            jnp.float32).sum(axis=(1, 2, 3)),
+        (jnp.square(gate_mass) / jnp.maximum(
+            gate_sq, 1.0e-8)).astype(
+                jnp.float32).sum(axis=(1, 2, 3)),
+        (gate_max / jnp.maximum(gate_mass, 1.0e-8)).astype(
+            jnp.float32).sum(axis=(1, 2, 3)),
+        (floor_compare(gate_mass, floor_mass) & (valid > 0.0)).astype(
+            jnp.float32).sum(axis=(1, 2, 3)),
+    ), axis=-1)
+
+
+def _finish_blocked_dense_rw_metric_vector_sharded(
+        operator_sums: jax.Array,
+        route_specs: tuple[tuple[str, int], ...],
+        routing: Mapping[str, jax.Array]) -> jax.Array:
+    """Finish exact all-space metrics accumulated in four-space blocks."""
+    global_sums = jax.lax.psum(operator_sums, "data")
+    n_spaces = int(routing["space_gate"].shape[-1])
+    token_count = int(routing["space_gate"].shape[0])
+    global_positions = jax.lax.psum(
+        jnp.float32(n_spaces * token_count), "data")
+    global_positions = jnp.maximum(
+        global_positions, jnp.float32(1.0))
+    metric_values = []
+    for route_index, (_, n_operators_per_space) in enumerate(route_specs):
+        route_sum = global_sums[route_index]
+        active_sum = route_sum[0]
+        metric_values.extend((
+            active_sum / global_positions / float(n_operators_per_space),
+            active_sum / global_positions,
+            route_sum[1] / global_positions,
+            route_sum[2] / global_positions,
+            route_sum[3] / global_positions,
+            route_sum[4] / global_positions,
+            route_sum[5] / global_positions,
+            route_sum[6] / global_positions,
+            route_sum[7] / global_positions,
+        ))
+
+    gate = jax.lax.stop_gradient(
+        routing["space_gate"].astype(jnp.float32))
+    mass = jax.lax.stop_gradient(
+        routing["space_gate_mass"][..., 0].astype(jnp.float32))
+    selected_ids = jax.lax.stop_gradient(routing["selected_ids"])
+    top1_counts = jax.nn.one_hot(
+        selected_ids[..., 0], n_spaces, dtype=jnp.float32).sum(axis=0)
+    space_active_count = (
+        (gate > 0.0).astype(jnp.float32).sum(axis=-1))
+    routing_sums = jnp.concatenate((
+        jnp.stack((
+            mass.sum(),
+            space_active_count.sum(),
+            (mass <= 0.0).astype(jnp.float32).sum(),
+        )),
+        top1_counts,
+        jnp.asarray((token_count,), dtype=jnp.float32),
+    ))
+    global_routing = jax.lax.psum(routing_sums, "data")
+    global_tokens = jnp.maximum(
+        global_routing[-1], jnp.float32(1.0))
+    top1_offset = 3
+    metric_values.extend((
+        global_routing[0] / global_tokens,
+        global_routing[1] / global_tokens,
+        global_routing[2] / global_tokens,
+        (global_routing[top1_offset:top1_offset + n_spaces]
+         / global_tokens).max(),
+    ))
+    return jax.lax.stop_gradient(jnp.stack(metric_values))
 
 
 def _collect_dense_rw_metric_vector_sharded(
@@ -2515,6 +2966,7 @@ def _make_sharded_attention_space_dense(
         check_rep=False)
     kernel._v4174_kernel_profile = "production"
     kernel._v4174_dense_grouped_execution = "attention_qkv"
+    kernel._v4174_execution_mode = "dense_all_space"
     kernel._v4174_qk_paired = True
     kernel._v4174_dynamic_metric_flag = True
     kernel._v4174_chunk_remat_policy = "always"
@@ -2543,6 +2995,390 @@ def make_sharded_attention_space_dense_fp32_collective_reference(
 def make_sharded_attention_space_dense_fp32_reference(mesh, **kwargs):
     """Create a fused FP32 executor for structural/numerical tests only."""
     return _make_sharded_attention_space_dense(
+        mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
+
+
+def _make_sharded_attention_space_bundle_dense(
+        mesh, *,
+        max_chunk_size_qk: int,
+        max_chunk_size_v: int,
+        operation_space_top_k: int,
+        admission_den_power_qk: float,
+        admission_den_power_v: float,
+        operation_space_bundle_size: int,
+        operation_space_bundle_token_block_size: int,
+        srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
+        soft_gate_effective_active_eps: float = 1.0e-6,
+        throughput_bf16: bool,
+        output_collective_bf16: bool):
+    """Create compact fixed-four-space production Q/K/V execution."""
+    composition_mode = str(srw_composition_mode)
+    top_k = int(operation_space_top_k)
+    bundle_size = int(operation_space_bundle_size)
+    token_block_size = int(operation_space_bundle_token_block_size)
+    if top_k != 2:
+        raise ValueError("bundle_dense attention requires top_k=2")
+    if bundle_size != BUNDLE_DENSE_SIZE:
+        raise ValueError(
+            f"bundle_dense attention requires bundle_size={BUNDLE_DENSE_SIZE}")
+    if token_block_size <= 0:
+        raise ValueError("bundle_dense token_block_size must be positive")
+    model_axis_size = int(mesh.shape["model"])
+    operator_metric_names = tuple(
+        f"{route}_operator_{suffix}"
+        for route in ("q", "k", "v")
+        for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
+    ) + tuple(
+        f"attention_space_{suffix}"
+        for suffix in (
+            "gate_mass_mean", "active_count_mean",
+            "zero_gate_frac", "top1_rate"))
+    bundle_metric_names = _bundle_packing_metric_names("attention")
+
+    def attention_core(
+            flat_state,
+            space_route_kernel, space_read_vectors,
+            space_state_proj, space_state_writeback,
+            q_tau_kernel, q_tau_bias,
+            k_tau_kernel, k_tau_bias,
+            v_tau_kernel, v_tau_bias,
+            q_read, q_write, k_read, k_write, v_read, v_write,
+            qk_temperature, v_temperature,
+            boundary_power, execution_prune_eps,
+            qk_scale, v_scale, collect_metrics):
+        routing = _compute_space_routing(
+            flat_state, space_route_kernel, space_read_vectors, top_k)
+        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
+            routing,
+            bundle_size=bundle_size,
+            token_block_size=token_block_size,
+            stage="attention")
+        token_count = int(flat_state.shape[0])
+        d_model = int(flat_state.shape[1])
+        n_spaces = int(space_state_proj.shape[0])
+        if n_spaces % bundle_size:
+            raise ValueError(
+                "bundle_dense attention space count is not divisible by 4")
+        n_bundles = n_spaces // bundle_size
+        scan_blocks = (
+            int(packing["token_id"].shape[0]) // token_block_size)
+        qk_reads = jnp.stack((q_read, k_read), axis=0)
+        qk_writes = jnp.stack((q_write, k_write), axis=0)
+        qk_tau_kernels = jnp.stack(
+            (q_tau_kernel, k_tau_kernel), axis=0)
+        qk_tau_biases = jnp.stack(
+            (q_tau_bias, k_tau_bias), axis=0)
+        den_powers = jnp.asarray(
+            (
+                admission_den_power_qk,
+                admission_den_power_qk,
+                admission_den_power_v,
+            ),
+            dtype=jnp.float32).reshape((3, 1, 1, 1))
+        route_scales = jnp.asarray(
+            (qk_scale, qk_scale, v_scale), dtype=jnp.float32
+        ).reshape((3, 1, 1, 1))
+        projection_dot = (
+            _throughput_einsum_bf16_f32
+            if throughput_bf16 else _control_einsum_f32)
+        writeback_dot = projection_dot
+        initial_output = jnp.zeros(
+            (3, token_count, d_model), dtype=jnp.float32)
+
+        def block_step(local_output, block_index):
+            packed_start = block_index * token_block_size
+            block_bundle = jax.lax.dynamic_index_in_dim(
+                packing["bundle_id"], packed_start,
+                axis=0, keepdims=False)
+
+            def execute_block(output_value):
+                space_start = block_bundle * bundle_size
+                block_token = jax.lax.dynamic_slice_in_dim(
+                    packing["token_id"], packed_start,
+                    token_block_size, axis=0)
+                block_valid = jax.lax.dynamic_slice_in_dim(
+                    packing["token_valid"], packed_start,
+                    token_block_size, axis=0)
+                block_membership = jax.lax.dynamic_slice_in_dim(
+                    packing["membership_mask"], packed_start,
+                    token_block_size, axis=0)
+                block_weight = jax.lax.dynamic_slice_in_dim(
+                    packing["routing_weight"], packed_start,
+                    token_block_size, axis=0)
+                packed_state = flat_state[block_token]
+                projection = jax.lax.dynamic_slice_in_dim(
+                    space_state_proj, space_start, bundle_size, axis=0)
+                local = projection_dot(
+                    "bd,mdr->mbr", packed_state, projection
+                ).astype(jnp.float32)
+                local_norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(RW_FORWARD_NORM_EPS))
+                token_space_valid = (
+                    jnp.swapaxes(block_membership, 0, 1)
+                    & block_valid[None, :])
+
+                qk_raw_tau = (
+                    _control_einsum_f32(
+                        "mbr,ari->ambi", local, qk_tau_kernels)
+                    + qk_tau_biases[:, None, None, :])
+                block_qk_read = jax.lax.dynamic_slice_in_dim(
+                    qk_reads, space_start, bundle_size, axis=1)
+                block_qk_write = jax.lax.dynamic_slice_in_dim(
+                    qk_writes, space_start, bundle_size, axis=1)
+                qk_raw_out, qk_gate_mass = _dense_rw_output_sharded(
+                    local, local_norm, token_space_valid,
+                    block_qk_read, block_qk_write, qk_raw_tau,
+                    max_chunk_size=max_chunk_size_qk,
+                    soft_gate_temperature=qk_temperature,
+                    soft_gate_boundary_power=boundary_power,
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+
+                v_raw_tau = (
+                    _control_einsum_f32(
+                        "mbr,ri->mbi", local, v_tau_kernel)
+                    + v_tau_bias)
+                block_v_read = jax.lax.dynamic_slice_in_dim(
+                    v_read, space_start, bundle_size, axis=0)
+                block_v_write = jax.lax.dynamic_slice_in_dim(
+                    v_write, space_start, bundle_size, axis=0)
+                v_raw_out, v_gate_mass = _dense_rw_output_sharded(
+                    local, local_norm, token_space_valid,
+                    block_v_read[None, ...], block_v_write[None, ...],
+                    v_raw_tau[None, ...],
+                    max_chunk_size=max_chunk_size_v,
+                    soft_gate_temperature=v_temperature,
+                    soft_gate_boundary_power=boundary_power,
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                grouped_raw_out = jnp.concatenate(
+                    (qk_raw_out, v_raw_out), axis=0)
+                grouped_gate_mass = jnp.concatenate(
+                    (qk_gate_mass, v_gate_mass), axis=0)
+                _, grouped_gate_den = _global_dense_rw_den_sharded(
+                    grouped_gate_mass, den_powers, composition_mode)
+                local_results = (
+                    grouped_raw_out / grouped_gate_den).astype(jnp.float32)
+                weights = jnp.swapaxes(
+                    block_weight, 0, 1)[None, ..., None]
+                writeback = jax.lax.dynamic_slice_in_dim(
+                    space_state_writeback,
+                    space_start, bundle_size, axis=0)
+                block_output = writeback_dot(
+                    "ambr,mrd->abd",
+                    local_results * weights * route_scales,
+                    writeback).astype(jnp.float32)
+                block_output = jnp.where(
+                    block_valid[None, :, None], block_output, 0.0)
+                return output_value.at[
+                    :, block_token, :].add(block_output)
+
+            return jax.lax.cond(
+                block_bundle < n_bundles,
+                execute_block,
+                lambda output_value: output_value,
+                local_output), None
+
+        scan_step = jax.checkpoint(block_step, prevent_cse=False)
+        local_grouped_output, _ = jax.lax.scan(
+            scan_step, initial_output, jnp.arange(scan_blocks))
+        grouped_output = _psum_dense_rw_representation_sharded(
+            local_grouped_output, output_collective_bf16)
+
+        q_per_space = int(q_read.shape[1]) * model_axis_size
+        k_per_space = int(k_read.shape[1]) * model_axis_size
+        v_per_space = int(v_read.shape[1]) * model_axis_size
+        route_specs = (
+            ("q", q_per_space),
+            ("k", k_per_space),
+            ("v", v_per_space),
+        )
+        metric_operands = (
+            jax.lax.stop_gradient(flat_state),
+            jax.lax.stop_gradient(space_state_proj),
+            jax.lax.stop_gradient(qk_tau_kernels),
+            jax.lax.stop_gradient(qk_tau_biases),
+            jax.lax.stop_gradient(v_tau_kernel),
+            jax.lax.stop_gradient(v_tau_bias),
+            jax.lax.stop_gradient(qk_reads),
+            jax.lax.stop_gradient(v_read),
+            jax.tree.map(jax.lax.stop_gradient, routing),
+            jax.lax.stop_gradient(qk_temperature),
+            jax.lax.stop_gradient(v_temperature),
+            jax.lax.stop_gradient(boundary_power),
+            jax.lax.stop_gradient(execution_prune_eps),
+        )
+
+        def collect_metric_vector(operands):
+            (metric_state,
+             metric_projection,
+             metric_qk_tau_kernels,
+             metric_qk_tau_biases,
+             metric_v_tau_kernel,
+             metric_v_tau_bias,
+             metric_qk_reads,
+             metric_v_reads,
+             metric_routing,
+             metric_qk_temperature,
+             metric_v_temperature,
+             metric_boundary_power,
+             metric_execution_prune_eps) = operands
+            metric_token_blocks = math.ceil(
+                token_count / token_block_size)
+            metric_capacity = metric_token_blocks * token_block_size
+            metric_state = jnp.pad(
+                metric_state,
+                ((0, metric_capacity - token_count), (0, 0)))
+            initial_sums = jnp.zeros((3, 8), dtype=jnp.float32)
+
+            def metric_block_step(operator_sums, block_index):
+                bundle_id = block_index // metric_token_blocks
+                token_block = block_index % metric_token_blocks
+                token_start = token_block * token_block_size
+                space_start = bundle_id * bundle_size
+                state_block = jax.lax.dynamic_slice_in_dim(
+                    metric_state, token_start,
+                    token_block_size, axis=0)
+                token_valid = (
+                    jnp.arange(token_block_size) + token_start
+                    < token_count)
+                token_space_valid = jnp.broadcast_to(
+                    token_valid[None, :],
+                    (bundle_size, token_block_size))
+                projection_block = jax.lax.dynamic_slice_in_dim(
+                    metric_projection, space_start,
+                    bundle_size, axis=0)
+                local = projection_dot(
+                    "bd,mdr->mbr", state_block, projection_block
+                ).astype(jnp.float32)
+                local_norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(RW_FORWARD_NORM_EPS))
+                qk_tau = (
+                    _control_einsum_f32(
+                        "mbr,ari->ambi",
+                        local, metric_qk_tau_kernels)
+                    + metric_qk_tau_biases[:, None, None, :])
+                qk_read_block = jax.lax.dynamic_slice_in_dim(
+                    metric_qk_reads, space_start,
+                    bundle_size, axis=1)
+                qk_stats = _dense_rw_metric_stats_sharded(
+                    local, local_norm, token_space_valid,
+                    qk_read_block, qk_tau,
+                    max_chunk_size=max_chunk_size_qk,
+                    soft_gate_temperature=metric_qk_temperature,
+                    soft_gate_boundary_power=metric_boundary_power,
+                    execution_prune_eps=metric_execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                qk_sums = _dense_rw_metric_operator_sums_sharded(
+                    qk_stats, token_space_valid,
+                    den_powers[:2], composition_mode)
+
+                v_tau = (
+                    _control_einsum_f32(
+                        "mbr,ri->mbi", local,
+                        metric_v_tau_kernel)
+                    + metric_v_tau_bias)
+                v_read_block = jax.lax.dynamic_slice_in_dim(
+                    metric_v_reads, space_start,
+                    bundle_size, axis=0)
+                v_stats = _dense_rw_metric_stats_sharded(
+                    local, local_norm, token_space_valid,
+                    v_read_block[None, ...], v_tau[None, ...],
+                    max_chunk_size=max_chunk_size_v,
+                    soft_gate_temperature=metric_v_temperature,
+                    soft_gate_boundary_power=metric_boundary_power,
+                    execution_prune_eps=metric_execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                v_sums = _dense_rw_metric_operator_sums_sharded(
+                    v_stats, token_space_valid,
+                    den_powers[2:3], composition_mode)
+                return operator_sums + jnp.concatenate(
+                    (qk_sums, v_sums), axis=0), None
+
+            operator_sums, _ = jax.lax.scan(
+                metric_block_step,
+                initial_sums,
+                jnp.arange(n_bundles * metric_token_blocks))
+            return _finish_blocked_dense_rw_metric_vector_sharded(
+                operator_sums, route_specs, metric_routing)
+
+        metric_vector = _metric_only_cond(
+            collect_metric_vector,
+            len(operator_metric_names),
+            collect_metrics,
+            metric_operands)
+        metrics = {
+            name: metric_vector[index]
+            for index, name in enumerate(operator_metric_names)}
+        metrics.update(packing_metrics)
+        return (
+            grouped_output[0], grouped_output[1], grouped_output[2], metrics)
+
+    all_metric_names = (*operator_metric_names, *bundle_metric_names)
+    kernel = shard_map(
+        attention_core,
+        mesh=mesh,
+        in_specs=(
+            P("data", None),
+            P(), P(), P(), P(),
+            P(), P(), P(), P(), P(), P(),
+            P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
+            P(), P(), P(), P(), P(), P(),
+            P(),
+        ),
+        out_specs=(
+            P("data", None), P("data", None), P("data", None),
+            {name: P() for name in all_metric_names}),
+        check_rep=False)
+    kernel._v4174_kernel_profile = "production"
+    kernel._v4174_dense_grouped_execution = "attention_qkv_bundle4"
+    kernel._v4174_execution_mode = "bundle_dense"
+    kernel._v4174_bundle_size = bundle_size
+    kernel._v4174_bundle_token_block_size = token_block_size
+    kernel._v4174_packed_entry_capacity = (
+        "2*T + n_bundles*(token_block_size-1)")
+    kernel._v4174_bundle_packing = "prefix_count_exact"
+    kernel._v4174_bundle_packing_vjp = "saved_metadata_scatter"
+    kernel._v4174_attention_packing_count = 1
+    kernel._v4174_qk_paired = True
+    kernel._v4174_dynamic_metric_flag = True
+    kernel._v4174_chunk_remat_policy = "always"
+    kernel._v4174_throughput_precision = (
+        "bf16_operands_f32_accum"
+        if throughput_bf16 else "fp32_reference")
+    kernel._v4174_output_collective_dtype = (
+        "bf16" if output_collective_bf16 else "fp32")
+    kernel._v4174_output_contract = (
+        "q[T,D]", "k[T,D]", "v[T,D]", "scalars")
+    return kernel
+
+
+def make_sharded_attention_space_bundle_dense_minimal(mesh, **kwargs):
+    """Create the mixed-precision compact four-space attention executor."""
+    return _make_sharded_attention_space_bundle_dense(
+        mesh, throughput_bf16=True, output_collective_bf16=True, **kwargs)
+
+
+def make_sharded_attention_space_bundle_dense_fp32_reference(mesh, **kwargs):
+    """Create the compact FP32 attention executor for parity checks."""
+    return _make_sharded_attention_space_bundle_dense(
         mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
 
 
@@ -2712,6 +3548,7 @@ def _make_sharded_rst_space_dense(
         check_rep=False)
     kernel._v4174_kernel_profile = "production"
     kernel._v4174_dense_grouped_execution = "rst_end_to_end"
+    kernel._v4174_execution_mode = "dense_all_space"
     kernel._v4174_dynamic_metric_flag = True
     kernel._v4174_chunk_remat_policy = "always"
     kernel._v4174_throughput_precision = (
@@ -2741,6 +3578,302 @@ def make_sharded_rst_space_dense_fp32_reference(mesh, **kwargs):
         mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
 
 
+def _make_sharded_rst_space_bundle_dense(
+        mesh, *,
+        max_chunk_size: int,
+        operation_space_top_k: int,
+        admission_den_power: float,
+        operation_space_bundle_size: int,
+        operation_space_bundle_token_block_size: int,
+        srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
+        soft_gate_effective_active_eps: float = 1.0e-6,
+        throughput_bf16: bool,
+        output_collective_bf16: bool):
+    """Create compact fixed-four-space production RST execution."""
+    composition_mode = str(srw_composition_mode)
+    top_k = int(operation_space_top_k)
+    bundle_size = int(operation_space_bundle_size)
+    token_block_size = int(operation_space_bundle_token_block_size)
+    if top_k != 2:
+        raise ValueError("bundle_dense RST requires top_k=2")
+    if bundle_size != BUNDLE_DENSE_SIZE:
+        raise ValueError(
+            f"bundle_dense RST requires bundle_size={BUNDLE_DENSE_SIZE}")
+    if token_block_size <= 0:
+        raise ValueError("bundle_dense token_block_size must be positive")
+    model_axis_size = int(mesh.shape["model"])
+    operator_metric_names = tuple(
+        f"rst_operator_{suffix}"
+        for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
+    ) + tuple(
+        f"rst_space_{suffix}"
+        for suffix in (
+            "gate_mass_mean", "active_count_mean",
+            "zero_gate_frac", "top1_rate"))
+    bundle_metric_names = _bundle_packing_metric_names("rst")
+
+    def rst_core(
+            flat_state,
+            space_route_kernel, space_read_vectors,
+            space_state_proj, space_state_writeback,
+            tau_kernel, tau_bias,
+            read_vectors, write_vectors,
+            temperature, boundary_power, execution_prune_eps,
+            route_scale, collect_metrics):
+        routing = _compute_space_routing(
+            flat_state, space_route_kernel, space_read_vectors, top_k)
+        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
+            routing,
+            bundle_size=bundle_size,
+            token_block_size=token_block_size,
+            stage="rst")
+        token_count = int(flat_state.shape[0])
+        d_model = int(flat_state.shape[1])
+        n_spaces = int(space_state_proj.shape[0])
+        if n_spaces % bundle_size:
+            raise ValueError(
+                "bundle_dense RST space count is not divisible by 4")
+        n_bundles = n_spaces // bundle_size
+        scan_blocks = (
+            int(packing["token_id"].shape[0]) // token_block_size)
+        den_power = jnp.float32(
+            admission_den_power).reshape((1, 1, 1, 1))
+        projection_dot = (
+            _throughput_einsum_bf16_f32
+            if throughput_bf16 else _control_einsum_f32)
+        writeback_dot = projection_dot
+        initial_output = jnp.zeros(
+            (token_count, d_model), dtype=jnp.float32)
+
+        def block_step(local_output, block_index):
+            packed_start = block_index * token_block_size
+            block_bundle = jax.lax.dynamic_index_in_dim(
+                packing["bundle_id"], packed_start,
+                axis=0, keepdims=False)
+
+            def execute_block(output_value):
+                space_start = block_bundle * bundle_size
+                block_token = jax.lax.dynamic_slice_in_dim(
+                    packing["token_id"], packed_start,
+                    token_block_size, axis=0)
+                block_valid = jax.lax.dynamic_slice_in_dim(
+                    packing["token_valid"], packed_start,
+                    token_block_size, axis=0)
+                block_membership = jax.lax.dynamic_slice_in_dim(
+                    packing["membership_mask"], packed_start,
+                    token_block_size, axis=0)
+                block_weight = jax.lax.dynamic_slice_in_dim(
+                    packing["routing_weight"], packed_start,
+                    token_block_size, axis=0)
+                packed_state = flat_state[block_token]
+                projection = jax.lax.dynamic_slice_in_dim(
+                    space_state_proj, space_start, bundle_size, axis=0)
+                local = projection_dot(
+                    "bd,mdr->mbr", packed_state, projection
+                ).astype(jnp.float32)
+                local_norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(RW_FORWARD_NORM_EPS))
+                token_space_valid = (
+                    jnp.swapaxes(block_membership, 0, 1)
+                    & block_valid[None, :])
+                raw_tau = (
+                    _control_einsum_f32(
+                        "mbr,ri->mbi", local, tau_kernel)
+                    + tau_bias)
+                block_read = jax.lax.dynamic_slice_in_dim(
+                    read_vectors, space_start, bundle_size, axis=0)
+                block_write = jax.lax.dynamic_slice_in_dim(
+                    write_vectors, space_start, bundle_size, axis=0)
+                raw_out, gate_mass = _dense_rw_output_sharded(
+                    local, local_norm, token_space_valid,
+                    block_read[None, ...], block_write[None, ...],
+                    raw_tau[None, ...],
+                    max_chunk_size=max_chunk_size,
+                    soft_gate_temperature=temperature,
+                    soft_gate_boundary_power=boundary_power,
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                _, gate_den = _global_dense_rw_den_sharded(
+                    gate_mass, den_power, composition_mode)
+                local_results = (raw_out / gate_den).astype(jnp.float32)
+                weights = jnp.swapaxes(
+                    block_weight, 0, 1)[None, ..., None]
+                writeback = jax.lax.dynamic_slice_in_dim(
+                    space_state_writeback,
+                    space_start, bundle_size, axis=0)
+                block_output = writeback_dot(
+                    "ambr,mrd->abd",
+                    local_results
+                    * weights
+                    * jnp.asarray(route_scale, dtype=jnp.float32),
+                    writeback)[0].astype(jnp.float32)
+                block_output = jnp.where(
+                    block_valid[:, None], block_output, 0.0)
+                return output_value.at[
+                    block_token, :].add(block_output)
+
+            return jax.lax.cond(
+                block_bundle < n_bundles,
+                execute_block,
+                lambda output_value: output_value,
+                local_output), None
+
+        scan_step = jax.checkpoint(block_step, prevent_cse=False)
+        local_update, _ = jax.lax.scan(
+            scan_step, initial_output, jnp.arange(scan_blocks))
+        update = _psum_dense_rw_representation_sharded(
+            local_update, output_collective_bf16)
+
+        n_per_space = int(read_vectors.shape[1]) * model_axis_size
+        route_specs = (("rst", n_per_space),)
+        metric_operands = (
+            jax.lax.stop_gradient(flat_state),
+            jax.lax.stop_gradient(space_state_proj),
+            jax.lax.stop_gradient(tau_kernel),
+            jax.lax.stop_gradient(tau_bias),
+            jax.lax.stop_gradient(read_vectors),
+            jax.tree.map(jax.lax.stop_gradient, routing),
+            jax.lax.stop_gradient(temperature),
+            jax.lax.stop_gradient(boundary_power),
+            jax.lax.stop_gradient(execution_prune_eps),
+        )
+
+        def collect_metric_vector(operands):
+            (metric_state,
+             metric_projection,
+             metric_tau_kernel,
+             metric_tau_bias,
+             metric_reads,
+             metric_routing,
+             metric_temperature,
+             metric_boundary_power,
+             metric_execution_prune_eps) = operands
+            metric_token_blocks = math.ceil(
+                token_count / token_block_size)
+            metric_capacity = metric_token_blocks * token_block_size
+            metric_state = jnp.pad(
+                metric_state,
+                ((0, metric_capacity - token_count), (0, 0)))
+            initial_sums = jnp.zeros((1, 8), dtype=jnp.float32)
+
+            def metric_block_step(operator_sums, block_index):
+                bundle_id = block_index // metric_token_blocks
+                token_block = block_index % metric_token_blocks
+                token_start = token_block * token_block_size
+                space_start = bundle_id * bundle_size
+                state_block = jax.lax.dynamic_slice_in_dim(
+                    metric_state, token_start,
+                    token_block_size, axis=0)
+                token_valid = (
+                    jnp.arange(token_block_size) + token_start
+                    < token_count)
+                token_space_valid = jnp.broadcast_to(
+                    token_valid[None, :],
+                    (bundle_size, token_block_size))
+                projection_block = jax.lax.dynamic_slice_in_dim(
+                    metric_projection, space_start,
+                    bundle_size, axis=0)
+                local = projection_dot(
+                    "bd,mdr->mbr", state_block, projection_block
+                ).astype(jnp.float32)
+                local_norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(RW_FORWARD_NORM_EPS))
+                raw_tau = (
+                    _control_einsum_f32(
+                        "mbr,ri->mbi", local,
+                        metric_tau_kernel)
+                    + metric_tau_bias)
+                read_block = jax.lax.dynamic_slice_in_dim(
+                    metric_reads, space_start,
+                    bundle_size, axis=0)
+                stats = _dense_rw_metric_stats_sharded(
+                    local, local_norm, token_space_valid,
+                    read_block[None, ...], raw_tau[None, ...],
+                    max_chunk_size=max_chunk_size,
+                    soft_gate_temperature=metric_temperature,
+                    soft_gate_boundary_power=metric_boundary_power,
+                    execution_prune_eps=metric_execution_prune_eps,
+                    srw_composition_mode=composition_mode,
+                    heat_kernel_beta=heat_kernel_beta,
+                    effective_active_eps=soft_gate_effective_active_eps,
+                    throughput_bf16=throughput_bf16)
+                block_sums = _dense_rw_metric_operator_sums_sharded(
+                    stats, token_space_valid,
+                    den_power, composition_mode)
+                return operator_sums + block_sums, None
+
+            operator_sums, _ = jax.lax.scan(
+                metric_block_step,
+                initial_sums,
+                jnp.arange(n_bundles * metric_token_blocks))
+            return _finish_blocked_dense_rw_metric_vector_sharded(
+                operator_sums, route_specs, metric_routing)
+
+        metric_vector = _metric_only_cond(
+            collect_metric_vector,
+            len(operator_metric_names),
+            collect_metrics,
+            metric_operands)
+        metrics = {
+            name: metric_vector[index]
+            for index, name in enumerate(operator_metric_names)}
+        metrics.update(packing_metrics)
+        return update, metrics
+
+    all_metric_names = (*operator_metric_names, *bundle_metric_names)
+    kernel = shard_map(
+        rst_core,
+        mesh=mesh,
+        in_specs=(
+            P("data", None),
+            P(), P(), P(), P(), P(), P(),
+            P(None, "model", None), P(None, "model", None),
+            P(), P(), P(), P(),
+            P(),
+        ),
+        out_specs=(
+            P("data", None),
+            {name: P() for name in all_metric_names}),
+        check_rep=False)
+    kernel._v4174_kernel_profile = "production"
+    kernel._v4174_dense_grouped_execution = "rst_end_to_end_bundle4"
+    kernel._v4174_execution_mode = "bundle_dense"
+    kernel._v4174_bundle_size = bundle_size
+    kernel._v4174_bundle_token_block_size = token_block_size
+    kernel._v4174_packed_entry_capacity = (
+        "2*T + n_bundles*(token_block_size-1)")
+    kernel._v4174_bundle_packing = "prefix_count_exact"
+    kernel._v4174_bundle_packing_vjp = "saved_metadata_scatter"
+    kernel._v4174_rst_packing_count = 1
+    kernel._v4174_dynamic_metric_flag = True
+    kernel._v4174_chunk_remat_policy = "always"
+    kernel._v4174_throughput_precision = (
+        "bf16_operands_f32_accum"
+        if throughput_bf16 else "fp32_reference")
+    kernel._v4174_output_collective_dtype = (
+        "bf16" if output_collective_bf16 else "fp32")
+    kernel._v4174_output_contract = ("rst[T,D]", "scalars")
+    return kernel
+
+
+def make_sharded_rst_space_bundle_dense_minimal(mesh, **kwargs):
+    """Create the mixed-precision compact four-space RST executor."""
+    return _make_sharded_rst_space_bundle_dense(
+        mesh, throughput_bf16=True, output_collective_bf16=True, **kwargs)
+
+
+def make_sharded_rst_space_bundle_dense_fp32_reference(mesh, **kwargs):
+    """Create the compact FP32 RST executor for parity checks."""
+    return _make_sharded_rst_space_bundle_dense(
+        mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
+
+
 def _validate_v4174_sharded_fns(
         sharded_fns, admission_den_power, srw_composition_mode,
         heat_kernel_beta, **kwargs):
@@ -2755,6 +3888,29 @@ def _validate_v4174_sharded_fns(
             "production", "production_diagnostics",
             "retention", "suppression", "trajectory"):
         raise ValueError(f"unsupported v4174 kernel profile {profile!r}")
+    attention = sharded_fns.get("attention_space_dense")
+    rst = sharded_fns.get("rst_space_dense")
+    if attention is None and rst is None:
+        return
+    if attention is None or rst is None:
+        raise ValueError(
+            "v4174 production requires both attention and RST executors")
+    attention_mode = getattr(
+        attention, "_v4174_execution_mode", "dense_all_space")
+    rst_mode = getattr(rst, "_v4174_execution_mode", "dense_all_space")
+    if attention_mode != rst_mode:
+        raise ValueError(
+            "v4174 attention/RST execution mode mismatch: "
+            f"{attention_mode!r} != {rst_mode!r}")
+    if attention_mode == "bundle_dense":
+        for name, kernel in (("attention", attention), ("rst", rst)):
+            if getattr(kernel, "_v4174_bundle_size", None) != BUNDLE_DENSE_SIZE:
+                raise ValueError(
+                    f"v4174 {name} bundle executor must use bundle size 4")
+            if int(getattr(
+                    kernel, "_v4174_bundle_token_block_size", 0)) <= 0:
+                raise ValueError(
+                    f"v4174 {name} bundle token block size must be positive")
 
 
 def get_model_version() -> str:

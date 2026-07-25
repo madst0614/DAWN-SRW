@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone TPU benchmark harness for DAWN-SRW v4166/v4168.
+"""Standalone TPU benchmark harness for DAWN-SRW runtime comparisons.
 
 Runs model modules directly and reports benchmark details to stdout.
 """
@@ -32,10 +32,19 @@ optax = None
 
 V4166_MODEL_VERSION = "spatial-r1-v4.1.6.6"
 V4168_MODEL_VERSION = "spatial-r1-v4.1.6.8"
-SUPPORTED_MODEL_VERSIONS = (V4166_MODEL_VERSION, V4168_MODEL_VERSION)
+V4172_MODEL_VERSION = "spatial-r1-v4.1.7.2"
+V4174_MODEL_VERSION = "spatial-r1-v4.1.7.4"
+V417X_MODEL_VERSIONS = (V4172_MODEL_VERSION, V4174_MODEL_VERSION)
+SUPPORTED_MODEL_VERSIONS = (
+    V4166_MODEL_VERSION,
+    V4168_MODEL_VERSION,
+    *V417X_MODEL_VERSIONS,
+)
 MODEL_MODULES = {
     V4166_MODEL_VERSION: ("models.dawn_srw_v4166", "DAWN_SRW_V4166"),
     V4168_MODEL_VERSION: ("models.dawn_srw_v4168", "DAWN_SRW_V4168"),
+    V4172_MODEL_VERSION: ("models.dawn_srw_v4172", "DAWN_SRW_V4172"),
+    V4174_MODEL_VERSION: ("models.dawn_srw_v4174", "DAWN_SRW_V4174"),
 }
 RUNTIME_POOLS = ("attn_qk", "attn_v", "rst")
 RUNTIME_POOL_LABELS = {
@@ -589,17 +598,30 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy = jnp.ones((1, seq_len), dtype=jnp.int32)
     _log("Initializing model params...")
-    variables = model.init(
-        {"params": init_rng, "dropout": dropout_rng},
-        dummy,
-        labels=dummy,
-        attention_mask=jnp.ones_like(dummy),
-        deterministic=True,
-        sharded_fns=sharded_fns,
-        minimal_train=True,
-    )
+    if model_version in V417X_MODEL_VERSIONS:
+        variables = model.init(
+            {"params": init_rng, "dropout": dropout_rng},
+            dummy,
+            deterministic=True,
+        )
+    else:
+        variables = model.init(
+            {"params": init_rng, "dropout": dropout_rng},
+            dummy,
+            labels=dummy,
+            attention_mask=jnp.ones_like(dummy),
+            deterministic=True,
+            sharded_fns=sharded_fns,
+            minimal_train=True,
+        )
     params = variables["params"]
-    params = shard_params_to_mesh(params, get_param_shardings(params, mesh))
+    if model_version in V417X_MODEL_VERSIONS:
+        from scripts import train_jax
+        param_shardings = train_jax.get_param_shardings(
+            params, mesh, model_version=model_version)
+    else:
+        param_shardings = get_param_shardings(params, mesh)
+    params = shard_params_to_mesh(params, param_shardings)
 
     hbm_after = collect_hbm_stats()
     compile_seconds = None
@@ -768,6 +790,10 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
 
 def build_model(cfg):
     version = str(cfg["model"].get("model_version", ""))
+    if version in V417X_MODEL_VERSIONS:
+        from scripts import train_jax
+        train_jax._maybe_materialize_vocab_parallel_config(cfg)
+        return train_jax.build_model_from_config(cfg)
     module_name, class_name = MODEL_MODULES[version]
     cls = getattr(importlib.import_module(module_name), class_name)
     kwargs = model_kwargs(cfg)
@@ -1587,6 +1613,14 @@ def v4168_operation_space_backend_label(layout):
 
 def build_sharded_fns(cfg, mesh):
     version = str(cfg["model"].get("model_version", ""))
+    if version in V417X_MODEL_VERSIONS:
+        from scripts import train_jax
+        sharded = train_jax.build_canonical_sharded_fns(
+            cfg, mesh, kernel_profile="production")
+        _log(
+            "sharded SRW kernels: canonical production "
+            f"model_version={version}")
+        return sharded
     module_name, _class_name = MODEL_MODULES[version]
     module = importlib.import_module(module_name)
     if version == V4168_MODEL_VERSION:
@@ -1728,6 +1762,14 @@ def benchmark_apply_kwargs(cfg, version, sharded_fns, attention_mask, rng, step)
         "admission_den_power": admission_den_power,
         "execution_prune_eps": 0.0,
     }
+    if version in V417X_MODEL_VERSIONS:
+        out.update({
+            "minimal_runtime_profile": "training",
+            "ce_token_chunk_size": int(t.get("ce_token_chunk_size", 32768)),
+            "compute_accuracy": False,
+        })
+        if version == V4174_MODEL_VERSION:
+            out["collect_train_metrics"] = False
     if version == V4168_MODEL_VERSION:
         training_tokens = (
             jnp.asarray(step, dtype=jnp.float32)
@@ -2286,8 +2328,160 @@ def run_module_profile_pass(profile_fns, params, input_ids, rng, step,
     return records
 
 
+def create_v4174_detailed_profile_fns(cfg, sharded_fns):
+    """Split the fused bundle path at its material execution boundaries."""
+    module = importlib.import_module(MODEL_MODULES[V4174_MODEL_VERSION][0])
+    m = cfg["model"]
+    t = cfg["training"]
+    n_layers = int(m["n_layers"])
+    n_heads = int(m["n_heads"])
+    d_model = int(m["d_model"])
+    dropout_rate = float(m.get("dropout", m.get("dropout_rate", 0.0)))
+    soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
+    boundary_power = float(t.get(
+        "soft_gate_boundary_power_final",
+        t.get("soft_gate_boundary_power_mid",
+              t.get("soft_gate_boundary_power_start", 4.0))))
+    attention_dense = sharded_fns.get("attention_space_dense")
+    rst_dense = sharded_fns.get("rst_space_dense")
+    vocab_embed = sharded_fns.get("vocab_parallel_embedding")
+    vocab_ce_loss = sharded_fns.get("vocab_ce_loss")
+    if attention_dense is None or rst_dense is None:
+        raise RuntimeError(
+            "v4174 detailed profile requires fused attention and RST "
+            "production executors.")
+    if vocab_embed is None or vocab_ce_loss is None:
+        raise RuntimeError(
+            "v4174 detailed profile requires canonical vocab-parallel "
+            "embedding and CE loss.")
+    qk_scale, v_scale, rst_scale = module._shared_pool_output_scales(
+        d_model, n_layers)
+    collect_metrics = jnp.asarray(False, dtype=jnp.bool_)
+
+    @jax.jit
+    def embed_step(token_embedding, pos_embedding, input_ids):
+        positions = jnp.arange(input_ids.shape[1])[jnp.newaxis, :]
+        return (
+            vocab_embed(input_ids, token_embedding)
+            + pos_embedding[positions])
+
+    @jax.jit
+    def attn_norm_step(block_params, x):
+        return module._shared_layer_norm(
+            x, block_params["norm1"]["scale"], block_params["norm1"]["bias"])
+
+    @jax.jit
+    def qkv_bundle_srw_step(pool_params, router_params, normed):
+        flat_state = normed.reshape((-1, d_model))
+        q, k, v, _metrics = attention_dense(
+            flat_state,
+            router_params["space_route_proj"]["kernel"],
+            router_params["space_read_vectors"],
+            router_params["space_state_proj"],
+            router_params["space_state_writeback"],
+            router_params["q_operator_tau_proj"]["kernel"],
+            router_params["q_operator_tau_proj"]["bias"],
+            router_params["k_operator_tau_proj"]["kernel"],
+            router_params["k_operator_tau_proj"]["bias"],
+            router_params["v_operator_tau_proj"]["kernel"],
+            router_params["v_operator_tau_proj"]["bias"],
+            pool_params["q_read_vectors"],
+            pool_params["q_write_vectors"],
+            pool_params["k_read_vectors"],
+            pool_params["k_write_vectors"],
+            pool_params["v_read_vectors"],
+            pool_params["v_write_vectors"],
+            jnp.float32(soft_gate_t),
+            jnp.float32(soft_gate_t),
+            jnp.float32(boundary_power),
+            jnp.float32(0.0),
+            qk_scale,
+            v_scale,
+            collect_metrics)
+        return (
+            q.reshape(normed.shape),
+            k.reshape(normed.shape),
+            v.reshape(normed.shape))
+
+    @jax.jit
+    def attn_core_step(q, k, v, rng):
+        batch_size, sequence_length = q.shape[:2]
+        d_head = d_model // n_heads
+
+        def heads(value):
+            return value.reshape(
+                batch_size, sequence_length, n_heads, d_head
+            ).transpose(0, 2, 1, 3)
+
+        context = module._causal_attention_core(
+            heads(q), heads(k), heads(v),
+            dropout_rate, True, rng, throughput_bf16=True)
+        return context.transpose(0, 2, 1, 3).reshape(
+            batch_size, sequence_length, d_model)
+
+    @jax.jit
+    def attn_out_proj_step(block_params, x, context):
+        update = module._throughput_linear_bf16_f32(
+            block_params["attn"]["expand_O"], context)
+        return x + update
+
+    @jax.jit
+    def rst_norm_step(block_params, x):
+        return module._shared_layer_norm(
+            x, block_params["norm2"]["scale"], block_params["norm2"]["bias"])
+
+    @jax.jit
+    def rst_bundle_srw_step(pool_params, router_params, normed, x):
+        flat_state = normed.reshape((-1, d_model))
+        update, _metrics = rst_dense(
+            flat_state,
+            router_params["space_route_proj"]["kernel"],
+            router_params["space_read_vectors"],
+            router_params["space_state_proj"],
+            router_params["space_state_writeback"],
+            router_params["rst_operator_tau_proj"]["kernel"],
+            router_params["rst_operator_tau_proj"]["bias"],
+            pool_params["rst_read_vectors"],
+            pool_params["rst_write_vectors"],
+            jnp.float32(soft_gate_t),
+            jnp.float32(boundary_power),
+            jnp.float32(0.0),
+            rst_scale,
+            collect_metrics)
+        return x + update.reshape(normed.shape)
+
+    @jax.jit
+    def final_loss_step(norm_scale, norm_bias, embedding_matrix, x, labels):
+        x = module._shared_layer_norm(x, norm_scale, norm_bias)
+        shift_x = x[:, :-1, :]
+        shift_labels = labels[:, 1:].astype(jnp.int32)
+        valid = shift_labels != -100
+        return {
+            "loss": vocab_ce_loss(
+                shift_x, embedding_matrix, shift_labels, valid),
+            "valid_count": valid.sum().astype(jnp.int32),
+        }
+
+    return {
+        "profile_kind": "v4174_bundle",
+        "module": module,
+        "model_version": V4174_MODEL_VERSION,
+        "embed_step": embed_step,
+        "attn_norm_step": attn_norm_step,
+        "qkv_bundle_srw_step": qkv_bundle_srw_step,
+        "attn_core_step": attn_core_step,
+        "attn_out_proj_step": attn_out_proj_step,
+        "rst_norm_step": rst_norm_step,
+        "rst_bundle_srw_step": rst_bundle_srw_step,
+        "final_loss_step": final_loss_step,
+        "n_layers": n_layers,
+    }
+
+
 def create_detailed_profile_fns(cfg, sharded_fns):
     version = str(cfg["model"].get("model_version", ""))
+    if version == V4174_MODEL_VERSION:
+        return create_v4174_detailed_profile_fns(cfg, sharded_fns)
     module = importlib.import_module(MODEL_MODULES[version][0])
     t = cfg["training"]
     m = cfg["model"]
@@ -2309,6 +2503,15 @@ def create_detailed_profile_fns(cfg, sharded_fns):
         version == V4168_MODEL_VERSION
         and isinstance(sharded_fns, dict)
         and bool(sharded_fns.get("operation_space_tau_free", False)))
+    direct_state_query = (
+        str(m.get("operator_query_mode", ""))
+        == "direct_state_projection")
+    vocab_embed = (
+        sharded_fns.get("vocab_parallel_embedding")
+        if isinstance(sharded_fns, dict) else None)
+    vocab_ce_loss = (
+        sharded_fns.get("vocab_ce_loss")
+        if isinstance(sharded_fns, dict) else None)
 
     if isinstance(sharded_fns, dict):
         fused_paired_qk = sharded_fns.get(
@@ -2376,7 +2579,10 @@ def create_detailed_profile_fns(cfg, sharded_fns):
     @jax.jit
     def embed_step(token_embedding, pos_embedding, input_ids):
         positions = jnp.arange(input_ids.shape[1])[jnp.newaxis, :]
-        return token_embedding[input_ids] + pos_embedding[positions]
+        token_state = (
+            vocab_embed(input_ids, token_embedding)
+            if vocab_embed is not None else token_embedding[input_ids])
+        return token_state + pos_embedding[positions]
 
     @jax.jit
     def attn_norm_step(block_params, x):
@@ -2391,12 +2597,18 @@ def create_detailed_profile_fns(cfg, sharded_fns):
             + router_params["proj_attn"]["bias"])
         q_read_query, k_read_query, v_read_query = jnp.split(
             attn_read_query, 3, axis=-1)
-        h_q = module._read_write_operator_query(
-            q_read_query, normed, router_params["q_op_write_query_proj"])
-        h_k = module._read_write_operator_query(
-            k_read_query, normed, router_params["k_op_write_query_proj"])
-        h_v = module._read_write_operator_query(
-            v_read_query, normed, router_params["v_op_write_query_proj"])
+        if direct_state_query:
+            h_q, h_k, h_v = q_read_query, k_read_query, v_read_query
+        else:
+            h_q = module._read_write_operator_query(
+                q_read_query, normed,
+                router_params["q_op_write_query_proj"])
+            h_k = module._read_write_operator_query(
+                k_read_query, normed,
+                router_params["k_op_write_query_proj"])
+            h_v = module._read_write_operator_query(
+                v_read_query, normed,
+                router_params["v_op_write_query_proj"])
         if opspace_tau_free:
             raw_tau_qk = jnp.zeros((B, S, 2, 1), dtype=normed.dtype)
             raw_tau_v = jnp.zeros((B, S, 1), dtype=normed.dtype)
@@ -2483,8 +2695,11 @@ def create_detailed_profile_fns(cfg, sharded_fns):
         rst_read_query = (
             normed @ router_params["proj_rst"]["kernel"]
             + router_params["proj_rst"]["bias"])
-        h_rst = module._read_write_operator_query(
-            rst_read_query, normed, router_params["rst_op_write_query_proj"])
+        h_rst = (
+            rst_read_query
+            if direct_state_query else module._read_write_operator_query(
+                rst_read_query, normed,
+                router_params["rst_op_write_query_proj"]))
         if opspace_tau_free:
             raw_tau_rst = jnp.zeros((B, S, 1), dtype=normed.dtype)
         else:
@@ -2518,8 +2733,14 @@ def create_detailed_profile_fns(cfg, sharded_fns):
         shift_x = x[:, :-1, :]
         shift_labels = labels[:, 1:].astype(jnp.int32)
         valid_mask = shift_labels != -100
-        loss, correct, valid_count = module._chunked_ce_loss_and_acc(
-            shift_x, embedding_matrix, shift_labels, valid_mask)
+        if vocab_ce_loss is not None:
+            loss = vocab_ce_loss(
+                shift_x, embedding_matrix, shift_labels, valid_mask)
+            correct = jnp.int32(0)
+            valid_count = valid_mask.sum().astype(jnp.int32)
+        else:
+            loss, correct, valid_count = module._chunked_ce_loss_and_acc(
+                shift_x, embedding_matrix, shift_labels, valid_mask)
         return {
             "loss": loss,
             "correct": correct,
@@ -2544,9 +2765,115 @@ def create_detailed_profile_fns(cfg, sharded_fns):
     }
 
 
+def run_v4174_detailed_profile_pass(
+        profile_fns, params, input_ids, step, run_index, variant_label,
+        batch_size, seq_len, phase, record=True):
+    records = []
+    total_seconds = 0.0
+
+    def add_record(op, group, seconds, hbm_after, hbm_before,
+                   layer=None, note=None):
+        nonlocal total_seconds
+        total_seconds += float(seconds)
+        if record:
+            records.append(benchmark_profile_record(
+                run_index, variant_label, phase, step, op, group,
+                seconds, batch_size, seq_len, hbm_after,
+                hbm_before=hbm_before, layer=layer, note=note))
+
+    hbm_before = collect_hbm_stats()
+    (x, seconds) = profile_timed_call(
+        profile_fns["embed_step"],
+        params["token_emb"]["embedding"],
+        params["pos_emb"]["embedding"],
+        input_ids)
+    hbm_after = collect_hbm_stats()
+    add_record("embedding", "embedding", seconds, hbm_after, hbm_before)
+
+    pool_params = params["neuron_pool"]
+    router_params = params["router"]
+    layer_rngs = jax.random.split(
+        jax.random.PRNGKey(0), int(profile_fns["n_layers"]))
+    for layer_idx in range(int(profile_fns["n_layers"])):
+        block_params = params[f"block_{layer_idx}"]
+
+        hbm_before = hbm_after
+        (normed, seconds) = profile_timed_call(
+            profile_fns["attn_norm_step"], block_params, x)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_norm", "attn_norm",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (qkv, seconds) = profile_timed_call(
+            profile_fns["qkv_bundle_srw_step"],
+            pool_params, router_params, normed)
+        q, k, v = qkv
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.qkv_bundle_srw", "qkv_bundle_srw",
+            seconds, hbm_after, hbm_before, layer=layer_idx,
+            note="routing + prefix-count bundle pack + Q/K/V SRW + writeback")
+
+        hbm_before = hbm_after
+        (context, seconds) = profile_timed_call(
+            profile_fns["attn_core_step"],
+            q, k, v, layer_rngs[layer_idx])
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_core", "attn_core",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (x, seconds) = profile_timed_call(
+            profile_fns["attn_out_proj_step"], block_params, x, context)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.attn_out_proj", "attn_out_proj",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (normed, seconds) = profile_timed_call(
+            profile_fns["rst_norm_step"], block_params, x)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.rst_norm", "rst_norm",
+            seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        hbm_before = hbm_after
+        (x, seconds) = profile_timed_call(
+            profile_fns["rst_bundle_srw_step"],
+            pool_params, router_params, normed, x)
+        hbm_after = collect_hbm_stats()
+        add_record(
+            f"layer_{layer_idx:02d}.rst_bundle_srw", "rst_bundle_srw",
+            seconds, hbm_after, hbm_before, layer=layer_idx,
+            note="routing + prefix-count bundle pack + RST SRW + writeback")
+
+    hbm_before = hbm_after
+    (_loss_metrics, seconds) = profile_timed_call(
+        profile_fns["final_loss_step"],
+        params["norm"]["scale"],
+        params["norm"]["bias"],
+        params["token_emb"]["embedding"],
+        x,
+        input_ids)
+    hbm_after = collect_hbm_stats()
+    add_record(
+        "final_norm_ce_loss", "loss", seconds, hbm_after, hbm_before,
+        note="final layer norm plus vocab-parallel CE")
+    return records, total_seconds
+
+
 def run_detailed_profile_pass(profile_fns, params, input_ids, step,
                               run_index, variant_label, batch_size,
                               seq_len, phase, record=True):
+    if profile_fns.get("profile_kind") == "v4174_bundle":
+        return run_v4174_detailed_profile_pass(
+            profile_fns, params, input_ids, step,
+            run_index, variant_label, batch_size, seq_len, phase,
+            record=record)
     module = profile_fns["module"]
     records = []
     total_seconds = 0.0
@@ -2811,11 +3138,13 @@ def summarize_detailed_profile_records(records):
         "attn_route": 4,
         "qk_srw": 5,
         "v_srw": 6,
+        "qkv_bundle_srw": 6,
         "attn_core": 7,
         "attn_out_proj": 8,
         "rst_norm": 9,
         "rst_route": 10,
         "rst_srw": 11,
+        "rst_bundle_srw": 11,
         "loss": 12,
     }
     aggregates.sort(key=lambda r: order.get(r["group"], 99))
@@ -2830,20 +3159,29 @@ def summarize_detailed_profile_records(records):
     for layer, row in sorted(layer_rows.items()):
         qk_s = layer_seconds(row, "qk_srw")
         v_s = layer_seconds(row, "v_srw")
+        qkv_bundle_s = layer_seconds(row, "qkv_bundle_srw")
         attn_core_s = layer_seconds(row, "attn_core")
-        rst_s = layer_seconds(row, "rst_srw")
-        qkv_s = (qk_s or 0.0) + (v_s or 0.0)
+        rst_s = (
+            layer_seconds(row, "rst_srw")
+            or layer_seconds(row, "rst_bundle_srw"))
+        qkv_s = (
+            qkv_bundle_s
+            if qkv_bundle_s is not None
+            else (qk_s or 0.0) + (v_s or 0.0))
         layer_summary.append({
             "layer": int(layer),
             "attn_norm_seconds": layer_seconds(row, "attn_norm"),
             "attn_route_seconds": layer_seconds(row, "attn_route"),
             "qk_srw_seconds": qk_s,
             "v_srw_seconds": v_s,
+            "qkv_bundle_srw_seconds": qkv_bundle_s,
             "attn_core_seconds": attn_core_s,
             "attn_out_proj_seconds": layer_seconds(row, "attn_out_proj"),
             "rst_norm_seconds": layer_seconds(row, "rst_norm"),
             "rst_route_seconds": layer_seconds(row, "rst_route"),
             "rst_srw_seconds": rst_s,
+            "rst_bundle_srw_seconds": layer_seconds(
+                row, "rst_bundle_srw"),
             "qkv_srw_seconds": qkv_s,
             "rst_over_qkv": ratio_float(rst_s, max(qkv_s, 1.0e-12)),
             "v_over_qk": ratio_float(v_s, qk_s),
@@ -2855,7 +3193,10 @@ def summarize_detailed_profile_records(records):
         })
 
     totals = {row["group"]: float(row["total_seconds"]) for row in aggregates}
-    attn_srw_total = totals.get("qk_srw", 0.0) + totals.get("v_srw", 0.0)
+    attn_srw_total = (
+        totals.get("qkv_bundle_srw", 0.0)
+        + totals.get("qk_srw", 0.0)
+        + totals.get("v_srw", 0.0))
     attn_non_srw_total = (
         totals.get("attn_norm", 0.0)
         + totals.get("attn_route", 0.0)
@@ -2864,13 +3205,16 @@ def summarize_detailed_profile_records(records):
     rst_total = (
         totals.get("rst_norm", 0.0)
         + totals.get("rst_route", 0.0)
-        + totals.get("rst_srw", 0.0))
+        + totals.get("rst_srw", 0.0)
+        + totals.get("rst_bundle_srw", 0.0))
     derived = {
         "attn_srw_seconds": attn_srw_total,
         "attn_non_srw_seconds": attn_non_srw_total,
         "rst_total_seconds": rst_total,
         "rst_srw_over_qkv": ratio_float(
-            totals.get("rst_srw", 0.0), max(attn_srw_total, 1.0e-12)),
+            totals.get("rst_srw", 0.0)
+            + totals.get("rst_bundle_srw", 0.0),
+            max(attn_srw_total, 1.0e-12)),
         "v_over_qk": ratio_float(
             totals.get("v_srw", 0.0), max(totals.get("qk_srw", 0.0),
                                           1.0e-12)),
@@ -3769,9 +4113,11 @@ def print_detailed_copy_lines(run_index, summary):
     module_groups = (
         "qk_srw",
         "v_srw",
+        "qkv_bundle_srw",
         "attn_core",
         "attn_out_proj",
         "rst_srw",
+        "rst_bundle_srw",
         "attn_route",
         "rst_route",
         "loss",
@@ -3807,6 +4153,8 @@ def print_detailed_copy_lines(run_index, summary):
 
         layer_line("layer_qk_srw_ms", "qk_srw_seconds", fmt_ms)
         layer_line("layer_v_srw_ms", "v_srw_seconds", fmt_ms)
+        layer_line(
+            "layer_qkv_bundle_srw_ms", "qkv_bundle_srw_seconds", fmt_ms)
         layer_line("layer_attn_core_ms", "attn_core_seconds", fmt_ms)
         layer_line("layer_rst_srw_ms", "rst_srw_seconds", fmt_ms)
         layer_line("layer_rst_over_qkv", "rst_over_qkv",

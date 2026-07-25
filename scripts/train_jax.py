@@ -1324,6 +1324,23 @@ V4174_SELECTOR_METRIC_NAMES = tuple(
         'top1_rate',
     ))
 
+V4174_BUNDLE_METRIC_NAMES = tuple(
+    f'{stage}_bundle_{suffix}'
+    for stage in ('attention', 'rst')
+    for suffix in (
+        'valid_entries',
+        'entries_per_token',
+        'same_top2_frac',
+        'physical_spaces_per_token',
+        'dense_compute_fraction',
+        'padding_entries',
+        'padding_fraction',
+        'token_count_min',
+        'token_count_mean',
+        'token_count_max',
+        'token_drop_count',
+    ))
+
 V4174_COMPOSITION_REGULAR_METRIC_NAMES = (
     *tuple(
         f'{pool}_{name}'
@@ -1353,14 +1370,26 @@ V4174_COMPACT_TRAIN_METRIC_NAMES = (
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
 )
+V4174_BUNDLE_COMPACT_TRAIN_METRIC_NAMES = (
+    *V4174_COMPACT_TRAIN_METRIC_NAMES,
+    *V4174_BUNDLE_METRIC_NAMES,
+)
 
 V4174_COMPACT_REGULAR_JSONL_REC_KEYS = (
     *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
 )
+V4174_BUNDLE_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    *V4174_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4174_BUNDLE_METRIC_NAMES,
+)
 V4174_COMPACT_REGULAR_JSONL_KEYS = (
     *V4174_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
+V4174_BUNDLE_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4174_BUNDLE_COMPACT_REGULAR_JSONL_REC_KEYS,
     'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
 )
 
@@ -3300,7 +3329,24 @@ def _v4170_compact_train_metrics(
                     "v4174 production train metrics are incomplete: "
                     + ", ".join(missing))
             metrics.update({key: result[key] for key in required})
-            if tuple(metrics) != V4174_COMPACT_TRAIN_METRIC_NAMES:
+            present_bundle_metrics = tuple(
+                key for key in V4174_BUNDLE_METRIC_NAMES
+                if key in result)
+            if present_bundle_metrics and len(present_bundle_metrics) != len(
+                    V4174_BUNDLE_METRIC_NAMES):
+                missing_bundle_metrics = tuple(
+                    key for key in V4174_BUNDLE_METRIC_NAMES
+                    if key not in result)
+                raise RuntimeError(
+                    "v4174 bundle train metrics are incomplete: "
+                    + ", ".join(missing_bundle_metrics))
+            metrics.update({
+                key: result[key] for key in present_bundle_metrics})
+            expected_metric_names = (
+                V4174_BUNDLE_COMPACT_TRAIN_METRIC_NAMES
+                if present_bundle_metrics
+                else V4174_COMPACT_TRAIN_METRIC_NAMES)
+            if tuple(metrics) != expected_metric_names:
                 raise RuntimeError(
                     "v4174 compact train metric schema drift: "
                     f"actual={tuple(metrics)}")
@@ -3500,6 +3546,12 @@ def _dawn_srw_kwargs(cfg):
         kw.update({
             'n_operation_spaces': m['n_operation_spaces'],
             'operation_space_top_k': m['operation_space_top_k'],
+            'operation_space_execution_mode':
+                m['operation_space_execution_mode'],
+            'operation_space_bundle_size':
+                m.get('operation_space_bundle_size'),
+            'operation_space_bundle_token_block_size':
+                m.get('operation_space_bundle_token_block_size'),
         })
     if str(version) == V4167_MODEL_VERSION:
         kw.update({
@@ -7550,6 +7602,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             result_payload = result
             if _is_v4170_compact_train:
                 if str(_model_version) == V4174_MODEL_VERSION:
+                    bundle_result_names = tuple(
+                        key for key in V4174_BUNDLE_METRIC_NAMES
+                        if key in result)
                     result_payload = {
                         key: result[key]
                         for key in (
@@ -7557,7 +7612,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                             'train_metrics_collected',
                             *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
                             *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
-                            *V4174_SELECTOR_METRIC_NAMES)}
+                            *V4174_SELECTOR_METRIC_NAMES,
+                            *bundle_result_names)}
                 elif _is_v417x_model:
                     result_payload = {
                         key: result[key]
@@ -12800,6 +12856,7 @@ MINIMAL_PRETRAINING_OPTIONAL_LOG_KEYS = (
     *V4170_TAU_UPDATE_METRIC_NAMES,
     *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
     *V4174_SELECTOR_METRIC_NAMES,
+    *V4174_BUNDLE_METRIC_NAMES,
 )
 
 
@@ -12830,7 +12887,8 @@ def _build_minimal_pretraining_record(
             *LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES,
             *V4170_TAU_UPDATE_METRIC_NAMES,
             *V4174_COMPOSITION_REGULAR_METRIC_NAMES,
-            *V4174_SELECTOR_METRIC_NAMES):
+            *V4174_SELECTOR_METRIC_NAMES,
+            *V4174_BUNDLE_METRIC_NAMES):
         if key in metrics:
             rec[key] = float(metrics[key])
     rec['timestamp'] = datetime.now().isoformat()
@@ -12896,6 +12954,22 @@ def _print_minimal_pretraining_record(rec):
         log_message(
             "  space: " + _space('attention', 'attn') + " "
             + _space('rst', 'rst'))
+    if all(key in rec for key in V4174_BUNDLE_METRIC_NAMES):
+        def _bundle(stage, label):
+            return (
+                f"{label}[entries/tok="
+                f"{rec[f'{stage}_bundle_entries_per_token']:.3f} "
+                f"same={rec[f'{stage}_bundle_same_top2_frac']:.3f} "
+                f"spaces/tok="
+                f"{rec[f'{stage}_bundle_physical_spaces_per_token']:.3f} "
+                f"dense={100.0 * rec[f'{stage}_bundle_dense_compute_fraction']:.2f}% "
+                f"pad={100.0 * rec[f'{stage}_bundle_padding_fraction']:.2f}% "
+                f"count={rec[f'{stage}_bundle_token_count_min']:.0f}/"
+                f"{rec[f'{stage}_bundle_token_count_mean']:.1f}/"
+                f"{rec[f'{stage}_bundle_token_count_max']:.0f}]")
+        log_message(
+            "  bundle: " + _bundle('attention', 'attn') + " "
+            + _bundle('rst', 'rst'))
     if all(
             key in rec for key in (
                 'attn_out_norm', 'rst_out_norm', 'residual_norm')):
@@ -13794,6 +13868,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in V4174_SELECTOR_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
+    for _key in V4174_BUNDLE_METRIC_NAMES:
+        if _key in m:
+            rec[_key] = float(m[_key])
     if str(ctx.get('model_version')) == V4174_MODEL_VERSION:
         _attach_v4174_direct_tau_regular_metrics(rec, m)
     rec['_linear_direct_tau_regular_missing_metrics'] = tuple(
@@ -13898,7 +13975,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 def _v4170_compact_regular_jsonl_record(rec, ctx):
     """Whitelist the low-cost v4170 regular record without fake fallbacks."""
     model_version = str(ctx.get('model_version'))
-    if model_version == V4174_MODEL_VERSION:
+    if (model_version == V4174_MODEL_VERSION
+            and all(
+                key in rec for key in V4174_BUNDLE_METRIC_NAMES)):
+        rec_keys = V4174_BUNDLE_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4174_BUNDLE_COMPACT_REGULAR_JSONL_KEYS
+    elif model_version == V4174_MODEL_VERSION:
         rec_keys = V4174_COMPACT_REGULAR_JSONL_REC_KEYS
         output_keys = V4174_COMPACT_REGULAR_JSONL_KEYS
     elif (model_version == V4173_MODEL_VERSION
@@ -14425,6 +14507,24 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
         log_message(
             "  space " + _space_stage('attention', 'attn') + " "
             + _space_stage('rst', 'rst'))
+    if (str(ctx.get('model_version')) == V4174_MODEL_VERSION
+            and all(name in rec for name in V4174_BUNDLE_METRIC_NAMES)):
+        def _bundle_stage(stage, label):
+            return (
+                f"{label}[entries/tok="
+                f"{float(rec[f'{stage}_bundle_entries_per_token']):.3f} "
+                f"same={float(rec[f'{stage}_bundle_same_top2_frac']):.3f} "
+                f"spaces/tok="
+                f"{float(rec[f'{stage}_bundle_physical_spaces_per_token']):.3f} "
+                f"dense="
+                f"{100.0 * float(rec[f'{stage}_bundle_dense_compute_fraction']):.2f}% "
+                f"pad={100.0 * float(rec[f'{stage}_bundle_padding_fraction']):.2f}% "
+                f"count={float(rec[f'{stage}_bundle_token_count_min']):.0f}/"
+                f"{float(rec[f'{stage}_bundle_token_count_mean']):.1f}/"
+                f"{float(rec[f'{stage}_bundle_token_count_max']):.0f}]")
+        log_message(
+            "  bundle " + _bundle_stage('attention', 'attn') + " "
+            + _bundle_stage('rst', 'rst'))
     if str(ctx.get('model_version')) in (
             V4170_MODEL_VERSION, *V417X_MODEL_VERSIONS):
         log_message(
@@ -16217,14 +16317,31 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                 raise ValueError(
                     "v4174 fused Q/K execution requires equal local operator "
                     "counts and chunk shapes")
+            execution_mode = str(model_cfg.get(
+                'operation_space_execution_mode',
+                'dense_all_space'))
+            if execution_mode == 'bundle_dense':
+                attention_factory_name = (
+                    'make_sharded_attention_space_bundle_dense_minimal')
+                rst_factory_name = (
+                    'make_sharded_rst_space_bundle_dense_minimal')
+            elif execution_mode == 'dense_all_space':
+                attention_factory_name = (
+                    'make_sharded_attention_space_dense_minimal')
+                rst_factory_name = 'make_sharded_rst_space_dense_minimal'
+            else:
+                raise ValueError(
+                    "v4174 operation_space_execution_mode must be "
+                    "'dense_all_space' or 'bundle_dense', got "
+                    f"{execution_mode!r}")
             attention_factory = getattr(
-                module, 'make_sharded_attention_space_dense_minimal', None)
+                module, attention_factory_name, None)
             rst_factory = getattr(
-                module, 'make_sharded_rst_space_dense_minimal', None)
+                module, rst_factory_name, None)
             if attention_factory is None or rst_factory is None:
                 raise RuntimeError(
                     "v4174 production requires fused attention and RST "
-                    "dense executor factories")
+                    f"{execution_mode} executor factories")
             common_fused = {
                 'mesh': mesh,
                 'operation_space_top_k':
@@ -16235,6 +16352,14 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                     'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)),
                 'soft_gate_effective_active_eps': 1.0e-6,
             }
+            if execution_mode == 'bundle_dense':
+                common_fused.update({
+                    'operation_space_bundle_size': int(
+                        model_cfg['operation_space_bundle_size']),
+                    'operation_space_bundle_token_block_size': int(
+                        model_cfg[
+                            'operation_space_bundle_token_block_size']),
+                })
             sharded['attention_space_dense'] = attention_factory(
                 max_chunk_size_qk=chunks['q'],
                 max_chunk_size_v=chunks['v'],
@@ -21518,9 +21643,25 @@ def main():
             if _is_v417x_version(model_version_cfg):
                 if str(model_version_cfg) == V4174_MODEL_VERSION:
                     log_message("DAWN spatial-r1-v4.1.7.4")
-                    log_message(
-                        "Execution: one shared operation-coordinate system "
-                        "with all-space dense Q/K/V/RST routes")
+                    if (
+                            str(cfg["model"].get(
+                                "operation_space_execution_mode",
+                                "dense_all_space"))
+                            == "bundle_dense"):
+                        bundle_size = int(
+                            cfg["model"]["operation_space_bundle_size"])
+                        token_block_size = int(cfg["model"][
+                            "operation_space_bundle_token_block_size"])
+                        log_message(
+                            "Execution: one shared operation-coordinate "
+                            "system with compact fixed "
+                            f"{bundle_size}"
+                            "-space Q/K/V/RST bundles and token blocks of "
+                            f"{token_block_size}")
+                    else:
+                        log_message(
+                            "Execution: one shared operation-coordinate "
+                            "system with all-space dense Q/K/V/RST routes")
                     log_message(
                         "Operation spaces: "
                         f"M={cfg['model']['n_operation_spaces']} "
@@ -22001,6 +22142,49 @@ def main():
                             f"step={step_after_update} "
                             f"train_metrics_collected="
                             f"{_train_metrics_collected!r}")
+                    _present_bundle_metrics = tuple(
+                        key for key in V4174_BUNDLE_METRIC_NAMES
+                        if key in _materialized_regular_metrics)
+                    if (_present_bundle_metrics
+                            and len(_present_bundle_metrics)
+                            != len(V4174_BUNDLE_METRIC_NAMES)):
+                        raise RuntimeError(
+                            "v4174 bundle diagnostics are incomplete: "
+                            + ", ".join(
+                                key for key in V4174_BUNDLE_METRIC_NAMES
+                                if key not in
+                                _materialized_regular_metrics))
+                    for _bundle_stage in (
+                            ('attention', 'attention'),
+                            ('rst', 'RST')):
+                        _stage_key, _stage_label = _bundle_stage
+                        if not _present_bundle_metrics:
+                            continue
+                        _drop_count = float(
+                            _materialized_regular_metrics[
+                                f'{_stage_key}_bundle_token_drop_count'])
+                        _physical_spaces = float(
+                            _materialized_regular_metrics[
+                                f'{_stage_key}_bundle_'
+                                'physical_spaces_per_token'])
+                        _compute_fraction = float(
+                            _materialized_regular_metrics[
+                                f'{_stage_key}_bundle_'
+                                'dense_compute_fraction'])
+                        if _drop_count != 0.0:
+                            raise RuntimeError(
+                                f"v4174 {_stage_label} bundle executor "
+                                f"dropped tokens: {_drop_count}")
+                        if not 4.0 <= _physical_spaces <= 8.0:
+                            raise RuntimeError(
+                                f"v4174 {_stage_label} bundle physical "
+                                "spaces/token invariant failed: "
+                                f"{_physical_spaces}")
+                        if _compute_fraction > (8.0 / 24.0 + 1.0e-6):
+                            raise RuntimeError(
+                                f"v4174 {_stage_label} bundle dense compute "
+                                "fraction invariant failed: "
+                                f"{_compute_fraction}")
                 else:
                     _win_vals = jax.device_get(_window_device_values)
                     _materialized_regular_metrics = metrics
