@@ -99,8 +99,8 @@ def test_v4174_dynamic_metric_source_contract():
 
     model_source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
     output_source = inspect.getsource(v4174._dense_rw_output_sharded)
-    reduce_source = inspect.getsource(
-        v4174._reduce_dense_rw_output_sharded)
+    den_source = inspect.getsource(
+        v4174._global_dense_rw_den_sharded)
     metric_scan_source = inspect.getsource(
         v4174._dense_rw_metric_stats_sharded)
     metric_vector_source = inspect.getsource(
@@ -136,9 +136,11 @@ def test_v4174_dynamic_metric_source_contract():
             "read_value", "rho", "gate", "valid", "execution_weight"):
         assert required in production_step_source
 
-    assert "jax.lax.cond(" not in reduce_source
-    assert "jax.lax.psum(gate_mass, \"model\")" in reduce_source
-    assert "raw_out / gate_den" in reduce_source
+    assert "jax.lax.cond(" not in den_source
+    assert "jax.lax.psum(gate_mass, \"model\")" in den_source
+    assert "_shared_composition_den(" in den_source
+    assert "return global_gate_mass, gate_den" in den_source
+    assert "raw_out" not in den_source
     assert "write_vectors" not in metric_scan_source
     assert "\"amtn,amnr->amtr\"" not in metric_scan_source
     assert "raw_out" not in metric_scan_source
@@ -166,10 +168,34 @@ def test_v4174_dynamic_metric_source_contract():
         assert "metric_vector = _metric_only_cond(" in executor_source
         assert "len(metric_names)" in executor_source
         assert "collect_metrics" in executor_source
-    assert "grouped_local_output" in attention_source
-    assert "grouped_space_results" in attention_source
+    attention_production_source = attention_source.split(
+        "q_per_space =", 1)[0]
+    rst_production_source = rst_source.split("n_per_space =", 1)[0]
+    assert "grouped_raw_out" in attention_production_source
+    assert "grouped_gate_mass" in attention_production_source
+    assert "local_grouped_space_results" in attention_production_source
+    assert "local_grouped_output" in attention_production_source
     assert "grouped_output" in attention_source
-    assert attention_source.count("_reduce_dense_rw_output_sharded(") == 1
+    assert attention_production_source.count(
+        "_global_dense_rw_den_sharded(") == 1
+    assert attention_production_source.count("jax.lax.psum(") == 1
+    assert attention_production_source.index(
+        'writeback_dot(\n            "amtr,mrd->atd"') < (
+            attention_production_source.index(
+                'jax.lax.psum(local_grouped_output, "model")'))
+    assert "local_space_result" in rst_production_source
+    assert "local_update" in rst_production_source
+    assert rst_production_source.count(
+        "_global_dense_rw_den_sharded(") == 1
+    assert rst_production_source.count("jax.lax.psum(") == 1
+    assert rst_production_source.index(
+        'writeback_dot(\n            "mtr,mrd->td"') < (
+            rst_production_source.index(
+                'jax.lax.psum(local_update, "model")'))
+    assert "_reduce_dense_rw_output_sharded" not in attention_source
+    assert "_reduce_dense_rw_output_sharded" not in rst_source
+    assert "stop_gradient" not in attention_production_source
+    assert "stop_gradient" not in rst_production_source
     assert "remat_chunks" not in attention_source
     assert "remat_chunks" not in rst_source
     assert "remat_chunks" not in builder_source

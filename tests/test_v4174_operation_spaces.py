@@ -223,6 +223,43 @@ def _fp32_separate_sharded(mesh):
     }
 
 
+def _make_post_rw_collective_probe(mesh, *, u_before_psum):
+    def core(
+            sharded_raw_out, sharded_gate_mass,
+            space_weights, space_state_writeback,
+            route_scales, den_powers):
+        raw_out = sharded_raw_out[0]
+        gate_mass = sharded_gate_mass[0]
+        global_gate_mass, gate_den = (
+            v4174._global_dense_rw_den_sharded(
+                gate_mass, den_powers, "linear_angular"))
+        if u_before_psum:
+            local_output = v4174._control_einsum_f32(
+                "amtr,mrd->atd",
+                raw_out / gate_den * space_weights * route_scales,
+                space_state_writeback).astype(jnp.float32)
+            output = jax.lax.psum(local_output, "model")
+        else:
+            space_results = jax.lax.psum(
+                (raw_out / gate_den).astype(jnp.float32), "model")
+            output = v4174._control_einsum_f32(
+                "amtr,mrd->atd",
+                space_results * space_weights * route_scales,
+                space_state_writeback).astype(jnp.float32)
+        return global_gate_mass, gate_den, output
+
+    return shard_map(
+        core,
+        mesh=mesh,
+        in_specs=(
+            P("model", None, None, None, None),
+            P("model", None, None, None, None),
+            P(), P(), P(), P(),
+        ),
+        out_specs=(P(), P(), P()),
+        check_rep=False)
+
+
 def test_config_validation_rejects_noncanonical_and_removed_schema():
     config = _model_config()
     assert v4174.resolve_operation_space_config(config) == (4, 2)
@@ -938,7 +975,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
             (q_output_fp32, k_output_fp32, v_output_fp32),
             ("q", "k", "v")):
         np.testing.assert_allclose(
-            actual, reference_outputs[route], atol=1e-5, rtol=1e-5)
+            actual, reference_outputs[route], atol=1e-5, rtol=0.0)
     for mixed, fp32 in zip(
             (q_output, k_output, v_output),
             (q_output_fp32, k_output_fp32, v_output_fp32)):
@@ -1024,7 +1061,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         "mtr,mrd->td", rst_reference_weighted,
         router["space_state_writeback"])
     np.testing.assert_allclose(
-        rst_output_fp32, rst_reference, atol=1e-5, rtol=1e-5)
+        rst_output_fp32, rst_reference, atol=1e-5, rtol=0.0)
     assert abs(float(
         rst_metrics["rst_operator_active_tau_frac"]
         - rst_metrics_fp32["rst_operator_active_tau_frac"])) <= 0.001
@@ -1056,7 +1093,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert sharded_forward["logits"].shape == (1, 16, 64)
     np.testing.assert_allclose(
         reference_forward["logits"], separate_fp32_forward["logits"],
-        atol=1e-5, rtol=1e-5)
+        atol=1e-5, rtol=0.0)
     np.testing.assert_allclose(
         sharded_forward["logits"], reference_forward["logits"],
         atol=2e-2, rtol=2e-2)
@@ -1082,8 +1119,8 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         lambda current: model_loss(current, sharded)))(params)
     assert bool(jnp.isfinite(reference_loss))
     assert bool(jnp.isfinite(fused_loss))
-    np.testing.assert_allclose(
-        reference_loss, separate_fp32_loss, atol=1e-6, rtol=1e-6)
+    assert abs(float(
+        reference_loss - separate_fp32_loss)) <= 1.0e-6
     separate_gradient_dot = sum(
         jnp.sum(
             left.astype(jnp.float32) * right.astype(jnp.float32))
@@ -1099,7 +1136,21 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert float(
         separate_gradient_dot / jnp.sqrt(jnp.maximum(
             separate_gradient_sq * reference_gradient_sq,
-            1.0e-12))) >= 0.999
+            1.0e-12))) >= 0.99999
+    fp32_optimizer = optax.sgd(1.0e-3)
+    fp32_opt_state = fp32_optimizer.init(params)
+    reference_updates, _ = fp32_optimizer.update(
+        reference_grads, fp32_opt_state, params)
+    separate_updates, _ = fp32_optimizer.update(
+        separate_fp32_grads, fp32_opt_state, params)
+    reference_next = optax.apply_updates(params, reference_updates)
+    separate_next = optax.apply_updates(params, separate_updates)
+    for reference_value, separate_value in zip(
+            jax.tree.leaves(reference_next),
+            jax.tree.leaves(separate_next)):
+        np.testing.assert_allclose(
+            reference_value, separate_value,
+            atol=1.0e-7, rtol=1.0e-6)
     assert float(
         jnp.abs(fused_loss - reference_loss)
         / jnp.maximum(jnp.abs(reference_loss), 1.0e-8)) <= 0.002
@@ -1176,6 +1227,253 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert pool_diagnostics
     assert any(key.startswith("attn_q_read_") for key in pool_diagnostics)
     assert any(key.startswith("attn_k_read_") for key in pool_diagnostics)
+
+
+@pytest.mark.skipif(
+    jax.local_device_count() < 2,
+    reason="requires two CPU or accelerator devices")
+def test_u_before_psum_fp32_math_gradient_optimizer_and_partition_parity():
+    devices = np.asarray(jax.devices()[:2])
+    mesh_one = jax.sharding.Mesh(
+        devices[:1].reshape((1, 1)), ("data", "model"))
+    mesh_two = jax.sharding.Mesh(
+        devices.reshape((1, 2)), ("data", "model"))
+    legacy_one = _make_post_rw_collective_probe(
+        mesh_one, u_before_psum=False)
+    changed_one = _make_post_rw_collective_probe(
+        mesh_one, u_before_psum=True)
+    legacy_two = _make_post_rw_collective_probe(
+        mesh_two, u_before_psum=False)
+    changed_two = _make_post_rw_collective_probe(
+        mesh_two, u_before_psum=True)
+
+    raw_out = jax.random.normal(
+        jax.random.PRNGKey(101), (2, 3, 4, 6, 4))
+    gate_mass = (
+        jnp.abs(jax.random.normal(
+            jax.random.PRNGKey(102), (2, 3, 4, 6, 1)))
+        + jnp.float32(0.25))
+    space_weights = jax.nn.softmax(
+        jax.random.normal(jax.random.PRNGKey(103), (4, 6)),
+        axis=0)[None, ..., None]
+    space_state_writeback = jax.random.normal(
+        jax.random.PRNGKey(104), (4, 4, 16))
+    route_scales = jnp.asarray(
+        (0.5, 0.5, 0.75), dtype=jnp.float32).reshape((3, 1, 1, 1))
+    den_powers = jnp.asarray(
+        (0.5, 0.5, 1.0), dtype=jnp.float32).reshape((3, 1, 1, 1))
+    operands_two = (
+        raw_out, gate_mass, space_weights,
+        space_state_writeback, route_scales, den_powers)
+    legacy_two_result = legacy_two(*operands_two)
+    changed_two_result = changed_two(*operands_two)
+    np.testing.assert_allclose(
+        changed_two_result[0], legacy_two_result[0],
+        atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        changed_two_result[1], legacy_two_result[1],
+        atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        changed_two_result[2], legacy_two_result[2],
+        atol=1.0e-5, rtol=1.0e-5)
+
+    operands_one = (
+        raw_out.sum(axis=0, keepdims=True),
+        gate_mass.sum(axis=0, keepdims=True),
+        space_weights,
+        space_state_writeback,
+        route_scales,
+        den_powers,
+    )
+    legacy_one_result = legacy_one(*operands_one)
+    changed_one_result = changed_one(*operands_one)
+    for one_result in (legacy_one_result, changed_one_result):
+        np.testing.assert_allclose(
+            one_result[0], changed_two_result[0],
+            atol=0.0, rtol=0.0)
+        np.testing.assert_allclose(
+            one_result[1], changed_two_result[1],
+            atol=0.0, rtol=0.0)
+        np.testing.assert_allclose(
+            one_result[2], changed_two_result[2],
+            atol=1.0e-5, rtol=1.0e-5)
+
+    legacy_rst = legacy_two(
+        raw_out[:, :1],
+        gate_mass[:, :1],
+        space_weights,
+        space_state_writeback,
+        route_scales[:1],
+        jnp.float32(1.2).reshape((1, 1, 1, 1)),
+    )[2]
+    changed_rst = changed_two(
+        raw_out[:, :1],
+        gate_mass[:, :1],
+        space_weights,
+        space_state_writeback,
+        route_scales[:1],
+        jnp.float32(1.2).reshape((1, 1, 1, 1)),
+    )[2]
+    np.testing.assert_allclose(
+        changed_rst, legacy_rst, atol=1.0e-5, rtol=1.0e-5)
+
+    target = jax.random.normal(
+        jax.random.PRNGKey(105), changed_two_result[2].shape)
+
+    def loss_fn(probe, raw, gate, weights, writeback, scales):
+        output = probe(
+            raw, gate, weights, writeback, scales, den_powers)[2]
+        return jnp.mean(jnp.square(output - target))
+
+    differentiable_operands = operands_two[:5]
+    legacy_loss, legacy_grads = jax.value_and_grad(
+        lambda *values: loss_fn(legacy_two, *values),
+        argnums=(0, 1, 2, 3, 4))(*differentiable_operands)
+    changed_loss, changed_grads = jax.value_and_grad(
+        lambda *values: loss_fn(changed_two, *values),
+        argnums=(0, 1, 2, 3, 4))(*differentiable_operands)
+    assert abs(float(changed_loss - legacy_loss)) <= 1.0e-6
+    assert all(
+        bool(jnp.all(jnp.isfinite(value)))
+        for value in jax.tree.leaves(changed_grads))
+    assert all(
+        float(jnp.linalg.norm(value.astype(jnp.float32))) > 0.0
+        for value in jax.tree.leaves(changed_grads))
+    gradient_dot = sum(
+        jnp.sum(left * right)
+        for left, right in zip(
+            jax.tree.leaves(legacy_grads),
+            jax.tree.leaves(changed_grads)))
+    legacy_gradient_sq = sum(
+        jnp.sum(jnp.square(value))
+        for value in jax.tree.leaves(legacy_grads))
+    changed_gradient_sq = sum(
+        jnp.sum(jnp.square(value))
+        for value in jax.tree.leaves(changed_grads))
+    gradient_cosine = gradient_dot / jnp.sqrt(jnp.maximum(
+        legacy_gradient_sq * changed_gradient_sq, 1.0e-12))
+    assert float(gradient_cosine) >= 0.99999
+
+    optimizer = optax.sgd(1.0e-3)
+    opt_state = optimizer.init(differentiable_operands)
+    legacy_updates, _ = optimizer.update(
+        legacy_grads, opt_state, differentiable_operands)
+    changed_updates, _ = optimizer.update(
+        changed_grads, opt_state, differentiable_operands)
+    legacy_next = optax.apply_updates(
+        differentiable_operands, legacy_updates)
+    changed_next = optax.apply_updates(
+        differentiable_operands, changed_updates)
+    for legacy_value, changed_value in zip(
+            jax.tree.leaves(legacy_next),
+            jax.tree.leaves(changed_next)):
+        np.testing.assert_allclose(
+            changed_value, legacy_value, atol=1.0e-7, rtol=1.0e-6)
+
+
+@pytest.mark.skipif(
+    jax.local_device_count() < 2,
+    reason="requires two CPU or accelerator devices")
+def test_v4174_production_hlo_collective_shapes_and_kernel_partition_parity():
+    devices = np.asarray(jax.devices()[:2])
+    mesh_one = jax.sharding.Mesh(
+        devices[:1].reshape((1, 1)), ("data", "model"))
+    mesh_two = jax.sharding.Mesh(
+        devices.reshape((1, 2)), ("data", "model"))
+    sharded_one = _fp32_fused_sharded(mesh_one)
+    sharded_two = _fp32_fused_sharded(mesh_two)
+    _, _, variables = _variables(seed=106)
+    params = variables["params"]
+    router = params["router"]
+    pool = params["neuron_pool"]
+    flat = jax.random.normal(jax.random.PRNGKey(107), (6, 16))
+    qk_scale, v_scale, rst_scale = v4174._shared_pool_output_scales(16, 1)
+    attention_operands = (
+        flat,
+        router["space_route_proj"]["kernel"],
+        router["space_read_vectors"],
+        router["space_state_proj"],
+        router["space_state_writeback"],
+        router["q_operator_tau_proj"]["kernel"],
+        router["q_operator_tau_proj"]["bias"],
+        router["k_operator_tau_proj"]["kernel"],
+        router["k_operator_tau_proj"]["bias"],
+        router["v_operator_tau_proj"]["kernel"],
+        router["v_operator_tau_proj"]["bias"],
+        pool["q_read_vectors"], pool["q_write_vectors"],
+        pool["k_read_vectors"], pool["k_write_vectors"],
+        pool["v_read_vectors"], pool["v_write_vectors"],
+        jnp.float32(0.07), jnp.float32(0.07),
+        jnp.float32(2.0), jnp.float32(0.0),
+        qk_scale, v_scale,
+    )
+    collect_metrics = jnp.asarray(False, dtype=jnp.bool_)
+    attention_one = sharded_one["attention_space_dense"](
+        *attention_operands, collect_metrics)
+    attention_two = sharded_two["attention_space_dense"](
+        *attention_operands, collect_metrics)
+    for output_one, output_two in zip(
+            attention_one[:3], attention_two[:3]):
+        np.testing.assert_allclose(
+            output_two, output_one, atol=1.0e-5, rtol=1.0e-5)
+
+    rst_operands = (
+        flat,
+        router["space_route_proj"]["kernel"],
+        router["space_read_vectors"],
+        router["space_state_proj"],
+        router["space_state_writeback"],
+        router["rst_operator_tau_proj"]["kernel"],
+        router["rst_operator_tau_proj"]["bias"],
+        pool["rst_read_vectors"], pool["rst_write_vectors"],
+        jnp.float32(0.07), jnp.float32(2.0), jnp.float32(0.0),
+        rst_scale,
+    )
+    rst_one = sharded_one["rst_space_dense"](
+        *rst_operands, collect_metrics)[0]
+    rst_two = sharded_two["rst_space_dense"](
+        *rst_operands, collect_metrics)[0]
+    np.testing.assert_allclose(
+        rst_two, rst_one, atol=1.0e-5, rtol=1.0e-5)
+
+    def attention_outputs(*operands):
+        return sharded_two["attention_space_dense"](
+            *operands, collect_metrics)[:3]
+
+    def rst_output(*operands):
+        return sharded_two["rst_space_dense"](
+            *operands, collect_metrics)[0]
+
+    attention_hlo = jax.jit(attention_outputs).lower(
+        *attention_operands).compiler_ir(
+            dialect="hlo").as_hlo_text().lower()
+    rst_hlo = jax.jit(rst_output).lower(
+        *rst_operands).compiler_ir(
+            dialect="hlo").as_hlo_text().lower()
+    attention_collectives = [
+        line for line in attention_hlo.splitlines()
+        if "all-reduce" in line]
+    rst_collectives = [
+        line for line in rst_hlo.splitlines()
+        if "all-reduce" in line]
+    assert any(
+        "f32[3,4,6,1]" in line
+        for line in attention_collectives)
+    assert any(
+        "f32[3,6,16]" in line
+        for line in attention_collectives)
+    assert not any(
+        "f32[3,4,6,4]" in line
+        for line in attention_collectives)
+    assert any(
+        "f32[1,4,6,1]" in line
+        for line in rst_collectives)
+    assert any(
+        "f32[6,16]" in line
+        for line in rst_collectives)
+    assert not any(
+        "f32[1,4,6,4]" in line
+        for line in rst_collectives)
 
 
 def test_v4174_precision_partition_and_vocab_ce_contract():

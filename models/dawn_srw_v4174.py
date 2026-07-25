@@ -2068,17 +2068,15 @@ def _dense_rw_output_sharded(
     return raw_out, gate_mass
 
 
-def _reduce_dense_rw_output_sharded(
-        local_output: tuple[jax.Array, jax.Array],
+def _global_dense_rw_den_sharded(
+        gate_mass: jax.Array,
         admission_den_power: jax.Array,
-        srw_composition_mode: str) -> jax.Array:
-    """Apply only the production denominator and model-axis reductions."""
-    raw_out, gate_mass = local_output
+        srw_composition_mode: str) -> tuple[jax.Array, jax.Array]:
+    """Form the live global denominator without reducing the RW numerator."""
     global_gate_mass = jax.lax.psum(gate_mass, "model")
     gate_den = _shared_composition_den(
         global_gate_mass, admission_den_power, srw_composition_mode)
-    return jax.lax.psum(
-        (raw_out / gate_den).astype(jnp.float32), "model")
+    return global_gate_mass, gate_den
 
 
 def _dense_rw_metric_stats_sharded(
@@ -2360,10 +2358,12 @@ def _make_sharded_attention_space_dense(
             heat_kernel_beta=heat_kernel_beta,
             effective_active_eps=soft_gate_effective_active_eps,
             throughput_bf16=throughput_bf16)
-        grouped_local_output = tuple(
-            jnp.concatenate((qk_value, v_value), axis=0)
-            for qk_value, v_value in zip(
-                qk_local_output, v_local_output))
+        qk_raw_out, qk_gate_mass = qk_local_output
+        v_raw_out, v_gate_mass = v_local_output
+        grouped_raw_out = jnp.concatenate(
+            (qk_raw_out, v_raw_out), axis=0)
+        grouped_gate_mass = jnp.concatenate(
+            (qk_gate_mass, v_gate_mass), axis=0)
         grouped_den_powers = jnp.asarray(
             (
                 admission_den_power_qk,
@@ -2371,10 +2371,12 @@ def _make_sharded_attention_space_dense(
                 admission_den_power_v,
             ),
             dtype=jnp.float32).reshape((3, 1, 1, 1))
-        grouped_space_results = _reduce_dense_rw_output_sharded(
-            grouped_local_output,
+        _, grouped_gate_den = _global_dense_rw_den_sharded(
+            grouped_gate_mass,
             grouped_den_powers,
             composition_mode)
+        local_grouped_space_results = (
+            grouped_raw_out / grouped_gate_den).astype(jnp.float32)
         space_weights = jnp.swapaxes(
             routing["dense_space_weights"], 0, 1)[None, ..., None]
         route_scales = jnp.asarray(
@@ -2383,10 +2385,11 @@ def _make_sharded_attention_space_dense(
         writeback_dot = (
             _throughput_einsum_bf16_f32
             if throughput_bf16 else _control_einsum_f32)
-        grouped_output = writeback_dot(
+        local_grouped_output = writeback_dot(
             "amtr,mrd->atd",
-            grouped_space_results * space_weights * route_scales,
+            local_grouped_space_results * space_weights * route_scales,
             space_state_writeback).astype(jnp.float32)
+        grouped_output = jax.lax.psum(local_grouped_output, "model")
 
         q_per_space = int(q_read.shape[1]) * model_axis_size
         k_per_space = int(k_read.shape[1]) * model_axis_size
@@ -2586,20 +2589,23 @@ def _make_sharded_rst_space_dense(
             heat_kernel_beta=heat_kernel_beta,
             effective_active_eps=soft_gate_effective_active_eps,
             throughput_bf16=throughput_bf16)
-        space_results = _reduce_dense_rw_output_sharded(
-            local_output, jnp.float32(admission_den_power),
+        raw_out, gate_mass = local_output
+        _, gate_den = _global_dense_rw_den_sharded(
+            gate_mass, jnp.float32(admission_den_power),
             composition_mode)
-        weighted = (
-            space_results[0]
+        local_space_result = (raw_out / gate_den).astype(jnp.float32)
+        local_weighted = (
+            local_space_result[0]
             * jnp.swapaxes(
                 routing["dense_space_weights"], 0, 1)[..., None]
             * jnp.asarray(route_scale))
         writeback_dot = (
             _throughput_einsum_bf16_f32
             if throughput_bf16 else _control_einsum_f32)
-        update = writeback_dot(
-            "mtr,mrd->td", weighted,
+        local_update = writeback_dot(
+            "mtr,mrd->td", local_weighted,
             space_state_writeback).astype(jnp.float32)
+        update = jax.lax.psum(local_update, "model")
         n_per_space = int(read_vectors.shape[1]) * model_axis_size
         route_specs = (("rst", n_per_space),)
         metric_local = jax.lax.stop_gradient(local)
