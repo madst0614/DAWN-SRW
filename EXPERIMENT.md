@@ -350,6 +350,16 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Decision/next: publish this launcher path, then run the fusion candidate with `--fast --backward-profile --detailed-profile-layers 2 --no-xla-dump`.
 - Evidence: `scripts/launch_tpu_pod.sh`; `scripts/launch_srw_benchmark_tpu_pod.sh`; local shell validation on 2026-07-26 KST.
 
+#### #12 — Verify the accepted checkpoint resume before profiling
+
+- Status: control passed; intentionally replaced by the matched baseline gate after 19 completed optimizer steps.
+- Hypothesis/change: the fixed-user and holder-verified lock cleanup should restore the canonical accepted run directly into final mesh shardings and advance beyond emergency checkpoint step 1681 without a resume-only HBM failure.
+- Run identity: existing TPU `spatial-se-400m`; branch `codex/v4174-accepted-8187`; commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5`; config `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`; resume folder `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_40B_v4_64_space24_top2_direct_read/run_vspatial-r1-v4.1.7.4_20260724_223010_3201`; clean checkout; batch 1024, sequence 512, mesh `16x2`/32 devices.
+- Result: all eight hosts initialized as `madst0614`; process 0 was worker 6. Orbax restored `global_step=1681`, `opt_state_count=1681`, RNG, and final parameter/optimizer shardings consistently across all hosts. Training reached step 1700 with loss/CE 5.1633, grad norm 28.98, and no OOM or process loss. The reported 28.045 s/it and 18,658 tok/s cover a 533.952 s cold window containing first JIT, so they are not a steady-state performance measurement.
+- Lesson: the canonical accepted checkpoint and resume path are healthy once remote-user identity and stale libtpu state are corrected; the fusion decision can now be isolated to matched profiler evidence.
+- Decision/next: compare clean accepted model commit `001c2c27fd7baf6998937530cdca3e55e57fccf0` and fusion commit `1ff2e57b811175a875795c85f7c2f14a7d71bb0b` with identical real-data two-layer forward/backward gates.
+- Evidence: `/home/madst0614/train.accepted_resume_control_20260726T040810KST.log` on all eight workers; primary worker 6 `~/train.log` before the gate launch.
+
 ## Backfill Boundary
 
 - The initial notebook covered evidence-backed work from 2026-07-21 through the step-1500 resume attempt.
