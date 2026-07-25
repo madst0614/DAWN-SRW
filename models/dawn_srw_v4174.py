@@ -2044,8 +2044,6 @@ _BUNDLE_BLOCK_CHECKPOINT_POLICY = (
         jax.checkpoint_policies.save_only_these_names(
             _BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME,
             _BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)))
-_P_RW_U_FUSION_CHECKPOINT_POLICY = (
-    jax.checkpoint_policies.nothing_saveable)
 
 _BUNDLE_PACKING_METRIC_SUFFIXES = (
     "valid_entries",
@@ -3585,7 +3583,7 @@ def _make_sharded_attention_space_bundle_dense(
         scan_step = jax.checkpoint(
             task_group_step,
             prevent_cse=False,
-            policy=_P_RW_U_FUSION_CHECKPOINT_POLICY)
+            policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
         def execute_overflow(output_value):
             return jax.lax.scan(
                 scan_step, output_value, jnp.arange(task_groups))[0]
@@ -3676,12 +3674,8 @@ def _make_sharded_attention_space_bundle_dense(
                 exact_primary_weight,
                 exact_overflow_weight)
 
-        fused_exact_primal = jax.checkpoint(
-            exact_primal,
-            prevent_cse=False,
-            policy=_P_RW_U_FUSION_CHECKPOINT_POLICY)
         _, pullback = jax.vjp(
-            fused_exact_primal,
+            exact_primal,
             flat_state,
             state_params,
             operator_params,
@@ -3936,9 +3930,7 @@ def _make_sharded_attention_space_bundle_dense(
     kernel._v4174_block_remat_policy = (
         "dots_and_compact_rw_outputs_saveable")
     kernel._v4174_backward_execution_mode = (
-        "exact_top2_space_batched_dense_p_rw_u_fused_remat_with_overflow")
-    kernel._v4174_exact_backward_remat_scope = "p_rw_u_end_to_end"
-    kernel._v4174_exact_backward_remat_policy = "nothing_saveable"
+        "exact_top2_space_batched_dense_with_overflow")
     kernel._v4174_backward_bucket_capacity = (
         _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
     kernel._v4174_backward_overflow_task_group_size = (
@@ -4457,7 +4449,7 @@ def _make_sharded_rst_space_bundle_dense(
         scan_step = jax.checkpoint(
             task_group_step,
             prevent_cse=False,
-            policy=_P_RW_U_FUSION_CHECKPOINT_POLICY)
+            policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
         def execute_overflow(output_value):
             return jax.lax.scan(
                 scan_step, output_value, jnp.arange(task_groups))[0]
@@ -4548,12 +4540,8 @@ def _make_sharded_rst_space_bundle_dense(
                 exact_primary_weight,
                 exact_overflow_weight)
 
-        fused_exact_primal = jax.checkpoint(
-            exact_primal,
-            prevent_cse=False,
-            policy=_P_RW_U_FUSION_CHECKPOINT_POLICY)
         _, pullback = jax.vjp(
-            fused_exact_primal,
+            exact_primal,
             flat_state,
             state_params,
             operator_params,
@@ -4753,9 +4741,7 @@ def _make_sharded_rst_space_bundle_dense(
     kernel._v4174_block_remat_policy = (
         "dots_and_compact_rw_outputs_saveable")
     kernel._v4174_backward_execution_mode = (
-        "exact_top2_space_batched_dense_p_rw_u_fused_remat_with_overflow")
-    kernel._v4174_exact_backward_remat_scope = "p_rw_u_end_to_end"
-    kernel._v4174_exact_backward_remat_policy = "nothing_saveable"
+        "exact_top2_space_batched_dense_with_overflow")
     kernel._v4174_backward_bucket_capacity = (
         _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
     kernel._v4174_backward_overflow_task_group_size = (
