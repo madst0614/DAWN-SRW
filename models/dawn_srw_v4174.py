@@ -2034,6 +2034,14 @@ _FUSED_OPERATOR_METRIC_SUFFIXES = (
     "top1_gate_frac_mean",
     "den_floor_frac",
 )
+_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME = "v4174_bundle_rw_raw_out"
+_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME = "v4174_bundle_rw_gate_mass"
+_BUNDLE_BLOCK_CHECKPOINT_POLICY = (
+    jax.checkpoint_policies.save_from_both_policies(
+        jax.checkpoint_policies.dots_saveable,
+        jax.checkpoint_policies.save_only_these_names(
+            _BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME,
+            _BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)))
 
 _BUNDLE_PACKING_METRIC_SUFFIXES = (
     "valid_entries",
@@ -3163,6 +3171,12 @@ def _make_sharded_attention_space_bundle_dense(
                     (qk_raw_out, v_raw_out), axis=0)
                 grouped_gate_mass = jnp.concatenate(
                     (qk_gate_mass, v_gate_mass), axis=0)
+                grouped_raw_out = ad_checkpoint.checkpoint_name(
+                    grouped_raw_out,
+                    name=_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME)
+                grouped_gate_mass = ad_checkpoint.checkpoint_name(
+                    grouped_gate_mass,
+                    name=_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)
                 _, grouped_gate_den = _global_dense_rw_den_sharded(
                     grouped_gate_mass, den_powers, composition_mode)
                 local_results = (
@@ -3187,7 +3201,10 @@ def _make_sharded_attention_space_bundle_dense(
                 lambda output_value: output_value,
                 local_output), None
 
-        scan_step = jax.checkpoint(block_step, prevent_cse=False)
+        scan_step = jax.checkpoint(
+            block_step,
+            prevent_cse=False,
+            policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
         local_grouped_output, _ = jax.lax.scan(
             scan_step, initial_output, jnp.arange(scan_blocks))
         grouped_output = _psum_dense_rw_representation_sharded(
@@ -3360,6 +3377,8 @@ def _make_sharded_attention_space_bundle_dense(
     kernel._v4174_qk_paired = True
     kernel._v4174_dynamic_metric_flag = True
     kernel._v4174_chunk_remat_policy = "always"
+    kernel._v4174_block_remat_policy = (
+        "dots_and_compact_rw_outputs_saveable")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -3698,6 +3717,10 @@ def _make_sharded_rst_space_bundle_dense(
                     heat_kernel_beta=heat_kernel_beta,
                     effective_active_eps=soft_gate_effective_active_eps,
                     throughput_bf16=throughput_bf16)
+                raw_out = ad_checkpoint.checkpoint_name(
+                    raw_out, name=_BUNDLE_RW_RAW_OUT_CHECKPOINT_NAME)
+                gate_mass = ad_checkpoint.checkpoint_name(
+                    gate_mass, name=_BUNDLE_RW_GATE_MASS_CHECKPOINT_NAME)
                 _, gate_den = _global_dense_rw_den_sharded(
                     gate_mass, den_power, composition_mode)
                 local_results = (raw_out / gate_den).astype(jnp.float32)
@@ -3723,7 +3746,10 @@ def _make_sharded_rst_space_bundle_dense(
                 lambda output_value: output_value,
                 local_output), None
 
-        scan_step = jax.checkpoint(block_step, prevent_cse=False)
+        scan_step = jax.checkpoint(
+            block_step,
+            prevent_cse=False,
+            policy=_BUNDLE_BLOCK_CHECKPOINT_POLICY)
         local_update, _ = jax.lax.scan(
             scan_step, initial_output, jnp.arange(scan_blocks))
         update = _psum_dense_rw_representation_sharded(
@@ -3853,6 +3879,8 @@ def _make_sharded_rst_space_bundle_dense(
     kernel._v4174_rst_packing_count = 1
     kernel._v4174_dynamic_metric_flag = True
     kernel._v4174_chunk_remat_policy = "always"
+    kernel._v4174_block_remat_policy = (
+        "dots_and_compact_rw_outputs_saveable")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
