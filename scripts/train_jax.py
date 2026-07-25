@@ -1677,11 +1677,13 @@ def _validate_v4171_resume_compatibility(
             f"checkpoint={checkpoint_heat_kernel_beta}. Automatic "
             "resume-time heat profile changes are disabled; use params-only "
             "initialization to change heat_kernel_beta.")
-    required = ('d_route', 'operator_key_mode', 'operator_query_mode')
-    expected_key_mode = (
-        OPERATOR_KEY_MODE_LEARNED
-        if requested_version == V4171_MODEL_VERSION
-        else OPERATOR_KEY_MODE_GENERALIZED_BILINEAR)
+    required = ('d_route',)
+    if requested_version != V4174_MODEL_VERSION:
+        required += ('operator_key_mode', 'operator_query_mode')
+        expected_key_mode = (
+            OPERATOR_KEY_MODE_LEARNED
+            if requested_version == V4171_MODEL_VERSION
+            else OPERATOR_KEY_MODE_GENERALIZED_BILINEAR)
     for field in required:
         requested = requested_model_cfg.get(field)
         if field == 'operator_key_mode' and requested is None:
