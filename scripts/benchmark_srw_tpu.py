@@ -208,6 +208,10 @@ def main():
         "--backward-profile", action="store_true",
         help=("With --fast, also measure v4174 QKV and RST "
               "forward+backward kernels."))
+    parser.add_argument(
+        "--detailed-profile-layers", type=int, default=0,
+        help=("Limit v4174 detailed profiling to the first N layers. "
+              "Use 0 for all layers."))
     parser.add_argument("--model-version", default=None,
                         help="Optional expected model version.")
     parser.add_argument("--allow-model-version-override", action="store_true",
@@ -251,6 +255,8 @@ def main():
         raise SystemExit("--module-profile-steps must be >= 0")
     if args.backward_profile and not args.fast_only:
         raise SystemExit("--backward-profile requires --fast")
+    if args.detailed_profile_layers < 0:
+        raise SystemExit("--detailed-profile-layers must be >= 0")
     if args.model_version and args.model_version not in SUPPORTED_MODEL_VERSIONS:
         raise SystemExit(
             f"--model-version must be one of {SUPPORTED_MODEL_VERSIONS}")
@@ -2839,8 +2845,17 @@ def run_v4174_detailed_profile_pass(
                 seconds, batch_size, seq_len, hbm_after,
                 hbm_before=hbm_before, layer=layer, note=note))
 
+    def timed_call(label, fn, *args):
+        if not record:
+            _log(f"[profile-compile] start {label}")
+        value, seconds = profile_timed_call(fn, *args)
+        if not record:
+            _log(f"[profile-compile] done {label} {seconds:.3f}s")
+        return value, seconds
+
     hbm_before = collect_hbm_stats()
-    (x, seconds) = profile_timed_call(
+    (x, seconds) = timed_call(
+        "embedding",
         profile_fns["embed_step"],
         params["token_emb"]["embedding"],
         params["pos_emb"]["embedding"],
@@ -2852,11 +2867,17 @@ def run_v4174_detailed_profile_pass(
     router_params = params["router"]
     layer_rngs = jax.random.split(
         jax.random.PRNGKey(0), int(profile_fns["n_layers"]))
-    for layer_idx in range(int(profile_fns["n_layers"])):
+    layer_count = int(profile_fns["n_layers"])
+    profile_layer_limit = int(
+        profile_fns.get("profile_layer_limit", 0))
+    if profile_layer_limit > 0:
+        layer_count = min(layer_count, profile_layer_limit)
+    for layer_idx in range(layer_count):
         block_params = params[f"block_{layer_idx}"]
 
         hbm_before = hbm_after
-        (normed, seconds) = profile_timed_call(
+        (normed, seconds) = timed_call(
+            f"layer_{layer_idx:02d}.attn_norm",
             profile_fns["attn_norm_step"], block_params, x)
         hbm_after = collect_hbm_stats()
         add_record(
@@ -2864,7 +2885,8 @@ def run_v4174_detailed_profile_pass(
             seconds, hbm_after, hbm_before, layer=layer_idx)
 
         hbm_before = hbm_after
-        (qkv, seconds) = profile_timed_call(
+        (qkv, seconds) = timed_call(
+            f"layer_{layer_idx:02d}.qkv_bundle_srw",
             profile_fns["qkv_bundle_srw_step"],
             pool_params, router_params, normed)
         q, k, v = qkv
@@ -2875,7 +2897,8 @@ def run_v4174_detailed_profile_pass(
             note="routing + prefix-count bundle pack + Q/K/V SRW + writeback")
         if profile_fns.get("include_backward_profile"):
             hbm_before = hbm_after
-            (_qkv_grad_checksum, seconds) = profile_timed_call(
+            (_qkv_grad_checksum, seconds) = timed_call(
+                f"layer_{layer_idx:02d}.qkv_bundle_srw_fwd_bwd",
                 profile_fns["qkv_bundle_srw_fwd_bwd_step"],
                 pool_params, router_params, normed)
             hbm_after = collect_hbm_stats()
@@ -2887,7 +2910,8 @@ def run_v4174_detailed_profile_pass(
                       "all gradients reduced to a device checksum"))
 
         hbm_before = hbm_after
-        (context, seconds) = profile_timed_call(
+        (context, seconds) = timed_call(
+            f"layer_{layer_idx:02d}.attn_core",
             profile_fns["attn_core_step"],
             q, k, v, layer_rngs[layer_idx])
         hbm_after = collect_hbm_stats()
@@ -2896,7 +2920,8 @@ def run_v4174_detailed_profile_pass(
             seconds, hbm_after, hbm_before, layer=layer_idx)
 
         hbm_before = hbm_after
-        (x, seconds) = profile_timed_call(
+        (x, seconds) = timed_call(
+            f"layer_{layer_idx:02d}.attn_out_proj",
             profile_fns["attn_out_proj_step"], block_params, x, context)
         hbm_after = collect_hbm_stats()
         add_record(
@@ -2904,7 +2929,8 @@ def run_v4174_detailed_profile_pass(
             seconds, hbm_after, hbm_before, layer=layer_idx)
 
         hbm_before = hbm_after
-        (normed, seconds) = profile_timed_call(
+        (normed, seconds) = timed_call(
+            f"layer_{layer_idx:02d}.rst_norm",
             profile_fns["rst_norm_step"], block_params, x)
         hbm_after = collect_hbm_stats()
         add_record(
@@ -2913,7 +2939,8 @@ def run_v4174_detailed_profile_pass(
 
         rst_input = x
         hbm_before = hbm_after
-        (x, seconds) = profile_timed_call(
+        (x, seconds) = timed_call(
+            f"layer_{layer_idx:02d}.rst_bundle_srw",
             profile_fns["rst_bundle_srw_step"],
             pool_params, router_params, normed, rst_input)
         hbm_after = collect_hbm_stats()
@@ -2923,7 +2950,8 @@ def run_v4174_detailed_profile_pass(
             note="routing + prefix-count bundle pack + RST SRW + writeback")
         if profile_fns.get("include_backward_profile"):
             hbm_before = hbm_after
-            (_rst_grad_checksum, seconds) = profile_timed_call(
+            (_rst_grad_checksum, seconds) = timed_call(
+                f"layer_{layer_idx:02d}.rst_bundle_srw_fwd_bwd",
                 profile_fns["rst_bundle_srw_fwd_bwd_step"],
                 pool_params, router_params, normed, rst_input)
             hbm_after = collect_hbm_stats()
@@ -2935,7 +2963,8 @@ def run_v4174_detailed_profile_pass(
                       "all gradients reduced to a device checksum"))
 
     hbm_before = hbm_after
-    (_loss_metrics, seconds) = profile_timed_call(
+    (_loss_metrics, seconds) = timed_call(
+        "final_norm_ce_loss",
         profile_fns["final_loss_step"],
         params["norm"]["scale"],
         params["norm"]["bias"],
@@ -3513,6 +3542,8 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
             detailed_fns = create_detailed_profile_fns(
                 cfg, sharded_fns,
                 include_backward=bool(args.backward_profile))
+            detailed_fns["profile_layer_limit"] = int(
+                args.detailed_profile_layers)
             profile_kind = (
                 "forward/backward"
                 if args.backward_profile else "forward")

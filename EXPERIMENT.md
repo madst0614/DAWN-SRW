@@ -5,13 +5,13 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: continue v4174 exact backward optimization without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V forward execution, or the accepted precision boundary.
-- Repository state at the 2026-07-26 audit: branch `codex/v4167-poc`, GitHub HEAD `75a4fa9d3c4fdf21dbd6968427197ea4eb3ae17d`; local uncommitted changes in `models/dawn_srw_v4174.py` and `scripts/benchmark_srw_tpu.py` belong to a parallel active-edge experiment and are not part of the accepted result or this notebook-only publication.
+- Current goal: close the v4174 active-edge screening cleanly without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V forward execution, or the accepted precision boundary.
+- Publication state: branch `codex/v4167-poc`, pre-publication GitHub HEAD `d68c58423de5db05fbe958a98103539c9255ab4d`; this publication preserves the rejected exact-owner implementation (`models/dawn_srw_v4174.py` SHA-256 `e27de9ab404a620f502394b271cb34703f619226351d751eaf43ce2abc01eebe`) and bounded profiler (`scripts/benchmark_srw_tpu.py` SHA-256 `03c32e30be954caee0b18264824fdeed3ba7d2e13d0e6f0e0cb839e38c8ff58f`) for reproducibility. It is not an accepted training head.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices. The accepted measurements below are from-scratch speed checks or benchmarks with no restored checkpoint.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
-- Current conclusion: bundle4 forward remains about 2.423 s and is accepted. Exact top-2 space backward and compact overflow are also accepted. The measured QKV/RST forward-plus-backward kernels still add about 5.557 s beyond their forward calls, so the remaining target is the numerical score/gate/write gradient rather than sort, packing, or scan control.
-- Current blocker: the first active-edge block-VJP lowering was exact but catastrophically slow, at 398.835 s for the detailed split. A separate owner-batched active-edge worktree is in progress and must not be attributed to a completed experiment until its owning workstream records a finished result.
-- Next experiment: evaluate an exact fused active-edge backward that avoids per-edge `[edge,R]` materialization and serial task loops; retain commit `8187c00d` as the accepted fallback until a complete TPU result beats it.
+- Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. Exact operator sparsity did not translate into TPU speed: dual-owner XLA tasks were extremely slow, Mosaic Pallas could not lower the required indirect gathers/reductions, static grouped XLA was slower still, and saving read scores duplicated enough metadata traffic to regress both QKV and RST.
+- Current blocker: the owner/task schedule and backward residual traffic dominate before active-edge arithmetic savings can appear. The failure is deterministic lowering/runtime behavior, not a corrupted compile cache.
+- Next experiment: resume from accepted fallback commit `8187c00d`, and only reopen operator sparsity with one shared compact edge representation or direct RW-to-P/U fusion that eliminates duplicated owner metadata and intermediate residual traffic.
 
 ## Fixed Context
 
@@ -247,6 +247,58 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Partial evidence: forward measured 2.4248 s. A later-layer QKV forward-plus-backward call was observed at 41.537 s, but the full benchmark did not complete, so aggregate performance, exactness, and program HBM are `not measured`.
 - Operational correction: during this notebook audit the parallel benchmark was mistakenly interrupted. Source files were not changed; the attempted Git restore failed before modifying them. The partial log and dirty source snapshot were preserved under `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_active_edge_dual_owner_xla/`. Restart was not performed because the user restricted this task to recordkeeping.
 - Decision/next: the owning parallel workstream must decide whether to resume or replace this attempt and append a later correction/result entry. Do not infer acceptance or rejection from the partial timing alone.
+
+#### #02 — Complete the dual-owner audit and reject its XLA task schedule
+
+- Status: rejected for performance; local exactness validated and TPU partially measured before external interruption.
+- Hypothesis/change: prefix-pack positive-margin support into one shared capacity, compute read/write gradients in operator-owned dense blocks, compute local/tau gradients in token-owned dense blocks, and replay every overflowing owner exactly with drop count zero.
+- Run identity: TPU checkout branch `codex/v4167-poc`, remote base HEAD `b046f3bb560c02e8209a7c644dafb26e0807688b`, dirty model SHA-256 `e27de9ab404a620f502394b271cb34703f619226351d751eaf43ce2abc01eebe`, benchmark SHA-256 `287194cd19ab4a069610f221bdc5c81767a6193b6e5842919f00a1d124dd7e10`, config SHA-256 `4e0dc1188c6489ac28e22f710f685c7b4554f0869557876f4205671ba150ef8f`; no checkpoint, batch 1024, sequence 512, mesh `16x2`/32 devices; remote Python 3.10.12, JAX 0.6.2, Flax 0.10.7.
+- Local validation: in `.venv-jax062` with Python 3.12.7, JAX 0.6.2, and Flax 0.10.7, `margin == 0` matched dense output and all gradients exactly. A forced overflow with capacity 24 for 256 dense edges matched output exactly with maximum gradient relative error `5.5334e-7`.
+- TPU result: forward remained 2.4248 s. First QKV/RST forward-plus-backward compile-and-run calls were 128.806/205.477 s. Cached QKV calls across completed layers were 41.125-41.559 s with mean 41.341 s; cached RST calls were 72.062-72.417 s with mean 72.202 s. The run reached layer 9 QKV and was interrupted during layer 9 RST, so a full 18-layer aggregate and program HBM are `not measured`.
+- Lesson: exact edge reduction alone is insufficient; the dual owner task graph, gathers, loops, and reductions dominate TPU execution.
+- Decision/next: reject this schedule and keep accepted commit `8187c00d` as the performance fallback. Preserve the exact source as a reproducible experimental checkpoint, not as an accepted training result.
+- Evidence: `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_active_edge_dual_owner_xla/interrupted_20260726_004200_kst/`.
+
+#### #03 — Reject Mosaic Pallas owner kernels at lowering
+
+- Status: rejected; TPU compiler probes failed before a valid performance measurement.
+- Hypothesis/change: retain dense bundle forward and replace only the exact-owner backward row-dot and owner reductions with operator-major/token-major Mosaic Pallas kernels.
+- Run identity: same config, no checkpoint, batch 1024, sequence 512, mesh `16x2`/32 devices, remote Python 3.10.12, JAX 0.6.2, Flax 0.10.7; the probes were dirty direct deployments on remote base HEAD `b046f3bb`. Exact intermediate source hashes were overwritten before notebook finalization.
+- Result: successive lowerings failed on the TPU last-two-dimension block-alignment rule, a Triton-only implicit `broadcast_to`, `Cannot do int indexing on TPU` for indirect edge gathers, a BF16 minor-singleton shape cast, `SupportsVectorPermuteBetweenSublane`, and finally `limits[i] <= dim(i) (128 vs. 1)` for a singleton MXU output. Retiling to 128 did not remove the sublane failure. Runtime speed and HBM are `not measured`.
+- Lesson: this owner layout requires indirect gathers and reduction shapes that Mosaic TPU cannot lower efficiently or legally; this is a deterministic compiler/layout limitation rather than compile-cache corruption.
+- Decision/next: reject the Pallas path and test only contiguous/static XLA owner blocks as a fallback.
+- Evidence: the experimental Pallas implementation is preserved in `models/dawn_srw_v4174.py`; the transient raw `~/train.log` was overwritten before this entry, so the exact error signatures above are the surviving evidence.
+
+#### #04 — Reject contiguous static grouped-XLA owner blocks
+
+- Status: rejected; TPU measured with a finite two-layer gate.
+- Hypothesis/change: move all indirect edge gathering back to XLA and execute contiguous static owner blocks, avoiding Mosaic indexing while retaining exact shared-capacity overflow.
+- Run identity: remote base HEAD `b046f3bb560c02e8209a7c644dafb26e0807688b`, dirty model SHA-256 `471ae4f480aad48d2bf4340efa74463eb1b7c70704d7fcb7e514beed9a26fe05`, benchmark SHA-256 `03c32e30be954caee0b18264824fdeed3ba7d2e13d0e6f0e0cb839e38c8ff58f`, config SHA-256 `4e0dc1188c6489ac28e22f710f685c7b4554f0869557876f4205671ba150ef8f`; no checkpoint, batch 1024, sequence 512, mesh `16x2`/32 devices; Python 3.10.12, JAX 0.6.2, Flax 0.10.7.
+- Result: forward was 2.4282 s. First QKV/RST compile-and-run calls were 139.690/245.434 s and cached layer-1 calls were 59.354/99.108 s. The measured two-layer QKV/RST forward-plus-backward totals were 118.9738/197.8045 s, detailed compile was 576.619 s, and runtime live-array peak was 5.530 GiB. Per layer this was about 43.9%/37.0% slower than the dual-owner XLA schedule.
+- Lesson: converting sparse ownership to static XLA scans increases executed task tiles and live state enough to overwhelm any indexing simplification.
+- Decision/next: reject static grouped XLA and isolate whether saving the dense-forward read score can remove the dominant repeated dot without changing the exact owner schedule.
+- Evidence: `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_active_edge_static_group_xla_gate/completed_20260726_023203_kst/`.
+
+#### #05 — Reject duplicated saved-read metadata
+
+- Status: rejected; local exactness and TPU two-layer performance measured.
+- Hypothesis/change: preserve dense forward, pack the forward read score beside each operator-major and token-major primary edge, and skip backward read-dot reconstruction while retaining exact overflow recomputation.
+- Run identity: remote base HEAD `b046f3bb560c02e8209a7c644dafb26e0807688b`, dirty model SHA-256 `413efea55e67711bfa5460969887854b5940eeb172cb5fbcc637d30270c5989d`, benchmark SHA-256 `03c32e30be954caee0b18264824fdeed3ba7d2e13d0e6f0e0cb839e38c8ff58f`, config SHA-256 `4e0dc1188c6489ac28e22f710f685c7b4554f0869557876f4205671ba150ef8f`; no checkpoint, batch 1024, sequence 512, mesh `16x2`/32 devices; Python 3.10.12, JAX 0.6.2, Flax 0.10.7.
+- Local validation: `margin == 0` matched dense output and all gradients exactly; forced exact overflow had maximum relative gradient error `5.5334e-7`; a representative BF16 production-shape comparison had minimum gradient cosine `0.999993`.
+- TPU result: forward remained 2.4264 s. First QKV/RST compile-and-run calls were 111.111/217.945 s; cached layer-1 calls were 48.402/78.710 s. Two-layer QKV/RST forward-plus-backward totals were 96.8341/157.2556 s, detailed compile was 489.425 s, and runtime live-array peak was 5.365 GiB. Cached QKV/RST regressed about 17.1%/9.0% versus the unsaved dual-owner schedule.
+- Lesson: duplicating FP32 read scores into both owner orderings costs more residual packing and memory traffic than recomputing the compact read dots.
+- Decision/next: reject saved-read metadata and restore exact-owner source SHA-256 `e27de9ab404a620f502394b271cb34703f619226351d751eaf43ce2abc01eebe` on the local checkout and all eight TPU workers.
+- Evidence: `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_active_edge_exact_owner_saved_read_gate/completed_20260726_saved_read/`.
+
+#### #06 — Retain bounded detailed-profile gates
+
+- Status: accepted benchmark instrumentation; used in completed TPU gates.
+- Hypothesis/change: add `--detailed-profile-layers N` with `0` meaning all layers and emit start/done timing for each compile/profile operator so a failing schedule can finish a bounded gate without manual termination.
+- Run identity: benchmark SHA-256 `03c32e30be954caee0b18264824fdeed3ba7d2e13d0e6f0e0cb839e38c8ff58f`; exercised by experiments #04 and #05 with the same config, no checkpoint, batch 1024, sequence 512, and mesh `16x2`/32 devices.
+- Result: both two-layer gates completed normally, emitted separate QKV/RST compile and cached timings, wrote metrics JSONL, and exited without leaving tmux sessions, benchmark processes, or TPU holders.
+- Lesson: bounded layer gates expose compile/runtime regressions early and avoid ambiguous manual kills during long detailed profiles.
+- Decision/next: retain the profiler change. Active-edge screening is closed; any future operator-sparse design must first pass this two-layer gate before a full profile.
+- Evidence: `scripts/benchmark_srw_tpu.py` and the completed archive directories recorded in experiments #04 and #05.
 
 ## Backfill Boundary
 
