@@ -284,13 +284,29 @@ tmux kill-session -t train 2>/dev/null || true
 pkill -9 -f "[p]ython3 .*scripts/benchmark_srw_tpu.py" || true
 pkill -9 -f "[p]ython .*scripts/benchmark_srw_tpu.py" || true
 sudo lsof /dev/accel* 2>/dev/null | grep -v PID | awk '{print $2}' | sort -u | xargs -r sudo kill -9 || true
+sleep 3
+ACCEL_HOLDERS="$(sudo lsof -t /dev/accel* 2>/dev/null | sort -u || true)"
+if [ -n "$ACCEL_HOLDERS" ]; then
+    echo "ERROR: TPU accelerator holder remains after cleanup:" >&2
+    echo "$ACCEL_HOLDERS" >&2
+    exit 1
+fi
+sudo rm -f /tmp/libtpu_lockfile
 EOFCLEANUP
 
 echo "Cleaning old benchmark processes on every worker..."
+cleanup_failed=0
 for worker in $(seq 0 $((WORKER_COUNT - 1))); do
     echo "  Cleaning worker $worker..."
-    run_worker_command "$worker" "$CLEANUP_CMD" || true
+    if ! run_worker_command "$worker" "$CLEANUP_CMD"; then
+        echo "ERROR: worker $worker cleanup failed." >&2
+        cleanup_failed=1
+    fi
 done
+if [ "$cleanup_failed" -ne 0 ]; then
+    echo "ERROR: cleanup verification failed. Aborting benchmark launch." >&2
+    exit 1
+fi
 
 REPO_URL_Q="$(shell_quote "$REPO_URL")"
 BRANCH_Q="$(shell_quote "$BRANCH")"

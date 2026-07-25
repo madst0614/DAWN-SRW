@@ -167,6 +167,13 @@ if [ -n "$REMAINING" ]; then
     echo "$REMAINING" >&2
     exit 1
 fi
+ACCEL_HOLDERS="$(sudo lsof -t /dev/accel* 2>/dev/null | sort -u || true)"
+if [ -n "$ACCEL_HOLDERS" ]; then
+    echo "ERROR: TPU accelerator holder remains after cleanup:" >&2
+    echo "$ACCEL_HOLDERS" >&2
+    exit 1
+fi
+sudo rm -f /tmp/libtpu_lockfile
 EOFCLEANUP
 
 cleanup_all_workers() {

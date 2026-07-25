@@ -6,12 +6,12 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 ## Current State
 
 - Current goal: screen end-to-end P-RW-U rematerialization inside the accepted exact selected-top-2 dense backward without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V execution, or the accepted precision boundary.
-- Publication state: branch `codex/v4167-poc`, GitHub HEAD `fd7e5e32f6c45ea421df19ecb0df18feb207f1a4`; rejected exact-owner source remains preserved at commit `4cacfe39`, while this HEAD restores accepted model commit `8187c00d` and adds only the P-RW-U rematerialization boundary. The candidate is not accepted until TPU measurement.
+- Publication state: branch `codex/v4167-poc`, GitHub HEAD `1d74f359b6bc082224ff93f10e1cead7465fba94`; rejected exact-owner source remains preserved at commit `4cacfe39`, fusion source is at `fd7e5e32`, and the current HEAD also pins the remote SSH user. The candidate is not accepted until TPU measurement.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices. The accepted measurements below are from-scratch speed checks or benchmarks with no restored checkpoint.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
 - Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. Exact operator sparsity did not translate into TPU speed: dual-owner XLA tasks were extremely slow, Mosaic Pallas could not lower the required indirect gathers/reductions, static grouped XLA was slower still, and saving read scores duplicated enough metadata traffic to regress both QKV and RST.
-- Current blocker: the first accepted-resume launch inherited the Windows caller name `MADST` instead of remote user `madst0614`, so TPU driver logs failed with `Permission denied`; a fixed-user launcher/watcher change is locally shell-validated but not yet relaunched.
-- Next experiment: relaunch the accepted checkpoint as `madst0614`, confirm one completed restored step, then require a bounded one-to-two-layer fusion detailed-profile gate against `8187c00d`; reject the candidate on a material regression and leave accepted checkpoint training resumed afterward.
+- Current blocker: the fixed-user retry reached the correct clean commit as UID 2001 but exited because the failed UID 2002 process had left `/tmp/libtpu_lockfile`; the exact stale lock was removed on all workers after verifying zero accelerator holders.
+- Next experiment: relaunch the accepted checkpoint with holder-verified stale-lock cleanup, confirm one completed restored step, then require a bounded one-to-two-layer fusion detailed-profile gate against `8187c00d`; reject the candidate on a material regression and leave accepted checkpoint training resumed afterward.
 
 ## Fixed Context
 
@@ -329,6 +329,16 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: supplying `madst0614@` in ad hoc inspection commands is insufficient when the launcher and watcher internally call gcloud with a bare TPU name; the user identity must be fixed at every current training/benchmark control boundary.
 - Decision/next: preserve the failed log, terminate only the UID 2002 run, publish the control-path fix, and relaunch the accepted branch as UID 2001 before any fusion benchmark.
 - Evidence: bad-user logs under `/home/MADST/train.log`; UID/ownership inspection on worker 0 at 2026-07-26 KST; the four launcher/watcher files above.
+
+#### #10 — Remove a stale libtpu lock only after holder verification
+
+- Status: root cause confirmed; live cleanup succeeded, corrected launcher code pending publication and relaunch.
+- Hypothesis/change: process cleanup must verify that `/dev/accel*` has no remaining holder and only then remove `/tmp/libtpu_lockfile`; both training and benchmark launchers should abort if a holder remains.
+- Run identity: existing TPU `spatial-se-400m`; accepted branch `codex/v4174-accepted-8187` at `8187c00d4b767a743c3178a5bcb8caac1c6124c5`; control source parent `1d74f359b6bc082224ff93f10e1cead7465fba94`; bundle4 config; requested checkpoint step `1681`; eight hosts/32 devices.
+- Result: the UID 2001 retry cloned a clean repository and printed the exact accepted SHA, but every worker exited from JAX initialization with `ABORTED: The TPU is already in use by another process`. Inspection showed no `/dev/accel0` holder and a zero-byte `/tmp/libtpu_lockfile` owned by the failed UID 2002 user from 18:33 UTC. After closing only the failed `tmux train` wrappers, all eight workers independently verified zero holders and removed that exact lockfile.
+- Lesson: killing the previous process is insufficient when libtpu leaves its lockfile behind; lock removal is safe only after an explicit zero-holder gate.
+- Decision/next: publish the fail-loud cleanup sequence, relaunch accepted training, and require one real restored step before the fusion gate.
+- Evidence: `/home/madst0614/train.log` on the fixed-user retry; live `lsof` and lock ownership inspection on all workers; `scripts/launch_tpu_pod.sh`; `scripts/launch_srw_benchmark_tpu_pod.sh`.
 
 ## Backfill Boundary
 
