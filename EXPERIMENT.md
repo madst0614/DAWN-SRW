@@ -5,13 +5,13 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: screen end-to-end P-RW-U rematerialization inside the accepted exact selected-top-2 dense backward without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V execution, or the accepted precision boundary.
-- Publication state: branch `codex/v4167-poc`, GitHub HEAD `1d74f359b6bc082224ff93f10e1cead7465fba94`; rejected exact-owner source remains preserved at commit `4cacfe39`, fusion source is at `fd7e5e32`, and the current HEAD also pins the remote SSH user. The candidate is not accepted until TPU measurement.
+- Current goal: keep the accepted exact selected-top-2 dense backward training from the canonical checkpoint after closing the end-to-end P-RW-U rematerialization screen.
+- Publication state: branch `codex/v4167-poc`, GitHub HEAD `0fa80a9a8f2dbd75f32f46a38e0097d3d9a325a4`; rejected exact-owner source remains preserved at `4cacfe39`, rejected P-RW-U source at `fd7e5e32`, and the accepted model at `8187c00d`.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices. The accepted measurements below are from-scratch speed checks or benchmarks with no restored checkpoint.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
-- Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. Exact operator sparsity did not translate into TPU speed: dual-owner XLA tasks were extremely slow, Mosaic Pallas could not lower the required indirect gathers/reductions, static grouped XLA was slower still, and saving read scores duplicated enough metadata traffic to regress both QKV and RST.
-- Current blocker: the fixed-user retry reached the correct clean commit as UID 2001 but exited because the failed UID 2002 process had left `/tmp/libtpu_lockfile`; the exact stale lock was removed on all workers after verifying zero accelerator holders.
-- Next experiment: relaunch the accepted checkpoint with holder-verified stale-lock cleanup, confirm one completed restored step, then require a bounded one-to-two-layer fusion detailed-profile gate against `8187c00d`; reject the candidate on a material regression and leave accepted checkpoint training resumed afterward.
+- Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. End-to-end `nothing_saveable` P-RW-U rematerialization improved the isolated two-layer QKV+RST forward/backward total by 3.60%, but the matched full train-step was unchanged (accepted 10.7882 s vs candidate 10.7895 s), runtime HBM was unchanged, and candidate compilation regressed; it is rejected.
+- Current blocker: none in the control path. The final accepted run restored step 1681 consistently across all eight hosts and is compiling its first post-restore train step.
+- Next experiment: verify the final accepted run reaches step 1700, publish this experiment record, and leave `tmux train`/`~/train.log` running on `spatial-se-400m`.
 
 ## Fixed Context
 
@@ -359,6 +359,18 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: the canonical accepted checkpoint and resume path are healthy once remote-user identity and stale libtpu state are corrected; the fusion decision can now be isolated to matched profiler evidence.
 - Decision/next: compare clean accepted model commit `001c2c27fd7baf6998937530cdca3e55e57fccf0` and fusion commit `1ff2e57b811175a875795c85f7c2f14a7d71bb0b` with identical real-data two-layer forward/backward gates.
 - Evidence: `/home/madst0614/train.accepted_resume_control_20260726T040810KST.log` on all eight workers; primary worker 6 `~/train.log` before the gate launch.
+
+#### #13 — Reject end-to-end P-RW-U rematerialization after matched TPU gates
+
+- Status: rejected for production; isolated backward improved, but full training did not.
+- Hypothesis/change: wrapping the accepted exact-space attention/RST P-RW-U primal and compact overflow groups in a `nothing_saveable` rematerialization boundary should reduce retained backward intermediates without changing model equations, shapes, grouped Q/K/V execution, precision, parameters, or checkpoint schema.
+- Run identity: existing TPU `spatial-se-400m`; accepted gate branch `codex/v4174-accepted-profile-gate` at clean commit `001c2c27fd7baf6998937530cdca3e55e57fccf0`; candidate gate branch `codex/v4174-p-rw-u-profile-gate` at clean commit `1ff2e57b811175a875795c85f7c2f14a7d71bb0b`; candidate model SHA-256 `709a0571ab3c510748c80a95e87d4caec788e1bce134f67b4e7b60f063278ae2`; bundle4 config; real C4 data; no checkpoint; batch 1024, sequence 512, mesh `16x2`/32 devices; Python 3.10.12, JAX 0.6.2, Flax 0.10.7.
+- Two-layer result: accepted/candidate forward was 2.4222/2.4224 s with identical printed loss 28.8470. QKV forward-plus-backward was 419.739/403.785 ms and RST was 426.555/412.014 ms; the combined 846.294/815.799 ms favored the candidate by 3.60%. Detailed split was 1.1242/1.0935 s and runtime peak HBM was 4.961/4.960 GiB. Candidate detailed compile regressed from 129.420 to 146.149 s (+12.93%).
+- Full train-step result: both runs used three warmups and five measured forward+backward+AdamW steps. Accepted/candidate mean was 10.7882/10.7895 s, median 10.8422/10.8453 s, throughput 48,610.4/48,603.7 tok/s, and runtime peak HBM 7.938/7.940 GiB. The candidate was 0.012% slower, effectively equal. Initial compile was 102.660/106.593 s, a 3.83% candidate regression.
+- Exactness evidence: all printed loss values matched to four decimals except one `9.3902` versus `9.3901`; the largest printed grad-norm delta across measured steps was 0.046. No OOM, NaN, invalid benchmark flag, or process loss occurred.
+- Lesson: the explicit boundary changes the isolated custom-VJP schedule, but its small gain disappears inside the complete 18-layer optimizer graph and does not reduce observed runtime HBM. Runtime telemetry is not XLA program-memory evidence, so no program-HBM reduction is claimed.
+- Decision/next: do not promote the P-RW-U candidate. Preserve it at `fd7e5e32`/`1ff2e57b`, retain `8187c00d` as the accepted fallback, and resume the canonical step-1681 training run.
+- Evidence: `/home/madst0614/train.v4174_p_rw_u_gate_accepted_001c2c27_20260726T041649KST.log`; `/home/madst0614/train.v4174_p_rw_u_gate_candidate_1ff2e57b_20260726T042523KST.log`; `/home/madst0614/train.v4174_p_rw_u_trainstep_candidate_1ff2e57b_20260726T043455KST.log`; `/home/madst0614/train.v4174_p_rw_u_trainstep_accepted_001c2c27_20260726T044420KST.log`; matching JSONL directories under `/home/madst0614/DAWN-SRW/benchmark_runs/`.
 
 ## Backfill Boundary
 
