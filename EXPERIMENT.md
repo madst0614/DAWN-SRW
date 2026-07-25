@@ -5,13 +5,13 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: close the v4174 active-edge screening cleanly without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V forward execution, or the accepted precision boundary.
-- Publication state: branch `codex/v4167-poc`, pre-publication GitHub HEAD `d68c58423de5db05fbe958a98103539c9255ab4d`; this publication preserves the rejected exact-owner implementation (`models/dawn_srw_v4174.py` SHA-256 `e27de9ab404a620f502394b271cb34703f619226351d751eaf43ce2abc01eebe`) and bounded profiler (`scripts/benchmark_srw_tpu.py` SHA-256 `03c32e30be954caee0b18264824fdeed3ba7d2e13d0e6f0e0cb839e38c8ff58f`) for reproducibility. It is not an accepted training head.
+- Current goal: screen end-to-end P-RW-U rematerialization inside the accepted exact selected-top-2 dense backward without changing model mathematics, parameter/checkpoint schema, canonical shapes, grouped Q/K/V execution, or the accepted precision boundary.
+- Publication state: branch `codex/v4167-poc`, GitHub HEAD `4cacfe3987e881c21881373f49fcb5903ee9c916`; that commit preserves the rejected exact-owner implementation and bounded profiler for reproducibility. The working candidate restores the model source from accepted commit `8187c00d` and adds only the P-RW-U rematerialization boundary; it is not accepted until TPU measurement.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_40B_v4_64_space24_top2_bundle4.yaml`, batch 1024, sequence 512, mesh `16x2` on 32 devices. The accepted measurements below are from-scratch speed checks or benchmarks with no restored checkpoint.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
 - Current conclusion: bundle4 dense forward and exact selected-top-2 space backward remain accepted. Exact operator sparsity did not translate into TPU speed: dual-owner XLA tasks were extremely slow, Mosaic Pallas could not lower the required indirect gathers/reductions, static grouped XLA was slower still, and saving read scores duplicated enough metadata traffic to regress both QKV and RST.
-- Current blocker: the owner/task schedule and backward residual traffic dominate before active-edge arithmetic savings can appear. The failure is deterministic lowering/runtime behavior, not a corrupted compile cache.
-- Next experiment: resume from accepted fallback commit `8187c00d`, and only reopen operator sparsity with one shared compact edge representation or direct RW-to-P/U fusion that eliminates duplicated owner metadata and intermediate residual traffic.
+- Current blocker: the P-RW-U candidate is locally syntax/import validated but its compile time, HBM, detailed backward time, and train-step time are not yet measured on TPU.
+- Next experiment: require a bounded one-to-two-layer TPU detailed-profile gate against `8187c00d`, then a short training window only if the gate is competitive; reject the candidate on a material regression and leave the accepted checkpoint training resumed afterward.
 
 ## Fixed Context
 
@@ -299,6 +299,26 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: bounded layer gates expose compile/runtime regressions early and avoid ambiguous manual kills during long detailed profiles.
 - Decision/next: retain the profiler change. Active-edge screening is closed; any future operator-sparse design must first pass this two-layer gate before a full profile.
 - Evidence: `scripts/benchmark_srw_tpu.py` and the completed archive directories recorded in experiments #04 and #05.
+
+#### #07 — Relaunch the accepted fallback from the latest canonical checkpoint
+
+- Status: in progress; launcher completed, first restored optimizer step not yet measured.
+- Hypothesis/change: keep `spatial-se-400m` occupied with the fastest accepted code while the next candidate is prepared, rather than leaving the pod idle on the rejected experimental HEAD.
+- Run identity: existing TPU `spatial-se-400m`; branch `codex/v4174-accepted-8187`; commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5`; bundle4 config; resume source `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_40B_v4_64_space24_top2_direct_read/run_vspatial-r1-v4.1.7.4_20260724_223010_3201`; latest checkpoint step `1681`; batch 1024, sequence 512, mesh `16x2`/32 devices.
+- Result: all eight SSH preflights and cleanup checks passed, dependency/repository setup completed, and `scripts/train_jax.py` was started in `tmux train` with combined output in `~/train.log`. A real restored step is still `not measured`.
+- Lesson: the previously dirty remote checkout at base `b046f3bb` was unsuitable for continuity; the exact accepted commit is now available as a clean remote branch.
+- Decision/next: confirm restore identity and at least one completed donated optimizer step before replacing this run with the bounded fusion gate.
+- Evidence: worker logs `/home/madst0614/train.log`; overwritten prelaunch logs preserved as `/home/madst0614/train.pre_fusion_resume_20260726T0326KST.log`.
+
+#### #08 — Build an end-to-end P-RW-U rematerialized exact backward candidate
+
+- Status: candidate; minimum local validation passed, TPU performance not measured.
+- Hypothesis/change: retain the exact top-2 space buckets, dense MXU-friendly RW arithmetic, compact exact overflow, and all gradients, but wrap each attention/RST exact-space P-RW-U primal in one `nothing_saveable` rematerialization boundary. Exact overflow task groups use the same policy so projection, RW, denominator, U writeback, and their pullback intermediates are recomputed together instead of retained across AD boundaries.
+- Run identity: branch `codex/v4167-poc`; parent GitHub HEAD `4cacfe3987e881c21881373f49fcb5903ee9c916`; model restored from accepted commit `8187c00d` before the fusion-only edit; candidate model SHA-256 `709a0571ab3c510748c80a95e87d4caec788e1bce134f67b4e7b60f063278ae2`; canonical bundle4 config; local Python 3.12.7, JAX 0.6.2, Flax 0.10.7.
+- Result: `.venv-jax062` `py_compile`, import, policy identity (`nothing_saveable`), and `git diff --check` passed. Numerical equivalence and TPU speed/HBM are `not measured`.
+- Lesson: this candidate changes residual lifetime only. It does not introduce active-edge packing, indirect gather, a new parameter/config field, or a claim that XLA emits one physical kernel.
+- Decision/next: publish the exact source, run the bounded TPU detailed-profile gate, and continue to a short training screen only if compile/runtime are competitive with `8187c00d`.
+- Evidence: `models/dawn_srw_v4174.py`; this notebook entry.
 
 ## Backfill Boundary
 
