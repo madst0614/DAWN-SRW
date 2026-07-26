@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import yaml
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 optax = None
@@ -212,6 +213,11 @@ def main():
         "--detailed-profile-layers", type=int, default=0,
         help=("Limit v4174 detailed profiling to the first N layers. "
               "Use 0 for all layers."))
+    parser.add_argument(
+        "--stage-attribution", action="store_true",
+        help=("With --fast --backward-profile, run the benchmark-only "
+              "v4174 bundle-forward/exact-backward stage attribution "
+              "factory. This does not change the production kernel."))
     parser.add_argument("--model-version", default=None,
                         help="Optional expected model version.")
     parser.add_argument("--allow-model-version-override", action="store_true",
@@ -255,6 +261,11 @@ def main():
         raise SystemExit("--module-profile-steps must be >= 0")
     if args.backward_profile and not args.fast_only:
         raise SystemExit("--backward-profile requires --fast")
+    if args.stage_attribution and not args.fast_only:
+        raise SystemExit("--stage-attribution requires --fast")
+    if args.stage_attribution and not args.backward_profile:
+        raise SystemExit(
+            "--stage-attribution requires --backward-profile")
     if args.detailed_profile_layers < 0:
         raise SystemExit("--detailed-profile-layers must be >= 0")
     if args.model_version and args.model_version not in SUPPORTED_MODEL_VERSIONS:
@@ -568,6 +579,7 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
     _log(f"  measure_steps: {0 if args.fast_only else args.steps}")
     _log(f"  forward_profile_steps: {args.forward_profile_steps}")
     _log(f"  module_profile_steps: {args.module_profile_steps}")
+    _log(f"  stage_attribution: {str(bool(args.stage_attribution)).lower()}")
     if variant_label:
         _log(f"  variant: {variant_label}")
     if overrides:
@@ -740,7 +752,7 @@ def run_one_config(config_arg, args, xla_dump_dir, overrides=None,
         (profile_summary, profile_records, iterator, rng,
          execution_step_no) = run_forward_profile(
             model, sharded_fns, params, cfg, args, iterator, train_loader,
-            data_sharding, batch_size, seq_len, rng, run_index,
+            mesh, data_sharding, batch_size, seq_len, rng, run_index,
             variant_label, execution_step_no, train_mean_step_seconds)
         write_jsonl_records(metrics_jsonl, profile_records)
         peak_hbm = update_peak_hbm(
@@ -2076,6 +2088,80 @@ def benchmark_profile_record(run_index, variant_label, phase, step, op, group,
     return record
 
 
+def benchmark_stage_attribution_record(
+        run_index, variant_label, phase, step, path, direction, executor,
+        stage, seconds, hbm, *, layer, hbm_before=None, pool=None, chunk=None,
+        call_index=None, active=None, note=None):
+    """One benchmark-only isolated-stage timing.
+
+    ``compile`` rows contain compile plus the first execution of one static
+    executable. ``measure`` rows contain only already-compiled executions.
+    The split barriers intentionally make these attribution records, not a
+    prediction obtained by summing them into production kernel latency.
+    """
+    record = {
+        "type": "benchmark_stage_attribution",
+        "run_index": int(run_index),
+        "variant": variant_label,
+        "phase": str(phase),
+        "step": int(step),
+        "layer": int(layer),
+        "path": str(path),
+        "direction": str(direction),
+        "executor": str(executor),
+        "stage": str(stage),
+        "seconds": float(seconds),
+        "hbm_used_gb": json_float(hbm_used_value(hbm), None),
+        "hbm_peak_gb": json_float(hbm_peak_value(hbm), None),
+        "hbm_used_delta_gb": json_float(
+            (
+                hbm_used_value(hbm) - hbm_used_value(hbm_before or {})
+                if (hbm_used_value(hbm) is not None
+                    and hbm_used_value(hbm_before or {}) is not None)
+                else None),
+            None),
+    }
+    if pool is not None:
+        record["pool"] = str(pool)
+    if chunk is not None:
+        record["chunk"] = int(chunk)
+    if call_index is not None:
+        record["call_index"] = int(call_index)
+    if active is not None:
+        record["active"] = bool(active)
+    if note:
+        record["note"] = str(note)
+    return record
+
+
+def benchmark_stage_metadata_record(
+        run_index, variant_label, step, path, layer, values):
+    names = (
+        "primary_valid_pairs",
+        "primary_capacity_pairs",
+        "overflow_valid_pairs",
+        "overflow_active_tasks",
+        "overflow_task_capacity",
+        "overflow_padding_pairs",
+        "overflow_padding_fraction",
+        "space_count_min",
+        "space_count_mean",
+        "space_count_max",
+    )
+    return {
+        "type": "benchmark_stage_attribution_metadata",
+        "run_index": int(run_index),
+        "variant": variant_label,
+        "step": int(step),
+        "path": str(path),
+        "layer": int(layer),
+        **{
+            name: json_float(value, None)
+            for name, value in zip(names, values)
+        },
+    }
+
+
 def short_exception(exc, limit=260):
     text = f"{type(exc).__name__}: {exc}"
     text = " ".join(str(text).split())
@@ -2340,8 +2426,2165 @@ def run_module_profile_pass(profile_fns, params, input_ids, rng, step,
     return records
 
 
+def create_v4174_stage_attribution_fns(cfg, mesh):
+    """Build isolated g4 stage executables without changing production code."""
+    module = importlib.import_module(MODEL_MODULES[V4174_MODEL_VERSION][0])
+    m = cfg["model"]
+    t = cfg["training"]
+    if str(m.get("operation_space_execution_mode")) != "bundle_dense":
+        raise RuntimeError(
+            "v4174 stage attribution requires production bundle_dense")
+    if str(m.get("srw_composition_mode")) != "linear_angular":
+        raise RuntimeError(
+            "v4174 stage attribution requires the g4 linear_angular path")
+
+    n_spaces = int(m["n_operation_spaces"])
+    top_k = int(m["operation_space_top_k"])
+    bundle_size = int(m["operation_space_bundle_size"])
+    bundle_tokens = int(m["operation_space_bundle_token_block_size"])
+    model_axis_size = int(mesh.shape["model"])
+    if top_k != 2 or bundle_size != 4:
+        raise RuntimeError(
+            "v4174 stage attribution requires exact top-2 bundle4")
+    local_counts = {
+        route: int(m[f"n_{route}"]) // (model_axis_size * n_spaces)
+        for route in ("q", "k", "v", "rst")
+    }
+    chunks = {
+        route: max(1, int(t.get(f"n_chunks_{route}", 1)))
+        for route in ("q", "k", "v", "rst")
+    }
+    chunk_sizes = {
+        route: max(1, math.ceil(local_counts[route] / chunks[route]))
+        for route in ("q", "k", "v", "rst")
+    }
+    if (local_counts["q"] != local_counts["k"]
+            or chunks["q"] != chunks["k"]):
+        raise RuntimeError("g4 Q/K attribution requires matched local chunks")
+
+    soft_gate_t = jnp.float32(t.get("soft_gate_temperature", 0.07))
+    boundary_power = jnp.float32(t.get(
+        "soft_gate_boundary_power_final",
+        t.get("soft_gate_boundary_power_mid",
+              t.get("soft_gate_boundary_power_start", 4.0))))
+    execution_prune_eps = jnp.float32(0.0)
+    heat_kernel_beta = float(m.get(
+        "heat_kernel_beta", module.DEFAULT_HEAT_KERNEL_BETA))
+    effective_active_eps = 1.0e-6
+    qk_scale, v_scale, rst_scale = module._shared_pool_output_scales(
+        int(m["d_model"]), int(m["n_layers"]))
+    den_qkv = jnp.asarray(
+        (float(m["admission_den_power_qk"]),
+         float(m["admission_den_power_qk"]),
+         float(m["admission_den_power_v"])),
+        dtype=jnp.float32).reshape((3, 1, 1, 1))
+    den_rst = jnp.asarray(
+        (float(m["admission_den_power_rst"]),),
+        dtype=jnp.float32).reshape((1, 1, 1, 1))
+
+    def d_spec(local_ndim):
+        return P("data", *([None] * int(local_ndim)))
+
+    def dm_spec(local_ndim):
+        return P("data", "model", *([None] * int(local_ndim)))
+
+    def wrap_d(value):
+        return jnp.expand_dims(value, axis=0)
+
+    def unwrap_d(value):
+        return value[0]
+
+    def wrap_dm(value):
+        return value[None, None, ...]
+
+    def unwrap_dm(value):
+        return value[0, 0]
+
+    def mapped(fn, in_specs, out_specs):
+        return jax.jit(shard_map(
+            fn,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False))
+
+    def route_core(flat_state, query_kernel, route_keys):
+        routing = module._select_operation_spaces(
+            flat_state, query_kernel, route_keys, top_k)
+        return (
+            routing["selected_ids"].astype(jnp.int32),
+            routing["dense_space_weights"].astype(jnp.float32))
+
+    route_step = mapped(
+        route_core,
+        (P("data", None), P(), P()),
+        (P("data", None), P("data", None)))
+
+    def route_fwd_bwd_core(
+            flat_state, query_kernel, route_keys, dense_weight_cotangent):
+        def selected_weight_fn(state, kernel, keys):
+            return module._select_operation_spaces(
+                state, kernel, keys, top_k)[
+                    "dense_space_weights"].astype(jnp.float32)
+
+        weights, pullback = jax.vjp(
+            selected_weight_fn, flat_state, query_kernel, route_keys)
+        state_ct, kernel_ct, keys_ct = pullback(dense_weight_cotangent)
+        checksum = (
+            jnp.sum(jnp.square(weights))
+            + jnp.sum(jnp.square(state_ct.astype(jnp.float32)))
+            + jnp.sum(jnp.square(kernel_ct.astype(jnp.float32)))
+            + jnp.sum(jnp.square(keys_ct.astype(jnp.float32))))
+        return checksum, state_ct
+
+    route_fwd_bwd_step = mapped(
+        route_fwd_bwd_core,
+        (P("data", None), P(), P(), P("data", None)),
+        (P(), P("data", None)))
+
+    def bundle_pack_core(selected_ids, dense_weights):
+        packed = module._prefix_pack_top2_bundle_arrays_impl(
+            selected_ids, dense_weights, bundle_size, bundle_tokens)
+        return packed[:5]
+
+    bundle_pack_step = mapped(
+        bundle_pack_core,
+        (P("data", None), P("data", None)),
+        (
+            P("data"), P("data"), P("data", None),
+            P("data", None), P("data")))
+
+    exact_bucket = int(module._EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
+    overflow_group = int(module._EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
+
+    def exact_pack_core(selected_ids, dense_weights):
+        selected_weights = jnp.take_along_axis(
+            dense_weights, selected_ids, axis=1)
+        packed = module._prefix_pack_top2_space_buckets(
+            selected_ids,
+            selected_weights,
+            operation_space_count=n_spaces,
+            bucket_capacity=min(exact_bucket, int(selected_ids.shape[0])),
+            task_group_size=overflow_group)
+        return (
+            wrap_d(packed["primary_token_id"]),
+            wrap_d(packed["primary_routing_weight"]),
+            wrap_d(packed["primary_token_valid"]),
+            wrap_d(packed["overflow_task_space_id"]),
+            wrap_d(packed["overflow_task_token_id"]),
+            wrap_d(packed["overflow_task_routing_weight"]),
+            wrap_d(packed["overflow_task_token_valid"]),
+            wrap_d(packed["space_counts"]))
+
+    exact_pack_step = mapped(
+        exact_pack_core,
+        (P("data", None), P("data", None)),
+        (
+            d_spec(2), d_spec(2), d_spec(2), d_spec(1),
+            d_spec(2), d_spec(2), d_spec(2), d_spec(1)))
+
+    def exact_pack_stats_core(primary_valid, overflow_valid, space_counts):
+        primary = unwrap_d(primary_valid)
+        overflow = unwrap_d(overflow_valid)
+        counts = unwrap_d(space_counts).astype(jnp.float32)
+        primary_valid_pairs = jax.lax.psum(
+            primary.astype(jnp.float32).sum(), "data")
+        primary_capacity_pairs = jax.lax.psum(
+            jnp.float32(primary.size), "data")
+        overflow_valid_pairs = jax.lax.psum(
+            overflow.astype(jnp.float32).sum(), "data")
+        overflow_active_tasks = jax.lax.psum(
+            jnp.any(overflow, axis=-1).astype(jnp.float32).sum(), "data")
+        overflow_task_capacity = jax.lax.psum(
+            jnp.float32(overflow.shape[0]), "data")
+        overflow_pair_capacity = jax.lax.psum(
+            jnp.float32(overflow.size), "data")
+        overflow_padding = jnp.maximum(
+            overflow_pair_capacity - overflow_valid_pairs, 0.0)
+        global_counts = jax.lax.psum(counts, "data")
+        return jnp.stack((
+            primary_valid_pairs,
+            primary_capacity_pairs,
+            overflow_valid_pairs,
+            overflow_active_tasks,
+            overflow_task_capacity,
+            overflow_padding,
+            overflow_padding / jnp.maximum(overflow_pair_capacity, 1.0),
+            global_counts.min(),
+            global_counts.mean(),
+            global_counts.max(),
+        ))
+
+    exact_pack_stats_step = mapped(
+        exact_pack_stats_core,
+        (d_spec(2), d_spec(2), d_spec(1)),
+        P())
+
+    def make_route_weight_scatter_step(local_token_count):
+        def scatter_core(
+                primary_token, primary_valid, overflow_space,
+                overflow_token, overflow_valid, primary_ct, overflow_ct):
+            packed = {
+                "primary_token_id": unwrap_d(primary_token),
+                "primary_token_valid": unwrap_d(primary_valid),
+                "overflow_task_space_id": unwrap_d(overflow_space),
+                "overflow_task_token_id": unwrap_d(overflow_token),
+                "overflow_task_token_valid": unwrap_d(overflow_valid),
+            }
+            return module._exact_space_bucket_weight_cotangents_to_dense(
+                packed,
+                unwrap_d(primary_ct),
+                unwrap_d(overflow_ct),
+                token_count=int(local_token_count),
+                operation_space_count=n_spaces)
+
+        return mapped(
+            scatter_core,
+            (
+                d_spec(2), d_spec(2), d_spec(1), d_spec(2),
+                d_spec(2), d_spec(2), d_spec(2)),
+            P("data", None))
+
+    def materializer(executor):
+        if executor == "bundle":
+            def materialize(
+                    flat_state, packed_bundle, packed_token,
+                    packed_membership, packed_weight, packed_valid,
+                    call_index):
+                start = call_index * bundle_tokens
+                bundle_id = jax.lax.dynamic_index_in_dim(
+                    packed_bundle, start, axis=0, keepdims=False)
+                safe_bundle = jnp.minimum(
+                    bundle_id, jnp.int32(n_spaces // bundle_size - 1))
+                token = jax.lax.dynamic_slice_in_dim(
+                    packed_token, start, bundle_tokens, axis=0)
+                packed_ok = jax.lax.dynamic_slice_in_dim(
+                    packed_valid, start, bundle_tokens, axis=0)
+                membership = jax.lax.dynamic_slice_in_dim(
+                    packed_membership, start, bundle_tokens, axis=0)
+                weight = jax.lax.dynamic_slice_in_dim(
+                    packed_weight, start, bundle_tokens, axis=0)
+                valid = jnp.swapaxes(membership, 0, 1) & packed_ok[None, :]
+                state = flat_state[token]
+                spaces = (
+                    safe_bundle * bundle_size
+                    + jnp.arange(bundle_size, dtype=jnp.int32))
+                active = bundle_id < (n_spaces // bundle_size)
+                return (
+                    wrap_d(state),
+                    wrap_d(token),
+                    wrap_d(valid),
+                    wrap_d(jnp.swapaxes(weight, 0, 1)),
+                    wrap_d(spaces),
+                    wrap_d(active))
+
+            return mapped(
+                materialize,
+                (
+                    P("data", None), P("data"), P("data"),
+                    P("data", None), P("data", None), P("data"), P()),
+                (
+                    d_spec(2), d_spec(1), d_spec(2),
+                    d_spec(2), d_spec(1), d_spec(0)))
+
+        if executor == "primary":
+            def materialize(flat_state, token, weight, valid, call_index):
+                del call_index
+                token_local = unwrap_d(token)
+                return (
+                    wrap_d(flat_state[token_local]),
+                    token,
+                    valid,
+                    weight,
+                    wrap_d(jnp.arange(n_spaces, dtype=jnp.int32)),
+                    wrap_d(jnp.asarray(True, dtype=jnp.bool_)))
+
+            return mapped(
+                materialize,
+                (P("data", None), d_spec(2), d_spec(2), d_spec(2), P()),
+                (
+                    d_spec(3), d_spec(2), d_spec(2),
+                    d_spec(2), d_spec(1), d_spec(0)))
+
+        if executor != "overflow":
+            raise ValueError(f"unknown stage executor {executor!r}")
+
+        def materialize(flat_state, task_space, task_token,
+                        task_weight, task_valid, call_index):
+            start = call_index * overflow_group
+            spaces = jax.lax.dynamic_slice_in_dim(
+                unwrap_d(task_space), start, overflow_group, axis=0)
+            token = jax.lax.dynamic_slice_in_dim(
+                unwrap_d(task_token), start, overflow_group, axis=0)
+            weight = jax.lax.dynamic_slice_in_dim(
+                unwrap_d(task_weight), start, overflow_group, axis=0)
+            valid = jax.lax.dynamic_slice_in_dim(
+                unwrap_d(task_valid), start, overflow_group, axis=0)
+            spaces = jnp.minimum(spaces, jnp.int32(n_spaces - 1))
+            active = jnp.any(valid)
+            state = jax.lax.cond(
+                active,
+                lambda _: flat_state[token],
+                lambda _: jnp.zeros(
+                    (*token.shape, flat_state.shape[-1]),
+                    dtype=flat_state.dtype),
+                operand=None)
+            return (
+                wrap_d(state), wrap_d(token), wrap_d(valid),
+                wrap_d(weight), wrap_d(spaces), wrap_d(active))
+
+        return mapped(
+            materialize,
+            (
+                P("data", None), d_spec(1), d_spec(2),
+                d_spec(2), d_spec(2), P()),
+            (
+                d_spec(3), d_spec(2), d_spec(2),
+                d_spec(2), d_spec(1), d_spec(0)))
+
+    def select_space_param(value, spaces, executor):
+        if executor == "primary":
+            return value
+        return value[spaces]
+
+    def p_stage(executor):
+        state_ndim = 2 if executor == "bundle" else 3
+
+        def p_core(state, spaces, active, read_proj):
+            state_local = unwrap_d(state)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                projection = select_space_param(
+                    read_proj, spaces_local, executor)
+                if executor == "bundle":
+                    local = module._throughput_einsum_bf16_f32(
+                        "td,gdr->gtr", state_local, projection)
+                else:
+                    local = module._throughput_einsum_bf16_f32(
+                        "gtd,gdr->gtr", state_local, projection)
+                local = local.astype(jnp.float32)
+                norm = jnp.maximum(
+                    jnp.linalg.norm(local, axis=-1, keepdims=True),
+                    jnp.float32(module.RW_FORWARD_NORM_EPS))
+                return local, norm
+
+            group_count = (
+                bundle_size if executor in ("bundle", "overflow")
+                else n_spaces)
+            token_capacity = int(state_local.shape[-2])
+            zeros = (
+                jnp.zeros(
+                    (group_count, token_capacity, int(m["d_route"])),
+                    dtype=jnp.float32),
+                jnp.zeros(
+                    (group_count, token_capacity, 1),
+                    dtype=jnp.float32))
+            local, norm = jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None)
+            return wrap_d(local), wrap_d(norm)
+
+        return mapped(
+            p_core,
+            (d_spec(state_ndim), d_spec(1), d_spec(0), P()),
+            (d_spec(3), d_spec(3)))
+
+    def tau_stage(path, executor):
+        if path == "qkv":
+            def tau_core(
+                    local, spaces, active,
+                    q_kernel, q_bias, k_kernel, k_bias,
+                    v_kernel, v_bias):
+                local_f32 = unwrap_d(local)
+                spaces_local = unwrap_d(spaces)
+                active_local = unwrap_d(active)
+
+                def execute(_):
+                    qk_kernel = jnp.stack((
+                        select_space_param(q_kernel, spaces_local, executor),
+                        select_space_param(k_kernel, spaces_local, executor)))
+                    qk_bias = jnp.stack((
+                        select_space_param(q_bias, spaces_local, executor),
+                        select_space_param(k_bias, spaces_local, executor)))
+                    qk_tau = (
+                        module._control_einsum_f32(
+                            "gtr,agri->agti", local_f32, qk_kernel)
+                        + qk_bias[:, :, None, :])
+                    vk = select_space_param(
+                        v_kernel, spaces_local, executor)
+                    vb = select_space_param(
+                        v_bias, spaces_local, executor)
+                    v_tau = (
+                        module._control_einsum_f32(
+                            "gtr,gri->gti", local_f32, vk)
+                        + vb[:, None, :])
+                    return qk_tau, v_tau[None, ...]
+
+                group_count = int(local_f32.shape[0])
+                token_capacity = int(local_f32.shape[1])
+                zeros = (
+                    jnp.zeros(
+                        (2, group_count, token_capacity, 1),
+                        dtype=jnp.float32),
+                    jnp.zeros(
+                        (1, group_count, token_capacity, 1),
+                        dtype=jnp.float32))
+                qk_tau, v_tau = jax.lax.cond(
+                    active_local, execute, lambda _: zeros, operand=None)
+                return wrap_d(qk_tau), wrap_d(v_tau)
+
+            return mapped(
+                tau_core,
+                (
+                    d_spec(3), d_spec(1), d_spec(0),
+                    P(), P(), P(), P(), P(), P()),
+                (d_spec(4), d_spec(4)))
+
+        def tau_core(local, spaces, active, kernel, bias):
+            local_f32 = unwrap_d(local)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                selected_kernel = select_space_param(
+                    kernel, spaces_local, executor)
+                selected_bias = select_space_param(
+                    bias, spaces_local, executor)
+                return (
+                    module._control_einsum_f32(
+                        "gtr,gri->gti", local_f32, selected_kernel)
+                    + selected_bias[:, None, :])[None, ...]
+
+            zeros = jnp.zeros(
+                (1, int(local_f32.shape[0]), int(local_f32.shape[1]), 1),
+                dtype=jnp.float32)
+            return wrap_d(jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None))
+
+        return mapped(
+            tau_core,
+            (d_spec(3), d_spec(1), d_spec(0), P(), P()),
+            d_spec(4))
+
+    def pool_static(pool):
+        if pool == "qk":
+            return 2, local_counts["q"], chunk_sizes["q"], chunks["q"]
+        return (
+            1, local_counts[pool], chunk_sizes[pool], chunks[pool])
+
+    def select_pool_bank(bank_args, spaces, executor, pool):
+        if pool == "qk":
+            q_bank, k_bank = bank_args
+            return jnp.stack((
+                select_space_param(q_bank, spaces, executor),
+                select_space_param(k_bank, spaces, executor)))
+        return select_space_param(bank_args[0], spaces, executor)[None, ...]
+
+    def bank_specs(pool):
+        return (
+            (P(None, "model", None), P(None, "model", None))
+            if pool == "qk" else (P(None, "model", None),))
+
+    def rw_read_stage(pool, executor):
+        routes, n_local, chunk_size, n_chunks = pool_static(pool)
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - n_local
+
+        def read_core(local, spaces, active, chunk_index, *bank_args):
+            local_f32 = unwrap_d(local)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                bank = select_pool_bank(
+                    bank_args, spaces_local, executor, pool)
+                bank = jnp.pad(
+                    bank, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+                raw_chunk = jax.lax.dynamic_slice_in_dim(
+                    bank, chunk_index * chunk_size, chunk_size, axis=2)
+                read = module.forward_unit_direction(raw_chunk)
+                return module._throughput_einsum_bf16_f32(
+                    "gtr,agnr->agtn", local_f32, read
+                ).astype(jnp.float32)
+
+            zeros = jnp.zeros(
+                (routes, int(local_f32.shape[0]),
+                 int(local_f32.shape[1]), chunk_size),
+                dtype=jnp.float32)
+            return wrap_dm(jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None))
+
+        return mapped(
+            read_core,
+            (d_spec(3), d_spec(1), d_spec(0), P(), *bank_specs(pool)),
+            dm_spec(4))
+
+    def gate_stage(pool):
+        routes, n_local, chunk_size, _n_chunks = pool_static(pool)
+
+        def gate_primal(
+                read_f32, norm_f32, tau_raw, valid_tokens, chunk_index):
+            row_valid = (
+                jnp.arange(chunk_size)
+                + chunk_index * chunk_size < n_local)
+            valid = (
+                valid_tokens[None, ..., None]
+                & row_valid[None, None, None, :])
+            tau = module._shared_tau_from_param(tau_raw)
+            rho = jnp.clip(
+                read_f32 / norm_f32[None, ...], -1.0, 1.0)
+            rho_compute = jnp.where(valid, rho, tau)
+            _, gate, _, execution_weight, _ = (
+                module._shared_compute_admission_drive(
+                    rho_compute,
+                    tau,
+                    soft_gate_t,
+                    boundary_power=boundary_power,
+                    effective_active_eps=jnp.float32(
+                        effective_active_eps),
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode="linear_angular",
+                    heat_kernel_beta=jnp.float32(heat_kernel_beta)))
+            gate = jnp.where(valid, gate, 0.0)
+            execution_weight = jnp.where(
+                valid, execution_weight, 0.0)
+            return (
+                execution_weight * read_f32,
+                gate.sum(axis=-1, keepdims=True))
+
+        def gate_core(
+                read_value, local_norm, raw_tau, token_valid,
+                active, chunk_index):
+            read_f32 = unwrap_dm(read_value)
+            norm_f32 = unwrap_d(local_norm)
+            tau_raw = unwrap_d(raw_tau)
+            valid_tokens = unwrap_d(token_valid)
+            active_local = unwrap_d(active)
+            zeros = (
+                jnp.zeros_like(read_f32),
+                jnp.zeros(
+                    (routes, int(read_f32.shape[1]),
+                     int(read_f32.shape[2]), 1),
+                    dtype=jnp.float32))
+            weighted, gate_mass = jax.lax.cond(
+                active_local,
+                lambda _: gate_primal(
+                    read_f32, norm_f32, tau_raw,
+                    valid_tokens, chunk_index),
+                lambda _: zeros,
+                operand=None)
+            return wrap_dm(weighted), wrap_dm(gate_mass)
+
+        return mapped(
+            gate_core,
+            (
+                dm_spec(4), d_spec(3), d_spec(4), d_spec(2),
+                d_spec(0), P()),
+            (dm_spec(4), dm_spec(4)))
+
+    def rw_write_stage(pool, executor):
+        _routes, n_local, chunk_size, n_chunks = pool_static(pool)
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - n_local
+
+        def write_core(
+                weighted_read, gate_chunk, raw_carry, gate_carry,
+                spaces, active, chunk_index, *bank_args):
+            weighted = unwrap_dm(weighted_read)
+            gate_value = unwrap_dm(gate_chunk)
+            raw_value = unwrap_dm(raw_carry)
+            gate_value_carry = unwrap_dm(gate_carry)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                bank = select_pool_bank(
+                    bank_args, spaces_local, executor, pool)
+                bank = jnp.pad(
+                    bank, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+                raw_chunk = jax.lax.dynamic_slice_in_dim(
+                    bank, chunk_index * chunk_size, chunk_size, axis=2)
+                write = module.forward_unit_direction(raw_chunk)
+                chunk_out = module._throughput_einsum_bf16_f32(
+                    "agtn,agnr->agtr", weighted, write
+                ).astype(jnp.float32)
+                return (
+                    raw_value + chunk_out,
+                    gate_value_carry + gate_value)
+
+            raw_value, gate_value_carry = jax.lax.cond(
+                active_local,
+                execute,
+                lambda _: (raw_value, gate_value_carry),
+                operand=None)
+            return wrap_dm(raw_value), wrap_dm(gate_value_carry)
+
+        return mapped(
+            write_core,
+            (
+                dm_spec(4), dm_spec(4), dm_spec(4), dm_spec(4),
+                d_spec(1), d_spec(0), P(), *bank_specs(pool)),
+            (dm_spec(4), dm_spec(4)))
+
+    def rw_init_stage(pool):
+        routes, _n_local, _chunk_size, _n_chunks = pool_static(pool)
+
+        def init_core(local):
+            local_f32 = unwrap_d(local)
+            shape = (
+                routes, int(local_f32.shape[0]),
+                int(local_f32.shape[1]), int(local_f32.shape[2]))
+            return (
+                wrap_dm(jnp.zeros(shape, dtype=jnp.float32)),
+                wrap_dm(jnp.zeros((*shape[:-1], 1), dtype=jnp.float32)))
+
+        return mapped(
+            init_core, (d_spec(3),), (dm_spec(4), dm_spec(4)))
+
+    def denominator_stage(path):
+        den_powers = den_qkv if path == "qkv" else den_rst
+
+        def den_core(*pool_values):
+            if path == "qkv":
+                qk_raw, qk_gate, v_raw, v_gate = map(
+                    unwrap_dm, pool_values)
+                raw_out = jnp.concatenate((qk_raw, v_raw), axis=0)
+                gate_mass = jnp.concatenate((qk_gate, v_gate), axis=0)
+            else:
+                raw_out, gate_mass = map(unwrap_dm, pool_values)
+            global_gate_mass = jax.lax.psum(
+                gate_mass.astype(jnp.float32), "model")
+            gate_den = module._shared_composition_den(
+                global_gate_mass, den_powers, "linear_angular")
+            return (
+                wrap_dm((raw_out / gate_den).astype(jnp.float32)),
+                wrap_d(global_gate_mass),
+                wrap_d(gate_den))
+
+        if path == "qkv":
+            in_specs = (
+                dm_spec(4), dm_spec(4), dm_spec(4), dm_spec(4))
+        else:
+            in_specs = (dm_spec(4), dm_spec(4))
+        return mapped(
+            den_core, in_specs, (dm_spec(4), d_spec(4), d_spec(4)))
+
+    def u_stage(path, executor):
+        route_count = 3 if path == "qkv" else 1
+        scales = (
+            jnp.asarray(
+                (qk_scale, qk_scale, v_scale), dtype=jnp.float32)
+            if path == "qkv"
+            else jnp.asarray((rst_scale,), dtype=jnp.float32))
+
+        def u_core(
+                local_results, routing_weight, token_valid,
+                spaces, active, write_proj):
+            results = unwrap_dm(local_results)
+            weight = unwrap_d(routing_weight)
+            valid = unwrap_d(token_valid)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                writeback = select_space_param(
+                    write_proj, spaces_local, executor)
+                weighted = (
+                    results
+                    * weight[None, ..., None]
+                    * scales[:, None, None, None])
+                if executor == "bundle":
+                    output = module._throughput_einsum_bf16_f32(
+                        "agtr,grd->atd", weighted, writeback)
+                    output = jnp.where(
+                        jnp.any(valid, axis=0)[None, :, None],
+                        output, 0.0)
+                else:
+                    output = module._throughput_einsum_bf16_f32(
+                        "agtr,grd->agtd", weighted, writeback)
+                    output = jnp.where(
+                        valid[None, ..., None], output, 0.0)
+                return output.astype(jnp.float32)
+
+            token_capacity = int(weight.shape[-1])
+            if executor == "bundle":
+                zero_shape = (
+                    route_count, token_capacity, int(m["d_model"]))
+            else:
+                zero_shape = (
+                    route_count, int(weight.shape[0]), token_capacity,
+                    int(m["d_model"]))
+            output = jax.lax.cond(
+                active_local,
+                execute,
+                lambda _: jnp.zeros(zero_shape, dtype=jnp.float32),
+                operand=None)
+            return wrap_dm(output)
+
+        output_ndim = 3 if executor == "bundle" else 4
+        return mapped(
+            u_core,
+            (
+                dm_spec(4), d_spec(2), d_spec(2),
+                d_spec(1), d_spec(0), P()),
+            dm_spec(output_ndim))
+
+    def bundle_scatter_stage(path):
+        route_count = 3 if path == "qkv" else 1
+
+        def scatter_core(carry, block_output, token, valid, active):
+            output = unwrap_dm(carry)
+            block = unwrap_dm(block_output)
+            token_local = unwrap_d(token)
+            valid_local = unwrap_d(valid)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                block_valid = jnp.any(valid_local, axis=0)
+                masked = jnp.where(
+                    block_valid[None, :, None], block, 0.0)
+                return output.at[:, token_local, :].add(masked)
+
+            output = jax.lax.cond(
+                active_local, execute, lambda _: output, operand=None)
+            return wrap_dm(output)
+
+        return mapped(
+            scatter_core,
+            (dm_spec(3), dm_spec(3), d_spec(1), d_spec(2), d_spec(0)),
+            dm_spec(3))
+
+    def make_output_init_step(route_count):
+        def output_init_core(flat_state):
+            return wrap_dm(jnp.zeros(
+                (route_count,
+                 int(flat_state.shape[0]),
+                 int(flat_state.shape[1])),
+                dtype=jnp.float32))
+
+        return mapped(output_init_core, (P("data", None),), dm_spec(3))
+
+    output_init_steps = {
+        "qkv": make_output_init_step(3),
+        "rst": make_output_init_step(1),
+    }
+
+    def output_collective_core(local_output):
+        local = unwrap_dm(local_output)
+        return jax.lax.psum(
+            local.astype(jnp.bfloat16), "model").astype(jnp.float32)
+
+    output_collective_step = mapped(
+        output_collective_core, (dm_spec(3),), P(None, "data", None))
+
+    def exact_output_cotangent_stage(path):
+        route_scales = (
+            (1.0, 0.5, 0.25) if path == "qkv" else (1.0,))
+
+        def cotangent_core(flat_state):
+            token_count = int(flat_state.shape[0])
+            d_model = int(flat_state.shape[1])
+            values = jnp.asarray(
+                route_scales, dtype=jnp.float32).reshape((-1, 1, 1))
+            return values * jnp.ones(
+                (len(route_scales), token_count, d_model),
+                dtype=jnp.float32) / jnp.float32(token_count * d_model)
+
+        return mapped(
+            cotangent_core, (P("data", None),), P(None, "data", None))
+
+    def exact_output_gather_stage(path):
+        route_count = 3 if path == "qkv" else 1
+
+        def gather_core(global_ct, token, valid, active):
+            token_local = unwrap_d(token)
+            valid_local = unwrap_d(valid)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                gathered = global_ct[:, token_local, :]
+                return jnp.where(
+                    valid_local[None, ..., None], gathered, 0.0)
+
+            zeros = jnp.zeros(
+                (route_count, *token_local.shape, int(global_ct.shape[-1])),
+                dtype=jnp.float32)
+            return wrap_d(jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None))
+
+        return mapped(
+            gather_core,
+            (P(None, "data", None), d_spec(2), d_spec(2), d_spec(0)),
+            d_spec(4))
+
+    def u_backward_stage(path, executor):
+        route_count = 3 if path == "qkv" else 1
+        scales = (
+            jnp.asarray(
+                (qk_scale, qk_scale, v_scale), dtype=jnp.float32)
+            if path == "qkv"
+            else jnp.asarray((rst_scale,), dtype=jnp.float32))
+
+        def u_bwd_core(
+                local_results, routing_weight, token_valid, spaces,
+                active, write_proj, block_output_cotangent):
+            results = unwrap_dm(local_results)
+            weight = unwrap_d(routing_weight)
+            valid = unwrap_d(token_valid)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+            block_ct = unwrap_d(block_output_cotangent)
+
+            def execute(_):
+                writeback = select_space_param(
+                    write_proj, spaces_local, executor)
+                valid_ct = jnp.where(
+                    valid[None, ..., None], block_ct, 0.0)
+                weighted_results = (
+                    results
+                    * weight[None, ..., None]
+                    * scales[:, None, None, None])
+                weighted_ct = module._dense_rw_vjp_dot(
+                    "agtd,grd->agtr",
+                    valid_ct,
+                    writeback.astype(jnp.bfloat16),
+                    throughput_bf16=True)
+                write_ct = module._dense_rw_vjp_dot(
+                    "agtr,agtd->grd",
+                    weighted_results.astype(jnp.bfloat16),
+                    valid_ct,
+                    throughput_bf16=True)
+                local_ct = (
+                    weighted_ct
+                    * weight[None, ..., None]
+                    * scales[:, None, None, None])
+                weight_ct = (
+                    weighted_ct
+                    * results
+                    * scales[:, None, None, None]
+                ).sum(axis=(0, 3))
+                scale_ct = (
+                    weighted_ct * results * weight[None, ..., None]
+                ).sum(axis=(1, 2, 3))
+                checksum = (
+                    jnp.sum(jnp.square(write_ct))
+                    + jnp.sum(jnp.square(scale_ct)))
+                return local_ct, weight_ct, checksum
+
+            zeros = (
+                jnp.zeros_like(results),
+                jnp.zeros_like(weight),
+                jnp.float32(0.0))
+            local_ct, weight_ct, checksum = jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None)
+            return (
+                wrap_dm(local_ct),
+                wrap_dm(weight_ct),
+                wrap_dm(checksum))
+
+        return mapped(
+            u_bwd_core,
+            (
+                dm_spec(4), d_spec(2), d_spec(2), d_spec(1),
+                d_spec(0), P(), d_spec(4)),
+            (dm_spec(4), dm_spec(2), dm_spec(0)))
+
+    def denominator_backward_stage(path):
+        den_powers = den_qkv if path == "qkv" else den_rst
+
+        def den_bwd_core(*values):
+            if path == "qkv":
+                (qk_raw, qk_gate, v_raw, v_gate,
+                 local_results_ct) = values
+                raw_out = jnp.concatenate(
+                    (unwrap_dm(qk_raw), unwrap_dm(v_raw)), axis=0)
+                gate_mass = jnp.concatenate(
+                    (unwrap_dm(qk_gate), unwrap_dm(v_gate)), axis=0)
+            else:
+                raw_out, gate_mass, local_results_ct = values
+                raw_out = unwrap_dm(raw_out)
+                gate_mass = unwrap_dm(gate_mass)
+            local_ct = unwrap_dm(local_results_ct)
+            global_gate_mass = jax.lax.psum(
+                gate_mass.astype(jnp.float32), "model")
+            gate_den = module._shared_composition_den(
+                global_gate_mass, den_powers, "linear_angular")
+            raw_ct = local_ct / gate_den
+            den_ct = -(
+                local_ct * raw_out / jnp.square(gate_den)
+            ).sum(axis=-1, keepdims=True)
+            global_mass_ct = module._composition_den_mass_pullback(
+                global_gate_mass, den_ct, den_powers, "linear_angular")
+            gate_ct = jax.lax.psum(global_mass_ct, "model")
+            return wrap_dm(raw_ct), wrap_dm(gate_ct)
+
+        if path == "qkv":
+            in_specs = (
+                dm_spec(4), dm_spec(4), dm_spec(4),
+                dm_spec(4), dm_spec(4))
+        else:
+            in_specs = (dm_spec(4), dm_spec(4), dm_spec(4))
+        return mapped(
+            den_bwd_core, in_specs, (dm_spec(4), dm_spec(4)))
+
+    def rw_write_backward_stage(pool, executor):
+        _routes, n_local, chunk_size, n_chunks = pool_static(pool)
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - n_local
+
+        def write_bwd_core(
+                weighted_read, raw_out_cotangent, spaces,
+                active, chunk_index, *bank_args):
+            weighted = unwrap_dm(weighted_read)
+            raw_ct = unwrap_dm(raw_out_cotangent)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                bank = select_pool_bank(
+                    bank_args, spaces_local, executor, pool)
+                bank = jnp.pad(
+                    bank, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+                raw_chunk = jax.lax.dynamic_slice_in_dim(
+                    bank, chunk_index * chunk_size, chunk_size, axis=2)
+                write = module.forward_unit_direction(raw_chunk)
+                weighted_ct = module._dense_rw_vjp_dot(
+                    "agtr,agnr->agtn",
+                    raw_ct,
+                    write.astype(jnp.bfloat16),
+                    throughput_bf16=True)
+                write_unit_ct = module._dense_rw_vjp_dot(
+                    "agtn,agtr->agnr",
+                    weighted.astype(jnp.bfloat16),
+                    raw_ct,
+                    throughput_bf16=True)
+                raw_write_ct = module._forward_unit_direction_vjp(
+                    raw_chunk, write_unit_ct)
+                return weighted_ct, jnp.sum(jnp.square(raw_write_ct))
+
+            zeros = (jnp.zeros_like(weighted), jnp.float32(0.0))
+            weighted_ct, checksum = jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None)
+            return wrap_dm(weighted_ct), wrap_dm(checksum)
+
+        return mapped(
+            write_bwd_core,
+            (
+                dm_spec(4), dm_spec(4), d_spec(1),
+                d_spec(0), P(), *bank_specs(pool)),
+            (dm_spec(4), dm_spec(0)))
+
+    def gate_backward_stage(pool):
+        routes, n_local, chunk_size, _n_chunks = pool_static(pool)
+
+        def gate_primal(read_f32, norm_f32, tau_raw, valid_tokens,
+                        chunk_index):
+            row_valid = (
+                jnp.arange(chunk_size)
+                + chunk_index * chunk_size < n_local)
+            valid = (
+                valid_tokens[None, ..., None]
+                & row_valid[None, None, None, :])
+            tau = module._shared_tau_from_param(tau_raw)
+            rho = jnp.clip(
+                read_f32 / norm_f32[None, ...], -1.0, 1.0)
+            rho_compute = jnp.where(valid, rho, tau)
+            _, gate, _, execution_weight, _ = (
+                module._shared_compute_admission_drive(
+                    rho_compute,
+                    tau,
+                    soft_gate_t,
+                    boundary_power=boundary_power,
+                    effective_active_eps=jnp.float32(
+                        effective_active_eps),
+                    execution_prune_eps=execution_prune_eps,
+                    srw_composition_mode="linear_angular",
+                    heat_kernel_beta=jnp.float32(heat_kernel_beta)))
+            gate = jnp.where(valid, gate, 0.0)
+            execution_weight = jnp.where(
+                valid, execution_weight, 0.0)
+            return (
+                execution_weight * read_f32,
+                gate.sum(axis=-1, keepdims=True))
+
+        def gate_bwd_core(
+                read_value, local_norm, raw_tau, token_valid,
+                weighted_cotangent, gate_cotangent, active, chunk_index):
+            read_f32 = unwrap_dm(read_value)
+            norm_f32 = unwrap_d(local_norm)
+            tau_raw = unwrap_d(raw_tau)
+            valid_tokens = unwrap_d(token_valid)
+            weighted_ct = unwrap_dm(weighted_cotangent)
+            gate_ct = unwrap_dm(gate_cotangent)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                _, pullback = jax.vjp(
+                    lambda read, norm, tau: gate_primal(
+                        read, norm, tau, valid_tokens, chunk_index),
+                    read_f32, norm_f32, tau_raw)
+                return pullback((weighted_ct, gate_ct))
+
+            zeros = (
+                jnp.zeros_like(read_f32),
+                jnp.zeros_like(norm_f32),
+                jnp.zeros_like(tau_raw))
+            read_ct, norm_ct, tau_ct = jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None)
+            return wrap_dm(read_ct), wrap_dm(norm_ct), wrap_dm(tau_ct)
+
+        return mapped(
+            gate_bwd_core,
+            (
+                dm_spec(4), d_spec(3), d_spec(4), d_spec(2),
+                dm_spec(4), dm_spec(4), d_spec(0), P()),
+            (dm_spec(4), dm_spec(3), dm_spec(4)))
+
+    def rw_read_backward_stage(pool, executor):
+        _routes, n_local, chunk_size, n_chunks = pool_static(pool)
+        n_padded = n_chunks * chunk_size
+        pad_n = n_padded - n_local
+
+        def read_bwd_core(
+                local, read_value_cotangent, norm_cotangent,
+                tau_cotangent, local_carry, norm_carry, tau_carry,
+                spaces, active, chunk_index, *bank_args):
+            local_f32 = unwrap_d(local)
+            read_ct = unwrap_dm(read_value_cotangent)
+            norm_ct = unwrap_dm(norm_cotangent)
+            tau_ct = unwrap_dm(tau_cotangent)
+            local_value = unwrap_dm(local_carry)
+            norm_value = unwrap_dm(norm_carry)
+            tau_value = unwrap_dm(tau_carry)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                bank = select_pool_bank(
+                    bank_args, spaces_local, executor, pool)
+                bank = jnp.pad(
+                    bank, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+                raw_chunk = jax.lax.dynamic_slice_in_dim(
+                    bank, chunk_index * chunk_size, chunk_size, axis=2)
+                read = module.forward_unit_direction(raw_chunk)
+                chunk_local_ct = module._dense_rw_vjp_dot(
+                    "agtn,agnr->gtr",
+                    read_ct,
+                    read.astype(jnp.bfloat16),
+                    throughput_bf16=True)
+                read_unit_ct = module._dense_rw_vjp_dot(
+                    "agtn,gtr->agnr",
+                    read_ct,
+                    local_f32.astype(jnp.bfloat16),
+                    throughput_bf16=True)
+                raw_read_ct = module._forward_unit_direction_vjp(
+                    raw_chunk, read_unit_ct)
+                return (
+                    local_value + chunk_local_ct[None, ...],
+                    norm_value + norm_ct,
+                    tau_value + tau_ct,
+                    jnp.sum(jnp.square(raw_read_ct)))
+
+            result = jax.lax.cond(
+                active_local,
+                execute,
+                lambda _: (
+                    local_value, norm_value, tau_value, jnp.float32(0.0)),
+                operand=None)
+            return (
+                wrap_dm(result[0]), wrap_dm(result[1]),
+                wrap_dm(result[2]), wrap_dm(result[3]))
+
+        return mapped(
+            read_bwd_core,
+            (
+                d_spec(3), dm_spec(4), dm_spec(3), dm_spec(4),
+                dm_spec(4), dm_spec(3), dm_spec(4),
+                d_spec(1), d_spec(0), P(), *bank_specs(pool)),
+            (dm_spec(4), dm_spec(3), dm_spec(4), dm_spec(0)))
+
+    def rw_backward_init_stage(pool):
+        routes, _n_local, _chunk_size, _n_chunks = pool_static(pool)
+
+        def init_core(local):
+            local_f32 = unwrap_d(local)
+            g, token_capacity, d_route = map(int, local_f32.shape)
+            return (
+                wrap_dm(jnp.zeros(
+                    (1, g, token_capacity, d_route),
+                    dtype=jnp.float32)),
+                wrap_dm(jnp.zeros(
+                    (g, token_capacity, 1),
+                    dtype=jnp.float32)),
+                wrap_dm(jnp.zeros(
+                    (routes, g, token_capacity, 1),
+                    dtype=jnp.float32)))
+
+        return mapped(
+            init_core,
+            (d_spec(3),),
+            (dm_spec(4), dm_spec(3), dm_spec(4)))
+
+    def tau_backward_stage(path, executor):
+        if path == "qkv":
+            def tau_bwd_core(
+                    local, spaces, active, qk_tau_ct, v_tau_ct,
+                    q_kernel, q_bias, k_kernel, k_bias,
+                    v_kernel, v_bias):
+                del q_bias, k_bias, v_bias
+                local_f32 = unwrap_d(local)
+                spaces_local = unwrap_d(spaces)
+                active_local = unwrap_d(active)
+                qk_ct = unwrap_dm(qk_tau_ct)
+                v_ct = unwrap_dm(v_tau_ct)
+
+                def execute(_):
+                    qk_kernel = jnp.stack((
+                        select_space_param(q_kernel, spaces_local, executor),
+                        select_space_param(k_kernel, spaces_local, executor)))
+                    vk = select_space_param(
+                        v_kernel, spaces_local, executor)
+                    qk_local_ct = module._control_einsum_f32(
+                        "agti,agri->gtr", qk_ct, qk_kernel)
+                    v_local_ct = module._control_einsum_f32(
+                        "gti,gri->gtr", v_ct[0], vk)
+                    qk_kernel_ct = module._control_einsum_f32(
+                        "gtr,agti->agri", local_f32, qk_ct)
+                    v_kernel_ct = module._control_einsum_f32(
+                        "gtr,gti->gri", local_f32, v_ct[0])
+                    bias_checksum = (
+                        jnp.sum(jnp.square(qk_ct.sum(axis=2)))
+                        + jnp.sum(jnp.square(v_ct.sum(axis=2))))
+                    return (
+                        qk_local_ct + v_local_ct,
+                        jnp.sum(jnp.square(qk_kernel_ct))
+                        + jnp.sum(jnp.square(v_kernel_ct))
+                        + bias_checksum)
+
+                zeros = (jnp.zeros_like(local_f32), jnp.float32(0.0))
+                local_ct, checksum = jax.lax.cond(
+                    active_local, execute, lambda _: zeros, operand=None)
+                return wrap_dm(local_ct[None, ...]), wrap_dm(checksum)
+
+            return mapped(
+                tau_bwd_core,
+                (
+                    d_spec(3), d_spec(1), d_spec(0),
+                    dm_spec(4), dm_spec(4),
+                    P(), P(), P(), P(), P(), P()),
+                (dm_spec(4), dm_spec(0)))
+
+        def tau_bwd_core(
+                local, spaces, active, tau_ct, kernel, bias):
+            del bias
+            local_f32 = unwrap_d(local)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+            raw_ct = unwrap_dm(tau_ct)[0]
+
+            def execute(_):
+                selected_kernel = select_space_param(
+                    kernel, spaces_local, executor)
+                local_ct = module._control_einsum_f32(
+                    "gti,gri->gtr", raw_ct, selected_kernel)
+                kernel_ct = module._control_einsum_f32(
+                    "gtr,gti->gri", local_f32, raw_ct)
+                checksum = (
+                    jnp.sum(jnp.square(kernel_ct))
+                    + jnp.sum(jnp.square(raw_ct.sum(axis=1))))
+                return local_ct, checksum
+
+            zeros = (jnp.zeros_like(local_f32), jnp.float32(0.0))
+            local_ct, checksum = jax.lax.cond(
+                active_local, execute, lambda _: zeros, operand=None)
+            return wrap_dm(local_ct[None, ...]), wrap_dm(checksum)
+
+        return mapped(
+            tau_bwd_core,
+            (
+                d_spec(3), d_spec(1), d_spec(0),
+                dm_spec(4), P(), P()),
+            (dm_spec(4), dm_spec(0)))
+
+    def dm_add_stage(local_ndim):
+        def add_core(lhs, rhs):
+            return wrap_dm(unwrap_dm(lhs) + unwrap_dm(rhs))
+
+        return mapped(
+            add_core,
+            (dm_spec(local_ndim), dm_spec(local_ndim)),
+            dm_spec(local_ndim))
+
+    def p_backward_stage(executor):
+        state_ndim = 2 if executor == "bundle" else 3
+
+        def p_bwd_core(
+                state, local, local_cotangent, norm_cotangent,
+                spaces, active, read_proj):
+            state_local = unwrap_d(state)
+            local_f32 = unwrap_d(local)
+            local_ct = unwrap_dm(local_cotangent)[0]
+            norm_ct = unwrap_dm(norm_cotangent)
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                projection = select_space_param(
+                    read_proj, spaces_local, executor)
+                raw_norm = jnp.linalg.norm(
+                    local_f32, axis=-1, keepdims=True)
+                norm_direction = jnp.where(
+                    raw_norm > 0.0,
+                    local_f32 / jnp.maximum(
+                        raw_norm, jnp.finfo(jnp.float32).tiny),
+                    0.0)
+                total_local_ct = (
+                    local_ct
+                    + norm_ct
+                    * module._maximum_floor_vjp_multiplier(
+                        raw_norm, module.RW_FORWARD_NORM_EPS)
+                    * norm_direction)
+                if executor == "bundle":
+                    state_ct = module._dense_rw_vjp_dot(
+                        "gtr,gdr->td",
+                        total_local_ct,
+                        projection.astype(jnp.bfloat16),
+                        throughput_bf16=True)
+                    projection_ct = module._dense_rw_vjp_dot(
+                        "td,gtr->gdr",
+                        state_local.astype(jnp.bfloat16),
+                        total_local_ct,
+                        throughput_bf16=True)
+                else:
+                    state_ct = module._dense_rw_vjp_dot(
+                        "gtr,gdr->gtd",
+                        total_local_ct,
+                        projection.astype(jnp.bfloat16),
+                        throughput_bf16=True)
+                    projection_ct = module._dense_rw_vjp_dot(
+                        "gtd,gtr->gdr",
+                        state_local.astype(jnp.bfloat16),
+                        total_local_ct,
+                        throughput_bf16=True)
+                return state_ct, jnp.sum(jnp.square(projection_ct))
+
+            state_zero = jnp.zeros_like(state_local, dtype=jnp.float32)
+            state_ct, checksum = jax.lax.cond(
+                active_local,
+                execute,
+                lambda _: (state_zero, jnp.float32(0.0)),
+                operand=None)
+            return wrap_dm(state_ct), wrap_dm(checksum)
+
+        return mapped(
+            p_bwd_core,
+            (
+                d_spec(state_ndim), d_spec(3), dm_spec(4), dm_spec(3),
+                d_spec(1), d_spec(0), P()),
+            (dm_spec(state_ndim), dm_spec(0)))
+
+    def model_psum_stage(local_ndim):
+        def psum_core(local_partial):
+            value = unwrap_dm(local_partial)
+            return wrap_d(jax.lax.psum(value, "model"))
+
+        return mapped(
+            psum_core, (dm_spec(local_ndim),), d_spec(local_ndim))
+
+    def exact_state_scatter_stage(executor):
+        def scatter_core(carry, state_cotangent, token, valid, active):
+            carry_local = carry
+            state_ct = unwrap_d(state_cotangent)
+            token_local = unwrap_d(token)
+            valid_local = unwrap_d(valid)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                masked = jnp.where(
+                    valid_local[..., None], state_ct, 0.0)
+                return carry_local.at[token_local].add(masked)
+
+            return jax.lax.cond(
+                active_local, execute, lambda _: carry_local, operand=None)
+
+        return mapped(
+            scatter_core,
+            (
+                P("data", None), d_spec(3), d_spec(2),
+                d_spec(2), d_spec(0)),
+            P("data", None))
+
+    def state_carry_init_core(flat_state):
+        return jnp.zeros_like(flat_state, dtype=jnp.float32)
+
+    state_carry_init_step = mapped(
+        state_carry_init_core, (P("data", None),), P("data", None))
+
+    state_add_step = mapped(
+        lambda lhs, rhs: lhs + rhs,
+        (P("data", None), P("data", None)),
+        P("data", None))
+
+    def overflow_param_scatter_stage(path):
+        """Attribute the exact overflow accumulator scatters separately."""
+        if path == "qkv":
+            def scatter_core(
+                    spaces, active, read_proj, write_proj,
+                    q_tau_kernel, q_tau_bias,
+                    k_tau_kernel, k_tau_bias,
+                    v_tau_kernel, v_tau_bias,
+                    q_read, q_write, k_read, k_write, v_read, v_write):
+                spaces_local = unwrap_d(spaces)
+                active_local = unwrap_d(active)
+
+                def execute(_):
+                    p_read = read_proj[spaces_local]
+                    p_write = write_proj[spaces_local]
+                    banks = (
+                        q_read[spaces_local], q_write[spaces_local],
+                        k_read[spaces_local], k_write[spaces_local],
+                        v_read[spaces_local], v_write[spaces_local])
+                    p_acc = jnp.zeros_like(read_proj).at[
+                        spaces_local].add(p_read)
+                    u_acc = jnp.zeros_like(write_proj).at[
+                        spaces_local].add(p_write)
+                    tau_values = (
+                        q_tau_kernel, q_tau_bias,
+                        k_tau_kernel, k_tau_bias,
+                        v_tau_kernel, v_tau_bias)
+                    checksum = (
+                        jnp.sum(jnp.square(p_acc))
+                        + jnp.sum(jnp.square(u_acc)))
+                    for full in tau_values:
+                        checksum = checksum + jnp.sum(jnp.square(
+                            jnp.zeros_like(full).at[spaces_local].add(
+                                full[spaces_local])))
+                    for full, selected in zip(
+                            (q_read, q_write, k_read, k_write,
+                             v_read, v_write), banks):
+                        checksum = checksum + jnp.sum(jnp.square(
+                            jnp.zeros_like(full).at[
+                                spaces_local].add(selected)))
+                    return checksum
+
+                return wrap_dm(jax.lax.cond(
+                    active_local, execute,
+                    lambda _: jnp.float32(0.0), operand=None))
+
+            return mapped(
+                scatter_core,
+                (
+                    d_spec(1), d_spec(0), P(), P(),
+                    P(), P(), P(), P(), P(), P(),
+                    P(None, "model", None), P(None, "model", None),
+                    P(None, "model", None), P(None, "model", None),
+                    P(None, "model", None), P(None, "model", None)),
+                dm_spec(0))
+
+        def scatter_core(
+                spaces, active, read_proj, write_proj,
+                tau_kernel, tau_bias, read, write):
+            spaces_local = unwrap_d(spaces)
+            active_local = unwrap_d(active)
+
+            def execute(_):
+                p_acc = jnp.zeros_like(read_proj).at[
+                    spaces_local].add(read_proj[spaces_local])
+                u_acc = jnp.zeros_like(write_proj).at[
+                    spaces_local].add(write_proj[spaces_local])
+                read_acc = jnp.zeros_like(read).at[
+                    spaces_local].add(read[spaces_local])
+                write_acc = jnp.zeros_like(write).at[
+                    spaces_local].add(write[spaces_local])
+                tau_acc = jnp.zeros_like(tau_kernel).at[
+                    spaces_local].add(tau_kernel[spaces_local])
+                bias_acc = jnp.zeros_like(tau_bias).at[
+                    spaces_local].add(tau_bias[spaces_local])
+                return sum(jnp.sum(jnp.square(value)) for value in (
+                    p_acc, u_acc, tau_acc, bias_acc,
+                    read_acc, write_acc))
+
+            return wrap_dm(jax.lax.cond(
+                active_local, execute,
+                lambda _: jnp.float32(0.0), operand=None))
+
+        return mapped(
+            scatter_core,
+            (
+                d_spec(1), d_spec(0), P(), P(),
+                P(), P(),
+                P(None, "model", None), P(None, "model", None)),
+            dm_spec(0))
+
+
+    def weight_zero_stage(weight_ndim):
+        def zero_core(weight):
+            return wrap_d(jnp.zeros_like(
+                unwrap_d(weight), dtype=jnp.float32))
+
+        return mapped(
+            zero_core, (d_spec(weight_ndim),), d_spec(weight_ndim))
+
+    def overflow_weight_update_core(carry, group_weight, call_index):
+        return wrap_d(jax.lax.dynamic_update_slice_in_dim(
+            unwrap_d(carry),
+            unwrap_d(group_weight),
+            call_index * overflow_group,
+            axis=0))
+
+    overflow_weight_update_step = mapped(
+        overflow_weight_update_core,
+        (d_spec(2), d_spec(2), P()),
+        d_spec(2))
+
+    executors = {}
+    for executor in ("bundle", "primary", "overflow"):
+        executor_fns = {
+            "materialize": materializer(executor),
+            "p": p_stage(executor),
+        }
+        for path in ("qkv", "rst"):
+            pools = ("qk", "v") if path == "qkv" else ("rst",)
+            path_fns = {
+                "tau": tau_stage(path, executor),
+                "den": denominator_stage(path),
+                "u": u_stage(path, executor),
+                "pools": {
+                    pool: {
+                        "init": rw_init_stage(pool),
+                        "read": rw_read_stage(pool, executor),
+                        "gate": gate_stage(pool),
+                        "write": rw_write_stage(pool, executor),
+                        "bwd_init": rw_backward_init_stage(pool),
+                        "write_bwd": rw_write_backward_stage(
+                            pool, executor),
+                        "gate_bwd": gate_backward_stage(pool),
+                        "read_bwd": rw_read_backward_stage(
+                            pool, executor),
+                    }
+                    for pool in pools
+                },
+            }
+            if executor == "bundle":
+                path_fns.update({
+                    "scatter": bundle_scatter_stage(path),
+                    "output_collective": output_collective_step,
+                })
+            else:
+                path_fns.update({
+                    "output_ct": exact_output_cotangent_stage(path),
+                    "output_gather": exact_output_gather_stage(path),
+                    "u_bwd": u_backward_stage(path, executor),
+                    "den_bwd": denominator_backward_stage(path),
+                    "tau_bwd": tau_backward_stage(path, executor),
+                    "p_bwd": p_backward_stage(executor),
+                    "state_scatter": exact_state_scatter_stage(executor),
+                })
+                if executor == "overflow":
+                    path_fns["param_scatter"] = (
+                        overflow_param_scatter_stage(path))
+            executor_fns[path] = path_fns
+        executors[executor] = executor_fns
+
+    return {
+        "module": module,
+        "route": route_step,
+        "route_fwd_bwd": route_fwd_bwd_step,
+        "bundle_pack": bundle_pack_step,
+        "exact_pack": exact_pack_step,
+        "exact_pack_stats": exact_pack_stats_step,
+        "make_route_weight_scatter": make_route_weight_scatter_step,
+        "executors": executors,
+        "output_init": output_init_steps,
+        "output_ct": {
+            path: exact_output_cotangent_stage(path)
+            for path in ("qkv", "rst")
+        },
+        "state_carry_init": state_carry_init_step,
+        "state_add": state_add_step,
+        "weight_zero_primary": weight_zero_stage(2),
+        "weight_zero_overflow": weight_zero_stage(2),
+        "overflow_weight_update": overflow_weight_update_step,
+        "model_psum_state": model_psum_stage(3),
+        "model_psum_weight": model_psum_stage(2),
+        "dm_add_local": dm_add_stage(4),
+        "dm_add_norm": dm_add_stage(3),
+        "static": {
+            "n_spaces": n_spaces,
+            "bundle_size": bundle_size,
+            "bundle_tokens": bundle_tokens,
+            "exact_bucket": exact_bucket,
+            "overflow_group": overflow_group,
+            "local_counts": local_counts,
+            "chunks": chunks,
+            "chunk_sizes": chunk_sizes,
+            "model_axis_size": model_axis_size,
+            "data_axis_size": int(mesh.shape["data"]),
+        },
+    }
+
+
+def _v4174_stage_param_views(operator_bank_params, operation_space_params):
+    selector = operation_space_params["space_selector"]
+    interface = operation_space_params["space_interface"]
+    controller = operation_space_params["operator_controller"]
+    return {
+        "query_kernel": selector["space_query_proj"]["kernel"],
+        "route_keys": selector["space_route_keys"],
+        "p": interface["space_read_proj"],
+        "u": interface["space_write_proj"],
+        "q_tau_kernel": controller["q_tau_kernel"],
+        "q_tau_bias": controller["q_tau_bias"],
+        "k_tau_kernel": controller["k_tau_kernel"],
+        "k_tau_bias": controller["k_tau_bias"],
+        "v_tau_kernel": controller["v_tau_kernel"],
+        "v_tau_bias": controller["v_tau_bias"],
+        "rst_tau_kernel": controller["rst_tau_kernel"],
+        "rst_tau_bias": controller["rst_tau_bias"],
+        "q_read": operator_bank_params["q_read_vectors"],
+        "q_write": operator_bank_params["q_write_vectors"],
+        "k_read": operator_bank_params["k_read_vectors"],
+        "k_write": operator_bank_params["k_write_vectors"],
+        "v_read": operator_bank_params["v_read_vectors"],
+        "v_write": operator_bank_params["v_write_vectors"],
+        "rst_read": operator_bank_params["rst_read_vectors"],
+        "rst_write": operator_bank_params["rst_write_vectors"],
+    }
+
+
+def run_v4174_stage_attribution(
+        stage_fns, flat_state, operator_bank_params, operation_space_params,
+        *, path, layer, step, run_index, variant_label, compile_phase):
+    """Run one QKV or RST attribution pass on materialized stage boundaries."""
+    records = []
+    views = _v4174_stage_param_views(
+        operator_bank_params, operation_space_params)
+    static = stage_fns["static"]
+    if "route_weight_scatter" not in stage_fns:
+        local_token_count = (
+            int(flat_state.shape[0]) // int(static["data_axis_size"]))
+        stage_fns["route_weight_scatter"] = (
+            stage_fns["make_route_weight_scatter"](local_token_count))
+    compiled_keys = stage_fns.setdefault("_compiled_keys", set())
+    phase = (
+        "stage_attribution_compile"
+        if compile_phase else "stage_attribution_measure")
+
+    def timed(
+            fn, args, *, stage, direction, executor, pool=None,
+            chunk=None, call_index=None, note=None, key_suffix=None):
+        del key_suffix
+        signature = tuple(
+            (tuple(getattr(leaf, "shape", ())),
+             str(getattr(leaf, "dtype", type(leaf).__name__)))
+            for leaf in jax.tree.leaves(args))
+        key = (id(fn), signature)
+        hbm_before = collect_hbm_stats()
+        value, seconds = profile_timed_call(fn, *args)
+        hbm_after = collect_hbm_stats()
+        if compile_phase:
+            if key in compiled_keys:
+                return value
+            compiled_keys.add(key)
+        records.append(benchmark_stage_attribution_record(
+            run_index,
+            variant_label,
+            phase,
+            step,
+            path,
+            direction,
+            executor,
+            stage,
+            seconds,
+            hbm_after,
+            layer=layer,
+            hbm_before=hbm_before,
+            pool=pool,
+            chunk=chunk,
+            call_index=call_index,
+            note=note))
+        return value
+
+    def tau_args(executor, context, local):
+        common = (local, context["spaces"], context["active"])
+        if path == "qkv":
+            return (
+                *common,
+                views["q_tau_kernel"], views["q_tau_bias"],
+                views["k_tau_kernel"], views["k_tau_bias"],
+                views["v_tau_kernel"], views["v_tau_bias"])
+        return (
+            *common, views["rst_tau_kernel"], views["rst_tau_bias"])
+
+    def pool_names():
+        return ("qk", "v") if path == "qkv" else ("rst",)
+
+    def bank_args(pool, kind):
+        if pool == "qk":
+            return (
+                views[f"q_{kind}"],
+                views[f"k_{kind}"])
+        return (views[f"{pool}_{kind}"],)
+
+    def run_pool_forward(executor, context, local, norm, raw_tau, pool):
+        pool_fns = stage_fns["executors"][executor][path]["pools"][pool]
+        raw_carry, gate_carry = pool_fns["init"](local)
+        chunk_count = int(static["chunks"]["q" if pool == "qk" else pool])
+        for chunk_index in range(chunk_count):
+            chunk_arg = jnp.asarray(chunk_index, dtype=jnp.int32)
+            read_value = timed(
+                pool_fns["read"],
+                (
+                    local, context["spaces"], context["active"],
+                    chunk_arg, *bank_args(pool, "read")),
+                stage="RW_read_GEMM",
+                direction=context["direction"],
+                executor=executor,
+                pool=pool,
+                chunk=chunk_index,
+                call_index=context["call_index"],
+                note=context["rw_note"])
+            weighted, gate_chunk = timed(
+                pool_fns["gate"],
+                (
+                    read_value, norm, raw_tau, context["valid"],
+                    context["active"], chunk_arg),
+                stage="gate_admission_execution_weight",
+                direction=context["direction"],
+                executor=executor,
+                pool=pool,
+                chunk=chunk_index,
+                call_index=context["call_index"],
+                note=context["rw_note"])
+            raw_carry, gate_carry = timed(
+                pool_fns["write"],
+                (
+                    weighted, gate_chunk, raw_carry, gate_carry,
+                    context["spaces"], context["active"], chunk_arg,
+                    *bank_args(pool, "write")),
+                stage="RW_write_GEMM",
+                direction=context["direction"],
+                executor=executor,
+                pool=pool,
+                chunk=chunk_index,
+                call_index=context["call_index"],
+                note=context["rw_note"])
+        return raw_carry, gate_carry
+
+    def den_forward(path_fns, pool_results, context):
+        if path == "qkv":
+            args = (
+                pool_results["qk"][0], pool_results["qk"][1],
+                pool_results["v"][0], pool_results["v"][1])
+        else:
+            args = pool_results["rst"]
+        return timed(
+            path_fns["den"],
+            args,
+            stage="global_denominator_model_psum",
+            direction=context["direction"],
+            executor=context["executor"],
+            call_index=context["call_index"],
+            note=context["rw_note"])[0]
+
+    # Shared routing is measured once in the forward direction. The exact
+    # backward packing and selector pullback are measured later.
+    selected_ids, dense_weights = timed(
+        stage_fns["route"],
+        (flat_state, views["query_kernel"], views["route_keys"]),
+        stage="space_selection",
+        direction="forward",
+        executor="bundle",
+        note="production top-2 selector")
+    bundle_packing = timed(
+        stage_fns["bundle_pack"],
+        (selected_ids, dense_weights),
+        stage="bundle_pack",
+        direction="forward",
+        executor="bundle",
+        note="production prefix-count bundle4 packing")
+
+    # Forward attribution: execute one independently timed production-shape
+    # block at a time and retain the same bundle4/chunk ordering.
+    data_axis_size = int(static["data_axis_size"])
+    local_packed_capacity = (
+        int(bundle_packing[0].shape[0]) // data_axis_size)
+    bundle_calls = local_packed_capacity // int(static["bundle_tokens"])
+    output_carry = stage_fns["output_init"][path](flat_state)
+    bundle_executor = stage_fns["executors"]["bundle"]
+    bundle_path = bundle_executor[path]
+    for call_index in range(bundle_calls):
+        call_arg = jnp.asarray(call_index, dtype=jnp.int32)
+        materialized = timed(
+            bundle_executor["materialize"],
+            (flat_state, *bundle_packing, call_arg),
+            stage="bundle_block_materialize",
+            direction="forward",
+            executor="bundle",
+            call_index=call_index,
+            note="dynamic bundle/token/space slice")
+        state, token, valid, weight, spaces, active = materialized
+        context = {
+            "valid": valid,
+            "spaces": spaces,
+            "active": active,
+            "direction": "forward",
+            "executor": "bundle",
+            "call_index": call_index,
+            "rw_note": "bundle4 production-shape stage",
+        }
+        local, norm = timed(
+            bundle_executor["p"],
+            (state, spaces, active, views["p"]),
+            stage="P_projection",
+            direction="forward",
+            executor="bundle",
+            call_index=call_index)
+        tau_values = timed(
+            bundle_path["tau"],
+            tau_args("bundle", context, local),
+            stage="tau_projection",
+            direction="forward",
+            executor="bundle",
+            call_index=call_index)
+        if path == "qkv":
+            tau_by_pool = {"qk": tau_values[0], "v": tau_values[1]}
+        else:
+            tau_by_pool = {"rst": tau_values}
+        pool_results = {
+            pool: run_pool_forward(
+                "bundle", context, local, norm, tau_by_pool[pool], pool)
+            for pool in pool_names()
+        }
+        local_results = den_forward(bundle_path, pool_results, context)
+        block_output = timed(
+            bundle_path["u"],
+            (
+                local_results, weight, valid, spaces, active, views["u"]),
+            stage="U_writeback",
+            direction="forward",
+            executor="bundle",
+            call_index=call_index)
+        output_carry = timed(
+            bundle_path["scatter"],
+            (output_carry, block_output, token, valid, active),
+            stage="bundle_output_scatter",
+            direction="forward",
+            executor="bundle",
+            call_index=call_index)
+    forward_output = timed(
+        bundle_path["output_collective"],
+        (output_carry,),
+        stage="global_denominator_model_psum",
+        direction="forward",
+        executor="bundle",
+        note="final BF16 model-axis representation psum",
+        key_suffix="output_collective")
+
+    # Backward attribution starts from the exact no-drop packing used by the
+    # custom VJP, not from the bundle4 metadata.
+    exact = timed(
+        stage_fns["exact_pack"],
+        (selected_ids, dense_weights),
+        stage="exact_packing",
+        direction="backward",
+        executor="shared",
+        note="Tcap=3072 primary plus compact exact overflow")
+    (primary_token, primary_weight, primary_valid,
+     overflow_space, overflow_token, overflow_weight,
+     overflow_valid, _space_counts) = exact
+    pack_stats = stage_fns["exact_pack_stats"](
+        primary_valid, overflow_valid, _space_counts)
+    block_value(pack_stats)
+    if not compile_phase:
+        records.append(benchmark_stage_metadata_record(
+            run_index,
+            variant_label,
+            step,
+            path,
+            layer,
+            np.asarray(jax.device_get(pack_stats)).tolist()))
+    output_ct = stage_fns["output_ct"][path](flat_state)
+    state_carry = stage_fns["state_carry_init"](flat_state)
+    overflow_weight_ct = stage_fns["weight_zero_overflow"](
+        overflow_weight)
+    primary_weight_ct = None
+
+    def run_exact_group(executor, call_index, state_carry_value,
+                        overflow_weight_carry):
+        executor_fns = stage_fns["executors"][executor]
+        path_fns = executor_fns[path]
+        call_arg = jnp.asarray(call_index, dtype=jnp.int32)
+        if executor == "primary":
+            materialize_args = (
+                flat_state, primary_token, primary_weight,
+                primary_valid, call_arg)
+            materialize_stage = "exact_primary_scatter"
+            materialize_note = "primary state gather"
+        else:
+            materialize_args = (
+                flat_state, overflow_space, overflow_token,
+                overflow_weight, overflow_valid, call_arg)
+            materialize_stage = "compact_overflow_executor"
+            materialize_note = "four-task metadata slice and state gather"
+        state, token, valid, weight, spaces, active = timed(
+            executor_fns["materialize"],
+            materialize_args,
+            stage=materialize_stage,
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note=materialize_note)
+        context = {
+            "valid": valid,
+            "spaces": spaces,
+            "active": active,
+            "direction": "backward",
+            "executor": executor,
+            "call_index": call_index,
+            "rw_note": "analytic pullback primal recompute",
+        }
+        local, norm = timed(
+            executor_fns["p"],
+            (state, spaces, active, views["p"]),
+            stage="P_projection",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="analytic P/local-norm recompute")
+        tau_values = timed(
+            path_fns["tau"],
+            tau_args(executor, context, local),
+            stage="tau_projection",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="analytic tau recompute")
+        if path == "qkv":
+            tau_by_pool = {"qk": tau_values[0], "v": tau_values[1]}
+        else:
+            tau_by_pool = {"rst": tau_values}
+        pool_results = {
+            pool: run_pool_forward(
+                executor, context, local, norm, tau_by_pool[pool], pool)
+            for pool in pool_names()
+        }
+        local_results = den_forward(path_fns, pool_results, context)
+        block_ct = timed(
+            path_fns["output_gather"],
+            (output_ct, token, valid, active),
+            stage="exact_primary_scatter",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="gather global output cotangent")
+        local_results_ct, weight_ct_partial, _u_checksum = timed(
+            path_fns["u_bwd"],
+            (
+                local_results, weight, valid, spaces,
+                active, views["u"], block_ct),
+            stage="U_writeback",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="analytic dU, dlocal_result, and routing weight")
+        weight_ct = timed(
+            stage_fns["model_psum_weight"],
+            (weight_ct_partial,),
+            stage="global_denominator_model_psum",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="routing-weight cotangent model psum",
+            key_suffix="weight_psum")
+        if path == "qkv":
+            raw_ct, gate_ct = timed(
+                path_fns["den_bwd"],
+                (
+                    pool_results["qk"][0], pool_results["qk"][1],
+                    pool_results["v"][0], pool_results["v"][1],
+                    local_results_ct),
+                stage="global_denominator_model_psum",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="analytic denominator pullback")
+            raw_ct_by_pool = {
+                "qk": raw_ct[:, :, :2, ...],
+                "v": raw_ct[:, :, 2:, ...],
+            }
+            gate_ct_by_pool = {
+                "qk": gate_ct[:, :, :2, ...],
+                "v": gate_ct[:, :, 2:, ...],
+            }
+        else:
+            raw_ct, gate_ct = timed(
+                path_fns["den_bwd"],
+                (
+                    pool_results["rst"][0],
+                    pool_results["rst"][1],
+                    local_results_ct),
+                stage="global_denominator_model_psum",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="analytic denominator pullback")
+            raw_ct_by_pool = {"rst": raw_ct}
+            gate_ct_by_pool = {"rst": gate_ct}
+
+        pool_backward = {}
+        for pool in pool_names():
+            pool_fns = path_fns["pools"][pool]
+            local_carry, norm_carry, tau_carry = (
+                pool_fns["bwd_init"](local))
+            chunk_count = int(
+                static["chunks"]["q" if pool == "qk" else pool])
+            for chunk_index in range(chunk_count):
+                chunk_arg = jnp.asarray(chunk_index, dtype=jnp.int32)
+                recompute_context = dict(context)
+                recompute_context["rw_note"] = (
+                    "analytic RW chunk reverse recompute")
+                read_value = timed(
+                    pool_fns["read"],
+                    (
+                        local, spaces, active, chunk_arg,
+                        *bank_args(pool, "read")),
+                    stage="RW_read_GEMM",
+                    direction="backward",
+                    executor=executor,
+                    pool=pool,
+                    chunk=chunk_index,
+                    call_index=call_index,
+                    note=recompute_context["rw_note"],
+                    key_suffix="reverse_recompute")
+                weighted, _gate_chunk = timed(
+                    pool_fns["gate"],
+                    (
+                        read_value, norm, tau_by_pool[pool], valid,
+                        active, chunk_arg),
+                    stage="gate_admission_execution_weight",
+                    direction="backward",
+                    executor=executor,
+                    pool=pool,
+                    chunk=chunk_index,
+                    call_index=call_index,
+                    note=recompute_context["rw_note"],
+                    key_suffix="reverse_recompute")
+                weighted_ct, _write_checksum = timed(
+                    pool_fns["write_bwd"],
+                    (
+                        weighted, raw_ct_by_pool[pool], spaces,
+                        active, chunk_arg, *bank_args(pool, "write")),
+                    stage="RW_write_GEMM",
+                    direction="backward",
+                    executor=executor,
+                    pool=pool,
+                    chunk=chunk_index,
+                    call_index=call_index,
+                    note="analytic write GEMM and row-normalization VJP",
+                    key_suffix="reverse")
+                read_value_ct, norm_ct, tau_ct = timed(
+                    pool_fns["gate_bwd"],
+                    (
+                        read_value, norm, tau_by_pool[pool], valid,
+                        weighted_ct, gate_ct_by_pool[pool],
+                        active, chunk_arg),
+                    stage="gate_admission_execution_weight",
+                    direction="backward",
+                    executor=executor,
+                    pool=pool,
+                    chunk=chunk_index,
+                    call_index=call_index,
+                    note="analytic gate/admission pullback",
+                    key_suffix="reverse")
+                (local_carry,
+                 norm_carry,
+                 tau_carry,
+                 _read_checksum) = timed(
+                    pool_fns["read_bwd"],
+                    (
+                        local, read_value_ct, norm_ct, tau_ct,
+                        local_carry, norm_carry, tau_carry,
+                        spaces, active, chunk_arg,
+                        *bank_args(pool, "read")),
+                    stage="RW_read_GEMM",
+                    direction="backward",
+                    executor=executor,
+                    pool=pool,
+                    chunk=chunk_index,
+                    call_index=call_index,
+                    note="analytic read GEMM and row-normalization VJP",
+                    key_suffix="reverse")
+            pool_backward[pool] = (
+                local_carry, norm_carry, tau_carry)
+
+        if path == "qkv":
+            rw_local = timed(
+                stage_fns["dm_add_local"],
+                (pool_backward["qk"][0], pool_backward["v"][0]),
+                stage="RW_read_GEMM",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="Q/K/V shared local-state cotangent accumulation",
+                key_suffix="pool_local_add")
+            rw_norm = timed(
+                stage_fns["dm_add_norm"],
+                (pool_backward["qk"][1], pool_backward["v"][1]),
+                stage="RW_read_GEMM",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="Q/K/V shared norm cotangent accumulation",
+                key_suffix="pool_norm_add")
+            tau_local, _tau_checksum = timed(
+                path_fns["tau_bwd"],
+                (
+                    local, spaces, active,
+                    pool_backward["qk"][2], pool_backward["v"][2],
+                    views["q_tau_kernel"], views["q_tau_bias"],
+                    views["k_tau_kernel"], views["k_tau_bias"],
+                    views["v_tau_kernel"], views["v_tau_bias"]),
+                stage="tau_projection",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="shared Q/K/V tau pullback")
+        else:
+            rw_local = pool_backward["rst"][0]
+            rw_norm = pool_backward["rst"][1]
+            tau_local, _tau_checksum = timed(
+                path_fns["tau_bwd"],
+                (
+                    local, spaces, active,
+                    pool_backward["rst"][2],
+                    views["rst_tau_kernel"], views["rst_tau_bias"]),
+                stage="tau_projection",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="RST tau pullback")
+        total_local = timed(
+            stage_fns["dm_add_local"],
+            (rw_local, tau_local),
+            stage="P_projection",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="combine RW and tau local-state cotangents",
+            key_suffix="tau_local_add")
+        state_ct_partial, _p_checksum = timed(
+            path_fns["p_bwd"],
+            (
+                state, local, total_local, rw_norm,
+                spaces, active, views["p"]),
+            stage="P_projection",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="shared P projection and local-norm pullback")
+        state_ct = timed(
+            stage_fns["model_psum_state"],
+            (state_ct_partial,),
+            stage="global_denominator_model_psum",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="global-state cotangent model psum",
+            key_suffix="state_psum")
+        state_carry_value = timed(
+            path_fns["state_scatter"],
+            (state_carry_value, state_ct, token, valid, active),
+            stage="exact_primary_scatter",
+            direction="backward",
+            executor=executor,
+            call_index=call_index,
+            note="scatter selected-space state cotangent")
+        if executor == "overflow":
+            overflow_weight_carry = timed(
+                stage_fns["overflow_weight_update"],
+                (overflow_weight_carry, weight_ct, call_arg),
+                stage="routing_weight_scatter",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="compact task weight-cotangent accumulation")
+            scatter_args = (
+                spaces, active, views["p"], views["u"])
+            if path == "qkv":
+                scatter_args = (
+                    *scatter_args,
+                    views["q_tau_kernel"], views["q_tau_bias"],
+                    views["k_tau_kernel"], views["k_tau_bias"],
+                    views["v_tau_kernel"], views["v_tau_bias"],
+                    views["q_read"], views["q_write"],
+                    views["k_read"], views["k_write"],
+                    views["v_read"], views["v_write"])
+            else:
+                scatter_args = (
+                    *scatter_args,
+                    views["rst_tau_kernel"], views["rst_tau_bias"],
+                    views["rst_read"], views["rst_write"])
+            timed(
+                path_fns["param_scatter"],
+                scatter_args,
+                stage="compact_overflow_executor",
+                direction="backward",
+                executor=executor,
+                call_index=call_index,
+                note="overflow parameter-gradient accumulator scatters")
+        return (
+            state_carry_value,
+            overflow_weight_carry,
+            weight_ct if executor == "primary" else None)
+
+    state_carry, overflow_weight_ct, primary_weight_ct = run_exact_group(
+        "primary", 0, state_carry, overflow_weight_ct)
+    overflow_task_capacity = int(overflow_space.shape[1])
+    overflow_calls = overflow_task_capacity // int(static["overflow_group"])
+    for call_index in range(overflow_calls):
+        state_carry, overflow_weight_ct, _unused_primary = run_exact_group(
+            "overflow", call_index, state_carry, overflow_weight_ct)
+    dense_weight_ct = timed(
+        stage_fns["route_weight_scatter"],
+        (
+            primary_token, primary_valid, overflow_space,
+            overflow_token, overflow_valid,
+            primary_weight_ct, overflow_weight_ct),
+        stage="routing_weight_scatter",
+        direction="backward",
+        executor="shared",
+        note="exact primary plus overflow weight scatter")
+    _selector_checksum, selector_state_ct = timed(
+        stage_fns["route_fwd_bwd"],
+        (
+            flat_state, views["query_kernel"], views["route_keys"],
+            dense_weight_ct),
+        stage="space_selection",
+        direction="backward",
+        executor="shared",
+        note="selector projection, normalization, top-2 gate pullback")
+    state_carry = timed(
+        stage_fns["state_add"],
+        (state_carry, selector_state_ct),
+        stage="space_selection",
+        direction="backward",
+        executor="shared",
+        note="add selector cotangent to exact execution state cotangent",
+        key_suffix="state_add")
+    return records, {
+        "forward_output": forward_output,
+        "state_cotangent": state_carry,
+        "dense_weight_cotangent": dense_weight_ct,
+        "space_counts": _space_counts,
+        "overflow_task_valid": overflow_valid,
+    }
+
+
 def create_v4174_detailed_profile_fns(
-        cfg, sharded_fns, *, include_backward=False):
+        cfg, sharded_fns, *, include_backward=False, mesh=None,
+        stage_attribution=False):
     """Split the fused bundle path at its material execution boundaries."""
     module = importlib.import_module(MODEL_MODULES[V4174_MODEL_VERSION][0])
     m = cfg["model"]
@@ -2367,6 +4610,8 @@ def create_v4174_detailed_profile_fns(
         raise RuntimeError(
             "v4174 detailed profile requires canonical vocab-parallel "
             "embedding and CE loss.")
+    if stage_attribution and mesh is None:
+        raise RuntimeError("v4174 stage attribution requires the active mesh")
     qk_scale, v_scale, rst_scale = module._shared_pool_output_scales(
         d_model, n_layers)
     collect_metrics = jnp.asarray(False, dtype=jnp.bool_)
@@ -2554,15 +4799,26 @@ def create_v4174_detailed_profile_fns(
         "final_loss_step": final_loss_step,
         "n_layers": n_layers,
         "include_backward_profile": bool(include_backward),
+        "stage_attribution_fns": (
+            create_v4174_stage_attribution_fns(cfg, mesh)
+            if stage_attribution else None),
     }
 
 
 def create_detailed_profile_fns(
-        cfg, sharded_fns, *, include_backward=False):
+        cfg, sharded_fns, *, include_backward=False, mesh=None,
+        stage_attribution=False):
     version = str(cfg["model"].get("model_version", ""))
     if version == V4174_MODEL_VERSION:
         return create_v4174_detailed_profile_fns(
-            cfg, sharded_fns, include_backward=include_backward)
+            cfg,
+            sharded_fns,
+            include_backward=include_backward,
+            mesh=mesh,
+            stage_attribution=stage_attribution)
+    if stage_attribution:
+        raise RuntimeError(
+            "Stage attribution is defined for v4174 g4 only.")
     if include_backward:
         raise RuntimeError(
             "Detailed backward profile is currently defined for v4174 only.")
@@ -2908,6 +5164,23 @@ def run_v4174_detailed_profile_pass(
             f"layer_{layer_idx:02d}.attn_norm", "attn_norm",
             seconds, hbm_after, hbm_before, layer=layer_idx)
 
+        stage_attribution_fns = profile_fns.get(
+            "stage_attribution_fns")
+        if stage_attribution_fns is not None:
+            stage_records, _stage_outputs = run_v4174_stage_attribution(
+                stage_attribution_fns,
+                normed.reshape((-1, normed.shape[-1])),
+                operator_bank_params,
+                operation_space_params,
+                path="qkv",
+                layer=layer_idx,
+                step=step,
+                run_index=run_index,
+                variant_label=variant_label,
+                compile_phase=not record)
+            records.extend(stage_records)
+            hbm_after = collect_hbm_stats()
+
         hbm_before = hbm_after
         (qkv, seconds) = timed_call(
             f"layer_{layer_idx:02d}.qkv_bundle_srw",
@@ -2960,6 +5233,21 @@ def run_v4174_detailed_profile_pass(
         add_record(
             f"layer_{layer_idx:02d}.rst_norm", "rst_norm",
             seconds, hbm_after, hbm_before, layer=layer_idx)
+
+        if stage_attribution_fns is not None:
+            stage_records, _stage_outputs = run_v4174_stage_attribution(
+                stage_attribution_fns,
+                normed.reshape((-1, normed.shape[-1])),
+                operator_bank_params,
+                operation_space_params,
+                path="rst",
+                layer=layer_idx,
+                step=step,
+                run_index=run_index,
+                variant_label=variant_label,
+                compile_phase=not record)
+            records.extend(stage_records)
+            hbm_after = collect_hbm_stats()
 
         rst_input = x
         hbm_before = hbm_after
@@ -3360,6 +5648,85 @@ def summarize_detailed_profile_records(records):
     return aggregates, layer_summary, derived
 
 
+def summarize_stage_attribution_records(records):
+    stage_records = [
+        row for row in records
+        if row.get("type") == "benchmark_stage_attribution"]
+
+    def aggregate(phase):
+        groups = {}
+        for row in stage_records:
+            if row.get("phase") != phase:
+                continue
+            key = (
+                row.get("path"),
+                row.get("direction"),
+                row.get("executor"),
+                row.get("stage"),
+                row.get("pool"),
+                row.get("chunk"))
+            group = groups.setdefault(key, {
+                "calls": 0,
+                "total_seconds": 0.0,
+                "max_hbm_peak_gb": None,
+            })
+            group["calls"] += 1
+            group["total_seconds"] += float(row.get("seconds", 0.0))
+            peak = num(row.get("hbm_peak_gb"))
+            if peak is not None:
+                group["max_hbm_peak_gb"] = (
+                    peak if group["max_hbm_peak_gb"] is None
+                    else max(group["max_hbm_peak_gb"], peak))
+        result = []
+        for key, value in groups.items():
+            calls = max(1, int(value["calls"]))
+            result.append({
+                "path": key[0],
+                "direction": key[1],
+                "executor": key[2],
+                "stage": key[3],
+                "pool": key[4],
+                "chunk": key[5],
+                "calls": int(value["calls"]),
+                "total_seconds": float(value["total_seconds"]),
+                "mean_seconds": float(value["total_seconds"]) / calls,
+                "max_hbm_peak_gb": value["max_hbm_peak_gb"],
+            })
+        result.sort(key=lambda row: (
+            str(row["path"]),
+            str(row["direction"]),
+            str(row["executor"]),
+            str(row["stage"]),
+            str(row.get("pool")),
+            -1 if row.get("chunk") is None else int(row["chunk"])))
+        return result
+
+    measured = aggregate("stage_attribution_measure")
+    compiled = aggregate("stage_attribution_compile")
+    bottlenecks = {}
+    for row in measured:
+        if row.get("direction") != "backward":
+            continue
+        key = (row.get("path"), row.get("stage"))
+        bottlenecks[key] = (
+            bottlenecks.get(key, 0.0)
+            + float(row.get("total_seconds", 0.0)))
+    bottleneck_rows = [
+        {
+            "path": key[0],
+            "stage": key[1],
+            "total_seconds": value,
+        }
+        for key, value in bottlenecks.items()
+    ]
+    bottleneck_rows.sort(
+        key=lambda row: row["total_seconds"], reverse=True)
+    metadata_rows = [
+        row for row in records
+        if row.get("type") == "benchmark_stage_attribution_metadata"]
+    return measured, compiled, bottleneck_rows, metadata_rows
+
+
 def summarize_runtime_metric_snapshots(snapshots):
     if not snapshots:
         return {}
@@ -3470,7 +5837,7 @@ def ratio_float(a, b):
 
 
 def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
-                        data_sharding, batch_size, seq_len, rng, run_index,
+                        mesh, data_sharding, batch_size, seq_len, rng, run_index,
                         variant_label, start_step, train_mean_seconds):
     records = []
     summary = {}
@@ -3567,7 +5934,9 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
         try:
             detailed_fns = create_detailed_profile_fns(
                 cfg, sharded_fns,
-                include_backward=bool(args.backward_profile))
+                include_backward=bool(args.backward_profile),
+                mesh=mesh,
+                stage_attribution=bool(args.stage_attribution))
             detailed_fns["profile_layer_limit"] = int(
                 args.detailed_profile_layers)
             profile_kind = (
@@ -3580,6 +5949,7 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
                     detailed_fns, params, ids, step_no,
                     run_index, variant_label, batch_size, seq_len,
                     "detailed_compile", record=False))
+            records.extend(_compile_records)
             _log(
                 "[profile] detailed compile "
                 f"{detailed_compile_seconds:.3f}s")
@@ -3674,6 +6044,11 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
     aggregates, layer_rows = summarize_profile_records(records)
     (detailed_aggregates, detailed_layer_rows,
      detailed_derived) = summarize_detailed_profile_records(records)
+    (stage_attribution_rows,
+     stage_attribution_compile_rows,
+     stage_attribution_bottlenecks,
+     stage_attribution_metadata) = (
+        summarize_stage_attribution_records(records))
     summary.update({
         "profile_records": records,
         "profile_aggregates": aggregates,
@@ -3681,6 +6056,11 @@ def run_forward_profile(model, sharded_fns, params, cfg, args, iterator, loader,
         "detailed_profile_aggregates": detailed_aggregates,
         "detailed_profile_layer_rows": detailed_layer_rows,
         "detailed_profile_derived": detailed_derived,
+        "stage_attribution_enabled": bool(args.stage_attribution),
+        "stage_attribution_rows": stage_attribution_rows,
+        "stage_attribution_compile_rows": stage_attribution_compile_rows,
+        "stage_attribution_bottlenecks": stage_attribution_bottlenecks,
+        "stage_attribution_metadata": stage_attribution_metadata,
         "profile_peak_hbm_gb": peak_hbm,
     })
     return summary, records, iterator, rng, next_step
@@ -4242,6 +6622,79 @@ def print_detailed_profile_summary(summary):
                 f"{fmt(row.get('max_hbm_peak_gb'))}",
                 flush=True)
     print_detailed_copy_lines(int(summary.get("run_index") or 1), summary)
+    print_stage_attribution_summary(
+        int(summary.get("run_index") or 1), summary)
+
+
+def print_stage_attribution_summary(run_index, summary):
+    if not summary.get("stage_attribution_enabled"):
+        return
+    rows = summary.get("stage_attribution_rows", []) or []
+    compile_rows = summary.get(
+        "stage_attribution_compile_rows", []) or []
+    print("\n[stage-attribution-runtime]", flush=True)
+    print(
+        "path | dir | executor | stage | pool | chunk | calls | "
+        "total_ms | mean_ms | hbm_peak_gb",
+        flush=True)
+    for row in rows:
+        chunk = (
+            "-" if row.get("chunk") is None
+            else str(int(row["chunk"])))
+        print(
+            f"{row.get('path')} | {row.get('direction')} | "
+            f"{row.get('executor')} | {row.get('stage')} | "
+            f"{row.get('pool') or '-'} | {chunk} | "
+            f"{int(row.get('calls') or 0)} | "
+            f"{fmt_ms(row.get('total_seconds'))} | "
+            f"{fmt_ms(row.get('mean_seconds'))} | "
+            f"{fmt(row.get('max_hbm_peak_gb'))}",
+            flush=True)
+    print("\n[stage-attribution-compile-plus-first-run]", flush=True)
+    print(
+        "path | dir | executor | stage | pool | chunk | compile_ms",
+        flush=True)
+    for row in compile_rows:
+        chunk = (
+            "-" if row.get("chunk") is None
+            else str(int(row["chunk"])))
+        print(
+            f"{row.get('path')} | {row.get('direction')} | "
+            f"{row.get('executor')} | {row.get('stage')} | "
+            f"{row.get('pool') or '-'} | {chunk} | "
+            f"{fmt_ms(row.get('total_seconds'))}",
+            flush=True)
+    metadata = summary.get("stage_attribution_metadata", []) or []
+    if metadata:
+        print("\n[stage-attribution-exact-pack]", flush=True)
+        print(
+            "path | layer | primary_valid | primary_capacity | "
+            "overflow_valid | overflow_tasks | task_capacity | "
+            "overflow_padding_frac | count_min/mean/max",
+            flush=True)
+        for row in metadata:
+            print(
+                f"{row.get('path')} | {int(row.get('layer') or 0)} | "
+                f"{fmt(row.get('primary_valid_pairs'), 0)} | "
+                f"{fmt(row.get('primary_capacity_pairs'), 0)} | "
+                f"{fmt(row.get('overflow_valid_pairs'), 0)} | "
+                f"{fmt(row.get('overflow_active_tasks'), 0)} | "
+                f"{fmt(row.get('overflow_task_capacity'), 0)} | "
+                f"{fmt(row.get('overflow_padding_fraction'), 4)} | "
+                f"{fmt(row.get('space_count_min'), 1)}/"
+                f"{fmt(row.get('space_count_mean'), 1)}/"
+                f"{fmt(row.get('space_count_max'), 1)}",
+                flush=True)
+    bottlenecks = summary.get(
+        "stage_attribution_bottlenecks", []) or []
+    if bottlenecks:
+        print(
+            f"run={run_index} stage_backward_rank "
+            + " ".join(
+                f"{rank}:{row.get('path')}/{row.get('stage')}"
+                f"_ms={fmt_ms(row.get('total_seconds'))}"
+                for rank, row in enumerate(bottlenecks, 1)),
+            flush=True)
 
 
 def print_detailed_copy_lines(run_index, summary):

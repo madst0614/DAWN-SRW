@@ -27,6 +27,7 @@ FORWARD_PROFILE_STEPS_SET="0"
 MODULE_PROFILE_STEPS_SET="0"
 FAST_ONLY="0"
 BACKWARD_PROFILE="0"
+STAGE_ATTRIBUTION="0"
 DETAILED_PROFILE_LAYERS="0"
 OUTPUT_DIR=""
 XLA_DUMP_ENABLED="1"
@@ -49,6 +50,7 @@ Options:
   --module-profile-steps N      Split-module profile steps per config (default: 1)
   --fast, --fast-only           Run quick real-data detailed forward diagnosis
   --backward-profile            With --fast, include v4174 QKV/RST backward profiles
+  --stage-attribution           Add benchmark-only v4174 fine stage attribution
   --detailed-profile-layers N   Limit v4174 detailed profiling to first N layers
   --model-version VERSION        Optional expected version check
   --allow-model-version-override Allow --model-version to override config
@@ -106,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         --module-profile-steps) MODULE_PROFILE_STEPS="$2"; MODULE_PROFILE_STEPS_SET="1"; shift 2 ;;
         --fast|--fast-only) FAST_ONLY="1"; shift ;;
         --backward-profile) BACKWARD_PROFILE="1"; shift ;;
+        --stage-attribution) STAGE_ATTRIBUTION="1"; shift ;;
         --detailed-profile-layers) DETAILED_PROFILE_LAYERS="$2"; shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --xla-dump)
@@ -175,6 +178,11 @@ if ! is_nonnegative_int "$DETAILED_PROFILE_LAYERS"; then
 fi
 if [[ "$BACKWARD_PROFILE" = "1" && "$FAST_ONLY" != "1" ]]; then
     echo "ERROR: --backward-profile requires --fast." >&2
+    exit 1
+fi
+if [[ "$STAGE_ATTRIBUTION" = "1" &&
+      ( "$FAST_ONLY" != "1" || "$BACKWARD_PROFILE" != "1" ) ]]; then
+    echo "ERROR: --stage-attribution requires --fast --backward-profile." >&2
     exit 1
 fi
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -343,6 +351,7 @@ FORWARD_PROFILE_STEPS_SET_Q="$(shell_quote "$FORWARD_PROFILE_STEPS_SET")"
 MODULE_PROFILE_STEPS_SET_Q="$(shell_quote "$MODULE_PROFILE_STEPS_SET")"
 FAST_ONLY_Q="$(shell_quote "$FAST_ONLY")"
 BACKWARD_PROFILE_Q="$(shell_quote "$BACKWARD_PROFILE")"
+STAGE_ATTRIBUTION_Q="$(shell_quote "$STAGE_ATTRIBUTION")"
 DETAILED_PROFILE_LAYERS_Q="$(shell_quote "$DETAILED_PROFILE_LAYERS")"
 XLA_DUMP_ENABLED_Q="$(shell_quote "$XLA_DUMP_ENABLED")"
 XLA_DUMP_BASE_Q="$(shell_quote "$XLA_DUMP_BASE")"
@@ -369,6 +378,7 @@ FORWARD_PROFILE_STEPS_SET=${FORWARD_PROFILE_STEPS_SET_Q}
 MODULE_PROFILE_STEPS_SET=${MODULE_PROFILE_STEPS_SET_Q}
 FAST_ONLY=${FAST_ONLY_Q}
 BACKWARD_PROFILE=${BACKWARD_PROFILE_Q}
+STAGE_ATTRIBUTION=${STAGE_ATTRIBUTION_Q}
 DETAILED_PROFILE_LAYERS=${DETAILED_PROFILE_LAYERS_Q}
 XLA_DUMP_ENABLED=${XLA_DUMP_ENABLED_Q}
 XLA_DUMP_BASE=${XLA_DUMP_BASE_Q}
@@ -405,6 +415,9 @@ if [ "\$FAST_ONLY" = "1" ]; then
     BENCH_ARGS="\$BENCH_ARGS --fast"
     if [ "\$BACKWARD_PROFILE" = "1" ]; then
         BENCH_ARGS="\$BENCH_ARGS --backward-profile"
+    fi
+    if [ "\$STAGE_ATTRIBUTION" = "1" ]; then
+        BENCH_ARGS="\$BENCH_ARGS --stage-attribution"
     fi
     BENCH_ARGS="\$BENCH_ARGS --detailed-profile-layers \$DETAILED_PROFILE_LAYERS"
     if [ "\$STEPS_SET" = "1" ]; then
