@@ -1,11 +1,11 @@
 schema_version: 1
 registry_id: v4174-400m-dense-rw
-updated_kst: "2026-07-26"
-active_generation: g4
+updated_kst: "2026-07-27"
+active_generation: g5
 
 canonical_source:
   branch: codex/v4167-poc
-  audited_commit: 62417b239d5b79c5dfa8684563532958ed212385
+  audited_commit: ae12416b40607ef8dd21fe79a64d86b4335e18b3
   baseline_source_branch: codex/v4167-poc
   experimental_branches_are_candidate_only: true
   accepted_changes_require_sync_to_canonical_branch: true
@@ -116,14 +116,18 @@ comparison_invariants:
     k: 1
     v: 2
     rst: 8
+  tau_init_target_fractions:
+    qk: 0.08
+    v: 0.08
+    rst: 0.05
   precision:
     control: FP32
     read_write_gemm_operands: BF16
     route_output: BF16
     final_model_axis_d_output_psum: BF16_then_FP32
   config: configs/train_config_v4174_400M_c4_20B_v4_64.yaml
-  config_git_blob: d1b0e0895a7238eb01d6f513cb8ed340ea697bf5
-  config_sha256: 2945e84a0b3e989ec50da337f322ec20bd0ab2f3933e3887c6ce41f2353fcc68
+  config_git_blob: 33b63502bfce873a34965c2846709f39b4102a3a
+  config_sha256: 0cea96f49f5dda5153f27f32a50acbd9cbd6af41b7d5df10182538b5bda898cb
   initialization_seed: 1
   operation_space_projection_initialization: independently_keyed_per_space_semi_orthogonal
   checkpoint: none
@@ -321,7 +325,7 @@ generations:
       full_step_peak_hbm_gib_delta: 0.007598080000000174
 
   g4:
-    status: active
+    status: superseded
     role: "Accepted QKV+RST outer P/RW/U analytic pullback with bundle4 forward and exact top-2 backward."
     promoted_from_generation: g3
     branch: codex/v4174-p-rw-u-analytic-vjp-rst
@@ -375,3 +379,67 @@ generations:
       full_step_compile_percent: 2.408069218384421
       two_layer_peak_hbm_gib_delta: -0.009046016000000101
       full_step_peak_hbm_gib_delta: -0.017450495999999482
+
+  g5:
+    status: active
+    role: "Canonical g4 execution rebaseline with user-approved QK/V/RST tau target fractions 0.08/0.08/0.05."
+    rebaseline_reason: "The performance-relevant fresh-initialization target fractions changed, so both canonical protocols were rerun under the new initializer fingerprint."
+    branch: codex/v4167-poc
+    commit: ae12416b40607ef8dd21fe79a64d86b4335e18b3
+    model_git_blob: aaee2b34815a5867b9cc0d8f3b718fb71a0d56d8
+    config_git_blob: 33b63502bfce873a34965c2846709f39b4102a3a
+    config_sha256: 0cea96f49f5dda5153f27f32a50acbd9cbd6af41b7d5df10182538b5bda898cb
+    canonical_integration_branch: codex/v4167-poc
+    canonical_integration_commit: bb2a3ada9a0c281df9439043162dde8045d62bfd
+    dirty_worktree_state:
+      at_launch: "tracked clean; pre-existing untracked launcher captures only"
+      after_metrics_write: "tracked clean; pre-existing untracked launcher captures only"
+    measured_on_tpu: spatial-se-400m
+    two_layer_backward_gate:
+      fast_forward_compile_seconds: 55.87398428100278
+      fast_forward_mean_seconds: 2.4444737269950565
+      qkv_forward_seconds: 0.1250813249789644
+      qkv_forward_backward_seconds: 0.3263002290332224
+      rst_forward_seconds: 0.10524593602167442
+      rst_forward_backward_seconds: 0.30248835001839325
+      combined_forward_backward_seconds: 0.6287885790516157
+      combined_backward_only_seconds: 0.39846131805097684
+      detailed_split_seconds: 0.9076308180810884
+      detailed_compile_seconds: 92.7052035050001
+      peak_hbm_gib: 4.95752448
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_g4_frac885_ae12416b_gate/benchmark_metrics_host_6.jsonl
+    five_step_full_train:
+      compile_seconds: 97.44298499001889
+      warmup_step_seconds:
+        - 101.05375642099534
+        - 8.790992591006216
+        - 8.916142255999148
+      measured_step_seconds:
+        - 9.008026133000385
+        - 8.935588836000534
+        - 8.939958845992805
+        - 8.936091604991816
+        - 8.89912104702671
+      mean_step_seconds: 8.94375729340245
+      median_step_seconds: 8.936091604991816
+      p90_step_seconds: 8.980799218197353
+      mean_tokens_per_second: 58621.46826400951
+      peak_hbm_gib: 7.929470464
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_g4_frac885_ae12416b_fullstep/benchmark_metrics_host_6.jsonl
+    comparison_to_g4:
+      note: "The execution graph is unchanged; these signed deltas establish the new initializer fingerprint as runtime-equivalent to historical g4."
+      qkv_forward_backward_time_change_percent: 0.03273549863977987
+      rst_forward_backward_time_change_percent: 0.05028903745869506
+      two_layer_combined_forward_backward_time_change_percent: 0.041179127709578545
+      two_layer_backward_only_time_change_percent: 0.11878282522939099
+      fast_forward_time_change_percent: 0.08250826024465141
+      fast_forward_compile_time_change_percent: 11.393025486989483
+      detailed_split_time_change_percent: -0.023305363589365413
+      detailed_compile_time_change_percent: -2.477187177640894
+      two_layer_peak_hbm_gib_delta: 0.0
+      five_step_mean_time_change_percent: 0.0038756131337747135
+      five_step_median_time_change_percent: -0.01102275434490263
+      five_step_p90_time_change_percent: 0.008487715573091137
+      throughput_change_percent: -0.0038554271897250914
+      full_step_compile_time_change_percent: 3.511461773999436
+      full_step_peak_hbm_gib_delta: 0.0
