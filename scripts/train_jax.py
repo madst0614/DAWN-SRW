@@ -1320,6 +1320,9 @@ V4174_SELECTOR_METRIC_NAMES = tuple(
     for suffix in (
         'gate_mass_mean',
         'active_count_mean',
+        'exact_zero_mass_frac',
+        'fallback_frac',
+        # Temporary compatibility alias for older log analysis.
         'zero_gate_frac',
         'top1_rate',
     ))
@@ -13116,7 +13119,8 @@ def _print_minimal_pretraining_record(rec):
             return (
                 f"{label}[mass={rec[f'{stage}_space_gate_mass_mean']:.3f} "
                 f"active={rec[f'{stage}_space_active_count_mean']:.3f} "
-                f"zero={rec[f'{stage}_space_zero_gate_frac']:.3f} "
+                f"exact0={rec[f'{stage}_space_exact_zero_mass_frac']:.3f} "
+                f"fallback={rec[f'{stage}_space_fallback_frac']:.3f} "
                 f"top1={rec[f'{stage}_space_top1_rate']:.3f}]")
         log_message(
             "  space: " + _space('attention', 'attn') + " "
@@ -14669,7 +14673,8 @@ def _print_linear_direct_tau_regular_block(rec, ctx):
             return (
                 f"{label}[mass={float(rec[f'{stage}_space_gate_mass_mean']):.3f} "
                 f"active={float(rec[f'{stage}_space_active_count_mean']):.3f} "
-                f"zero={float(rec[f'{stage}_space_zero_gate_frac']):.3f} "
+                f"exact0={float(rec[f'{stage}_space_exact_zero_mass_frac']):.3f} "
+                f"fallback={float(rec[f'{stage}_space_fallback_frac']):.3f} "
                 f"top1={float(rec[f'{stage}_space_top1_rate']):.3f}]")
         log_message(
             "  space " + _space_stage('attention', 'attn') + " "

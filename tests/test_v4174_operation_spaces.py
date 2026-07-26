@@ -347,7 +347,7 @@ def test_config_validation_rejects_noncanonical_and_removed_schema():
                 **config, **update})
 
 
-def test_nonfactorized_operation_spaces_initialize_independent_coordinates():
+def test_operation_space_projection_initialization_is_independent_and_seeded():
     model = _model(
         n_operation_spaces=3,
         n_q=30,
@@ -356,7 +356,10 @@ def test_nonfactorized_operation_spaces_initialize_independent_coordinates():
         n_rst=30,
     )
     _, _, variables = _variables(model=model, seed=5)
-    projection = variables["params"]["space_interface"]["space_read_proj"]
+    _, _, same_seed_variables = _variables(model=model, seed=5)
+    _, _, other_seed_variables = _variables(model=model, seed=6)
+    interface = variables["params"]["space_interface"]
+    projection = interface["space_read_proj"]
     assert projection.shape == (3, 16, 4)
     gram = jnp.einsum("mdr,mds->mrs", projection, projection)
     np.testing.assert_allclose(
@@ -366,6 +369,21 @@ def test_nonfactorized_operation_spaces_initialize_independent_coordinates():
         rtol=2.0e-5,
     )
     assert not np.allclose(projection[0], projection[1])
+    assert not np.allclose(
+        np.abs(projection[0]),
+        np.abs(projection[1]),
+    )
+    np.testing.assert_array_equal(
+        interface["space_write_proj"],
+        jnp.swapaxes(projection, -1, -2),
+    )
+    for value, same_seed_value in zip(
+            jax.tree.leaves(variables["params"]),
+            jax.tree.leaves(same_seed_variables["params"])):
+        np.testing.assert_array_equal(value, same_seed_value)
+    other_projection = other_seed_variables[
+        "params"]["space_interface"]["space_read_proj"]
+    assert not np.array_equal(projection, other_projection)
     counts = v4174.symbolic_parameter_count({
         **_model_config(),
         "n_operation_spaces": 3,
@@ -556,6 +574,44 @@ def test_space_gate_is_fixed_nonsoftmax_topk_relu_squared_gate():
         1.0,
     )
     np.testing.assert_array_equal(zero_route, np.zeros((2, 5)))
+
+
+def test_space_gate_fallback_boundary_matches_execution_and_metrics():
+    below_eps_score = np.sqrt(v4174.SPACE_GATE_L1_EPS * 0.5)
+    above_eps_score = np.sqrt(v4174.SPACE_GATE_L1_EPS * 2.0)
+    scores = jnp.asarray([
+        [0.0, -1.0],
+        [below_eps_score, -1.0],
+        [above_eps_score, -1.0],
+    ], dtype=jnp.float32)
+    routing = v4174._space_gate_from_scores(scores, 1)
+    mass = np.asarray(routing["space_gate_mass"][..., 0])
+    fallback = np.asarray(routing["fallback_mask"][..., 0])
+    np.testing.assert_array_equal(fallback, [True, True, False])
+    assert mass[0] == 0.0
+    assert 0.0 < mass[1] < v4174.SPACE_GATE_L1_EPS
+    assert mass[2] > v4174.SPACE_GATE_L1_EPS
+
+    for metric_fn in (
+            v4174._space_routing_metrics,
+            v4174._compact_space_routing_metrics):
+        metrics = metric_fn(routing, "probe")
+        np.testing.assert_allclose(
+            metrics["probe_space_exact_zero_mass_frac"],
+            1.0 / 3.0,
+            atol=1.0e-7,
+            rtol=0.0,
+        )
+        np.testing.assert_allclose(
+            metrics["probe_space_fallback_frac"],
+            2.0 / 3.0,
+            atol=1.0e-7,
+            rtol=0.0,
+        )
+        np.testing.assert_array_equal(
+            metrics["probe_space_zero_gate_frac"],
+            metrics["probe_space_exact_zero_mass_frac"],
+        )
 
 
 def test_qk_banks_are_independent_and_production_execution_is_paired():
@@ -1030,6 +1086,17 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         attention_metrics["attention_space_gate_mass_mean"],
         routing["space_gate_mass"].mean(),
         atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(
+        attention_metrics["attention_space_exact_zero_mass_frac"],
+        (routing["space_gate_mass"] <= 0.0).astype(jnp.float32).mean(),
+        atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(
+        attention_metrics["attention_space_fallback_frac"],
+        routing["fallback_mask"].astype(jnp.float32).mean(),
+        atol=0.0, rtol=0.0)
+    np.testing.assert_array_equal(
+        attention_metrics["attention_space_zero_gate_frac"],
+        attention_metrics["attention_space_exact_zero_mass_frac"])
     local = v4174._control_einsum_f32(
         "td,mdr->mtr", flat, interface["space_read_proj"])
     reference_outputs = {}
@@ -1062,11 +1129,16 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         reference_outputs[route] = v4174._control_einsum_f32(
             "mtr,mrd->td", weighted,
             interface["space_write_proj"])
+        active_resolution = 1.0 / float(
+            flat.shape[0]
+            * interface["space_read_proj"].shape[0]
+            * pool[f"{route}_read_vectors"].shape[1])
         assert abs(float(
             attention_metrics[
                 f"{route}_operator_active_tau_frac"]
             - attention_metrics_fp32[
-                f"{route}_operator_active_tau_frac"])) <= 0.001
+                f"{route}_operator_active_tau_frac"])) <= (
+                    active_resolution + np.finfo(np.float32).eps)
     for actual, route in zip(
             (q_output_fp32, k_output_fp32, v_output_fp32),
             ("q", "k", "v")):
@@ -2099,14 +2171,19 @@ def test_v4174_mixed_precision_20_step_trajectory_is_stable():
     mixed_grads = np.asarray([value[1] for value in mixed_history])
     fp32_grads = np.asarray([value[1] for value in fp32_history])
     assert np.all(np.isfinite(mixed_losses))
+    assert np.all(np.isfinite(fp32_losses))
     assert np.all(np.isfinite(mixed_grads))
+    assert np.all(np.isfinite(fp32_grads))
     loss_relative = np.abs(
         mixed_losses - fp32_losses) / np.maximum(
             np.abs(fp32_losses), 1.0e-8)
     grad_ratio = mixed_grads / np.maximum(fp32_grads, 1.0e-8)
     assert loss_relative[0] <= 0.002
     assert np.max(loss_relative) <= 0.02
-    assert np.all((grad_ratio >= 0.8) & (grad_ratio <= 1.2))
+    # The first step compares identical parameters. Later steps intentionally
+    # follow separate mixed/FP32 optimizer trajectories, so cross-trajectory
+    # gradient ratios are not a same-state numerical parity contract.
+    assert 0.8 <= grad_ratio[0] <= 1.2
     active_diffs = np.abs(
         np.stack([value[2] for value in mixed_history])
         - np.stack([value[2] for value in fp32_history]))
@@ -2138,6 +2215,18 @@ def test_v4174_regular_console_maps_direct_operator_diagnostics(monkeypatch):
         minimal_runtime_profile="diagnostics",
         rngs={"dropout": jax.random.PRNGKey(36)},
     ))
+    for new_name, legacy_name in (
+            ("q_global_interface_norm", "q_route_output_norm"),
+            ("k_global_interface_norm", "k_route_output_norm"),
+            ("v_global_interface_norm", "v_route_output_norm"),
+            ("rst_global_update_norm", "rst_route_update_norm")):
+        assert new_name in metrics
+        assert legacy_name in metrics
+        np.testing.assert_array_equal(
+            metrics[new_name], metrics[legacy_name])
+    for stage in ("attention", "rst"):
+        assert f"{stage}_space_exact_zero_mass_frac" in metrics
+        assert f"{stage}_space_fallback_frac" in metrics
     metrics.update({
         "tau_lr_mult": jnp.float32(0.001),
         **{

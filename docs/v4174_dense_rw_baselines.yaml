@@ -110,6 +110,7 @@ comparison_invariants:
   config_git_blob: d1b0e0895a7238eb01d6f513cb8ed340ea697bf5
   config_sha256: 2945e84a0b3e989ec50da337f322ec20bd0ab2f3933e3887c6ce41f2353fcc68
   initialization_seed: 1
+  operation_space_projection_initialization: shared_base_row_sign_derived
   checkpoint: none
   data_source: gs://dawn-tpu-data-c4/c4_train_40B
   max_train_tokens: 20000000000

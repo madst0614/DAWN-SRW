@@ -11,10 +11,11 @@ Q/K/V share one attention-space selection but use separate operator banks.  RST
 recomputes both selection and operation-space state after the attention
 residual.  Every route owns a distinct tau map for every operation space, so a
 coordinate in one space is never interpreted by another space's controller.
-Selected-space weights are L1-normalized across the hard top-k support; if all
-selected ReLU-squared scores vanish, the highest-ranked space receives a
-deterministic one-hot fallback.  Absolute update scale therefore belongs to the
-within-space RW composition and residual/output scales, not the selector.
+Selected-space weights are L1-normalized across the hard top-k support; if
+their total ReLU-squared mass is at or below ``SPACE_GATE_L1_EPS``, the
+highest-ranked space receives a deterministic one-hot fallback.  Absolute
+update scale therefore belongs to the within-space RW composition and
+residual/output scales, not the selector.
 The final attention ``expand_O`` remains the global interface that combines
 attention heads before the residual update.
 
@@ -65,6 +66,14 @@ BUNDLE_DENSE_SIZE = 4
 DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE = 1024
 SPACE_GATE_L1_EPS = 1.0e-8
 _BUNDLE_PACKING_CHECKPOINT_NAME = "v4174_bundle_packing_metadata"
+_SPACE_ROUTING_COMPACT_METRIC_SUFFIXES = (
+    "gate_mass_mean",
+    "active_count_mean",
+    "exact_zero_mass_frac",
+    "fallback_frac",
+    "zero_gate_frac",
+    "top1_rate",
+)
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -221,15 +230,13 @@ def _independent_space_projection_init(
     if d_route > d_model:
         raise ValueError(
             "space projection initialization requires d_route <= d_model")
-    basis_key, sign_key = jax.random.split(key)
-    base = nn.initializers.orthogonal(scale=1.0)(
-        basis_key, (d_model, d_route), jnp.float32)
-    signs = jnp.where(
-        jax.random.bernoulli(
-            sign_key, shape=(n_spaces, d_model, 1)),
-        jnp.float32(1.0),
-        jnp.float32(-1.0))
-    return (base[None, :, :] * signs).astype(dtype)
+    space_keys = jax.random.split(key, n_spaces)
+    orthogonal = nn.initializers.orthogonal(scale=1.0)
+    projections = jax.vmap(
+        lambda space_key: orthogonal(
+            space_key, (d_model, d_route), jnp.float32)
+    )(space_keys)
+    return projections.astype(dtype)
 
 
 def _unit_space_route_key_init(
@@ -519,7 +526,9 @@ def _space_gate_from_scores(
     raw_space_gate = jnp.square(jax.nn.relu(space_scores))
     space_gate = raw_space_gate * top_k_mask
     space_gate_mass = space_gate.sum(axis=-1, keepdims=True)
-    has_positive_mass = space_gate_mass > jnp.float32(SPACE_GATE_L1_EPS)
+    fallback_mask = (
+        space_gate_mass <= jnp.float32(SPACE_GATE_L1_EPS))
+    has_positive_mass = jnp.logical_not(fallback_mask)
     space_gate_den = jnp.where(
         has_positive_mass, space_gate_mass, jnp.float32(1.0))
     normalized_space_weights = space_gate / space_gate_den
@@ -535,6 +544,7 @@ def _space_gate_from_scores(
         "space_gate": space_gate,
         "space_gate_mass": space_gate_mass,
         "space_gate_den": space_gate_den,
+        "fallback_mask": fallback_mask,
         "dense_space_weights": dense_space_weights,
     }
 
@@ -677,6 +687,7 @@ def _space_routing_metrics(
     weights = routing["dense_space_weights"].astype(jnp.float32)
     mass = routing["space_gate_mass"][..., 0].astype(jnp.float32)
     den = routing["space_gate_den"][..., 0].astype(jnp.float32)
+    fallback = routing["fallback_mask"][..., 0]
     selected_ids = routing["selected_ids"]
     n_spaces = int(gate.shape[-1])
     active = weights > 0.0
@@ -689,6 +700,11 @@ def _space_routing_metrics(
         f"{prefix}_space_gate_den_mean": den.mean(),
         f"{prefix}_space_active_count_mean": (
             active.astype(jnp.float32).sum(axis=-1).mean()),
+        f"{prefix}_space_exact_zero_mass_frac": (
+            mass <= 0.0).astype(jnp.float32).mean(),
+        f"{prefix}_space_fallback_frac": (
+            fallback.astype(jnp.float32).mean()),
+        # Temporary compatibility alias for existing log consumers.
         f"{prefix}_space_zero_gate_frac": (
             mass <= 0.0).astype(jnp.float32).mean(),
         f"{prefix}_space_top1_rate": top1_usage.max(),
@@ -714,6 +730,7 @@ def _compact_space_routing_metrics(
     gate = routing["space_gate"].astype(jnp.float32)
     weights = routing["dense_space_weights"].astype(jnp.float32)
     mass = routing["space_gate_mass"][..., 0].astype(jnp.float32)
+    fallback = routing["fallback_mask"][..., 0]
     selected_ids = routing["selected_ids"]
     n_spaces = int(gate.shape[-1])
     top1_usage = jax.nn.one_hot(
@@ -723,6 +740,11 @@ def _compact_space_routing_metrics(
         f"{prefix}_space_gate_mass_mean": mass.mean(),
         f"{prefix}_space_active_count_mean": (
             (weights > 0.0).astype(jnp.float32).sum(axis=-1).mean()),
+        f"{prefix}_space_exact_zero_mass_frac": (
+            mass <= 0.0).astype(jnp.float32).mean(),
+        f"{prefix}_space_fallback_frac": (
+            fallback.astype(jnp.float32).mean()),
+        # Temporary compatibility alias for existing log consumers.
         f"{prefix}_space_zero_gate_frac": (
             mass <= 0.0).astype(jnp.float32).mean(),
         f"{prefix}_space_top1_rate": top1_usage.max(),
@@ -818,9 +840,11 @@ def _canonical_regular_operator_metrics(
         "rst_composition_den_floor_frac": metrics[
             "rst_operator_den_floor_frac"],
         "attn_qk_pool_scaled_srw_out_norm": jnp.float32(0.5) * (
-            metrics["q_route_output_norm"] + metrics["k_route_output_norm"]),
-        "attn_v_pool_scaled_srw_out_norm": metrics["v_route_output_norm"],
-        "rst_pool_scaled_srw_out_norm": metrics["rst_route_update_norm"],
+            metrics["q_global_interface_norm"]
+            + metrics["k_global_interface_norm"]),
+        "attn_v_pool_scaled_srw_out_norm": metrics[
+            "v_global_interface_norm"],
+        "rst_pool_scaled_srw_out_norm": metrics["rst_global_update_norm"],
     })
     return {
         key: jax.lax.stop_gradient(value)
@@ -1530,6 +1554,10 @@ class DAWN_SRW_V4174(nn.Module):
                 "attn_out_norm",
                 "rst_out_norm",
                 "residual_norm",
+                "q_global_interface_norm",
+                "k_global_interface_norm",
+                "v_global_interface_norm",
+                "rst_global_update_norm",
                 "q_route_output_norm",
                 "k_route_output_norm",
                 "v_route_output_norm",
@@ -1537,6 +1565,18 @@ class DAWN_SRW_V4174(nn.Module):
             )
 
             def compute_norm_metrics(_):
+                q_global_interface_norm = jnp.linalg.norm(
+                    q_global_interface.astype(jnp.float32),
+                    axis=-1).mean()
+                k_global_interface_norm = jnp.linalg.norm(
+                    k_global_interface.astype(jnp.float32),
+                    axis=-1).mean()
+                v_global_interface_norm = jnp.linalg.norm(
+                    v_global_interface.astype(jnp.float32),
+                    axis=-1).mean()
+                rst_global_update_norm = jnp.linalg.norm(
+                    rst_global_update.astype(jnp.float32),
+                    axis=-1).mean()
                 values = {
                     "attn_out_norm": jnp.linalg.norm(
                         attention_global_update.astype(jnp.float32),
@@ -1546,18 +1586,15 @@ class DAWN_SRW_V4174(nn.Module):
                         axis=-1).mean(),
                     "residual_norm": jnp.linalg.norm(
                         global_state.astype(jnp.float32), axis=-1).mean(),
-                    "q_route_output_norm": jnp.linalg.norm(
-                        q_global_interface.astype(jnp.float32),
-                        axis=-1).mean(),
-                    "k_route_output_norm": jnp.linalg.norm(
-                        k_global_interface.astype(jnp.float32),
-                        axis=-1).mean(),
-                    "v_route_output_norm": jnp.linalg.norm(
-                        v_global_interface.astype(jnp.float32),
-                        axis=-1).mean(),
-                    "rst_route_update_norm": jnp.linalg.norm(
-                        rst_global_update.astype(jnp.float32),
-                        axis=-1).mean(),
+                    "q_global_interface_norm": q_global_interface_norm,
+                    "k_global_interface_norm": k_global_interface_norm,
+                    "v_global_interface_norm": v_global_interface_norm,
+                    "rst_global_update_norm": rst_global_update_norm,
+                    # Temporary compatibility aliases for existing logs.
+                    "q_route_output_norm": q_global_interface_norm,
+                    "k_route_output_norm": k_global_interface_norm,
+                    "v_route_output_norm": v_global_interface_norm,
+                    "rst_route_update_norm": rst_global_update_norm,
                 }
                 return {
                     key: jax.lax.stop_gradient(value)
@@ -1722,7 +1759,7 @@ class DAWN_SRW_V4174(nn.Module):
             f"R={self.d_route}; space-specific D->R read coordinates, "
             f"top_k={self.operation_space_top_k}",
             "space gate: hard top-k ReLU^2, non-softmax, selected-space "
-            "L1 sum 1 with deterministic top-1 zero-mass fallback",
+            "L1 sum 1 with deterministic top-1 epsilon-mass fallback",
             "operation-space state: each selected space reads its own state "
             "from the global representation",
             "local transition: route-specific RW composition and a distinct "
@@ -3355,6 +3392,8 @@ def _finish_blocked_dense_rw_metric_vector_sharded(
         routing["space_gate"].astype(jnp.float32))
     mass = jax.lax.stop_gradient(
         routing["space_gate_mass"][..., 0].astype(jnp.float32))
+    fallback = jax.lax.stop_gradient(
+        routing["fallback_mask"][..., 0].astype(jnp.float32))
     selected_ids = jax.lax.stop_gradient(routing["selected_ids"])
     top1_counts = jax.nn.one_hot(
         selected_ids[..., 0], n_spaces, dtype=jnp.float32).sum(axis=0)
@@ -3365,6 +3404,7 @@ def _finish_blocked_dense_rw_metric_vector_sharded(
             mass.sum(),
             space_active_count.sum(),
             (mass <= 0.0).astype(jnp.float32).sum(),
+            fallback.sum(),
         )),
         top1_counts,
         jnp.asarray((token_count,), dtype=jnp.float32),
@@ -3372,11 +3412,14 @@ def _finish_blocked_dense_rw_metric_vector_sharded(
     global_routing = jax.lax.psum(routing_sums, "data")
     global_tokens = jnp.maximum(
         global_routing[-1], jnp.float32(1.0))
-    top1_offset = 3
+    top1_offset = 4
+    exact_zero_mass_frac = global_routing[2] / global_tokens
     metric_values.extend((
         global_routing[0] / global_tokens,
         global_routing[1] / global_tokens,
-        global_routing[2] / global_tokens,
+        exact_zero_mass_frac,
+        global_routing[3] / global_tokens,
+        exact_zero_mass_frac,
         (global_routing[top1_offset:top1_offset + n_spaces]
          / global_tokens).max(),
     ))
@@ -3436,6 +3479,8 @@ def _collect_dense_rw_metric_vector_sharded(
         routing["space_gate"].astype(jnp.float32))
     mass = jax.lax.stop_gradient(
         routing["space_gate_mass"][..., 0].astype(jnp.float32))
+    fallback = jax.lax.stop_gradient(
+        routing["fallback_mask"][..., 0].astype(jnp.float32))
     selected_ids = jax.lax.stop_gradient(routing["selected_ids"])
     n_spaces = int(gate.shape[-1])
     top1_counts = jax.nn.one_hot(
@@ -3451,6 +3496,7 @@ def _collect_dense_rw_metric_vector_sharded(
             mass.sum(),
             space_active_count.sum(),
             (mass <= 0.0).astype(jnp.float32).sum(),
+            fallback.sum(),
         )),
         top1_counts,
         jnp.stack((local_positions, local_tokens)),
@@ -3459,7 +3505,7 @@ def _collect_dense_rw_metric_vector_sharded(
 
     operator_width = 8
     space_offset = operator_width * len(route_specs)
-    top1_offset = space_offset + 3
+    top1_offset = space_offset + 4
     global_positions = jnp.maximum(
         global_metrics[-2], jnp.float32(1.0))
     global_tokens = jnp.maximum(
@@ -3479,10 +3525,14 @@ def _collect_dense_rw_metric_vector_sharded(
             global_metrics[offset + 6] / global_positions,
             global_metrics[offset + 7] / global_positions,
         ))
+    exact_zero_mass_frac = (
+        global_metrics[space_offset + 2] / global_tokens)
     metric_values.extend((
         global_metrics[space_offset] / global_tokens,
         global_metrics[space_offset + 1] / global_tokens,
-        global_metrics[space_offset + 2] / global_tokens,
+        exact_zero_mass_frac,
+        global_metrics[space_offset + 3] / global_tokens,
+        exact_zero_mass_frac,
         (global_metrics[top1_offset:top1_offset + n_spaces]
          / global_tokens).max(),
     ))
@@ -3511,9 +3561,7 @@ def _make_sharded_attention_space_dense(
         for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
     ) + tuple(
         f"attention_space_{suffix}"
-        for suffix in (
-            "gate_mass_mean", "active_count_mean",
-            "zero_gate_frac", "top1_rate"))
+        for suffix in _SPACE_ROUTING_COMPACT_METRIC_SUFFIXES)
 
     def attention_core(
             global_state,
@@ -3789,9 +3837,7 @@ def _make_sharded_attention_space_bundle_dense(
         for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
     ) + tuple(
         f"attention_space_{suffix}"
-        for suffix in (
-            "gate_mass_mean", "active_count_mean",
-            "zero_gate_frac", "top1_rate"))
+        for suffix in _SPACE_ROUTING_COMPACT_METRIC_SUFFIXES)
     bundle_metric_names = _bundle_packing_metric_names("attention")
     projection_dot = (
         _throughput_einsum_bf16_f32
@@ -4582,9 +4628,7 @@ def _make_sharded_rst_space_dense(
         for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
     ) + tuple(
         f"rst_space_{suffix}"
-        for suffix in (
-            "gate_mass_mean", "active_count_mean",
-            "zero_gate_frac", "top1_rate"))
+        for suffix in _SPACE_ROUTING_COMPACT_METRIC_SUFFIXES)
 
     def rst_core(
             global_state,
@@ -4787,9 +4831,7 @@ def _make_sharded_rst_space_bundle_dense(
         for suffix in _FUSED_OPERATOR_METRIC_SUFFIXES
     ) + tuple(
         f"rst_space_{suffix}"
-        for suffix in (
-            "gate_mass_mean", "active_count_mean",
-            "zero_gate_frac", "top1_rate"))
+        for suffix in _SPACE_ROUTING_COMPACT_METRIC_SUFFIXES)
     bundle_metric_names = _bundle_packing_metric_names("rst")
     den_power = jnp.float32(
         admission_den_power).reshape((1, 1, 1, 1))

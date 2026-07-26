@@ -99,6 +99,14 @@ def test_v4174_dynamic_metric_source_contract():
 
     model_source = inspect.getsource(v4174.DAWN_SRW_V4174.__call__)
     output_source = inspect.getsource(v4174._dense_rw_output_sharded)
+    autodiff_output_source = inspect.getsource(
+        v4174._dense_rw_output_sharded_autodiff)
+    analytic_output_source = inspect.getsource(
+        v4174._dense_rw_output_sharded_linear_analytic)
+    analytic_fwd_source = inspect.getsource(
+        v4174._dense_rw_output_sharded_linear_analytic_fwd)
+    analytic_bwd_source = inspect.getsource(
+        v4174._dense_rw_output_sharded_linear_analytic_bwd)
     den_source = inspect.getsource(
         v4174._global_dense_rw_den_sharded)
     representation_reduce_source = inspect.getsource(
@@ -132,15 +140,27 @@ def test_v4174_dynamic_metric_source_contract():
     assert "jax.lax.cond(" in model_source
     assert "collect_metrics" not in output_source
     assert "jax.lax.cond(" not in output_source
-    assert "raw_out, gate_mass = carry_value" in output_source
-    assert "jnp.square" not in output_source
-    assert "gate.max" not in output_source
-    assert "margin >" not in output_source
-    assert "depth.sum" not in output_source
-    assert "jax.checkpoint(production_step, prevent_cse=False)" in output_source
-    assert "use_chunk_remat" not in output_source
-    assert "remat_chunks" not in output_source
-    production_step_source = output_source.split(
+    assert 'str(srw_composition_mode) == "linear_angular"' in output_source
+    assert "_dense_rw_output_sharded_linear_analytic(" in output_source
+    assert "_dense_rw_output_sharded_autodiff(" in output_source
+    assert "return _dense_rw_output_sharded_autodiff(" in (
+        analytic_output_source)
+    assert "output = _dense_rw_output_sharded_autodiff(" in (
+        analytic_fwd_source)
+    assert "def chunk_pullback" in analytic_bwd_source
+    assert "_dense_rw_vjp_dot(" in analytic_bwd_source
+    assert "_forward_unit_direction_vjp(" in analytic_bwd_source
+    assert "jax.vjp(" not in analytic_bwd_source
+    assert "raw_out, gate_mass = carry_value" in autodiff_output_source
+    assert "jnp.square" not in autodiff_output_source
+    assert "gate.max" not in autodiff_output_source
+    assert "margin >" not in autodiff_output_source
+    assert "depth.sum" not in autodiff_output_source
+    assert "jax.checkpoint(production_step, prevent_cse=False)" in (
+        autodiff_output_source)
+    assert "use_chunk_remat" not in autodiff_output_source
+    assert "remat_chunks" not in autodiff_output_source
+    production_step_source = autodiff_output_source.split(
         "def production_step", 1)[1].split("scan_step =", 1)[0]
     for required in (
             "read_value", "rho", "gate", "valid", "execution_weight"):
@@ -189,8 +209,8 @@ def test_v4174_dynamic_metric_source_contract():
     rst_production_source = rst_source.split("n_per_space =", 1)[0]
     assert "grouped_raw_out" in attention_production_source
     assert "grouped_gate_mass" in attention_production_source
-    assert "local_grouped_space_results" in attention_production_source
-    assert "local_grouped_output" in attention_production_source
+    assert "grouped_space_results" in attention_production_source
+    assert "grouped_global_interfaces" in attention_production_source
     assert "grouped_output" in attention_source
     assert attention_production_source.count(
         "_global_dense_rw_den_sharded(") == 1
