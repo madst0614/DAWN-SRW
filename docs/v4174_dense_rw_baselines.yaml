@@ -1,0 +1,253 @@
+schema_version: 1
+registry_id: v4174-400m-dense-rw
+updated_kst: "2026-07-26"
+active_generation: g2
+
+purpose:
+  question: "Can a candidate make the same canonical dense v4174 computation cheaper?"
+  default_control: "Reuse the active generation's stored measurements."
+  default_measurement: "Run the candidate only."
+
+policy:
+  reuse:
+    rerun_control_by_default: false
+    compare_candidate_to: active_generation
+    requirement:
+      - "The active generation fingerprint and all comparison invariants still match."
+      - "The candidate changes only the implementation under test."
+      - "The candidate uses the same protocol, real data, initialization seed, shapes, precision, mesh, and runtime release line."
+  candidate_protocol:
+    first: two_layer_backward_gate
+    continue_to_full_step_only_if_gate_passes: true
+    second: five_step_full_train
+  acceptance:
+    two_layer_combined_qkv_rst_fwd_bwd_improvement_percent_min: 10.0
+    five_step_mean_improvement_percent_min: 2.0
+    compile_regression_percent_max: 5.0
+    runtime_peak_hbm_regression_gib_max: 0.05
+    fail_on_oom_nan_inf_or_process_loss: true
+    always_report_signed_compile_and_hbm_deltas: true
+  promotion:
+    action: "Promote the accepted candidate and its already measured gate/full-step results as a new generation."
+    rerun_promoted_candidate_as_control: false
+    requirement: "Both canonical protocols must have completed under one matching fingerprint before promotion."
+  invalidation:
+    create_a_new_baseline_generation_once_if:
+      - "The accepted model structure, parameter roots/count/shapes, layer count, D, R, M, K, operator counts, or chunk semantics changes."
+      - "The forward topology, exact-overflow behavior, collective placement, precision boundary, or composition mode changes."
+      - "The performance-relevant config file or initialization seed changes."
+      - "The TPU accelerator type, global device count, mesh, batch size, sequence length, or real-data source changes."
+      - "The Python, JAX, Flax, Orbax, or libtpu release line changes."
+      - "The benchmark script, profiler semantics, warmup/measurement counts, or launcher execution semantics changes."
+      - "The accepted source changed without completing both canonical protocols before acceptance."
+    do_not_invalidate_for:
+      - "A candidate-only source edit under test."
+      - "Notebook, comments, logging text, or other non-performance metadata."
+      - "Promotion of a fully measured accepted candidate; use its existing measurements."
+    near_threshold_or_suspected_noise:
+      - "Repeat the candidate first."
+      - "Rerun the control only after a fingerprint mismatch or concrete drift evidence."
+  recording:
+    canonical_notebook: EXPERIMENT.md
+    canonical_registry: docs/v4174_dense_rw_baselines.yaml
+    raw_logs_in_git: false
+    required_identity:
+      - branch
+      - commit
+      - model_git_blob
+      - config_git_blob
+      - config_sha256
+      - benchmark_git_blob
+      - launcher_git_blob
+      - setup_git_blob
+      - checkpoint
+      - accelerator
+      - device_count
+      - mesh
+      - batch_size
+      - sequence_length
+      - data_source
+      - Python
+      - JAX
+      - Flax
+      - Orbax
+      - dirty_worktree_state
+
+comparison_invariants:
+  model_version: spatial-r1-v4.1.7.4
+  parameter_count: 393803872
+  parameter_roots:
+    - space_selector
+    - space_interface
+    - operator_controller
+    - operator_bank
+  n_layers: 18
+  d_model: 2048
+  d_route: 256
+  n_operation_spaces: 24
+  operation_space_top_k: 2
+  n_q: 21504
+  n_k: 21504
+  n_v: 134016
+  n_rst: 270000
+  execution_mode: bundle_dense
+  bundle_size: 4
+  bundle_token_block_size: 2048
+  exact_backward_bucket_capacity: 3072
+  exact_compact_overflow: true
+  composition_mode: linear_angular
+  chunks:
+    q: 1
+    k: 1
+    v: 2
+    rst: 8
+  precision:
+    control: FP32
+    read_write_gemm_operands: BF16
+    route_output: BF16
+    final_model_axis_d_output_psum: BF16_then_FP32
+  config: configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+  config_git_blob: d1b0e0895a7238eb01d6f513cb8ed340ea697bf5
+  config_sha256: 2945e84a0b3e989ec50da337f322ec20bd0ab2f3933e3887c6ce41f2353fcc68
+  initialization_seed: 1
+  checkpoint: none
+  data_source: gs://dawn-tpu-data-c4/c4_train_40B
+  max_train_tokens: 20000000000
+  batch_size: 1024
+  sequence_length: 512
+  accelerator: TPU-v4-64
+  global_devices: 32
+  hosts: 8
+  mesh:
+    data: 16
+    model: 2
+  runtime:
+    Python: 3.10.12
+    JAX: 0.6.2
+    Flax: 0.10.7
+    Orbax: 0.11.24
+  harness:
+    benchmark: scripts/benchmark_srw_tpu.py
+    benchmark_git_blob: e3454ca75b8b0bfd08a8e92c5265b84c73f4078e
+    launcher: scripts/launch_srw_benchmark_tpu_pod.sh
+    launcher_git_blob: 0f26c5865c6b1b382074143b2d8c7495c82b6db6
+    setup: scripts/setup_and_run_tpu_pod.sh
+    setup_git_blob: e74e14f95071371a8aa374b92deb7c42b1d27f82
+    tmux_session: train
+    remote_log: /home/madst0614/train.log
+
+protocols:
+  two_layer_backward_gate:
+    benchmark_args:
+      - --fast
+      - --backward-profile
+      - --detailed-profile-layers
+      - "2"
+      - --no-xla-dump
+    warmup_steps: 0
+    train_measure_steps: 0
+    detailed_profile_steps: 1
+    primary_metric: "sum(qkv_bundle_srw_fwd_bwd.total_seconds, rst_bundle_srw_fwd_bwd.total_seconds)"
+    backward_only_metric: "primary_metric - sum(qkv_bundle_srw.total_seconds, rst_bundle_srw.total_seconds)"
+  five_step_full_train:
+    benchmark_args:
+      - --steps
+      - "5"
+      - --warmup-steps
+      - "3"
+      - --forward-profile-steps
+      - "0"
+      - --module-profile-steps
+      - "0"
+      - --no-xla-dump
+    warmup_steps: 3
+    measure_steps: 5
+    primary_metric: mean_step_seconds
+
+generations:
+  g1:
+    status: superseded
+    role: "Matched control for the dense RW analytic pullback experiment."
+    branch: codex/v4167-poc
+    commit: d478168f88d844514529af4e8d517bbd40762fa8
+    model_git_blob: 82c490399bf05888a59c18c209f599ff4586efc0
+    dirty_worktree_state:
+      at_launch: clean
+      after_metrics_write: "tracked clean; untracked benchmark_runs/ only"
+    measured_on_tpu: spatial-se-400m
+    two_layer_backward_gate:
+      fast_forward_compile_seconds: 51.38521420001052
+      fast_forward_mean_seconds: 2.4598013650102075
+      qkv_forward_seconds: 0.12492777599254623
+      qkv_forward_backward_seconds: 0.4240119140013121
+      rst_forward_seconds: 0.10380587598774582
+      rst_forward_backward_seconds: 0.43120592302875593
+      combined_forward_backward_seconds: 0.855217837030068
+      combined_backward_only_seconds: 0.6264841850497759
+      detailed_split_seconds: 1.1328774790163152
+      detailed_compile_seconds: 133.63561926200055
+      peak_hbm_gib: 4.961921024
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_analytic_control_d478/benchmark_metrics_host_6.jsonl
+    five_step_full_train:
+      compile_seconds: 101.85790558700683
+      measured_step_seconds:
+        - 11.055918145983014
+        - 10.997462247993099
+        - 10.989541240996914
+        - 10.984891783999046
+        - 11.134331569017377
+      mean_step_seconds: 11.03242899759789
+      median_step_seconds: 10.997462247993099
+      p90_step_seconds: 11.102966199803632
+      mean_tokens_per_second: 47523.70862908454
+      peak_hbm_gib: 7.942043648
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_fullstep_control_d478/benchmark_metrics_host_6.jsonl
+
+  g2:
+    status: active
+    role: "Accepted canonical dense RW analytic pullback."
+    promoted_from_generation: g1
+    branch: codex/v4174-dense-rw-analytic-vjp
+    commit: 7b14a45668e6d262eede1fe43c9344d0b7ddcd86
+    model_git_blob: 893816a4d01737055275c485139304f5626abed3
+    dirty_worktree_state:
+      at_launch: clean
+      after_metrics_write: "tracked clean; untracked benchmark_runs/ only"
+    measured_on_tpu: spatial-se-400m
+    two_layer_backward_gate:
+      fast_forward_compile_seconds: 50.81899016798707
+      fast_forward_mean_seconds: 2.4585397109913174
+      qkv_forward_seconds: 0.12511497401283123
+      qkv_forward_backward_seconds: 0.3738157760235481
+      rst_forward_seconds: 0.103845225967234
+      rst_forward_backward_seconds: 0.35129569601849653
+      combined_forward_backward_seconds: 0.7251114720420446
+      combined_backward_only_seconds: 0.4961512720619794
+      detailed_split_seconds: 1.0031136790057644
+      detailed_compile_seconds: 98.2564581859624
+      peak_hbm_gib: 4.958972928
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_analytic_candidate_7b14a456/benchmark_metrics_host_6.jsonl
+    five_step_full_train:
+      compile_seconds: 99.59427323201089
+      measured_step_seconds:
+        - 9.812504700996215
+        - 9.754084753018105
+        - 9.738807843998075
+        - 9.744463834009366
+        - 9.859656138985883
+      mean_step_seconds: 9.78190345420153
+      median_step_seconds: 9.754084753018105
+      p90_step_seconds: 9.840795563790016
+      mean_tokens_per_second: 53598.978451549425
+      peak_hbm_gib: 7.93932288
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_fullstep_candidate_7b14a456/benchmark_metrics_host_6.jsonl
+    improvement_over_g1:
+      two_layer_combined_forward_backward_percent: 15.213242679765237
+      two_layer_backward_only_percent: 20.8038632256042
+      detailed_split_percent: 11.454354280502205
+      detailed_compile_percent: 26.474349631796297
+      five_step_mean_percent: 11.334997430471926
+      throughput_percent: 12.78366103512977
+      full_step_compile_percent: 2.222343314395311
+      two_layer_peak_hbm_gib_delta: -0.002948096000000122
+      full_step_peak_hbm_gib_delta: -0.002720767999999651

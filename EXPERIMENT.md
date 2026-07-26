@@ -5,14 +5,15 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: replace the disposable canonical v4174 initialization run immediately, screen a space-local dense RW analytic pullback on the explicitly authorized existing TPU `spatial-se-400m`, then leave an accepted canonical training process active so the TPU is not idle.
-- Publication state: branch `codex/v4167-poc`; implementation commit `db16ffdf9ecb1a65cdf5ea0cfe3702b790430055` and the notebook commit containing `2026-07-26/#16` are published to `origin/codex/v4167-poc`.
+- Current goal: keep the accepted space-local dense RW analytic pullback as the active v4174 baseline, use its stored measurements for later candidate-only comparisons, and leave a canonical process active on the explicitly authorized existing TPU `spatial-se-400m` so it is not idle.
+- Publication state: branch `codex/v4174-dense-rw-analytic-vjp`; implementation commit `7b14a45668e6d262eede1fe43c9344d0b7ddcd86` is published to `origin/codex/v4174-dense-rw-analytic-vjp`; the baseline registry and TPU acceptance record are being published with this notebook update.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`, 393,803,872 parameters, batch 1024, sequence 512, mesh `16x2` on 32 devices, and 38,146 full global steps. It is 3,164 parameters above the v4172 393,800,708 reference.
-- Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
-- Current conclusion: bundle4 dense forward and exact selected-top-2 backward remain the execution topology. The canonical model now separates selector/interface/controller/operator-bank parameters, uses one tau map per route and space, L1-normalizes selected-space weights to sum to one, and uses a deterministic top-1 fallback when all selected ReLU-squared scores vanish.
-- Candidate state: local branch `codex/v4174-dense-rw-analytic-vjp` keeps the accepted dense primal and replaces only the canonical linear-angular RW chunk pullback; focused local output/gradient parity and three existing v4174 regression paths pass.
-- Current blocker: TPU speed, compile, and HBM effects of the analytic pullback are not measured yet. The user stated that initialization will change, so the current accepted run does not need checkpoint preservation before replacement.
-- Next experiment: publish the candidate branch and immediately run the matched real-data two-layer QKV+RST backward gate. Continue to the five-step full train A/B only if the combined two-layer gate improves by at least 10% without compile or HBM regression, then relaunch accepted canonical training as the non-idle workload.
+- Best measured accepted result: generation `g2` at commit `7b14a45668e6d262eede1fe43c9344d0b7ddcd86` completed the matched five-step full train benchmark at 9.7819 s/it and 53,599.0 tokens/s, 11.33% faster and 12.78% higher-throughput than generation `g1` at `d478168f`. The two-layer QKV+RST forward-plus-backward gate improved 15.21%, with no compile or runtime-HBM regression.
+- Current conclusion: bundle4 dense forward and exact selected-top-2 backward remain the execution topology. The canonical linear-angular dense RW chunk now uses an explicit analytic pullback while preserving the accepted primal, shapes, precision boundaries, overflow semantics, and every gradient.
+- Baseline state: `docs/v4174_dense_rw_baselines.yaml` generation `g2` is active. Later candidates reuse its stored two-layer and five-step measurements; promotion reuses the accepted candidate's existing results. A control is measured again only when a listed structural, config, runtime, TPU/mesh, data, or profiler invariant changes.
+- Active run: generation `g2` commit `7b14a456` is running from scratch on `spatial-se-400m` in `tmux train`, with combined output in `~/train.log`. It passed 8-host/32-device initialization and entered the canonical training loop; the first optimizer step is not yet measured.
+- Current blocker: none. The active run is a disposable non-idle workload because the user plans another initialization change; it is not additional performance-acceptance evidence.
+- Next experiment: future dense-backward candidates start with a candidate-only two-layer gate against stored `g2`; do not rerun `g2` unless the registry fingerprint is invalidated.
 
 ## Fixed Context
 
@@ -28,6 +29,15 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Short TPU benchmarks and 50-step runs are sufficient for optimization screening. Require a longer steady window before production acceptance, and always report the measured window separately from compile, first-step, metric, validation, and checkpoint time.
 - TPU names recorded below are historical evidence, not authorization for a future task. `AGENTS.md` controls TPU authorization and prohibits TPU creation or allocation.
 - Evidence labels used below: `TPU measured`, `local validated`, `user-provided`, and `not measured`.
+
+## Baseline Registry
+
+- Machine-readable source: `docs/v4174_dense_rw_baselines.yaml`.
+- Normal path: reuse the active generation's stored control and run only the candidate with the same two-layer gate. Continue to the matched three-warmup/five-measure full train benchmark only after the gate passes.
+- Promotion path: when a candidate passes both protocols and is accepted, its measurements become the next generation baseline directly. Promotion by itself never triggers a duplicate control run.
+- Rebaseline path: create one new baseline generation when accepted structure/shapes, forward or overflow semantics, precision/collectives, performance config or seed, data/batch/sequence, TPU/mesh, Python/JAX/Flax/Orbax/libtpu release line, or benchmark/profiler semantics changes. If accepted source changed without both protocol results, measure that accepted source once before testing the next candidate.
+- Noise path: near a threshold, repeat the candidate first. Repeat the control only after an invariant mismatch or concrete baseline-drift evidence.
+- Acceptance thresholds: at least 10% for combined two-layer QKV+RST forward-plus-backward, at least 2% for five-step mean time, no more than 5% compile regression, no more than 0.05 GiB runtime peak-HBM regression, and no OOM/NaN/Inf/process loss. Signed compile and HBM deltas are always reported.
 
 ## Experiment Log
 
@@ -436,6 +446,28 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: the accepted BF16 primal's transpose rounds dot-result cotangents at the BF16 cast boundary without quantizing the upstream FP32 cotangent. Matching that exact order is required for near-bitwise parity; simply reusing the forward BF16 einsum helper in reverse is not equivalent.
 - Decision/next: publish this isolated candidate and run the real-data two-layer `--fast --backward-profile --detailed-profile-layers 2 --no-xla-dump` gate against the clean accepted control. Require at least 10% combined QKV+RST improvement and no compile/runtime-HBM regression before any full train-step A/B.
 - Evidence: `models/dawn_srw_v4174.py`; this notebook entry; focused local validation output from 2026-07-26 KST.
+
+#### #20 — Accept the dense RW analytic pullback and establish reusable baseline generations
+
+- Status: accepted; local validated, TPU measured, and promoted to active baseline generation `g2`.
+- Hypothesis/change: keep the accepted dense primal and replace only the canonical linear-angular RW chunk pullback with explicit analytic derivatives. Formalize control reuse so later candidates do not rerun a stable baseline, while forcing one new baseline when experiment-defining structure, config, runtime, TPU/mesh, data, or profiler invariants change.
+- Matched run identity: existing TPU `spatial-se-400m`; real C4 data; no checkpoint; seed 1; config `configs/train_config_v4174_400M_c4_20B_v4_64.yaml` at Git blob `d1b0e0895a7238eb01d6f513cb8ed340ea697bf5` / SHA-256 `2945e84a0b3e989ec50da337f322ec20bd0ab2f3933e3887c6ce41f2353fcc68`; batch 1024, sequence 512, mesh `16x2`/32 devices; benchmark blob `e3454ca75b8b0bfd08a8e92c5265b84c73f4078e`; launcher blob `0f26c5865c6b1b382074143b2d8c7495c82b6db6`; setup blob `e74e14f95071371a8aa374b92deb7c42b1d27f82`; Python 3.10.12, JAX 0.6.2, Flax 0.10.7, Orbax 0.11.24; clean remote checkouts.
+- Control/candidate identity: generation `g1` was branch `codex/v4167-poc`, commit `d478168f88d844514529af4e8d517bbd40762fa8`, model blob `82c490399bf05888a59c18c209f599ff4586efc0`. Generation `g2` is branch `codex/v4174-dense-rw-analytic-vjp`, commit `7b14a45668e6d262eede1fe43c9344d0b7ddcd86`, model blob `893816a4d01737055275c485139304f5626abed3`.
+- Two-layer gate: control/candidate forward was 2.459801/2.458540 s. Combined QKV+RST forward-plus-backward was 0.855218/0.725111 s, a 15.21% candidate improvement; subtracting the matched forward totals gave 0.626484/0.496151 s of backward-only work, a 20.80% improvement. Detailed split improved 1.132877/1.003114 s, or 11.45%; detailed compile improved 133.636/98.256 s, or 26.47%; runtime peak HBM was 4.961921/4.958973 GiB.
+- Full train result: with three warmups and five measured forward+backward+AdamW steps, control/candidate mean was 11.032429/9.781903 s, an 11.33% reduction; median was 10.997462/9.754085 s; throughput was 47,523.7/53,599.0 tokens/s, a 12.78% increase. Initial compile improved 101.858/99.594 s, or 2.22%; runtime peak HBM was 7.942044/7.939323 GiB. Both summaries were valid and no OOM, NaN, Inf, or process loss occurred.
+- Numerical evidence: focused local FP32/BF16, padding, mask, pruning, and exact-boundary parity produced bit-identical outputs and maximum gradient absolute difference `9.5367e-7`; all gradient cosines were effectively 1.0. TPU losses and gradients remained finite through both matched five-step trajectories.
+- Lesson: the analytic pullback removes enough generic autodiff overhead to survive the full 18-layer optimizer graph; unlike the earlier end-to-end rematerialization candidate, the isolated backward win produces a material full-step win without observed compile or runtime-HBM cost.
+- Baseline decision: promote the already measured candidate to active generation `g2`; do not rerun it merely to call it a control. Later candidates compare against the stored `g2` measurements unless `docs/v4174_dense_rw_baselines.yaml` declares an invariant invalid. If an accepted structural change lacks both canonical measurements, measure it once and create the next generation before continuing.
+- Evidence: `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_analytic_control_d478/benchmark_metrics_host_6.jsonl`; `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_analytic_candidate_7b14a456/benchmark_metrics_host_6.jsonl`; `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_fullstep_control_d478/benchmark_metrics_host_6.jsonl`; `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_fullstep_candidate_7b14a456/benchmark_metrics_host_6.jsonl`; `docs/v4174_dense_rw_baselines.yaml`.
+
+#### #21 — Leave the accepted generation running as the non-idle workload
+
+- Status: active; launcher and distributed startup passed, first optimizer step not yet measured.
+- Intent: replace the completed benchmark with a disposable canonical workload so the explicitly authorized existing TPU `spatial-se-400m` is not left idle while the user prepares a later initialization change. This run is not used to remeasure or promote the baseline.
+- Run identity: existing READY TPU-v4-64 `spatial-se-400m`; branch `codex/v4174-dense-rw-analytic-vjp`; clean tracked source commit `7b14a45668e6d262eede1fe43c9344d0b7ddcd86`; remote worktree has only untracked raw `benchmark_runs/`; config `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`; selected full-config SHA-256 `b3b7995ec09571e80bf2da54d1d8234f3fb1e1c6ae91ba5bbec764fe0b39cd38`; `--from-scratch`; seed 1; batch 1024, sequence 512, mesh `16x2`/32 devices; Python 3.10.12, JAX 0.6.2, Flax 0.10.7, Orbax 0.11.24.
+- Launch/result: all eight worker SSH preflights and holder-verified cleanup passed. The standard launcher started `scripts/train_jax.py` in `tmux train` on every worker at 2026-07-26 15:05 KST with combined stdout/stderr in `~/train.log`. Process 0 is gcloud worker 6; `jax.distributed` reported 8 processes and 32 global devices, created run folder `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_20B_v4_64/run_vspatial-r1-v4.1.7.4_20260726_150551_3201`, initialized 393,803,872 parameters, completed tau calibration and Orbax/barrier setup, verified `global_step=0` across all hosts, and entered the canonical minimal training loop.
+- Decision/next: leave this process running. Treat compile time, first-step time, loss, and throughput as `not measured` until a later observation; replacing it for the planned initialization change is explicitly allowed.
+- Evidence: primary worker 6 `/home/madst0614/train.log`; archived final candidate benchmark log `/home/madst0614/train.v4174_dense_rw_fullstep_candidate_7b14a456_20260726T1454KST.log`; local untracked launcher captures `launch_spatial-se-400m_20260726_150537_worker_{0..7}.log` are raw operational evidence and must not be committed.
 
 ## Backfill Boundary
 
