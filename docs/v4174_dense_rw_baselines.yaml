@@ -1,17 +1,17 @@
 schema_version: 1
 registry_id: v4174-400m-dense-rw
 updated_kst: "2026-07-26"
-active_generation: g2
+active_generation: g3
 
 canonical_source:
   branch: codex/v4167-poc
-  audited_commit: ec744a2a095227b4d928cdc058816976d10e98f0
+  audited_commit: 8313cb07711b8a29163503abefde28227588e73a
   baseline_source_branch: codex/v4167-poc
   experimental_branches_are_candidate_only: true
   accepted_changes_require_sync_to_canonical_branch: true
   historical_measurements_keep_actual_branch_and_commit: true
-  current_source_requires_new_generation: true
-  current_source_rebaseline_reason: "Fully independent per-space projection initialization changes the accepted initialization fingerprint."
+  current_source_requires_new_generation: false
+  current_source_rebaseline_reason: null
 
 purpose:
   question: "Can a candidate make the same canonical dense v4174 computation cheaper?"
@@ -125,7 +125,7 @@ comparison_invariants:
   config_git_blob: d1b0e0895a7238eb01d6f513cb8ed340ea697bf5
   config_sha256: 2945e84a0b3e989ec50da337f322ec20bd0ab2f3933e3887c6ce41f2353fcc68
   initialization_seed: 1
-  operation_space_projection_initialization: shared_base_row_sign_derived
+  operation_space_projection_initialization: independently_keyed_per_space_semi_orthogonal
   checkpoint: none
   data_source: gs://dawn-tpu-data-c4/c4_train_40B
   max_train_tokens: 20000000000
@@ -220,7 +220,7 @@ generations:
       evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_fullstep_control_d478/benchmark_metrics_host_6.jsonl
 
   g2:
-    status: active
+    status: superseded
     role: "Accepted canonical dense RW analytic pullback."
     promoted_from_generation: g1
     branch: codex/v4174-dense-rw-analytic-vjp
@@ -267,3 +267,55 @@ generations:
       full_step_compile_percent: 2.222343314395311
       two_layer_peak_hbm_gib_delta: -0.002948096000000122
       full_step_peak_hbm_gib_delta: -0.002720767999999651
+
+  g3:
+    status: active
+    role: "Canonical independent per-space initialization control."
+    rebaseline_reason: "The accepted source changed from shared-base/row-sign-derived projections to independently keyed semi-orthogonal bases."
+    branch: codex/v4167-poc
+    commit: 8313cb07711b8a29163503abefde28227588e73a
+    model_git_blob: 4fe109a5508343275f806373d94d5930dfdfc090
+    dirty_worktree_state:
+      at_launch: "tracked clean; pre-existing untracked benchmark_runs/ only"
+      after_metrics_write: "tracked clean; untracked benchmark_runs/ only"
+    measured_on_tpu: spatial-se-400m
+    two_layer_backward_gate:
+      fast_forward_compile_seconds: 51.51592814401374
+      fast_forward_mean_seconds: 2.4423412949836347
+      qkv_forward_seconds: 0.12515707503189333
+      qkv_forward_backward_seconds: 0.37392845601425506
+      rst_forward_seconds: 0.10527192597510293
+      rst_forward_backward_seconds: 0.35259727598167956
+      combined_forward_backward_seconds: 0.7265257319959346
+      combined_backward_only_seconds: 0.49609673098893836
+      detailed_split_seconds: 1.0055722099205013
+      detailed_compile_seconds: 96.88218019789201
+      peak_hbm_gib: 4.966570496
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_g3_independent_control_8313cb07_gate/benchmark_metrics_host_6.jsonl
+    five_step_full_train:
+      compile_seconds: 96.46021539799403
+      measured_step_seconds:
+        - 9.931495625001844
+        - 9.865838536992669
+        - 9.939949504012475
+        - 9.857401667017257
+        - 9.882363685988821
+      mean_step_seconds: 9.895409803802613
+      median_step_seconds: 9.882363685988821
+      p90_step_seconds: 9.936567952408222
+      mean_tokens_per_second: 52983.57413203665
+      peak_hbm_gib: 7.94692096
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_g3_independent_control_8313cb07_fullstep/benchmark_metrics_host_6.jsonl
+    comparison_to_g2:
+      note: "Informational only: the initialization fingerprint changed, so g2 is historical rather than a reusable current-source control."
+      two_layer_combined_forward_backward_time_change_percent: 0.19504035012812374
+      two_layer_forward_time_change_percent: 0.64150932216993
+      two_layer_backward_only_time_change_percent: -0.01099283144319409
+      detailed_split_time_change_percent: 0.24508996001068226
+      fast_forward_compile_time_change_percent: 1.371412485220346
+      detailed_compile_time_change_percent: -1.3986642847123592
+      two_layer_peak_hbm_gib_delta: 0.007597568000000443
+      five_step_mean_time_change_percent: 1.1603707819497031
+      throughput_change_percent: -1.1481642697147043
+      full_step_compile_time_change_percent: -3.1468253467906533
+      full_step_peak_hbm_gib_delta: 0.007598080000000174
