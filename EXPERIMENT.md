@@ -5,13 +5,14 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: keep the canonical v4174 20B 400M from-scratch run active on the explicitly authorized existing TPU `spatial-se-400m` and monitor its early training stability.
+- Current goal: replace the disposable canonical v4174 initialization run immediately, screen a space-local dense RW analytic pullback on the explicitly authorized existing TPU `spatial-se-400m`, then leave an accepted canonical training process active so the TPU is not idle.
 - Publication state: branch `codex/v4167-poc`; implementation commit `db16ffdf9ecb1a65cdf5ea0cfe3702b790430055` and the notebook commit containing `2026-07-26/#16` are published to `origin/codex/v4167-poc`.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`, 393,803,872 parameters, batch 1024, sequence 512, mesh `16x2` on 32 devices, and 38,146 full global steps. It is 3,164 parameters above the v4172 393,800,708 reference.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
 - Current conclusion: bundle4 dense forward and exact selected-top-2 backward remain the execution topology. The canonical model now separates selector/interface/controller/operator-bank parameters, uses one tau map per route and space, L1-normalizes selected-space weights to sum to one, and uses a deterministic top-1 fallback when all selected ReLU-squared scores vanish.
-- Current blocker: no immediate implementation or runtime blocker; long-window throughput, validation quality, and checkpoint behavior for this fresh run are not measured yet.
-- Next experiment: leave the current `tmux train` process running, inspect the regular step-100 window and the first validation/checkpoint boundaries, and compare steady-state behavior without changing the accepted topology or parameter tree.
+- Candidate state: local branch `codex/v4174-dense-rw-analytic-vjp` keeps the accepted dense primal and replaces only the canonical linear-angular RW chunk pullback; focused local output/gradient parity and three existing v4174 regression paths pass.
+- Current blocker: TPU speed, compile, and HBM effects of the analytic pullback are not measured yet. The user stated that initialization will change, so the current accepted run does not need checkpoint preservation before replacement.
+- Next experiment: publish the candidate branch and immediately run the matched real-data two-layer QKV+RST backward gate. Continue to the five-step full train A/B only if the combined two-layer gate improves by at least 10% without compile or HBM regression, then relaunch accepted canonical training as the non-idle workload.
 
 ## Fixed Context
 
@@ -416,6 +417,25 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Result: step 10 completed at loss 10.5675, 10.195 s/it, and 51,323.1 tokens/s. Step 20 completed at loss 10.3221, finite grad norm 17.11, 10.079 s/it, and 51,917.6 tokens/s. Attention/RST raw space mass remained 0.024 while both selected active-space counts remained 2.000; attention, RST, and residual norms were 0.291, 2.027, and 9.990. The primary `train_jax.py --from-scratch` process was still live and no fatal error was present.
 - Decision/next: leave training untouched and wait for the regular step-100 report before treating throughput or numerical behavior as a stable window.
 - Evidence: primary `~/train.log` on gcloud worker 6, observed 2026-07-26 KST.
+
+#### #18 — Record the canonical step-100 routing window
+
+- Status: TPU measured; accepted training remained live after observation.
+- Run identity: unchanged from `2026-07-26/#16`; existing TPU `spatial-se-400m`, clean commit `db16ffdf9ecb1a65cdf5ea0cfe3702b790430055`, canonical 20B config, GCS run `run_vspatial-r1-v4.1.7.4_20260726_135537_3201`, batch 1024, sequence 512, and mesh `16x2`/32 devices.
+- Result: step 100 completed with loss/CE 7.5920, finite grad norm 5.12, an 11.086 s/it 50-step window, and 47,199.0 tokens/s. Attention/RST selected-space active counts remained exactly 2.000 with zero fallback. Top-1 fractions were 0.795/0.839; bundle primary token counts ranged from 1,012 to 29,353 for attention and 461 to 30,484 for RST, with mean counts 10,715.8/10,757.5 and padding 6.76%/5.78%.
+- Lesson: routing had become strongly skewed by step 100 while exact selected-space execution remained complete. The accepted `Tcap=3072` primary bucket therefore still requires compact overflow replay; no-drop semantics remain mandatory for the analytic candidate.
+- Decision/next: preserve this accepted state with the cooperative SIGTERM emergency-save path before using the same TPU for the bounded analytic VJP gate.
+- Evidence: primary `~/train.log` on gcloud worker 6, observed 2026-07-26 KST.
+
+#### #19 — Implement a dense RW analytic chunk pullback
+
+- Status: candidate implemented and locally validated; TPU not yet measured.
+- Hypothesis/change: retain the accepted bundle4 forward, exact top-2 bucket/overflow topology, dense read/write GEMMs, precision boundaries, normalization, tau map, denominator, and every gradient, but replace general autodiff through each canonical linear-angular RW chunk with an explicit pullback for write GEMM, gate/tau algebra, read GEMM, and read/write normalization.
+- Run identity: branch `codex/v4174-dense-rw-analytic-vjp`; source parent `d478168f88d844514529af4e8d517bbd40762fa8`; dirty candidate model SHA-256 `4bba4a64915d95925afeef46cc88a4f740b099ee7e7e341f0b214e096c9de020`; config SHA-256 `2945e84a0b3e989ec50da337f322ec20bd0ab2f3933e3887c6ce41f2353fcc68`; no checkpoint or TPU execution in this entry. Local environment: Python 3.12.7, JAX 0.6.2, Flax 0.10.7.
+- Local validation: dense synthetic cases covered FP32/BF16 throughput dots, padded chunks, token masks, pruning at 0 and 0.05, and an exact `margin == 0` boundary. Forward outputs were bit-identical; maximum gradient absolute difference versus the former autodiff path was `9.5367e-7`, with all gradient cosines effectively 1.0. Existing checkpoint/JIT/diagnostics and 20-step mixed-precision paths passed `3 passed in 36.92s`; `py_compile` and `git diff --check` passed.
+- Lesson: the accepted BF16 primal's transpose rounds dot-result cotangents at the BF16 cast boundary without quantizing the upstream FP32 cotangent. Matching that exact order is required for near-bitwise parity; simply reusing the forward BF16 einsum helper in reverse is not equivalent.
+- Decision/next: publish this isolated candidate and run the real-data two-layer `--fast --backward-profile --detailed-profile-layers 2 --no-xla-dump` gate against the clean accepted control. Require at least 10% combined QKV+RST improvement and no compile/runtime-HBM regression before any full train-step A/B.
+- Evidence: `models/dawn_srw_v4174.py`; this notebook entry; focused local validation output from 2026-07-26 KST.
 
 ## Backfill Boundary
 

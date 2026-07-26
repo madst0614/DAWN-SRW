@@ -2687,7 +2687,7 @@ def _exact_space_bucket_weight_cotangents_to_dense(
         mode="drop")
 
 
-def _dense_rw_output_sharded(
+def _dense_rw_output_sharded_autodiff(
         local_f32: jax.Array,
         local_norm: jax.Array,
         token_valid: jax.Array,
@@ -2767,6 +2767,415 @@ def _dense_rw_output_sharded(
     (raw_out, gate_mass), _ = jax.lax.scan(
         scan_step, carry, jnp.arange(n_chunks))
     return raw_out, gate_mass
+
+
+def _closed_interval_clip_vjp_multiplier(
+        value: jax.Array,
+        lower: float,
+        upper: float) -> jax.Array:
+    """Match JAX's half-gradient convention at clip boundaries."""
+    value = jnp.asarray(value, dtype=jnp.float32)
+    lower_value = jnp.float32(lower)
+    upper_value = jnp.float32(upper)
+    interior = (value > lower_value) & (value < upper_value)
+    boundary = (value == lower_value) | (value == upper_value)
+    return (
+        interior.astype(jnp.float32)
+        + jnp.float32(0.5) * boundary.astype(jnp.float32))
+
+
+def _forward_unit_direction_vjp(
+        raw_value: jax.Array,
+        unit_cotangent: jax.Array) -> jax.Array:
+    """Analytic pullback for x / (||x|| + eps), independently per row."""
+    raw_f32 = jnp.asarray(raw_value, dtype=jnp.float32)
+    cotangent_f32 = jnp.asarray(unit_cotangent, dtype=jnp.float32)
+    norm = jnp.linalg.norm(raw_f32, axis=-1, keepdims=True)
+    denominator = norm + jnp.float32(RW_FORWARD_NORM_EPS)
+    denominator_cotangent = -(
+        cotangent_f32 * raw_f32
+    ).sum(axis=-1, keepdims=True) / jnp.square(denominator)
+    norm_direction = jnp.where(
+        norm > 0.0,
+        raw_f32 / jnp.maximum(norm, jnp.finfo(jnp.float32).tiny),
+        0.0)
+    return (
+        cotangent_f32 / denominator
+        + denominator_cotangent * norm_direction)
+
+
+def _dense_rw_vjp_dot(
+        equation: str,
+        lhs: jax.Array,
+        rhs: jax.Array, *,
+        throughput_bf16: bool) -> jax.Array:
+    """Transpose one RW dot while matching the primal cast boundary."""
+    if throughput_bf16:
+        result = jnp.einsum(
+            equation,
+            lhs,
+            rhs,
+            precision=jax.lax.Precision.DEFAULT,
+            preferred_element_type=jnp.float32)
+        return result.astype(jnp.bfloat16).astype(jnp.float32)
+    return jnp.einsum(
+        equation,
+        jnp.asarray(lhs, dtype=jnp.float32),
+        jnp.asarray(rhs, dtype=jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32)
+
+
+@partial(
+    jax.custom_vjp,
+    nondiff_argnums=(6, 10, 11, 12),
+)
+def _dense_rw_output_sharded_linear_analytic(
+        local_f32: jax.Array,
+        local_norm: jax.Array,
+        token_valid: jax.Array,
+        read_vectors: jax.Array,
+        write_vectors: jax.Array,
+        raw_tau: jax.Array,
+        max_chunk_size: int,
+        soft_gate_temperature: jax.Array,
+        soft_gate_boundary_power: jax.Array,
+        execution_prune_eps: jax.Array,
+        heat_kernel_beta: float,
+        effective_active_eps: float,
+        throughput_bf16: bool) -> tuple[jax.Array, jax.Array]:
+    """Keep the accepted dense primal and replace only its RW pullback."""
+    return _dense_rw_output_sharded_autodiff(
+        local_f32,
+        local_norm,
+        token_valid,
+        read_vectors,
+        write_vectors,
+        raw_tau,
+        max_chunk_size=max_chunk_size,
+        soft_gate_temperature=soft_gate_temperature,
+        soft_gate_boundary_power=soft_gate_boundary_power,
+        execution_prune_eps=execution_prune_eps,
+        srw_composition_mode="linear_angular",
+        heat_kernel_beta=heat_kernel_beta,
+        effective_active_eps=effective_active_eps,
+        throughput_bf16=throughput_bf16)
+
+
+def _dense_rw_output_sharded_linear_analytic_fwd(
+        local_f32: jax.Array,
+        local_norm: jax.Array,
+        token_valid: jax.Array,
+        read_vectors: jax.Array,
+        write_vectors: jax.Array,
+        raw_tau: jax.Array,
+        max_chunk_size: int,
+        soft_gate_temperature: jax.Array,
+        soft_gate_boundary_power: jax.Array,
+        execution_prune_eps: jax.Array,
+        heat_kernel_beta: float,
+        effective_active_eps: float,
+        throughput_bf16: bool):
+    output = _dense_rw_output_sharded_autodiff(
+        local_f32,
+        local_norm,
+        token_valid,
+        read_vectors,
+        write_vectors,
+        raw_tau,
+        max_chunk_size=max_chunk_size,
+        soft_gate_temperature=soft_gate_temperature,
+        soft_gate_boundary_power=soft_gate_boundary_power,
+        execution_prune_eps=execution_prune_eps,
+        srw_composition_mode="linear_angular",
+        heat_kernel_beta=heat_kernel_beta,
+        effective_active_eps=effective_active_eps,
+        throughput_bf16=throughput_bf16)
+    residual = (
+        local_f32,
+        local_norm,
+        token_valid,
+        read_vectors,
+        write_vectors,
+        raw_tau,
+        soft_gate_temperature,
+        soft_gate_boundary_power,
+        execution_prune_eps,
+    )
+    return output, residual
+
+
+def _dense_rw_output_sharded_linear_analytic_bwd(
+        max_chunk_size: int,
+        heat_kernel_beta: float,
+        effective_active_eps: float,
+        throughput_bf16: bool,
+        residual,
+        output_cotangent):
+    del heat_kernel_beta, effective_active_eps
+    (local_f32,
+     local_norm,
+     token_valid,
+     read_vectors,
+     write_vectors,
+     raw_tau,
+     soft_gate_temperature,
+     soft_gate_boundary_power,
+     execution_prune_eps) = residual
+    raw_out_cotangent, gate_mass_cotangent = output_cotangent
+    n_routes, n_spaces, token_capacity, d_route = map(
+        int, (read_vectors.shape[0], local_f32.shape[0],
+              local_f32.shape[1], local_f32.shape[2]))
+    n_local = int(read_vectors.shape[2])
+    chunk_size = min(max(1, int(max_chunk_size)), n_local)
+    n_chunks = math.ceil(n_local / chunk_size)
+    n_padded = n_chunks * chunk_size
+    pad_n = n_padded - n_local
+    pad_spec = ((0, 0), (0, 0), (0, pad_n), (0, 0))
+    padded_reads = jnp.pad(read_vectors, pad_spec)
+    padded_writes = jnp.pad(write_vectors, pad_spec)
+    normalized_reads = forward_unit_direction(padded_reads)
+    normalized_writes = forward_unit_direction(padded_writes)
+    valid_rows = jnp.arange(n_padded) < n_local
+    sigmoid_tau = jax.nn.sigmoid(
+        jnp.asarray(raw_tau, dtype=jnp.float32))
+    tau = (
+        jnp.float32(-1.0)
+        + jnp.float32(2.0) * sigmoid_tau)
+    tau_param_multiplier = (
+        jnp.float32(2.0)
+        * sigmoid_tau
+        * (jnp.float32(1.0) - sigmoid_tau))
+    prune_eps = jnp.asarray(
+        execution_prune_eps, dtype=jnp.float32)
+    raw_out_ct = jnp.asarray(
+        raw_out_cotangent, dtype=jnp.float32)
+    gate_mass_ct = jnp.asarray(
+        gate_mass_cotangent, dtype=jnp.float32)
+    initial_carry = (
+        jnp.zeros(
+            (n_spaces, token_capacity, d_route),
+            dtype=jnp.float32),
+        jnp.zeros(
+            (n_spaces, token_capacity, 1),
+            dtype=jnp.float32),
+        jnp.zeros_like(tau, dtype=jnp.float32),
+    )
+
+    def chunk_pullback(carry_value, chunk_index):
+        local_cotangent, norm_cotangent, tau_cotangent = carry_value
+        start = chunk_index * chunk_size
+        raw_read = jax.lax.dynamic_slice_in_dim(
+            padded_reads, start, chunk_size, axis=2)
+        raw_write = jax.lax.dynamic_slice_in_dim(
+            padded_writes, start, chunk_size, axis=2)
+        read = jax.lax.dynamic_slice_in_dim(
+            normalized_reads, start, chunk_size, axis=2)
+        write = jax.lax.dynamic_slice_in_dim(
+            normalized_writes, start, chunk_size, axis=2)
+        row_valid = jax.lax.dynamic_slice_in_dim(
+            valid_rows, start, chunk_size, axis=0)
+        valid = (
+            token_valid[None, :, :, None]
+            & row_valid[None, None, None, :])
+        read_value = (
+            _throughput_einsum_bf16_f32(
+                "mtr,amnr->amtn", local_f32, read)
+            if throughput_bf16
+            else _control_einsum_f32(
+                "mtr,amnr->amtn", local_f32, read)
+        ).astype(jnp.float32)
+        rho_unclipped = read_value / local_norm[None, ...]
+        rho = jnp.clip(rho_unclipped, -1.0, 1.0)
+        rho_compute = jnp.where(valid, rho, tau)
+        score = jnp.clip(rho_compute, -1.0, 1.0)
+        margin = score - tau
+        tau_distance = jnp.float32(1.0) - tau
+        angular_den = jnp.maximum(
+            tau_distance, jnp.float32(1.0e-4))
+        angular_unclipped = margin / angular_den
+        admission = jnp.clip(angular_unclipped, 0.0, 1.0)
+        execution_enabled = (
+            (prune_eps <= 0.0) | (admission >= prune_eps))
+        execution_weight = jnp.where(
+            execution_enabled, admission, 0.0)
+        execution_weight = jnp.where(
+            valid, execution_weight, 0.0)
+        weighted_read = execution_weight * read_value
+
+        write_operand = (
+            write.astype(jnp.bfloat16)
+            if throughput_bf16 else write)
+        weighted_operand = (
+            weighted_read.astype(jnp.bfloat16)
+            if throughput_bf16 else weighted_read)
+        weighted_cotangent = _dense_rw_vjp_dot(
+            "amtr,amnr->amtn",
+            raw_out_ct,
+            write_operand,
+            throughput_bf16=throughput_bf16)
+        write_unit_cotangent = _dense_rw_vjp_dot(
+            "amtn,amtr->amnr",
+            weighted_operand,
+            raw_out_ct,
+            throughput_bf16=throughput_bf16)
+        execution_cotangent = weighted_cotangent * read_value
+        read_value_cotangent = (
+            weighted_cotangent * execution_weight)
+
+        admission_cotangent = jnp.where(
+            valid,
+            gate_mass_ct + jnp.where(
+                execution_enabled, execution_cotangent, 0.0),
+            0.0)
+        angular_unclipped_cotangent = (
+            admission_cotangent
+            * _closed_interval_clip_vjp_multiplier(
+                angular_unclipped, 0.0, 1.0))
+        margin_cotangent = (
+            angular_unclipped_cotangent / angular_den)
+        angular_den_cotangent = -(
+            angular_unclipped_cotangent
+            * margin
+            / jnp.square(angular_den))
+        tau_distance_multiplier = jnp.where(
+            tau_distance > jnp.float32(1.0e-4),
+            jnp.float32(1.0),
+            jnp.where(
+                tau_distance == jnp.float32(1.0e-4),
+                jnp.float32(0.5),
+                jnp.float32(0.0)))
+        chunk_tau_cotangent = (
+            -margin_cotangent
+            - angular_den_cotangent * tau_distance_multiplier)
+        score_cotangent = margin_cotangent
+        rho_compute_cotangent = (
+            score_cotangent
+            * _closed_interval_clip_vjp_multiplier(
+                rho_compute, -1.0, 1.0))
+        chunk_tau_cotangent = (
+            chunk_tau_cotangent
+            + jnp.where(valid, 0.0, rho_compute_cotangent))
+        rho_cotangent = jnp.where(
+            valid, rho_compute_cotangent, 0.0)
+        rho_unclipped_cotangent = (
+            rho_cotangent
+            * _closed_interval_clip_vjp_multiplier(
+                rho_unclipped, -1.0, 1.0))
+        read_value_cotangent = (
+            read_value_cotangent
+            + rho_unclipped_cotangent / local_norm[None, ...])
+        chunk_norm_cotangent = -(
+            rho_unclipped_cotangent
+            * read_value
+            / jnp.square(local_norm[None, ...]))
+
+        read_operand = (
+            read.astype(jnp.bfloat16)
+            if throughput_bf16 else read)
+        local_operand = (
+            local_f32.astype(jnp.bfloat16)
+            if throughput_bf16 else local_f32)
+        chunk_local_cotangent = _dense_rw_vjp_dot(
+            "amtn,amnr->mtr",
+            read_value_cotangent,
+            read_operand,
+            throughput_bf16=throughput_bf16)
+        read_unit_cotangent = _dense_rw_vjp_dot(
+            "amtn,mtr->amnr",
+            read_value_cotangent,
+            local_operand,
+            throughput_bf16=throughput_bf16)
+        raw_read_cotangent = _forward_unit_direction_vjp(
+            raw_read, read_unit_cotangent)
+        raw_write_cotangent = _forward_unit_direction_vjp(
+            raw_write, write_unit_cotangent)
+        return (
+            local_cotangent + chunk_local_cotangent,
+            norm_cotangent + chunk_norm_cotangent.sum(
+                axis=(0, 3))[:, :, None],
+            tau_cotangent + chunk_tau_cotangent.sum(
+                axis=-1, keepdims=True),
+        ), (raw_read_cotangent, raw_write_cotangent)
+
+    (local_cotangent,
+     norm_cotangent,
+     tau_cotangent), (
+         read_chunk_cotangents,
+         write_chunk_cotangents,
+     ) = jax.lax.scan(
+        chunk_pullback, initial_carry, jnp.arange(n_chunks))
+    read_cotangent = jnp.transpose(
+        read_chunk_cotangents, (1, 2, 0, 3, 4)
+    ).reshape((n_routes, n_spaces, n_padded, d_route))[:, :, :n_local, :]
+    write_cotangent = jnp.transpose(
+        write_chunk_cotangents, (1, 2, 0, 3, 4)
+    ).reshape((n_routes, n_spaces, n_padded, d_route))[:, :, :n_local, :]
+    raw_tau_cotangent = tau_cotangent * tau_param_multiplier
+    return (
+        local_cotangent,
+        norm_cotangent,
+        None,
+        read_cotangent,
+        write_cotangent,
+        raw_tau_cotangent,
+        jnp.zeros_like(soft_gate_temperature),
+        jnp.zeros_like(soft_gate_boundary_power),
+        jnp.zeros_like(execution_prune_eps),
+    )
+
+
+_dense_rw_output_sharded_linear_analytic.defvjp(
+    _dense_rw_output_sharded_linear_analytic_fwd,
+    _dense_rw_output_sharded_linear_analytic_bwd)
+
+
+def _dense_rw_output_sharded(
+        local_f32: jax.Array,
+        local_norm: jax.Array,
+        token_valid: jax.Array,
+        read_vectors: jax.Array,
+        write_vectors: jax.Array,
+        raw_tau: jax.Array, *,
+        max_chunk_size: int,
+        soft_gate_temperature: jax.Array,
+        soft_gate_boundary_power: jax.Array,
+        execution_prune_eps: jax.Array,
+        srw_composition_mode: str,
+        heat_kernel_beta: float,
+        effective_active_eps: float,
+        throughput_bf16: bool) -> tuple[jax.Array, jax.Array]:
+    """Use the analytic dense RW pullback for canonical linear-angular runs."""
+    if str(srw_composition_mode) == "linear_angular":
+        return _dense_rw_output_sharded_linear_analytic(
+            local_f32,
+            local_norm,
+            token_valid,
+            read_vectors,
+            write_vectors,
+            raw_tau,
+            max_chunk_size,
+            soft_gate_temperature,
+            soft_gate_boundary_power,
+            execution_prune_eps,
+            heat_kernel_beta,
+            effective_active_eps,
+            throughput_bf16)
+    return _dense_rw_output_sharded_autodiff(
+        local_f32,
+        local_norm,
+        token_valid,
+        read_vectors,
+        write_vectors,
+        raw_tau,
+        max_chunk_size=max_chunk_size,
+        soft_gate_temperature=soft_gate_temperature,
+        soft_gate_boundary_power=soft_gate_boundary_power,
+        execution_prune_eps=execution_prune_eps,
+        srw_composition_mode=srw_composition_mode,
+        heat_kernel_beta=heat_kernel_beta,
+        effective_active_eps=effective_active_eps,
+        throughput_bf16=throughput_bf16)
 
 
 def _global_dense_rw_den_sharded(
