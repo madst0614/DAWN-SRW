@@ -80,7 +80,7 @@ training:
   n_chunks_q: 1
   n_chunks_k: 1
   n_chunks_v: 2
-  n_chunks_rst: 8
+  n_chunks_rst: 4
 
   lr: 3.0e-4
   tau_lr_mult: 0.001
