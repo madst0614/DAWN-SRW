@@ -2383,26 +2383,31 @@ def create_v4174_detailed_profile_fns(
         return module._shared_layer_norm(
             x, block_params["norm1"]["scale"], block_params["norm1"]["bias"])
 
-    def qkv_bundle_srw(pool_params, router_params, normed):
+    def qkv_bundle_srw(
+            operator_bank_params, operation_space_params, normed):
+        space_selector_params = operation_space_params["space_selector"]
+        space_interface_params = operation_space_params["space_interface"]
+        operator_controller_params = operation_space_params[
+            "operator_controller"]
         flat_state = normed.reshape((-1, d_model))
         q, k, v, _metrics = attention_dense(
             flat_state,
-            router_params["space_route_proj"]["kernel"],
-            router_params["space_read_vectors"],
-            router_params["space_state_proj"],
-            router_params["space_state_writeback"],
-            router_params["q_operator_tau_proj"]["kernel"],
-            router_params["q_operator_tau_proj"]["bias"],
-            router_params["k_operator_tau_proj"]["kernel"],
-            router_params["k_operator_tau_proj"]["bias"],
-            router_params["v_operator_tau_proj"]["kernel"],
-            router_params["v_operator_tau_proj"]["bias"],
-            pool_params["q_read_vectors"],
-            pool_params["q_write_vectors"],
-            pool_params["k_read_vectors"],
-            pool_params["k_write_vectors"],
-            pool_params["v_read_vectors"],
-            pool_params["v_write_vectors"],
+            space_selector_params["space_query_proj"]["kernel"],
+            space_selector_params["space_route_keys"],
+            space_interface_params["space_read_proj"],
+            space_interface_params["space_write_proj"],
+            operator_controller_params["q_tau_kernel"],
+            operator_controller_params["q_tau_bias"],
+            operator_controller_params["k_tau_kernel"],
+            operator_controller_params["k_tau_bias"],
+            operator_controller_params["v_tau_kernel"],
+            operator_controller_params["v_tau_bias"],
+            operator_bank_params["q_read_vectors"],
+            operator_bank_params["q_write_vectors"],
+            operator_bank_params["k_read_vectors"],
+            operator_bank_params["k_write_vectors"],
+            operator_bank_params["v_read_vectors"],
+            operator_bank_params["v_write_vectors"],
             jnp.float32(soft_gate_t),
             jnp.float32(soft_gate_t),
             jnp.float32(boundary_power),
@@ -2426,10 +2431,15 @@ def create_v4174_detailed_profile_fns(
     if include_backward:
         @jax.jit
         def qkv_bundle_srw_fwd_bwd_step(
-                pool_params, router_params, normed):
-            def objective(exact_pool, exact_router, exact_normed):
+                operator_bank_params, operation_space_params, normed):
+            def objective(
+                    exact_operator_bank,
+                    exact_operation_space_params,
+                    exact_normed):
                 q, k, v = qkv_bundle_srw(
-                    exact_pool, exact_router, exact_normed)
+                    exact_operator_bank,
+                    exact_operation_space_params,
+                    exact_normed)
                 return (
                     jnp.mean(q)
                     + jnp.float32(0.5) * jnp.mean(k)
@@ -2437,7 +2447,7 @@ def create_v4174_detailed_profile_fns(
 
             value, grads = jax.value_and_grad(
                 objective, argnums=(0, 1, 2))(
-                    pool_params, router_params, normed)
+                    operator_bank_params, operation_space_params, normed)
             return value, gradient_checksum(grads)
     else:
         qkv_bundle_srw_fwd_bwd_step = None
@@ -2469,18 +2479,23 @@ def create_v4174_detailed_profile_fns(
         return module._shared_layer_norm(
             x, block_params["norm2"]["scale"], block_params["norm2"]["bias"])
 
-    def rst_bundle_srw(pool_params, router_params, normed, x):
+    def rst_bundle_srw(
+            operator_bank_params, operation_space_params, normed, x):
+        space_selector_params = operation_space_params["space_selector"]
+        space_interface_params = operation_space_params["space_interface"]
+        operator_controller_params = operation_space_params[
+            "operator_controller"]
         flat_state = normed.reshape((-1, d_model))
         update, _metrics = rst_dense(
             flat_state,
-            router_params["space_route_proj"]["kernel"],
-            router_params["space_read_vectors"],
-            router_params["space_state_proj"],
-            router_params["space_state_writeback"],
-            router_params["rst_operator_tau_proj"]["kernel"],
-            router_params["rst_operator_tau_proj"]["bias"],
-            pool_params["rst_read_vectors"],
-            pool_params["rst_write_vectors"],
+            space_selector_params["space_query_proj"]["kernel"],
+            space_selector_params["space_route_keys"],
+            space_interface_params["space_read_proj"],
+            space_interface_params["space_write_proj"],
+            operator_controller_params["rst_tau_kernel"],
+            operator_controller_params["rst_tau_bias"],
+            operator_bank_params["rst_read_vectors"],
+            operator_bank_params["rst_write_vectors"],
             jnp.float32(soft_gate_t),
             jnp.float32(boundary_power),
             jnp.float32(0.0),
@@ -2493,15 +2508,20 @@ def create_v4174_detailed_profile_fns(
     if include_backward:
         @jax.jit
         def rst_bundle_srw_fwd_bwd_step(
-                pool_params, router_params, normed, x):
-            def objective(exact_pool, exact_router, exact_normed):
+                operator_bank_params, operation_space_params, normed, x):
+            def objective(
+                    exact_operator_bank,
+                    exact_operation_space_params,
+                    exact_normed):
                 update = rst_bundle_srw(
-                    exact_pool, exact_router, exact_normed, x)
+                    exact_operator_bank,
+                    exact_operation_space_params,
+                    exact_normed, x)
                 return jnp.mean(update)
 
             value, grads = jax.value_and_grad(
                 objective, argnums=(0, 1, 2))(
-                    pool_params, router_params, normed)
+                    operator_bank_params, operation_space_params, normed)
             return value, gradient_checksum(grads)
     else:
         rst_bundle_srw_fwd_bwd_step = None
@@ -2863,8 +2883,12 @@ def run_v4174_detailed_profile_pass(
     hbm_after = collect_hbm_stats()
     add_record("embedding", "embedding", seconds, hbm_after, hbm_before)
 
-    pool_params = params["neuron_pool"]
-    router_params = params["router"]
+    operator_bank_params = params["operator_bank"]
+    operation_space_params = {
+        "space_selector": params["space_selector"],
+        "space_interface": params["space_interface"],
+        "operator_controller": params["operator_controller"],
+    }
     layer_rngs = jax.random.split(
         jax.random.PRNGKey(0), int(profile_fns["n_layers"]))
     layer_count = int(profile_fns["n_layers"])
@@ -2888,7 +2912,7 @@ def run_v4174_detailed_profile_pass(
         (qkv, seconds) = timed_call(
             f"layer_{layer_idx:02d}.qkv_bundle_srw",
             profile_fns["qkv_bundle_srw_step"],
-            pool_params, router_params, normed)
+            operator_bank_params, operation_space_params, normed)
         q, k, v = qkv
         hbm_after = collect_hbm_stats()
         add_record(
@@ -2900,7 +2924,7 @@ def run_v4174_detailed_profile_pass(
             (_qkv_grad_checksum, seconds) = timed_call(
                 f"layer_{layer_idx:02d}.qkv_bundle_srw_fwd_bwd",
                 profile_fns["qkv_bundle_srw_fwd_bwd_step"],
-                pool_params, router_params, normed)
+                operator_bank_params, operation_space_params, normed)
             hbm_after = collect_hbm_stats()
             add_record(
                 f"layer_{layer_idx:02d}.qkv_bundle_srw_fwd_bwd",
@@ -2942,7 +2966,8 @@ def run_v4174_detailed_profile_pass(
         (x, seconds) = timed_call(
             f"layer_{layer_idx:02d}.rst_bundle_srw",
             profile_fns["rst_bundle_srw_step"],
-            pool_params, router_params, normed, rst_input)
+            operator_bank_params, operation_space_params,
+            normed, rst_input)
         hbm_after = collect_hbm_stats()
         add_record(
             f"layer_{layer_idx:02d}.rst_bundle_srw", "rst_bundle_srw",
@@ -2953,7 +2978,8 @@ def run_v4174_detailed_profile_pass(
             (_rst_grad_checksum, seconds) = timed_call(
                 f"layer_{layer_idx:02d}.rst_bundle_srw_fwd_bwd",
                 profile_fns["rst_bundle_srw_fwd_bwd_step"],
-                pool_params, router_params, normed, rst_input)
+                operator_bank_params, operation_space_params,
+                normed, rst_input)
             hbm_after = collect_hbm_stats()
             add_record(
                 f"layer_{layer_idx:02d}.rst_bundle_srw_fwd_bwd",

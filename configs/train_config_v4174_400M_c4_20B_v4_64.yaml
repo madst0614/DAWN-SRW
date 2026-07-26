@@ -1,14 +1,24 @@
-# DAWN-SRW v4.1.7.4 accepted 400M production configuration.
+# DAWN-SRW v4.1.7.4 canonical 400M production configuration.
 #
-# Accepted execution at model commit 8187c00d:
+# Execution topology retained from the accepted exact-backward path:
 #   forward: bundle4
 #   backward: exact selected-top-2 spaces
 #   bucket capacity: 3072 with compact exact overflow
 #
+# This config uses the fresh operation-space parameter schema:
+#   space_selector / space_interface / operator_controller / operator_bank
+# and one independent tau map per route and operation space. Earlier v4174
+# checkpoints are intentionally incompatible.
+#
 # Parameter-matched horizontal expansion with fixed D=2048 and R=256:
-#   target:          393,810,000
-#   v4174:           393,755,652
-#   difference:          -54,348 (-0.014%)
+#   v4172 reference: 393,800,708
+#   v4174:           393,803,872
+#   difference:          +3,164 (+0.0008%)
+#
+# Exact equality is not representable while preserving M=24, mesh_model=2,
+# Q=K, and whole per-space operator shards: one route changes in multiples of
+# 48 operators (24,576 parameters). The closest valid count adds 48 RST
+# operators and minimally perturbs the QK:V:RST ratio.
 #
 # The 40B C4 source remains unchanged; max_train_tokens selects its first 20B
 # tokens, yielding 38,146 full global batches at batch=1024 and seq=512.
@@ -44,7 +54,7 @@ model:
   n_q: 21504
   n_k: 21504
   n_v: 134016
-  n_rst: 269952
+  n_rst: 270000
 
   tau_init_mode: quantile_frac
   tau_init_min: -0.95

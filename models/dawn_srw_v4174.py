@@ -1,21 +1,25 @@
-"""DAWN-SRW v4.1.7.4: explicit direct-read operation spaces.
+"""DAWN-SRW v4.1.7.4: explicit operation-space interfaces.
 
-The model owns one shared ``D -> R`` space-routing projection and one explicit
-read vector per operation space.  Cosine scores select semantic support with a
-hard top-k mask; the canonical space gate is ``ReLU(score)^2`` divided by the
-square root of its mass and is never normalized with softmax.
+A token-level global representation first produces a shared space query.  That
+query selects operation spaces by matching learned per-space route keys.  A
+separate read projection then maps the global representation into each selected
+space's private coordinates.  Q, K, V, and RST apply independent RW operator
+banks in those coordinates, and a separate write projection returns their
+outputs to the global representation.
 
-Each operation space owns one encoder ``P_m`` and one decoder ``U_m``.  The
-projected local state ``z_m = P_m x`` directly matches forward-normalized RW
-read vectors: the read vector itself is the operator key.  Q, K, V, and RST
-have fully separate read/write banks and tau projections.  Q/K/V share the
-attention space gate, while RST recomputes routing and local state after the
-attention residual update.  Semantic execution is hard top-k.  The canonical
-dense executor remains available as a reference, while the production bundle
-executor compactly gathers tokens into fixed four-space physical blocks.
+Q/K/V share one attention-space selection but use separate operator banks.  RST
+recomputes both selection and operation-space state after the attention
+residual.  Every route owns a distinct tau map for every operation space, so a
+coordinate in one space is never interpreted by another space's controller.
+Selected-space weights are L1-normalized across the hard top-k support; if all
+selected ReLU-squared scores vanish, the highest-ranked space receives a
+deterministic one-hot fallback.  Absolute update scale therefore belongs to the
+within-space RW composition and residual/output scales, not the selector.
+The final attention ``expand_O`` remains the global interface that combines
+attention heads before the residual update.
 
-This is the sole v4.1.7.4 architecture.  Earlier checkpoint, optimizer,
-parameter-path, and config schemas are intentionally unsupported.
+This is the sole v4.1.7.4 architecture.  Earlier checkpoint, optimizer, and
+parameter-path schemas are intentionally unsupported.
 """
 
 from __future__ import annotations
@@ -59,6 +63,7 @@ LAYER_EXECUTION_NAME = "rematerialized"
 OPERATION_SPACE_EXECUTION_MODES = ("dense_all_space", "bundle_dense")
 BUNDLE_DENSE_SIZE = 4
 DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE = 1024
+SPACE_GATE_L1_EPS = 1.0e-8
 _BUNDLE_PACKING_CHECKPOINT_NAME = "v4174_bundle_packing_metadata"
 
 
@@ -141,10 +146,6 @@ def materialize_operation_space_config(
         raise ValueError(
             "v4174 requires the local route dimension to be no larger than "
             f"the model dimension, got d_route={d_route} > d_model={d_model}")
-    if n_spaces > d_route:
-        raise ValueError(
-            "v4174 orthogonal space reads require "
-            "model.n_operation_spaces <= model.d_route")
     for pool_name in ("n_q", "n_k", "n_v", "n_rst"):
         value = _positive_int(pool_name, model_cfg.get(pool_name))
         if value % n_spaces:
@@ -181,30 +182,33 @@ def symbolic_parameter_count(model_cfg: Mapping[str, Any]) -> dict[str, int]:
     n_spaces = int(cfg["n_operation_spaces"])
     n_layers = _positive_int("n_layers", cfg.get("n_layers"))
     pool_total = sum(int(cfg[name]) for name in ("n_q", "n_k", "n_v", "n_rst"))
-    shared_space_state = 2 * n_spaces * d_model * d_route
-    space_router = d_model * d_route + n_spaces * d_route
-    operator_tau = 4 * (d_route + 1)
-    read_write_pools = 2 * d_route * pool_total
+    operation_space_interface = 2 * n_spaces * d_model * d_route
+    space_addressing = d_model * d_route + n_spaces * d_route
+    space_operator_control = 4 * n_spaces * (d_route + 1)
+    operator_bank = 2 * d_route * pool_total
     counts = {
         "token_embedding": vocab * d_model,
         "position_embedding": max_seq * d_model,
         "layer_stack": n_layers * (d_model * d_model + 4 * d_model),
-        "shared_space_state": shared_space_state,
-        "space_router": space_router,
-        "operator_tau": operator_tau,
-        "read_write_pools": read_write_pools,
+        "operation_space_interface": operation_space_interface,
+        "space_addressing": space_addressing,
+        "space_operator_control": space_operator_control,
+        "operator_bank": operator_bank,
         "learned_key_tables": 0,
         "bilinear_probe_matrices": 0,
         "operator_query_projections": 0,
         "final_norm": 2 * d_model,
     }
-    counts["router"] = shared_space_state + space_router + operator_tau
+    counts["operation_space_system"] = (
+        operation_space_interface
+        + space_addressing
+        + space_operator_control)
     counts["total"] = (
         counts["token_embedding"]
         + counts["position_embedding"]
         + counts["layer_stack"]
-        + counts["router"]
-        + read_write_pools
+        + counts["operation_space_system"]
+        + operator_bank
         + counts["final_norm"])
     return counts
 
@@ -228,16 +232,12 @@ def _independent_space_projection_init(
     return (base[None, :, :] * signs).astype(dtype)
 
 
-def _orthogonal_space_read_init(
+def _unit_space_route_key_init(
         key: jax.Array, shape: tuple[int, ...],
         dtype=jnp.float32) -> jax.Array:
-    """Use the first M rows of an orthogonal ``[R,R]`` matrix."""
-    n_spaces, d_route = map(int, shape)
-    if n_spaces > d_route:
-        raise ValueError("orthogonal space-read initialization requires M <= R")
-    matrix = nn.initializers.orthogonal(scale=1.0)(
-        key, (d_route, d_route), jnp.float32)
-    return matrix[:n_spaces].astype(dtype)
+    """Initialize independent learned unit keys without an ``M <= R`` limit."""
+    values = jax.random.normal(key, shape, dtype=jnp.float32)
+    return _shared_forward_unit_direction(values).astype(dtype)
 
 
 def _isotropic_unit_init(
@@ -261,8 +261,8 @@ def _constant_tau_bias(cosine_tau: float) -> Callable:
     return initialize
 
 
-class OperationSpaceNeuronPool(nn.Module):
-    """Fully separate, space-indexed Q/K/V/RST read/write banks."""
+class OperationSpaceOperatorBank(nn.Module):
+    """Fully separate, space-indexed Q/K/V/RST RW operator banks."""
     n_q: int
     n_k: int
     n_v: int
@@ -283,9 +283,45 @@ class OperationSpaceNeuronPool(nn.Module):
                 f"{name}_write_vectors", _isotropic_unit_init, shape))
 
 
-class OperationSpaceRouter(nn.Module):
-    """Shared routing/local geometry and four independent local tau maps."""
+class OperationSpaceSelector(nn.Module):
+    """Map global representations to queries and select space route keys."""
     d_model: int
+    d_route: int
+    n_operation_spaces: int
+
+    def setup(self):
+        n_spaces = int(self.n_operation_spaces)
+        d_route = int(self.d_route)
+        self.space_query_proj = nn.Dense(
+            d_route, use_bias=False, name="space_query_proj",
+            kernel_init=nn.initializers.orthogonal(scale=1.0))
+        self.space_route_keys = self.param(
+            "space_route_keys", _unit_space_route_key_init,
+            (n_spaces, d_route))
+
+
+class OperationSpaceInterface(nn.Module):
+    """Read global representations into spaces and write outputs back."""
+    d_model: int
+    d_route: int
+    n_operation_spaces: int
+
+    def setup(self):
+        n_spaces = int(self.n_operation_spaces)
+        d_model = int(self.d_model)
+        d_route = int(self.d_route)
+        self.space_read_proj = self.param(
+            "space_read_proj", _independent_space_projection_init,
+            (n_spaces, d_model, d_route))
+        self.space_write_proj = self.param(
+            "space_write_proj",
+            lambda key, shape, dtype=jnp.float32: jnp.swapaxes(
+                self.space_read_proj, -1, -2).astype(dtype),
+            (n_spaces, d_route, d_model))
+
+
+class OperationGateController(nn.Module):
+    """Own one coordinate-sensitive tau map per route and operation space."""
     d_route: int
     n_operation_spaces: int
     tau_init_attn_q: float
@@ -295,22 +331,7 @@ class OperationSpaceRouter(nn.Module):
 
     def setup(self):
         n_spaces = int(self.n_operation_spaces)
-        d_model = int(self.d_model)
         d_route = int(self.d_route)
-        self.space_route_proj = nn.Dense(
-            d_route, use_bias=False, name="space_route_proj",
-            kernel_init=nn.initializers.orthogonal(scale=1.0))
-        self.space_read_vectors = self.param(
-            "space_read_vectors", _orthogonal_space_read_init,
-            (n_spaces, d_route))
-        self.space_state_proj = self.param(
-            "space_state_proj", _independent_space_projection_init,
-            (n_spaces, d_model, d_route))
-        self.space_state_writeback = self.param(
-            "space_state_writeback",
-            lambda key, shape, dtype=jnp.float32: jnp.swapaxes(
-                self.space_state_proj, -1, -2).astype(dtype),
-            (n_spaces, d_route, d_model))
         tau_values = {
             "q": self.tau_init_attn_q,
             "k": self.tau_init_attn_k,
@@ -318,10 +339,14 @@ class OperationSpaceRouter(nn.Module):
             "rst": self.tau_init_rst,
         }
         for route in ROUTES:
-            setattr(self, f"{route}_operator_tau_proj", nn.Dense(
-                1, name=f"{route}_operator_tau_proj",
-                kernel_init=nn.initializers.zeros,
-                bias_init=_constant_tau_bias(tau_values[route])))
+            setattr(self, f"{route}_tau_kernel", self.param(
+                f"{route}_tau_kernel",
+                nn.initializers.zeros,
+                (n_spaces, d_route, 1)))
+            setattr(self, f"{route}_tau_bias", self.param(
+                f"{route}_tau_bias",
+                _constant_tau_bias(tau_values[route]),
+                (n_spaces, 1)))
 
 
 def _linear(params: Mapping[str, jax.Array], state: jax.Array) -> jax.Array:
@@ -406,41 +431,84 @@ def forward_unit_direction(value: jax.Array) -> jax.Array:
     return _shared_forward_unit_direction(jnp.asarray(value, dtype=jnp.float32))
 
 
-def _project_space_local_states(
-        state: jax.Array, space_state_proj: jax.Array) -> jax.Array:
-    """Project a shared ``[T,D]`` state into ``[M,T,R]``."""
-    if state.ndim != 2 or space_state_proj.ndim != 3:
-        raise ValueError("state/projection must have shapes [T,D] and [M,D,R]")
-    return jnp.einsum("td,mdr->mtr", state, space_state_proj)
+def _read_operation_space_states(
+        global_state: jax.Array, space_read_proj: jax.Array) -> jax.Array:
+    """Read a global ``[T,D]`` representation into ``[M,T,R]`` spaces."""
+    if global_state.ndim != 2 or space_read_proj.ndim != 3:
+        raise ValueError(
+            "global_state/space_read_proj must have shapes [T,D] and [M,D,R]")
+    return jnp.einsum("td,mdr->mtr", global_state, space_read_proj)
 
 
-def _compute_space_routing(
-        flat_state: jax.Array,
-        space_route_kernel: jax.Array,
-        space_read_vectors: jax.Array,
+def _select_operation_spaces(
+        global_state: jax.Array,
+        space_query_kernel: jax.Array,
+        space_route_keys: jax.Array,
         operation_space_top_k: int) -> dict[str, jax.Array]:
     """Direct cosine routing with hard top-k ReLU-squared non-softmax gates."""
-    route_state = control_dot_f32(
-        flat_state, space_route_kernel,
+    space_query = control_dot_f32(
+        global_state, space_query_kernel,
         dimension_numbers=(((1,), (0,)), ((), ())))
-    normalized_state = forward_unit_direction(route_state)
-    normalized_reads = forward_unit_direction(space_read_vectors)
+    normalized_query = forward_unit_direction(space_query)
+    normalized_keys = forward_unit_direction(space_route_keys)
     space_scores = control_dot_f32(
-        normalized_state, normalized_reads,
+        normalized_query, normalized_keys,
         dimension_numbers=(((1,), (1,)), ((), ())))
     gate_values = _space_gate_from_scores(
         space_scores, operation_space_top_k)
     return {
-        "route_state": route_state,
+        "space_query": space_query,
         "space_scores": space_scores,
         **gate_values,
     }
 
 
+def _apply_operation_space_tau_map(
+        space_states: jax.Array,
+        tau_kernel: jax.Array,
+        tau_bias: jax.Array) -> jax.Array:
+    """Apply independent ``[R,1]`` tau maps in every operation space."""
+    if (space_states.ndim != 3
+            or tau_kernel.ndim != 3
+            or tau_bias.ndim != 2):
+        raise ValueError(
+            "space tau map requires [M,T,R], [M,R,1], and [M,1]")
+    if (space_states.shape[0] != tau_kernel.shape[0]
+            or space_states.shape[0] != tau_bias.shape[0]
+            or space_states.shape[-1] != tau_kernel.shape[1]
+            or tau_kernel.shape[-1] != 1
+            or tau_bias.shape[-1] != 1):
+        raise ValueError(
+            "operation-space tau map shapes are inconsistent: "
+            f"states={space_states.shape}, kernel={tau_kernel.shape}, "
+            f"bias={tau_bias.shape}")
+    return (
+        _control_einsum_f32("mtr,mro->mto", space_states, tau_kernel)
+        + tau_bias[:, None, :])
+
+
+def _select_and_read_operation_spaces(
+        global_state: jax.Array,
+        space_query_kernel: jax.Array,
+        space_route_keys: jax.Array,
+        space_read_proj: jax.Array,
+        operation_space_top_k: int
+) -> tuple[dict[str, jax.Array], jax.Array]:
+    """Select operation spaces, then read their states as a separate step."""
+    space_routing = _select_operation_spaces(
+        global_state,
+        space_query_kernel,
+        space_route_keys,
+        operation_space_top_k)
+    space_states = _read_operation_space_states(
+        global_state, space_read_proj)
+    return space_routing, space_states
+
+
 def _space_gate_from_scores(
         space_scores: jax.Array,
         operation_space_top_k: int) -> dict[str, jax.Array]:
-    """Apply the fixed hard-top-k ReLU-squared sqrt-mass space gate."""
+    """L1-normalize hard-top-k ReLU-squared weights across selected spaces."""
     selected_scores, selected_ids = jax.lax.top_k(
         space_scores, int(operation_space_top_k))
     top_k_mask = jnp.sum(
@@ -451,9 +519,16 @@ def _space_gate_from_scores(
     raw_space_gate = jnp.square(jax.nn.relu(space_scores))
     space_gate = raw_space_gate * top_k_mask
     space_gate_mass = space_gate.sum(axis=-1, keepdims=True)
-    space_gate_den = jnp.sqrt(jnp.maximum(
-        space_gate_mass, jnp.float32(1.0)))
-    dense_space_weights = space_gate / space_gate_den
+    has_positive_mass = space_gate_mass > jnp.float32(SPACE_GATE_L1_EPS)
+    space_gate_den = jnp.where(
+        has_positive_mass, space_gate_mass, jnp.float32(1.0))
+    normalized_space_weights = space_gate / space_gate_den
+    top1_fallback = jax.nn.one_hot(
+        selected_ids[..., 0],
+        int(space_scores.shape[-1]),
+        dtype=jnp.float32)
+    dense_space_weights = jnp.where(
+        has_positive_mass, normalized_space_weights, top1_fallback)
     return {
         "selected_scores": selected_scores,
         "selected_ids": selected_ids,
@@ -465,18 +540,18 @@ def _space_gate_from_scores(
 
 
 def _direct_read_match(
-        space_local_states: jax.Array,
+        space_states: jax.Array,
         read_vectors: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Reuse one read matmul for the scalar read and direct cosine score."""
     read_unit = forward_unit_direction(
         read_vectors.astype(jnp.float32))
     read_value = jnp.einsum(
         "mtr,mnr->mtn",
-        space_local_states.astype(jnp.bfloat16),
+        space_states.astype(jnp.bfloat16),
         read_unit.astype(jnp.bfloat16),
     ).astype(jnp.float32)
     local_norm = jnp.linalg.norm(
-        space_local_states.astype(jnp.float32),
+        space_states.astype(jnp.float32),
         axis=-1, keepdims=True)
     rho = read_value / jnp.maximum(
         local_norm, jnp.float32(RW_FORWARD_NORM_EPS))
@@ -484,7 +559,7 @@ def _direct_read_match(
 
 
 def _rw_compose_space_dense(
-        space_local_states: jax.Array,
+        space_states: jax.Array,
         read_vectors: jax.Array,
         write_vectors: jax.Array,
         raw_operator_tau: jax.Array, *,
@@ -497,11 +572,11 @@ def _rw_compose_space_dense(
         max_chunk_size: int = 2048,
         diagnostics: bool = False):
     """Execute direct-read RW composition densely over all spaces."""
-    if space_local_states.ndim != 3:
-        raise ValueError("space_local_states must have shape [M,T,R]")
+    if space_states.ndim != 3:
+        raise ValueError("space_states must have shape [M,T,R]")
     if read_vectors.ndim != 3 or write_vectors.ndim != 3:
         raise ValueError("read/write vectors must have shape [M,N,R]")
-    n_spaces, token_count, d_route = map(int, space_local_states.shape)
+    n_spaces, token_count, d_route = map(int, space_states.shape)
     n_operator = int(read_vectors.shape[1])
     chunk = min(max(1, int(max_chunk_size)), n_operator)
     n_chunks = math.ceil(n_operator / chunk)
@@ -512,9 +587,9 @@ def _rw_compose_space_dense(
     valid = jnp.arange(padded) < n_operator
     read_unit = forward_unit_direction(reads).astype(jnp.bfloat16)
     write_unit = forward_unit_direction(writes).astype(jnp.bfloat16)
-    local_bf16 = space_local_states.astype(jnp.bfloat16)
+    local_bf16 = space_states.astype(jnp.bfloat16)
     local_norm = jnp.linalg.norm(
-        space_local_states.astype(jnp.float32),
+        space_states.astype(jnp.float32),
         axis=-1, keepdims=True)
     local_norm = jnp.maximum(
         local_norm, jnp.float32(RW_FORWARD_NORM_EPS))
@@ -581,29 +656,30 @@ def _rw_compose_space_dense(
         gate_max, depth_sum, tau, gate_den)
 
 
-def _space_weighted_writeback(
-        space_results: jax.Array,
-        dense_space_weights: jax.Array,
-        space_state_writeback: jax.Array,
-        route_scale: jax.Array | float) -> jax.Array:
-    """Fuse space weights and ``U_m`` without materializing ``[M,T,D]``."""
-    weighted_local = (
-        space_results
-        * jnp.swapaxes(dense_space_weights, 0, 1)[..., None]
-        * jnp.asarray(route_scale))
+def _write_space_outputs_to_global(
+        space_output: jax.Array,
+        space_weights: jax.Array,
+        space_write_proj: jax.Array,
+        output_scale: jax.Array | float) -> jax.Array:
+    """Write weighted operation-space outputs to the global representation."""
+    weighted_space_output = (
+        space_output
+        * jnp.swapaxes(space_weights, 0, 1)[..., None]
+        * jnp.asarray(output_scale))
     return jnp.einsum(
-        "mtr,mrd->td", weighted_local, space_state_writeback)
+        "mtr,mrd->td", weighted_space_output, space_write_proj)
 
 
 def _space_routing_metrics(
         routing: Mapping[str, jax.Array],
         prefix: str) -> dict[str, jax.Array]:
     gate = routing["space_gate"].astype(jnp.float32)
+    weights = routing["dense_space_weights"].astype(jnp.float32)
     mass = routing["space_gate_mass"][..., 0].astype(jnp.float32)
     den = routing["space_gate_den"][..., 0].astype(jnp.float32)
     selected_ids = routing["selected_ids"]
     n_spaces = int(gate.shape[-1])
-    active = gate > 0.0
+    active = weights > 0.0
     top1_usage = jax.nn.one_hot(
         selected_ids[..., 0], n_spaces, dtype=jnp.float32
     ).reshape((-1, n_spaces)).mean(axis=0)
@@ -620,8 +696,7 @@ def _space_routing_metrics(
         f"{prefix}_space_usage_max": usage.max(),
         f"{prefix}_space_usage_std": usage.std(),
     }
-    diagnostic_probability = gate / jnp.maximum(
-        mass[..., None], jnp.float32(1.0e-8))
+    diagnostic_probability = weights
     values[f"{prefix}_space_selected_entropy"] = (
         -diagnostic_probability
         * jnp.log(jnp.maximum(
@@ -637,6 +712,7 @@ def _compact_space_routing_metrics(
         prefix: str) -> dict[str, jax.Array]:
     """Return only scalar routing metrics used by regular training."""
     gate = routing["space_gate"].astype(jnp.float32)
+    weights = routing["dense_space_weights"].astype(jnp.float32)
     mass = routing["space_gate_mass"][..., 0].astype(jnp.float32)
     selected_ids = routing["selected_ids"]
     n_spaces = int(gate.shape[-1])
@@ -646,7 +722,7 @@ def _compact_space_routing_metrics(
     values = {
         f"{prefix}_space_gate_mass_mean": mass.mean(),
         f"{prefix}_space_active_count_mean": (
-            (gate > 0.0).astype(jnp.float32).sum(axis=-1).mean()),
+            (weights > 0.0).astype(jnp.float32).sum(axis=-1).mean()),
         f"{prefix}_space_zero_gate_frac": (
             mass <= 0.0).astype(jnp.float32).mean(),
         f"{prefix}_space_top1_rate": top1_usage.max(),
@@ -763,74 +839,114 @@ def _off_diagonal_entries(value: jax.Array) -> jax.Array:
     return value[row, column]
 
 
-def _space_geometry_diagnostics(
-        space_state_proj: jax.Array,
-        space_state_writeback: jax.Array,
-        state: Optional[jax.Array] = None) -> dict[str, jax.Array]:
-    """Projection rank, overlap, principal angles, and local covariance."""
-    projection = jnp.asarray(space_state_proj, dtype=jnp.float32)
-    stacked = jnp.swapaxes(projection, -1, -2).reshape(
-        (-1, projection.shape[1]))
+def _effective_rank_from_singular_values(
+        singular_values: jax.Array) -> jax.Array:
+    probability = singular_values / jnp.maximum(
+        singular_values.sum(axis=-1, keepdims=True), 1.0e-8)
+    return jnp.exp(-jnp.sum(
+        probability * jnp.log(jnp.maximum(probability, 1.0e-8)),
+        axis=-1))
+
+
+def _operation_space_geometry_diagnostics(
+        space_read_proj: jax.Array,
+        space_write_proj: jax.Array,
+        global_state: Optional[jax.Array] = None) -> dict[str, jax.Array]:
+    """Measure read geometry, read/write round trips, and cross-space links."""
+    read_projection = jnp.asarray(space_read_proj, dtype=jnp.float32)
+    write_projection = jnp.asarray(space_write_proj, dtype=jnp.float32)
+    stacked = jnp.swapaxes(read_projection, -1, -2).reshape(
+        (-1, read_projection.shape[1]))
     singular = jnp.linalg.svd(stacked, compute_uv=False)
-    probability = singular / jnp.maximum(singular.sum(), 1.0e-8)
-    effective_rank = jnp.exp(-jnp.sum(
-        probability * jnp.log(jnp.maximum(probability, 1.0e-8))))
-    basis_overlap = jnp.einsum("mdr,nds->mnrs", projection, projection)
+    basis_overlap = jnp.einsum(
+        "mdr,nds->mnrs", read_projection, read_projection)
     principal_cosines = jax.vmap(lambda row: jax.vmap(
         lambda cross: jnp.linalg.svd(cross, compute_uv=False))(row))(
             basis_overlap)
     principal_angles = jnp.arccos(jnp.clip(principal_cosines, -1.0, 1.0))
-    frobenius = jnp.einsum("mdr,ndr->mn", projection, projection)
+    frobenius = jnp.einsum(
+        "mdr,ndr->mn", read_projection, read_projection)
     diagonal = jnp.sqrt(jnp.maximum(jnp.diag(frobenius), 1.0e-8))
     overlap = frobenius / (diagonal[:, None] * diagonal[None, :])
+
+    d_route = int(read_projection.shape[-1])
+    identity = jnp.eye(d_route, dtype=jnp.float32)
+    space_roundtrip = jnp.einsum(
+        "mrd,mds->mrs", write_projection, read_projection)
+    roundtrip_singular = jnp.linalg.svd(
+        space_roundtrip, compute_uv=False)
+    cross_space_transfer = jnp.einsum(
+        "mrd,nds->mnrs", write_projection, read_projection)
+    cross_space_principal_values = jnp.linalg.svd(
+        cross_space_transfer, compute_uv=False)
     out = {
-        "stacked_projection_singular_values": singular,
-        "stacked_projection_rank": jnp.linalg.matrix_rank(stacked),
-        "stacked_projection_effective_rank": effective_rank,
-        "space_projection_pairwise_overlap": _off_diagonal_entries(overlap),
-        "space_subspace_principal_angles": _off_diagonal_entries(
+        "stacked_space_read_projection_singular_values": singular,
+        "stacked_space_read_projection_rank": jnp.linalg.matrix_rank(stacked),
+        "stacked_space_read_projection_effective_rank":
+            _effective_rank_from_singular_values(singular),
+        "space_read_projection_overlap": _off_diagonal_entries(overlap),
+        "space_read_subspace_principal_angles": _off_diagonal_entries(
             principal_angles),
-        "encoder_writeback_init_error": jnp.max(jnp.abs(
-            jnp.swapaxes(projection, -1, -2) - space_state_writeback)),
+        "space_read_write_transpose_deviation": jnp.linalg.norm(
+            jnp.swapaxes(read_projection, -1, -2) - write_projection,
+            axis=(-2, -1)) / jnp.sqrt(jnp.float32(
+                write_projection.shape[-2] * write_projection.shape[-1])),
+        "space_roundtrip_identity_error": jnp.linalg.norm(
+            space_roundtrip - identity[None, ...],
+            axis=(-2, -1)) / jnp.sqrt(jnp.float32(d_route)),
+        "space_roundtrip_singular_values": roundtrip_singular,
+        "space_roundtrip_effective_rank":
+            _effective_rank_from_singular_values(roundtrip_singular),
+        "cross_space_transfer_norm": _off_diagonal_entries(
+            jnp.linalg.norm(cross_space_transfer, axis=(-2, -1))),
+        "cross_space_transfer_effective_rank": _off_diagonal_entries(
+            _effective_rank_from_singular_values(
+                cross_space_principal_values)),
+        "cross_space_principal_values": _off_diagonal_entries(
+            cross_space_principal_values),
     }
-    if state is not None:
-        local = _project_space_local_states(state, projection)
+    if global_state is not None:
+        space_states = _read_operation_space_states(
+            global_state, read_projection)
         covariance = jnp.einsum(
-            "mtr,nts->mnrs", local, local) / jnp.maximum(state.shape[0], 1)
+            "mtr,nts->mnrs", space_states, space_states
+        ) / jnp.maximum(global_state.shape[0], 1)
         covariance_norm = jnp.linalg.norm(covariance, axis=(-2, -1))
         covariance_diag = jnp.sqrt(jnp.maximum(
             jnp.diag(covariance_norm), 1.0e-8))
         covariance_overlap = covariance_norm / (
             covariance_diag[:, None] * covariance_diag[None, :])
-        variance = jnp.var(local, axis=1).sum(axis=-1)
+        variance = jnp.var(space_states, axis=1).sum(axis=-1)
         out.update({
-            "space_local_state_covariance_overlap": _off_diagonal_entries(
-                covariance_overlap),
-            "space_local_state_norm": jnp.linalg.norm(
-                local, axis=-1).mean(axis=-1),
-            "space_explained_variance": variance / jnp.maximum(
-                variance.sum(), 1.0e-8),
+            "operation_space_state_covariance_overlap":
+                _off_diagonal_entries(covariance_overlap),
+            "operation_space_state_norm": jnp.linalg.norm(
+                space_states, axis=-1).mean(axis=-1),
+            "operation_space_explained_variance":
+                variance / jnp.maximum(variance.sum(), 1.0e-8),
         })
     return out
 
 
-def _read_bank_geometry_diagnostics(
-        pool_params: Mapping[str, jax.Array],
-        space_read_vectors: jax.Array,
-        route_state: jax.Array) -> dict[str, jax.Array]:
-    """Direct-read geometry for explicit space reads and all four RW pools."""
-    space_reads = forward_unit_direction(space_read_vectors)
-    pairwise = space_reads @ space_reads.T
+def _operator_bank_geometry_diagnostics(
+        operator_bank_params: Mapping[str, jax.Array],
+        space_route_keys: jax.Array,
+        space_query: jax.Array) -> dict[str, jax.Array]:
+    """Address-key geometry and direct-read geometry for all RW banks."""
+    normalized_route_keys = forward_unit_direction(space_route_keys)
+    pairwise = normalized_route_keys @ normalized_route_keys.T
     out = {
-        "space_read_pairwise_cosine": _off_diagonal_entries(pairwise),
-        "space_read_norm": jnp.linalg.norm(
-            space_read_vectors.astype(jnp.float32), axis=-1),
-        "space_route_state_norm": jnp.linalg.norm(
-            route_state.astype(jnp.float32), axis=-1).mean(),
+        "space_route_key_pairwise_cosine": _off_diagonal_entries(pairwise),
+        "space_route_key_norm": jnp.linalg.norm(
+            space_route_keys.astype(jnp.float32), axis=-1),
+        "space_query_norm": jnp.linalg.norm(
+            space_query.astype(jnp.float32), axis=-1).mean(),
     }
     for pool in POOLS:
-        read = forward_unit_direction(pool_params[f"{pool}_read_vectors"])
-        write = forward_unit_direction(pool_params[f"{pool}_write_vectors"])
+        read = forward_unit_direction(
+            operator_bank_params[f"{pool}_read_vectors"])
+        write = forward_unit_direction(
+            operator_bank_params[f"{pool}_write_vectors"])
         covariance = jnp.einsum(
             "mnr,mns->mrs", read, read) / read.shape[1]
         eigenvalues = jnp.maximum(jnp.linalg.eigvalsh(covariance), 0.0)
@@ -848,10 +964,12 @@ def _read_bank_geometry_diagnostics(
             f"{pool}_cross_space_nearest_read_similarity": (
                 _off_diagonal_entries(cross_nearest)),
             f"{pool}_read_norm": jnp.linalg.norm(
-                pool_params[f"{pool}_read_vectors"].astype(jnp.float32),
+                operator_bank_params[
+                    f"{pool}_read_vectors"].astype(jnp.float32),
                 axis=-1).mean(axis=-1),
             f"{pool}_write_norm": jnp.linalg.norm(
-                pool_params[f"{pool}_write_vectors"].astype(jnp.float32),
+                operator_bank_params[
+                    f"{pool}_write_vectors"].astype(jnp.float32),
                 axis=-1).mean(axis=-1),
         })
     return out
@@ -970,12 +1088,18 @@ class DAWN_SRW_V4174(nn.Module):
         self.pos_emb = nn.Embed(
             self.max_seq_len, self.d_model,
             embedding_init=_shared_scaled_normal(0.02))
-        self.neuron_pool = OperationSpaceNeuronPool(
+        self.operator_bank = OperationSpaceOperatorBank(
             n_q=self.n_q, n_k=self.n_k, n_v=self.n_v, n_rst=self.n_rst,
             d_route=self.d_route,
             n_operation_spaces=self.n_operation_spaces)
-        self.router = OperationSpaceRouter(
+        self.space_selector = OperationSpaceSelector(
             d_model=self.d_model, d_route=self.d_route,
+            n_operation_spaces=self.n_operation_spaces)
+        self.space_interface = OperationSpaceInterface(
+            d_model=self.d_model, d_route=self.d_route,
+            n_operation_spaces=self.n_operation_spaces)
+        self.operator_controller = OperationGateController(
+            d_route=self.d_route,
             n_operation_spaces=self.n_operation_spaces,
             tau_init_attn_q=float(self.tau_init_attn_q),
             tau_init_attn_k=float(self.tau_init_attn_k),
@@ -989,17 +1113,19 @@ class DAWN_SRW_V4174(nn.Module):
         self.norm = nn.LayerNorm()
 
     def _realize_parameters(self, state: jax.Array) -> None:
-        _ = self.neuron_pool.q_read_vectors
-        _ = self.neuron_pool.k_read_vectors
-        _ = self.neuron_pool.v_read_vectors
-        _ = self.neuron_pool.rst_read_vectors
-        _ = self.router.space_route_proj(state)
+        _ = self.operator_bank.q_read_vectors
+        _ = self.operator_bank.k_read_vectors
+        _ = self.operator_bank.v_read_vectors
+        _ = self.operator_bank.rst_read_vectors
+        _ = self.space_selector.space_query_proj(state)
         local = jnp.einsum(
-            "bsd,mdr->mbsr", state, self.router.space_state_proj)
+            "bsd,mdr->mbsr", state, self.space_interface.space_read_proj)
         for route in ROUTES:
-            _ = getattr(self.router, f"{route}_operator_tau_proj")(local)
-        _ = self.router.space_read_vectors
-        _ = self.router.space_state_writeback
+            _ = getattr(self.operator_controller, f"{route}_tau_kernel")
+            _ = getattr(self.operator_controller, f"{route}_tau_bias")
+        _ = local
+        _ = self.space_selector.space_route_keys
+        _ = self.space_interface.space_write_proj
         for layer in self.layers:
             _ = layer.norm1(state)
             _ = layer.norm2(state)
@@ -1084,8 +1210,10 @@ class DAWN_SRW_V4174(nn.Module):
                 if embedding != logical else logits}
 
         params = self.variables["params"]
-        pool = params["neuron_pool"]
-        router = params["router"]
+        operator_bank = params["operator_bank"]
+        space_selector = params["space_selector"]
+        space_interface = params["space_interface"]
+        operator_controller = params["operator_controller"]
         route_counts = {
             "q": int(self.n_q),
             "k": int(self.n_k),
@@ -1170,30 +1298,30 @@ class DAWN_SRW_V4174(nn.Module):
             fused_throughput_precision == "bf16_operands_f32_accum")
         regular_lists: dict[str, list[jax.Array]] = {}
         analysis_lists: dict[str, list[jax.Array]] = {}
-        last_local_input = None
-        last_route_state = None
+        last_global_state_for_space_diagnostics = None
+        last_space_query = None
         scanned_regular_metrics: dict[str, jax.Array] = {}
 
         def append(target, values):
             for key, value in values.items():
                 target.setdefault(key, []).append(value)
 
-        def execute(route, local_states, raw_tau, pool_params):
-            read = pool_params[f"{route}_read_vectors"]
-            write = pool_params[f"{route}_write_vectors"]
+        def execute(route, space_states, raw_tau, operator_bank_params):
+            read = operator_bank_params[f"{route}_read_vectors"]
+            write = operator_bank_params[f"{route}_write_vectors"]
             direct_kernel = (
                 sharded_fns.get(f"{route}_space_dense")
                 if isinstance(sharded_fns, dict) else None)
             if direct_kernel is not None:
                 token_valid = jnp.ones(
-                    local_states.shape[:2], dtype=jnp.bool_)
+                    space_states.shape[:2], dtype=jnp.bool_)
                 return direct_kernel(
-                    local_states, raw_tau, token_valid, read, write,
+                    space_states, raw_tau, token_valid, read, write,
                     temperatures[route], temperatures[route],
                     soft_gate_boundary_power, soft_gate_boundary_power,
                     execution_prune_eps)
             return _rw_compose_space_dense(
-                local_states, read, write, raw_tau,
+                space_states, read, write, raw_tau,
                 soft_gate_temperature=temperatures[route],
                 soft_gate_boundary_power=soft_gate_boundary_power,
                 admission_den_power=den_powers[route],
@@ -1203,76 +1331,84 @@ class DAWN_SRW_V4174(nn.Module):
                 max_chunk_size=route_chunks[route],
                 diagnostics=True)
 
-        def route_and_local(flat_state, router_params):
-            routing = _compute_space_routing(
-                flat_state,
-                router_params["space_route_proj"]["kernel"],
-                router_params["space_read_vectors"],
-                top_k)
-            local_states = _project_space_local_states(
-                flat_state, router_params["space_state_proj"])
-            return routing, local_states
-
         def layer_forward(
-                current_state, block_params, pool_params,
-                router_params, layer_rng):
+                global_state, block_params, operator_bank_params,
+                space_selector_params, space_interface_params,
+                operator_controller_params, layer_rng):
             """One complete checkpointable Q/K/V-attention-RST layer."""
             regular_metrics: dict[str, jax.Array] = {}
             analysis_metrics: dict[str, jax.Array] = {}
             rng, rng_attn, rng_rst = jax.random.split(
                 layer_rng, 3)
-            normalized = _shared_layer_norm(
-                current_state,
+            attn_global_state = _shared_layer_norm(
+                global_state,
                 block_params["norm1"]["scale"],
                 block_params["norm1"]["bias"])
-            batch_size, sequence_length = normalized.shape[:2]
-            flat_attention_state = normalized.reshape((-1, self.d_model))
-            attention_routing = None
+            batch_size, sequence_length = attn_global_state.shape[:2]
+            attn_global_state_flat = attn_global_state.reshape(
+                (-1, self.d_model))
+            attention_space_routing = None
             if fused_production:
-                q_output, k_output, v_output, attention_metrics = (
+                (q_global_interface_flat,
+                 k_global_interface_flat,
+                 v_global_interface_flat,
+                 attention_metrics) = (
                     attention_dense(
-                        flat_attention_state,
-                        router_params["space_route_proj"]["kernel"],
-                        router_params["space_read_vectors"],
-                        router_params["space_state_proj"],
-                        router_params["space_state_writeback"],
-                        router_params["q_operator_tau_proj"]["kernel"],
-                        router_params["q_operator_tau_proj"]["bias"],
-                        router_params["k_operator_tau_proj"]["kernel"],
-                        router_params["k_operator_tau_proj"]["bias"],
-                        router_params["v_operator_tau_proj"]["kernel"],
-                        router_params["v_operator_tau_proj"]["bias"],
-                        pool_params["q_read_vectors"],
-                        pool_params["q_write_vectors"],
-                        pool_params["k_read_vectors"],
-                        pool_params["k_write_vectors"],
-                        pool_params["v_read_vectors"],
-                        pool_params["v_write_vectors"],
+                        attn_global_state_flat,
+                        space_selector_params[
+                            "space_query_proj"]["kernel"],
+                        space_selector_params["space_route_keys"],
+                        space_interface_params["space_read_proj"],
+                        space_interface_params["space_write_proj"],
+                        operator_controller_params["q_tau_kernel"],
+                        operator_controller_params["q_tau_bias"],
+                        operator_controller_params["k_tau_kernel"],
+                        operator_controller_params["k_tau_bias"],
+                        operator_controller_params["v_tau_kernel"],
+                        operator_controller_params["v_tau_bias"],
+                        operator_bank_params["q_read_vectors"],
+                        operator_bank_params["q_write_vectors"],
+                        operator_bank_params["k_read_vectors"],
+                        operator_bank_params["k_write_vectors"],
+                        operator_bank_params["v_read_vectors"],
+                        operator_bank_params["v_write_vectors"],
                         temperatures["q"], temperatures["v"],
                         soft_gate_boundary_power, execution_prune_eps,
                         route_scales["q"], route_scales["v"],
                         collect_regular_metrics))
-                route_outputs = {
-                    "q": q_output.reshape(normalized.shape),
-                    "k": k_output.reshape(normalized.shape),
-                    "v": v_output.reshape(normalized.shape),
+                global_interfaces = {
+                    "q": q_global_interface_flat.reshape(
+                        attn_global_state.shape),
+                    "k": k_global_interface_flat.reshape(
+                        attn_global_state.shape),
+                    "v": v_global_interface_flat.reshape(
+                        attn_global_state.shape),
                 }
                 regular_metrics.update(attention_metrics)
             else:
-                attention_routing, attention_local = route_and_local(
-                    flat_attention_state, router_params)
+                (attention_space_routing,
+                 attention_space_states) = _select_and_read_operation_spaces(
+                    attn_global_state_flat,
+                    space_selector_params[
+                        "space_query_proj"]["kernel"],
+                    space_selector_params["space_route_keys"],
+                    space_interface_params["space_read_proj"],
+                    top_k)
                 attention_tau = {
-                    route: _linear(
-                        router_params[f"{route}_operator_tau_proj"],
-                        attention_local)
+                    route: _apply_operation_space_tau_map(
+                        attention_space_states,
+                        operator_controller_params[
+                            f"{route}_tau_kernel"],
+                        operator_controller_params[
+                            f"{route}_tau_bias"])
                     for route in ("q", "k", "v")}
-                route_outputs = {}
+                global_interfaces = {}
                 for route in ("q", "k", "v"):
                     route_result = execute(
-                        route, attention_local, attention_tau[route],
-                        pool_params)
+                        route, attention_space_states, attention_tau[route],
+                        operator_bank_params)
                     if isinstance(route_result, tuple):
-                        local_output = route_result[0]
+                        space_output = route_result[0]
                         scalar, arrays = _aggregate_operator_diagnostics(
                             route_result, route_counts[route] // n_spaces,
                             route, composition_mode)
@@ -1280,70 +1416,90 @@ class DAWN_SRW_V4174(nn.Module):
                         if analysis:
                             analysis_metrics.update(arrays)
                     else:
-                        local_output = route_result
-                    route_outputs[route] = _space_weighted_writeback(
-                        local_output,
-                        attention_routing["dense_space_weights"],
-                        router_params["space_state_writeback"],
-                        route_scales[route]).reshape(normalized.shape)
+                        space_output = route_result
+                    global_interfaces[route] = (
+                        _write_space_outputs_to_global(
+                            space_output,
+                            attention_space_routing[
+                                "dense_space_weights"],
+                            space_interface_params["space_write_proj"],
+                            route_scales[route])
+                        .reshape(attn_global_state.shape))
 
             d_head = self.d_model // self.n_heads
-            query = route_outputs["q"].reshape(
+            q_global_interface = global_interfaces["q"]
+            k_global_interface = global_interfaces["k"]
+            v_global_interface = global_interfaces["v"]
+            query = q_global_interface.reshape(
                 batch_size, sequence_length, self.n_heads, d_head
             ).transpose(0, 2, 1, 3)
-            key = route_outputs["k"].reshape(
+            key = k_global_interface.reshape(
                 batch_size, sequence_length, self.n_heads, d_head
             ).transpose(0, 2, 1, 3)
-            value = route_outputs["v"].reshape(
+            value = v_global_interface.reshape(
                 batch_size, sequence_length, self.n_heads, d_head
             ).transpose(0, 2, 1, 3)
-            attention_output = _causal_attention_core(
+            attention_global_update = _causal_attention_core(
                 query, key, value, self.dropout_rate,
                 deterministic, rng_attn,
                 throughput_bf16=fused_throughput_bf16)
-            attention_output = attention_output.transpose(
+            attention_global_update = attention_global_update.transpose(
                 0, 2, 1, 3).reshape(
                     batch_size, sequence_length, self.d_model)
-            attention_output = (
+            attention_global_update = (
                 _throughput_linear_bf16_f32(
-                    block_params["attn"]["expand_O"], attention_output)
+                    block_params["attn"]["expand_O"],
+                    attention_global_update)
                 if fused_throughput_bf16 else _linear(
-                    block_params["attn"]["expand_O"], attention_output))
-            current_state = current_state + _shared_safe_dropout(
-                attention_output, self.dropout_rate, deterministic, rng)
+                    block_params["attn"]["expand_O"],
+                    attention_global_update))
+            global_state = global_state + _shared_safe_dropout(
+                attention_global_update,
+                self.dropout_rate, deterministic, rng)
 
-            rst_normalized = _shared_layer_norm(
-                current_state,
+            rst_global_state = _shared_layer_norm(
+                global_state,
                 block_params["norm2"]["scale"],
                 block_params["norm2"]["bias"])
-            flat_rst_state = rst_normalized.reshape((-1, self.d_model))
-            rst_routing = None
+            rst_global_state_flat = rst_global_state.reshape(
+                (-1, self.d_model))
+            rst_space_routing = None
             if fused_production:
-                rst_flat_update, rst_metrics = rst_dense(
-                    flat_rst_state,
-                    router_params["space_route_proj"]["kernel"],
-                    router_params["space_read_vectors"],
-                    router_params["space_state_proj"],
-                    router_params["space_state_writeback"],
-                    router_params["rst_operator_tau_proj"]["kernel"],
-                    router_params["rst_operator_tau_proj"]["bias"],
-                    pool_params["rst_read_vectors"],
-                    pool_params["rst_write_vectors"],
+                rst_global_update_flat, rst_metrics = rst_dense(
+                    rst_global_state_flat,
+                    space_selector_params[
+                        "space_query_proj"]["kernel"],
+                    space_selector_params["space_route_keys"],
+                    space_interface_params["space_read_proj"],
+                    space_interface_params["space_write_proj"],
+                    operator_controller_params["rst_tau_kernel"],
+                    operator_controller_params["rst_tau_bias"],
+                    operator_bank_params["rst_read_vectors"],
+                    operator_bank_params["rst_write_vectors"],
                     temperatures["rst"], soft_gate_boundary_power,
                     execution_prune_eps, route_scales["rst"],
                     collect_regular_metrics)
-                rst_route_update = rst_flat_update.reshape(
-                    rst_normalized.shape)
+                rst_global_update = rst_global_update_flat.reshape(
+                    rst_global_state.shape)
                 regular_metrics.update(rst_metrics)
             else:
-                rst_routing, rst_local = route_and_local(
-                    flat_rst_state, router_params)
-                rst_tau = _linear(
-                    router_params["rst_operator_tau_proj"], rst_local)
+                (rst_space_routing,
+                 rst_space_states) = _select_and_read_operation_spaces(
+                    rst_global_state_flat,
+                    space_selector_params[
+                        "space_query_proj"]["kernel"],
+                    space_selector_params["space_route_keys"],
+                    space_interface_params["space_read_proj"],
+                    top_k)
+                rst_tau = _apply_operation_space_tau_map(
+                    rst_space_states,
+                    operator_controller_params["rst_tau_kernel"],
+                    operator_controller_params["rst_tau_bias"])
                 rst_result = execute(
-                    "rst", rst_local, rst_tau, pool_params)
+                    "rst", rst_space_states, rst_tau,
+                    operator_bank_params)
                 if isinstance(rst_result, tuple):
-                    rst_space_output = rst_result[0]
+                    rst_space_update = rst_result[0]
                     scalar, arrays = _aggregate_operator_diagnostics(
                         rst_result, route_counts["rst"] // n_spaces,
                         "rst", composition_mode)
@@ -1351,14 +1507,15 @@ class DAWN_SRW_V4174(nn.Module):
                     if analysis:
                         analysis_metrics.update(arrays)
                 else:
-                    rst_space_output = rst_result
-                rst_route_update = _space_weighted_writeback(
-                    rst_space_output,
-                    rst_routing["dense_space_weights"],
-                    router_params["space_state_writeback"],
-                    route_scales["rst"]).reshape(rst_normalized.shape)
-            current_state = current_state + _shared_safe_dropout(
-                rst_route_update, self.dropout_rate, deterministic, rng_rst)
+                    rst_space_update = rst_result
+                rst_global_update = _write_space_outputs_to_global(
+                    rst_space_update,
+                    rst_space_routing["dense_space_weights"],
+                    space_interface_params["space_write_proj"],
+                    route_scales["rst"]).reshape(rst_global_state.shape)
+            global_state = global_state + _shared_safe_dropout(
+                rst_global_update,
+                self.dropout_rate, deterministic, rng_rst)
 
             if not fused_production:
                 routing_metric_fn = (
@@ -1366,9 +1523,9 @@ class DAWN_SRW_V4174(nn.Module):
                     if diagnostics_enabled
                     else _compact_space_routing_metrics)
                 regular_metrics.update(routing_metric_fn(
-                    attention_routing, "attention"))
+                    attention_space_routing, "attention"))
                 regular_metrics.update(routing_metric_fn(
-                    rst_routing, "rst"))
+                    rst_space_routing, "rst"))
             norm_metric_names = (
                 "attn_out_norm",
                 "rst_out_norm",
@@ -1382,24 +1539,24 @@ class DAWN_SRW_V4174(nn.Module):
             def compute_norm_metrics(_):
                 values = {
                     "attn_out_norm": jnp.linalg.norm(
-                        attention_output.astype(jnp.float32),
+                        attention_global_update.astype(jnp.float32),
                         axis=-1).mean(),
                     "rst_out_norm": jnp.linalg.norm(
-                        rst_route_update.astype(jnp.float32),
+                        rst_global_update.astype(jnp.float32),
                         axis=-1).mean(),
                     "residual_norm": jnp.linalg.norm(
-                        current_state.astype(jnp.float32), axis=-1).mean(),
+                        global_state.astype(jnp.float32), axis=-1).mean(),
                     "q_route_output_norm": jnp.linalg.norm(
-                        route_outputs["q"].astype(jnp.float32),
+                        q_global_interface.astype(jnp.float32),
                         axis=-1).mean(),
                     "k_route_output_norm": jnp.linalg.norm(
-                        route_outputs["k"].astype(jnp.float32),
+                        k_global_interface.astype(jnp.float32),
                         axis=-1).mean(),
                     "v_route_output_norm": jnp.linalg.norm(
-                        route_outputs["v"].astype(jnp.float32),
+                        v_global_interface.astype(jnp.float32),
                         axis=-1).mean(),
                     "rst_route_update_norm": jnp.linalg.norm(
-                        rst_route_update.astype(jnp.float32),
+                        rst_global_update.astype(jnp.float32),
                         axis=-1).mean(),
                 }
                 return {
@@ -1421,10 +1578,12 @@ class DAWN_SRW_V4174(nn.Module):
             if analysis:
                 layer_aux.update({
                     "analysis": analysis_metrics,
-                    "last_local_input": flat_rst_state,
-                    "last_route_state": rst_routing["route_state"],
+                    "last_global_state_for_space_diagnostics":
+                        rst_global_state_flat,
+                    "last_space_query":
+                        rst_space_routing["space_query"],
                 })
-            return current_state, layer_aux
+            return global_state, layer_aux
 
         layer_impl = layer_forward
         if self.gradient_checkpointing:
@@ -1440,12 +1599,14 @@ class DAWN_SRW_V4174(nn.Module):
         stacked_block_params = jax.tree.map(
             lambda *values: jnp.stack(values), *block_params)
         if not diagnostics_enabled:
-            def scan_body(current_state, layer_inputs):
+            def scan_body(global_state, layer_inputs):
                 return layer_impl(
-                    current_state,
+                    global_state,
                     layer_inputs["params"],
-                    pool,
-                    router,
+                    operator_bank,
+                    space_selector,
+                    space_interface,
+                    operator_controller,
                     layer_inputs["rng"])
 
             state, scan_aux = jax.lax.scan(
@@ -1466,14 +1627,17 @@ class DAWN_SRW_V4174(nn.Module):
                 state, layer_aux = layer_impl(
                     state,
                     layer_block_params,
-                    pool,
-                    router,
+                    operator_bank,
+                    space_selector,
+                    space_interface,
+                    operator_controller,
                     layer_rngs[layer_index])
                 append(regular_lists, layer_aux["regular"])
                 if analysis:
                     append(analysis_lists, layer_aux["analysis"])
-                    last_local_input = layer_aux["last_local_input"]
-                    last_route_state = layer_aux["last_route_state"]
+                    last_global_state_for_space_diagnostics = layer_aux[
+                        "last_global_state_for_space_diagnostics"]
+                    last_space_query = layer_aux["last_space_query"]
 
         state = self.norm(state)
         result: dict[str, jax.Array] = {}
@@ -1536,29 +1700,39 @@ class DAWN_SRW_V4174(nn.Module):
         if analysis:
             for key, values in analysis_lists.items():
                 result[key] = jnp.stack(values).mean(axis=0)
-            result.update(_space_geometry_diagnostics(
-                router["space_state_proj"],
-                router["space_state_writeback"],
-                last_local_input))
-            result.update(_read_bank_geometry_diagnostics(
-                pool, router["space_read_vectors"], last_route_state))
+            result.update(_operation_space_geometry_diagnostics(
+                space_interface["space_read_proj"],
+                space_interface["space_write_proj"],
+                last_global_state_for_space_diagnostics))
+            result.update(_operator_bank_geometry_diagnostics(
+                operator_bank,
+                space_selector["space_route_keys"],
+                last_space_query))
         return result
 
     def get_model_info(self) -> list[str]:
         n_spaces = int(self.n_operation_spaces)
         return [
             f"DAWN-SRW v4.1.7.4 ({MODEL_VERSION})",
-            "routing: one shared D->R projection directly matches explicit "
-            "space read vectors",
+            "global representation state: token-level persistent d_model "
+            "state between layers",
+            "space addressing: one shared space query and learned per-space "
+            "route keys",
             f"canonical geometry: D={self.d_model}, M={n_spaces}, "
-            f"R={self.d_route}; independent D->R coordinates, "
+            f"R={self.d_route}; space-specific D->R read coordinates, "
             f"top_k={self.operation_space_top_k}",
-            "space gate: hard top-k ReLU^2, non-softmax, sqrt-mass "
-            "composition denominator",
-            "local execution: z_m directly matches each pool's read vectors; "
-            "the read vector itself is the operator key",
-            "banks: Q/K/V/RST are fully separate; Q/K/V share the attention "
-            "space gate and RST recomputes routing after attention",
+            "space gate: hard top-k ReLU^2, non-softmax, selected-space "
+            "L1 sum 1 with deterministic top-1 zero-mass fallback",
+            "operation-space state: each selected space reads its own state "
+            "from the global representation",
+            "local transition: route-specific RW composition and a distinct "
+            "tau map in every operation space",
+            "operator banks: Q/K/V/RST are fully separate; Q/K/V share the "
+            "attention-space state and RST reselects after attention",
+            "space write: an independently learned projection returns local "
+            "outputs or updates to the global representation",
+            "attention output boundary: dense expand_O combines heads into "
+            "the global residual representation",
             f"operators per space: q={int(self.n_q)//n_spaces}, "
             f"k={int(self.n_k)//n_spaces}, "
             f"v={int(self.n_v)//n_spaces}, "
@@ -1571,8 +1745,7 @@ class DAWN_SRW_V4174(nn.Module):
                 if self.operation_space_execution_mode == "bundle_dense"
                 else (
                     "execution: semantic hard top-k, physical all-space "
-                    "dense, one shared P_m/U_m coordinate system and fused "
-                    "writeback")),
+                    "dense with fused operation-space writeback")),
             "layer execution: lax.scan with "
             + ("full-layer rematerialization"
                if self.gradient_checkpointing
@@ -1603,26 +1776,28 @@ def _sampled_layer_states(
         jnp.arange(batch_count) * int(input_ids.shape[0]) // batch_count)
     token_ids = input_ids[batch_index, :sequence_length]
     positions = jnp.arange(sequence_length)[None, :]
-    state = (
+    global_state = (
         params["token_emb"]["embedding"][token_ids]
         + params["pos_emb"]["embedding"][positions]
     ).astype(jnp.float32)
     block = params["block_0"]
-    attention_state = _shared_layer_norm(
-        state, block["norm1"]["scale"], block["norm1"]["bias"])
-    flat_attention_state = attention_state.reshape(
-        (-1, attention_state.shape[-1]))
+    attn_global_state = _shared_layer_norm(
+        global_state, block["norm1"]["scale"], block["norm1"]["bias"])
+    attn_global_state_flat = attn_global_state.reshape(
+        (-1, attn_global_state.shape[-1]))
     if not production_rst:
-        return flat_attention_state, flat_attention_state
-    router = params["router"]
-    pool = params["neuron_pool"]
-    routing = _compute_space_routing(
-        flat_attention_state,
-        router["space_route_proj"]["kernel"],
-        router["space_read_vectors"],
+        return attn_global_state_flat, attn_global_state_flat
+    space_selector = params["space_selector"]
+    space_interface = params["space_interface"]
+    operator_controller = params["operator_controller"]
+    operator_bank = params["operator_bank"]
+    attention_space_routing = _select_operation_spaces(
+        attn_global_state_flat,
+        space_selector["space_query_proj"]["kernel"],
+        space_selector["space_route_keys"],
         operation_space_top_k)
-    local = _project_space_local_states(
-        flat_attention_state, router["space_state_proj"])
+    attention_space_states = _read_operation_space_states(
+        attn_global_state_flat, space_interface["space_read_proj"])
     den_qk = (
         admission_den_power
         if admission_den_power_qk is None else admission_den_power_qk)
@@ -1630,9 +1805,9 @@ def _sampled_layer_states(
         admission_den_power
         if admission_den_power_v is None else admission_den_power_v)
     qk_scale, v_scale, _ = _shared_pool_output_scales(
-        int(attention_state.shape[-1]), int(n_layers))
+        int(attn_global_state.shape[-1]), int(n_layers))
     route_scales = {"q": qk_scale, "k": qk_scale, "v": v_scale}
-    route_outputs = {}
+    global_interfaces = {}
     for route in ("q", "k", "v"):
         route_temperature = (
             soft_gate_T_qk
@@ -1641,26 +1816,29 @@ def _sampled_layer_states(
                 soft_gate_T_v
                 if route == "v" and soft_gate_T_v is not None
                 else soft_gate_temperature))
-        raw_tau = _linear(
-            router[f"{route}_operator_tau_proj"], local)
-        local_output = _rw_compose_space_dense(
-            local,
-            pool[f"{route}_read_vectors"],
-            pool[f"{route}_write_vectors"],
+        raw_tau = _apply_operation_space_tau_map(
+            attention_space_states,
+            operator_controller[f"{route}_tau_kernel"],
+            operator_controller[f"{route}_tau_bias"])
+        space_output = _rw_compose_space_dense(
+            attention_space_states,
+            operator_bank[f"{route}_read_vectors"],
+            operator_bank[f"{route}_write_vectors"],
             raw_tau,
             soft_gate_temperature=route_temperature,
             soft_gate_boundary_power=soft_gate_boundary_power,
             admission_den_power=den_qk if route in ("q", "k") else den_v,
             srw_composition_mode=srw_composition_mode,
             heat_kernel_beta=heat_kernel_beta,
-            max_chunk_size=int(pool[f"{route}_read_vectors"].shape[1]))
-        route_outputs[route] = _space_weighted_writeback(
-            local_output,
-            routing["dense_space_weights"],
-            router["space_state_writeback"],
-            route_scales[route]).reshape(attention_state.shape)
+            max_chunk_size=int(
+                operator_bank[f"{route}_read_vectors"].shape[1]))
+        global_interfaces[route] = _write_space_outputs_to_global(
+            space_output,
+            attention_space_routing["dense_space_weights"],
+            space_interface["space_write_proj"],
+            route_scales[route]).reshape(attn_global_state.shape)
 
-    d_model = int(attention_state.shape[-1])
+    d_model = int(attn_global_state.shape[-1])
     n_heads = _positive_int("n_heads", int(n_heads))
     if d_model % n_heads:
         raise ValueError("calibration d_model must be divisible by n_heads")
@@ -1671,9 +1849,9 @@ def _sampled_layer_states(
             batch_count, sequence_length, n_heads, d_head
         ).transpose(0, 2, 1, 3)
 
-    query = split_heads(route_outputs["q"])
-    key = split_heads(route_outputs["k"])
-    value = split_heads(route_outputs["v"])
+    query = split_heads(global_interfaces["q"])
+    key = split_heads(global_interfaces["k"])
+    value = split_heads(global_interfaces["v"])
     attention_scores = jnp.einsum(
         "bhsd,bhtd->bhst", query, key
     ) / jnp.sqrt(jnp.float32(d_head))
@@ -1682,51 +1860,51 @@ def _sampled_layer_states(
     attention_scores = jnp.where(
         causal, attention_scores, jnp.finfo(attention_scores.dtype).min)
     attention_weights = jax.nn.softmax(attention_scores, axis=-1)
-    attention_output = jnp.einsum(
+    attention_global_update = jnp.einsum(
         "bhst,bhtd->bhsd", attention_weights, value)
-    attention_output = attention_output.transpose(0, 2, 1, 3).reshape(
-        batch_count, sequence_length, d_model)
-    attention_output = _linear(
-        block["attn"]["expand_O"], attention_output)
-    post_attention_state = state + attention_output
-    rst_state = _shared_layer_norm(
-        post_attention_state,
+    attention_global_update = attention_global_update.transpose(
+        0, 2, 1, 3).reshape(batch_count, sequence_length, d_model)
+    attention_global_update = _linear(
+        block["attn"]["expand_O"], attention_global_update)
+    global_state = global_state + attention_global_update
+    rst_global_state = _shared_layer_norm(
+        global_state,
         block["norm2"]["scale"],
         block["norm2"]["bias"])
-    return flat_attention_state, rst_state.reshape((-1, d_model))
+    return attn_global_state_flat, rst_global_state.reshape((-1, d_model))
 
 
 def _tau_init_calibration_scores(
         params, input_ids, max_tokens=128, **production_kwargs):
     """Return direct-read per-route ``[M,T,N]`` cosine tables."""
-    attention_state, rst_state = _sampled_layer_states(
+    attn_global_state, rst_global_state = _sampled_layer_states(
         params, input_ids, max_tokens, **production_kwargs)
-    router = params["router"]
-    pool = params["neuron_pool"]
+    space_interface = params["space_interface"]
+    operator_bank = params["operator_bank"]
 
-    def score(local, route):
+    def score(space_states, route):
         _, rho, _ = _direct_read_match(
-            local, pool[f"{route}_read_vectors"])
+            space_states, operator_bank[f"{route}_read_vectors"])
         return rho
 
-    attention_local = _project_space_local_states(
-        attention_state, router["space_state_proj"])
+    attention_space_states = _read_operation_space_states(
+        attn_global_state, space_interface["space_read_proj"])
     production_rst = bool(production_kwargs.get("production_rst", True))
-    rst_local = (
-        _project_space_local_states(
-            rst_state, router["space_state_proj"])
+    rst_space_states = (
+        _read_operation_space_states(
+            rst_global_state, space_interface["space_read_proj"])
         if production_rst else None)
     return {
-        "q": score(attention_local, "q"),
-        "k": score(attention_local, "k"),
-        "v": score(attention_local, "v"),
+        "q": score(attention_space_states, "q"),
+        "k": score(attention_space_states, "k"),
+        "v": score(attention_space_states, "v"),
         "rst": (
-            score(rst_local, "rst")
+            score(rst_space_states, "rst")
             if production_rst else jnp.zeros(
                 (
-                    attention_local.shape[0],
-                    attention_local.shape[1],
-                    pool["rst_read_vectors"].shape[1],
+                    attention_space_states.shape[0],
+                    attention_space_states.shape[1],
+                    operator_bank["rst_read_vectors"].shape[1],
                 ),
                 dtype=jnp.float32)),
     }
@@ -1775,22 +1953,23 @@ def initialization_diagnostics_from_params(
         params: Mapping[str, Any], input_ids: jax.Array,
         operation_space_top_k: int) -> dict[str, float]:
     """Host-side one-shot routing/local-geometry diagnostics."""
-    attention_state, _ = _sampled_layer_states(
+    attn_global_state, _ = _sampled_layer_states(
         params, input_ids, 4096, production_rst=False)
-    router = params["router"]
-    routing = _compute_space_routing(
-        attention_state,
-        router["space_route_proj"]["kernel"],
-        router["space_read_vectors"],
+    space_selector = params["space_selector"]
+    space_interface = params["space_interface"]
+    space_routing = _select_operation_spaces(
+        attn_global_state,
+        space_selector["space_query_proj"]["kernel"],
+        space_selector["space_route_keys"],
         operation_space_top_k)
-    diagnostics = _space_geometry_diagnostics(
-        router["space_state_proj"],
-        router["space_state_writeback"],
-        attention_state)
-    diagnostics.update(_read_bank_geometry_diagnostics(
-        params["neuron_pool"],
-        router["space_read_vectors"],
-        routing["route_state"]))
+    diagnostics = _operation_space_geometry_diagnostics(
+        space_interface["space_read_proj"],
+        space_interface["space_write_proj"],
+        attn_global_state)
+    diagnostics.update(_operator_bank_geometry_diagnostics(
+        params["operator_bank"],
+        space_selector["space_route_keys"],
+        space_routing["space_query"]))
     out = {}
     for key, value in diagnostics.items():
         value = jnp.asarray(value, dtype=jnp.float32)
@@ -1860,13 +2039,13 @@ def _make_sharded_space_dense_direct(
     beta = jnp.float32(heat_kernel_beta)
 
     def direct_core(
-            space_local_states, raw_tau, token_valid,
+            space_states, raw_tau, token_valid,
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
             execution_prune_eps):
         del soft_gate_t_final, soft_gate_boundary_power_final
-        n_spaces, token_capacity, d_route = space_local_states.shape
+        n_spaces, token_capacity, d_route = space_states.shape
         n_local = int(read_vectors_local.shape[1])
         chunk_size = min(int(max_chunk_size), n_local)
         n_chunks = math.ceil(n_local / chunk_size)
@@ -1878,10 +2057,10 @@ def _make_sharded_space_dense_direct(
         valid_rows = jnp.arange(n_padded) < n_local
         read_unit = forward_unit_direction(reads).astype(jnp.bfloat16)
         write_unit = forward_unit_direction(writes).astype(jnp.bfloat16)
-        local_bf16 = space_local_states.astype(jnp.bfloat16)
+        local_bf16 = space_states.astype(jnp.bfloat16)
         local_norm = jnp.maximum(
             jnp.linalg.norm(
-                space_local_states.astype(jnp.float32),
+                space_states.astype(jnp.float32),
                 axis=-1, keepdims=True),
             jnp.float32(RW_FORWARD_NORM_EPS))
         tau = _shared_tau_from_param(raw_tau)
@@ -2928,9 +3107,9 @@ def _make_sharded_attention_space_dense(
             "zero_gate_frac", "top1_rate"))
 
     def attention_core(
-            flat_state,
-            space_route_kernel, space_read_vectors,
-            space_state_proj, space_state_writeback,
+            global_state,
+            space_query_kernel, space_route_keys,
+            space_read_proj, space_write_proj,
             q_tau_kernel, q_tau_bias,
             k_tau_kernel, k_tau_bias,
             v_tau_kernel, v_tau_bias,
@@ -2938,32 +3117,32 @@ def _make_sharded_attention_space_dense(
             qk_temperature, v_temperature,
             boundary_power, execution_prune_eps,
             qk_scale, v_scale, collect_metrics):
-        routing = _compute_space_routing(
-            flat_state, space_route_kernel, space_read_vectors, top_k)
+        routing = _select_operation_spaces(
+            global_state, space_query_kernel, space_route_keys, top_k)
         if throughput_bf16:
-            local = jnp.swapaxes(
+            space_states = jnp.swapaxes(
                 throughput_dot_bf16_f32(
-                    flat_state, space_state_proj,
+                    global_state, space_read_proj,
                     dimension_numbers=(
                         ((1,), (1,)),
                         ((), ()))),
                 0, 1)
         else:
-            local = _control_einsum_f32(
-                "td,mdr->mtr", flat_state, space_state_proj)
-        local = local.astype(jnp.float32)
-        local_norm = jnp.maximum(
-            jnp.linalg.norm(local, axis=-1, keepdims=True),
+            space_states = _control_einsum_f32(
+                "td,mdr->mtr", global_state, space_read_proj)
+        space_states = space_states.astype(jnp.float32)
+        space_state_norm = jnp.maximum(
+            jnp.linalg.norm(space_states, axis=-1, keepdims=True),
             jnp.float32(RW_FORWARD_NORM_EPS))
-        token_valid = jnp.ones(local.shape[:2], dtype=jnp.bool_)
-        qk_tau_kernel = jnp.stack((q_tau_kernel, k_tau_kernel), axis=0)
-        qk_tau_bias = jnp.stack((q_tau_bias, k_tau_bias), axis=0)
+        token_valid = jnp.ones(space_states.shape[:2], dtype=jnp.bool_)
+        qk_tau_kernels = jnp.stack((q_tau_kernel, k_tau_kernel), axis=0)
+        qk_tau_biases = jnp.stack((q_tau_bias, k_tau_bias), axis=0)
         qk_raw_tau = (
             _control_einsum_f32(
-                "mtr,ari->amti", local, qk_tau_kernel)
-            + qk_tau_bias[:, None, None, :])
+                "mtr,amri->amti", space_states, qk_tau_kernels)
+            + qk_tau_biases[:, :, None, :])
         qk_local_output = _dense_rw_output_sharded(
-            local, local_norm, token_valid,
+            space_states, space_state_norm, token_valid,
             jnp.stack((q_read, k_read), axis=0),
             jnp.stack((q_write, k_write), axis=0),
             qk_raw_tau,
@@ -2976,12 +3155,10 @@ def _make_sharded_attention_space_dense(
             effective_active_eps=soft_gate_effective_active_eps,
             throughput_bf16=throughput_bf16)
 
-        v_raw_tau = (
-            _control_einsum_f32(
-                "mtr,ri->mti", local, v_tau_kernel)
-            + v_tau_bias)
+        v_raw_tau = _apply_operation_space_tau_map(
+            space_states, v_tau_kernel, v_tau_bias)
         v_local_output = _dense_rw_output_sharded(
-            local, local_norm, token_valid,
+            space_states, space_state_norm, token_valid,
             v_read[None, ...], v_write[None, ...],
             v_raw_tau[None, ...],
             max_chunk_size=max_chunk_size_v,
@@ -3009,7 +3186,7 @@ def _make_sharded_attention_space_dense(
             grouped_gate_mass,
             grouped_den_powers,
             composition_mode)
-        local_grouped_space_results = (
+        grouped_space_results = (
             grouped_raw_out / grouped_gate_den).astype(jnp.float32)
         space_weights = jnp.swapaxes(
             routing["dense_space_weights"], 0, 1)[None, ..., None]
@@ -3019,12 +3196,12 @@ def _make_sharded_attention_space_dense(
         writeback_dot = (
             _throughput_einsum_bf16_f32
             if throughput_bf16 else _control_einsum_f32)
-        local_grouped_output = writeback_dot(
+        grouped_global_interfaces = writeback_dot(
             "amtr,mrd->atd",
-            local_grouped_space_results * space_weights * route_scales,
-            space_state_writeback).astype(jnp.float32)
+            grouped_space_results * space_weights * route_scales,
+            space_write_proj).astype(jnp.float32)
         grouped_output = _psum_dense_rw_representation_sharded(
-            local_grouped_output, output_collective_bf16)
+            grouped_global_interfaces, output_collective_bf16)
 
         q_per_space = int(q_read.shape[1]) * model_axis_size
         k_per_space = int(k_read.shape[1]) * model_axis_size
@@ -3034,8 +3211,8 @@ def _make_sharded_attention_space_dense(
             ("k", k_per_space),
             ("v", v_per_space),
         )
-        metric_local = jax.lax.stop_gradient(local)
-        metric_norm = jax.lax.stop_gradient(local_norm)
+        metric_local = jax.lax.stop_gradient(space_states)
+        metric_norm = jax.lax.stop_gradient(space_state_norm)
         metric_qk_reads = jax.lax.stop_gradient(
             jnp.stack((q_read, k_read), axis=0))
         metric_v_reads = jax.lax.stop_gradient(v_read[None, ...])
@@ -3220,12 +3397,12 @@ def _make_sharded_attention_space_bundle_dense(
         dtype=jnp.float32).reshape((3, 1, 1, 1))
 
     def bundle_execute(
-            flat_state,
+            global_state,
             state_params,
             operator_params,
             controls,
             packing):
-        (space_state_proj, space_state_writeback,
+        (space_read_proj, space_write_proj,
          q_tau_kernel, q_tau_bias,
          k_tau_kernel, k_tau_bias,
          v_tau_kernel, v_tau_bias) = state_params
@@ -3234,9 +3411,9 @@ def _make_sharded_attention_space_bundle_dense(
         (qk_temperature, v_temperature,
          boundary_power, execution_prune_eps,
          qk_scale, v_scale) = controls
-        token_count = int(flat_state.shape[0])
-        d_model = int(flat_state.shape[1])
-        n_spaces = int(space_state_proj.shape[0])
+        token_count = int(global_state.shape[0])
+        d_model = int(global_state.shape[1])
+        n_spaces = int(space_read_proj.shape[0])
         n_bundles = n_spaces // bundle_size
         scan_blocks = (
             int(packing["token_id"].shape[0]) // token_block_size)
@@ -3272,9 +3449,9 @@ def _make_sharded_attention_space_bundle_dense(
                 block_weight = jax.lax.dynamic_slice_in_dim(
                     packing["routing_weight"], packed_start,
                     token_block_size, axis=0)
-                packed_state = flat_state[block_token]
+                packed_state = global_state[block_token]
                 projection = jax.lax.dynamic_slice_in_dim(
-                    space_state_proj, space_start, bundle_size, axis=0)
+                    space_read_proj, space_start, bundle_size, axis=0)
                 local = projection_dot(
                     "bd,mdr->mbr", packed_state, projection
                 ).astype(jnp.float32)
@@ -3285,10 +3462,14 @@ def _make_sharded_attention_space_bundle_dense(
                     jnp.swapaxes(block_membership, 0, 1)
                     & block_valid[None, :])
 
+                block_qk_tau_kernels = jax.lax.dynamic_slice_in_dim(
+                    qk_tau_kernels, space_start, bundle_size, axis=1)
+                block_qk_tau_biases = jax.lax.dynamic_slice_in_dim(
+                    qk_tau_biases, space_start, bundle_size, axis=1)
                 qk_raw_tau = (
                     _control_einsum_f32(
-                        "mbr,ari->ambi", local, qk_tau_kernels)
-                    + qk_tau_biases[:, None, None, :])
+                        "mbr,amri->ambi", local, block_qk_tau_kernels)
+                    + block_qk_tau_biases[:, :, None, :])
                 block_qk_read = jax.lax.dynamic_slice_in_dim(
                     qk_reads, space_start, bundle_size, axis=1)
                 block_qk_write = jax.lax.dynamic_slice_in_dim(
@@ -3305,10 +3486,12 @@ def _make_sharded_attention_space_bundle_dense(
                     effective_active_eps=soft_gate_effective_active_eps,
                     throughput_bf16=throughput_bf16)
 
-                v_raw_tau = (
-                    _control_einsum_f32(
-                        "mbr,ri->mbi", local, v_tau_kernel)
-                    + v_tau_bias)
+                block_v_tau_kernel = jax.lax.dynamic_slice_in_dim(
+                    v_tau_kernel, space_start, bundle_size, axis=0)
+                block_v_tau_bias = jax.lax.dynamic_slice_in_dim(
+                    v_tau_bias, space_start, bundle_size, axis=0)
+                v_raw_tau = _apply_operation_space_tau_map(
+                    local, block_v_tau_kernel, block_v_tau_bias)
                 block_v_read = jax.lax.dynamic_slice_in_dim(
                     v_read, space_start, bundle_size, axis=0)
                 block_v_write = jax.lax.dynamic_slice_in_dim(
@@ -3342,7 +3525,7 @@ def _make_sharded_attention_space_bundle_dense(
                 weights = jnp.swapaxes(
                     block_weight, 0, 1)[None, ..., None]
                 writeback = jax.lax.dynamic_slice_in_dim(
-                    space_state_writeback,
+                    space_write_proj,
                     space_start, bundle_size, axis=0)
                 block_output = writeback_dot(
                     "ambr,mrd->abd",
@@ -3369,14 +3552,14 @@ def _make_sharded_attention_space_bundle_dense(
             local_grouped_output, output_collective_bf16)
 
     def exact_space_execute(
-            flat_state,
+            global_state,
             state_params,
             operator_params,
             controls,
             packed_metadata,
             primary_weight,
             overflow_weight):
-        (space_state_proj, space_state_writeback,
+        (space_read_proj, space_write_proj,
          q_tau_kernel, q_tau_bias,
          k_tau_kernel, k_tau_bias,
          v_tau_kernel, v_tau_bias) = state_params
@@ -3385,9 +3568,9 @@ def _make_sharded_attention_space_bundle_dense(
         (qk_temperature, v_temperature,
          boundary_power, execution_prune_eps,
          qk_scale, v_scale) = controls
-        token_count = int(flat_state.shape[0])
-        d_model = int(flat_state.shape[1])
-        n_spaces = int(space_state_proj.shape[0])
+        token_count = int(global_state.shape[0])
+        d_model = int(global_state.shape[1])
+        n_spaces = int(space_read_proj.shape[0])
         task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
         task_capacity = int(
             packed_metadata["overflow_task_space_id"].shape[0])
@@ -3403,9 +3586,9 @@ def _make_sharded_attention_space_bundle_dense(
         ).reshape((3, 1, 1))
         primary_token = packed_metadata["primary_token_id"]
         primary_valid = packed_metadata["primary_token_valid"]
-        primary_state = flat_state[primary_token]
+        primary_state = global_state[primary_token]
         primary_local = projection_dot(
-            "mtd,mdr->mtr", primary_state, space_state_proj
+            "mtd,mdr->mtr", primary_state, space_read_proj
         ).astype(jnp.float32)
         primary_local_norm = jnp.maximum(
             jnp.linalg.norm(primary_local, axis=-1, keepdims=True),
@@ -3413,8 +3596,8 @@ def _make_sharded_attention_space_bundle_dense(
 
         primary_qk_tau = (
             _control_einsum_f32(
-                "mtr,ari->amti", primary_local, qk_tau_kernels)
-            + qk_tau_biases[:, None, None, :])
+                "mtr,amri->amti", primary_local, qk_tau_kernels)
+            + qk_tau_biases[:, :, None, :])
         qk_raw_out, qk_gate_mass = _dense_rw_output_sharded(
             primary_local,
             primary_local_norm,
@@ -3431,10 +3614,8 @@ def _make_sharded_attention_space_bundle_dense(
             effective_active_eps=soft_gate_effective_active_eps,
             throughput_bf16=throughput_bf16)
 
-        primary_v_tau = (
-            _control_einsum_f32(
-                "mtr,ri->mti", primary_local, v_tau_kernel)
-            + v_tau_bias)
+        primary_v_tau = _apply_operation_space_tau_map(
+            primary_local, v_tau_kernel, v_tau_bias)
         v_raw_out, v_gate_mass = _dense_rw_output_sharded(
             primary_local,
             primary_local_norm,
@@ -3469,7 +3650,7 @@ def _make_sharded_attention_space_bundle_dense(
             primary_results
             * primary_weight[None, ..., None]
             * route_scales[:, None, ...],
-            space_state_writeback).astype(jnp.float32)
+            space_write_proj).astype(jnp.float32)
         primary_block_output = jnp.where(
             primary_valid[None, ..., None],
             primary_block_output,
@@ -3496,8 +3677,8 @@ def _make_sharded_attention_space_bundle_dense(
                 task_space, jnp.int32(n_spaces - 1))
 
             def execute_group(output_value):
-                packed_state = flat_state[task_token]
-                projection = space_state_proj[safe_task_space]
+                packed_state = global_state[task_token]
+                projection = space_read_proj[safe_task_space]
                 local = projection_dot(
                     "gtd,gdr->gtr", packed_state, projection
                 ).astype(jnp.float32)
@@ -3505,10 +3686,12 @@ def _make_sharded_attention_space_bundle_dense(
                     jnp.linalg.norm(local, axis=-1, keepdims=True),
                     jnp.float32(RW_FORWARD_NORM_EPS))
 
+                task_qk_tau_kernels = qk_tau_kernels[:, safe_task_space]
+                task_qk_tau_biases = qk_tau_biases[:, safe_task_space]
                 qk_raw_tau = (
                     _control_einsum_f32(
-                        "gtr,ari->agti", local, qk_tau_kernels)
-                    + qk_tau_biases[:, None, None, :])
+                        "gtr,agri->agti", local, task_qk_tau_kernels)
+                    + task_qk_tau_biases[:, :, None, :])
                 task_qk_read = qk_reads[:, safe_task_space]
                 task_qk_write = qk_writes[:, safe_task_space]
                 qk_raw_out, qk_gate_mass = _dense_rw_output_sharded(
@@ -3527,10 +3710,12 @@ def _make_sharded_attention_space_bundle_dense(
                     effective_active_eps=soft_gate_effective_active_eps,
                     throughput_bf16=throughput_bf16)
 
+                task_v_tau_kernel = v_tau_kernel[safe_task_space]
+                task_v_tau_bias = v_tau_bias[safe_task_space]
                 v_raw_tau = (
                     _control_einsum_f32(
-                        "gtr,ri->gti", local, v_tau_kernel)
-                    + v_tau_bias)
+                        "gtr,gri->gti", local, task_v_tau_kernel)
+                    + task_v_tau_bias[:, None, :])
                 task_v_read = v_read[safe_task_space]
                 task_v_write = v_write[safe_task_space]
                 v_raw_out, v_gate_mass = _dense_rw_output_sharded(
@@ -3562,7 +3747,7 @@ def _make_sharded_attention_space_bundle_dense(
                     grouped_gate_mass, den_powers, composition_mode)
                 local_results = (
                     grouped_raw_out / grouped_gate_den).astype(jnp.float32)
-                writeback = space_state_writeback[safe_task_space]
+                writeback = space_write_proj[safe_task_space]
                 block_output = writeback_dot(
                     "agtr,grd->agtd",
                     local_results
@@ -3710,9 +3895,9 @@ def _make_sharded_attention_space_bundle_dense(
         execute_with_exact_space_backward_bwd)
 
     def attention_core(
-            flat_state,
-            space_route_kernel, space_read_vectors,
-            space_state_proj, space_state_writeback,
+            global_state,
+            space_query_kernel, space_route_keys,
+            space_read_proj, space_write_proj,
             q_tau_kernel, q_tau_bias,
             k_tau_kernel, k_tau_bias,
             v_tau_kernel, v_tau_bias,
@@ -3720,15 +3905,15 @@ def _make_sharded_attention_space_bundle_dense(
             qk_temperature, v_temperature,
             boundary_power, execution_prune_eps,
             qk_scale, v_scale, collect_metrics):
-        routing = _compute_space_routing(
-            flat_state, space_route_kernel, space_read_vectors, top_k)
+        routing = _select_operation_spaces(
+            global_state, space_query_kernel, space_route_keys, top_k)
         packing, packing_metrics = _pack_top2_bundle_entries_sharded(
             routing,
             bundle_size=bundle_size,
             token_block_size=token_block_size,
             stage="attention")
-        token_count = int(flat_state.shape[0])
-        n_spaces = int(space_state_proj.shape[0])
+        token_count = int(global_state.shape[0])
+        n_spaces = int(space_read_proj.shape[0])
         if n_spaces % bundle_size:
             raise ValueError(
                 "bundle_dense attention space count is not divisible by 4")
@@ -3739,7 +3924,7 @@ def _make_sharded_attention_space_bundle_dense(
         qk_tau_biases = jnp.stack(
             (q_tau_bias, k_tau_bias), axis=0)
         state_params = (
-            space_state_proj, space_state_writeback,
+            space_read_proj, space_write_proj,
             q_tau_kernel, q_tau_bias,
             k_tau_kernel, k_tau_bias,
             v_tau_kernel, v_tau_bias,
@@ -3752,7 +3937,7 @@ def _make_sharded_attention_space_bundle_dense(
             qk_scale, v_scale,
         )
         grouped_output = execute_with_exact_space_backward(
-            flat_state,
+            global_state,
             state_params,
             operator_params,
             controls,
@@ -3769,8 +3954,8 @@ def _make_sharded_attention_space_bundle_dense(
             ("v", v_per_space),
         )
         metric_operands = (
-            jax.lax.stop_gradient(flat_state),
-            jax.lax.stop_gradient(space_state_proj),
+            jax.lax.stop_gradient(global_state),
+            jax.lax.stop_gradient(space_read_proj),
             jax.lax.stop_gradient(qk_tau_kernels),
             jax.lax.stop_gradient(qk_tau_biases),
             jax.lax.stop_gradient(v_tau_kernel),
@@ -3829,11 +4014,17 @@ def _make_sharded_attention_space_bundle_dense(
                 local_norm = jnp.maximum(
                     jnp.linalg.norm(local, axis=-1, keepdims=True),
                     jnp.float32(RW_FORWARD_NORM_EPS))
+                qk_tau_kernel_block = jax.lax.dynamic_slice_in_dim(
+                    metric_qk_tau_kernels,
+                    space_start, bundle_size, axis=1)
+                qk_tau_bias_block = jax.lax.dynamic_slice_in_dim(
+                    metric_qk_tau_biases,
+                    space_start, bundle_size, axis=1)
                 qk_tau = (
                     _control_einsum_f32(
-                        "mbr,ari->ambi",
-                        local, metric_qk_tau_kernels)
-                    + metric_qk_tau_biases[:, None, None, :])
+                        "mbr,amri->ambi",
+                        local, qk_tau_kernel_block)
+                    + qk_tau_bias_block[:, :, None, :])
                 qk_read_block = jax.lax.dynamic_slice_in_dim(
                     metric_qk_reads, space_start,
                     bundle_size, axis=1)
@@ -3852,11 +4043,14 @@ def _make_sharded_attention_space_bundle_dense(
                     qk_stats, token_space_valid,
                     den_powers[:2], composition_mode)
 
-                v_tau = (
-                    _control_einsum_f32(
-                        "mbr,ri->mbi", local,
-                        metric_v_tau_kernel)
-                    + metric_v_tau_bias)
+                v_tau_kernel_block = jax.lax.dynamic_slice_in_dim(
+                    metric_v_tau_kernel,
+                    space_start, bundle_size, axis=0)
+                v_tau_bias_block = jax.lax.dynamic_slice_in_dim(
+                    metric_v_tau_bias,
+                    space_start, bundle_size, axis=0)
+                v_tau = _apply_operation_space_tau_map(
+                    local, v_tau_kernel_block, v_tau_bias_block)
                 v_read_block = jax.lax.dynamic_slice_in_dim(
                     metric_v_reads, space_start,
                     bundle_size, axis=0)
@@ -3984,37 +4178,35 @@ def _make_sharded_rst_space_dense(
             "zero_gate_frac", "top1_rate"))
 
     def rst_core(
-            flat_state,
-            space_route_kernel, space_read_vectors,
-            space_state_proj, space_state_writeback,
+            global_state,
+            space_query_kernel, space_route_keys,
+            space_read_proj, space_write_proj,
             tau_kernel, tau_bias,
             read_vectors, write_vectors,
             temperature, boundary_power, execution_prune_eps,
             route_scale, collect_metrics):
-        routing = _compute_space_routing(
-            flat_state, space_route_kernel, space_read_vectors, top_k)
+        routing = _select_operation_spaces(
+            global_state, space_query_kernel, space_route_keys, top_k)
         if throughput_bf16:
-            local = jnp.swapaxes(
+            space_states = jnp.swapaxes(
                 throughput_dot_bf16_f32(
-                    flat_state, space_state_proj,
+                    global_state, space_read_proj,
                     dimension_numbers=(
                         ((1,), (1,)),
                         ((), ()))),
                 0, 1)
         else:
-            local = _control_einsum_f32(
-                "td,mdr->mtr", flat_state, space_state_proj)
-        local = local.astype(jnp.float32)
-        local_norm = jnp.maximum(
-            jnp.linalg.norm(local, axis=-1, keepdims=True),
+            space_states = _control_einsum_f32(
+                "td,mdr->mtr", global_state, space_read_proj)
+        space_states = space_states.astype(jnp.float32)
+        space_state_norm = jnp.maximum(
+            jnp.linalg.norm(space_states, axis=-1, keepdims=True),
             jnp.float32(RW_FORWARD_NORM_EPS))
-        raw_tau = (
-            _control_einsum_f32(
-                "mtr,ri->mti", local, tau_kernel)
-            + tau_bias)
-        local_output = _dense_rw_output_sharded(
-            local, local_norm,
-            jnp.ones(local.shape[:2], dtype=jnp.bool_),
+        raw_tau = _apply_operation_space_tau_map(
+            space_states, tau_kernel, tau_bias)
+        space_output = _dense_rw_output_sharded(
+            space_states, space_state_norm,
+            jnp.ones(space_states.shape[:2], dtype=jnp.bool_),
             read_vectors[None, ...], write_vectors[None, ...],
             raw_tau[None, ...],
             max_chunk_size=max_chunk_size,
@@ -4025,7 +4217,7 @@ def _make_sharded_rst_space_dense(
             heat_kernel_beta=heat_kernel_beta,
             effective_active_eps=soft_gate_effective_active_eps,
             throughput_bf16=throughput_bf16)
-        raw_out, gate_mass = local_output
+        raw_out, gate_mass = space_output
         _, gate_den = _global_dense_rw_den_sharded(
             gate_mass, jnp.float32(admission_den_power),
             composition_mode)
@@ -4040,13 +4232,13 @@ def _make_sharded_rst_space_dense(
             if throughput_bf16 else _control_einsum_f32)
         local_update = writeback_dot(
             "mtr,mrd->td", local_weighted,
-            space_state_writeback).astype(jnp.float32)
+            space_write_proj).astype(jnp.float32)
         update = _psum_dense_rw_representation_sharded(
             local_update, output_collective_bf16)
         n_per_space = int(read_vectors.shape[1]) * model_axis_size
         route_specs = (("rst", n_per_space),)
-        metric_local = jax.lax.stop_gradient(local)
-        metric_norm = jax.lax.stop_gradient(local_norm)
+        metric_local = jax.lax.stop_gradient(space_states)
+        metric_norm = jax.lax.stop_gradient(space_state_norm)
         metric_reads = jax.lax.stop_gradient(read_vectors[None, ...])
         metric_tau = jax.lax.stop_gradient(raw_tau[None, ...])
         metric_routing = jax.tree.map(
@@ -4060,7 +4252,7 @@ def _make_sharded_rst_space_dense(
         metric_operands = (
             metric_local,
             metric_norm,
-            jnp.ones(local.shape[:2], dtype=jnp.bool_),
+            jnp.ones(space_states.shape[:2], dtype=jnp.bool_),
             metric_reads,
             metric_tau,
             metric_routing,
@@ -4198,19 +4390,19 @@ def _make_sharded_rst_space_bundle_dense(
     writeback_dot = projection_dot
 
     def bundle_execute(
-            flat_state,
+            global_state,
             state_params,
             operator_params,
             controls,
             packing):
-        (space_state_proj, space_state_writeback,
+        (space_read_proj, space_write_proj,
          tau_kernel, tau_bias) = state_params
         read_vectors, write_vectors = operator_params
         (temperature, boundary_power,
          execution_prune_eps, route_scale) = controls
-        token_count = int(flat_state.shape[0])
-        d_model = int(flat_state.shape[1])
-        n_spaces = int(space_state_proj.shape[0])
+        token_count = int(global_state.shape[0])
+        d_model = int(global_state.shape[1])
+        n_spaces = int(space_read_proj.shape[0])
         n_bundles = n_spaces // bundle_size
         scan_blocks = (
             int(packing["token_id"].shape[0]) // token_block_size)
@@ -4237,9 +4429,9 @@ def _make_sharded_rst_space_bundle_dense(
                 block_weight = jax.lax.dynamic_slice_in_dim(
                     packing["routing_weight"], packed_start,
                     token_block_size, axis=0)
-                packed_state = flat_state[block_token]
+                packed_state = global_state[block_token]
                 projection = jax.lax.dynamic_slice_in_dim(
-                    space_state_proj, space_start, bundle_size, axis=0)
+                    space_read_proj, space_start, bundle_size, axis=0)
                 local = projection_dot(
                     "bd,mdr->mbr", packed_state, projection
                 ).astype(jnp.float32)
@@ -4249,10 +4441,12 @@ def _make_sharded_rst_space_bundle_dense(
                 token_space_valid = (
                     jnp.swapaxes(block_membership, 0, 1)
                     & block_valid[None, :])
-                raw_tau = (
-                    _control_einsum_f32(
-                        "mbr,ri->mbi", local, tau_kernel)
-                    + tau_bias)
+                block_tau_kernel = jax.lax.dynamic_slice_in_dim(
+                    tau_kernel, space_start, bundle_size, axis=0)
+                block_tau_bias = jax.lax.dynamic_slice_in_dim(
+                    tau_bias, space_start, bundle_size, axis=0)
+                raw_tau = _apply_operation_space_tau_map(
+                    local, block_tau_kernel, block_tau_bias)
                 block_read = jax.lax.dynamic_slice_in_dim(
                     read_vectors, space_start, bundle_size, axis=0)
                 block_write = jax.lax.dynamic_slice_in_dim(
@@ -4279,7 +4473,7 @@ def _make_sharded_rst_space_bundle_dense(
                 weights = jnp.swapaxes(
                     block_weight, 0, 1)[None, ..., None]
                 writeback = jax.lax.dynamic_slice_in_dim(
-                    space_state_writeback,
+                    space_write_proj,
                     space_start, bundle_size, axis=0)
                 block_output = writeback_dot(
                     "ambr,mrd->abd",
@@ -4308,38 +4502,36 @@ def _make_sharded_rst_space_bundle_dense(
             local_update, output_collective_bf16)
 
     def exact_space_execute(
-            flat_state,
+            global_state,
             state_params,
             operator_params,
             controls,
             packed_metadata,
             primary_weight,
             overflow_weight):
-        (space_state_proj, space_state_writeback,
+        (space_read_proj, space_write_proj,
          tau_kernel, tau_bias) = state_params
         read_vectors, write_vectors = operator_params
         (temperature, boundary_power,
          execution_prune_eps, route_scale) = controls
-        token_count = int(flat_state.shape[0])
-        d_model = int(flat_state.shape[1])
-        n_spaces = int(space_state_proj.shape[0])
+        token_count = int(global_state.shape[0])
+        d_model = int(global_state.shape[1])
+        n_spaces = int(space_read_proj.shape[0])
         task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
         task_capacity = int(
             packed_metadata["overflow_task_space_id"].shape[0])
         task_groups = task_capacity // task_group_size
         primary_token = packed_metadata["primary_token_id"]
         primary_valid = packed_metadata["primary_token_valid"]
-        primary_state = flat_state[primary_token]
+        primary_state = global_state[primary_token]
         primary_local = projection_dot(
-            "mtd,mdr->mtr", primary_state, space_state_proj
+            "mtd,mdr->mtr", primary_state, space_read_proj
         ).astype(jnp.float32)
         primary_local_norm = jnp.maximum(
             jnp.linalg.norm(primary_local, axis=-1, keepdims=True),
             jnp.float32(RW_FORWARD_NORM_EPS))
-        primary_tau = (
-            _control_einsum_f32(
-                "mtr,ri->mti", primary_local, tau_kernel)
-            + tau_bias)
+        primary_tau = _apply_operation_space_tau_map(
+            primary_local, tau_kernel, tau_bias)
         raw_out, gate_mass = _dense_rw_output_sharded(
             primary_local,
             primary_local_norm,
@@ -4367,7 +4559,7 @@ def _make_sharded_rst_space_bundle_dense(
             primary_results[0]
             * primary_weight[..., None]
             * jnp.asarray(route_scale, dtype=jnp.float32),
-            space_state_writeback).astype(jnp.float32)
+            space_write_proj).astype(jnp.float32)
         primary_block_output = jnp.where(
             primary_valid[..., None], primary_block_output, 0.0)
         initial_output = jnp.zeros(
@@ -4392,18 +4584,20 @@ def _make_sharded_rst_space_bundle_dense(
                 task_space, jnp.int32(n_spaces - 1))
 
             def execute_group(output_value):
-                packed_state = flat_state[task_token]
-                projection = space_state_proj[safe_task_space]
+                packed_state = global_state[task_token]
+                projection = space_read_proj[safe_task_space]
                 local = projection_dot(
                     "gtd,gdr->gtr", packed_state, projection
                 ).astype(jnp.float32)
                 local_norm = jnp.maximum(
                     jnp.linalg.norm(local, axis=-1, keepdims=True),
                     jnp.float32(RW_FORWARD_NORM_EPS))
+                task_tau_kernel = tau_kernel[safe_task_space]
+                task_tau_bias = tau_bias[safe_task_space]
                 raw_tau = (
                     _control_einsum_f32(
-                        "gtr,ri->gti", local, tau_kernel)
-                    + tau_bias)
+                        "gtr,gri->gti", local, task_tau_kernel)
+                    + task_tau_bias[:, None, :])
                 task_read = read_vectors[safe_task_space]
                 task_write = write_vectors[safe_task_space]
                 raw_out, gate_mass = _dense_rw_output_sharded(
@@ -4428,7 +4622,7 @@ def _make_sharded_rst_space_bundle_dense(
                 _, gate_den = _global_dense_rw_den_sharded(
                     gate_mass, den_power, composition_mode)
                 local_results = (raw_out / gate_den).astype(jnp.float32)
-                writeback = space_state_writeback[safe_task_space]
+                writeback = space_write_proj[safe_task_space]
                 block_output = writeback_dot(
                     "gtr,grd->gtd",
                     local_results[0]
@@ -4576,28 +4770,28 @@ def _make_sharded_rst_space_bundle_dense(
         execute_with_exact_space_backward_bwd)
 
     def rst_core(
-            flat_state,
-            space_route_kernel, space_read_vectors,
-            space_state_proj, space_state_writeback,
+            global_state,
+            space_query_kernel, space_route_keys,
+            space_read_proj, space_write_proj,
             tau_kernel, tau_bias,
             read_vectors, write_vectors,
             temperature, boundary_power, execution_prune_eps,
             route_scale, collect_metrics):
-        routing = _compute_space_routing(
-            flat_state, space_route_kernel, space_read_vectors, top_k)
+        routing = _select_operation_spaces(
+            global_state, space_query_kernel, space_route_keys, top_k)
         packing, packing_metrics = _pack_top2_bundle_entries_sharded(
             routing,
             bundle_size=bundle_size,
             token_block_size=token_block_size,
             stage="rst")
-        token_count = int(flat_state.shape[0])
-        n_spaces = int(space_state_proj.shape[0])
+        token_count = int(global_state.shape[0])
+        n_spaces = int(space_read_proj.shape[0])
         if n_spaces % bundle_size:
             raise ValueError(
                 "bundle_dense RST space count is not divisible by 4")
         n_bundles = n_spaces // bundle_size
         state_params = (
-            space_state_proj, space_state_writeback,
+            space_read_proj, space_write_proj,
             tau_kernel, tau_bias,
         )
         operator_params = (read_vectors, write_vectors)
@@ -4606,7 +4800,7 @@ def _make_sharded_rst_space_bundle_dense(
             execution_prune_eps, route_scale,
         )
         update = execute_with_exact_space_backward(
-            flat_state,
+            global_state,
             state_params,
             operator_params,
             controls,
@@ -4617,8 +4811,8 @@ def _make_sharded_rst_space_bundle_dense(
         n_per_space = int(read_vectors.shape[1]) * model_axis_size
         route_specs = (("rst", n_per_space),)
         metric_operands = (
-            jax.lax.stop_gradient(flat_state),
-            jax.lax.stop_gradient(space_state_proj),
+            jax.lax.stop_gradient(global_state),
+            jax.lax.stop_gradient(space_read_proj),
             jax.lax.stop_gradient(tau_kernel),
             jax.lax.stop_gradient(tau_bias),
             jax.lax.stop_gradient(read_vectors),
@@ -4669,11 +4863,14 @@ def _make_sharded_rst_space_bundle_dense(
                 local_norm = jnp.maximum(
                     jnp.linalg.norm(local, axis=-1, keepdims=True),
                     jnp.float32(RW_FORWARD_NORM_EPS))
-                raw_tau = (
-                    _control_einsum_f32(
-                        "mbr,ri->mbi", local,
-                        metric_tau_kernel)
-                    + metric_tau_bias)
+                tau_kernel_block = jax.lax.dynamic_slice_in_dim(
+                    metric_tau_kernel,
+                    space_start, bundle_size, axis=0)
+                tau_bias_block = jax.lax.dynamic_slice_in_dim(
+                    metric_tau_bias,
+                    space_start, bundle_size, axis=0)
+                raw_tau = _apply_operation_space_tau_map(
+                    local, tau_kernel_block, tau_bias_block)
                 read_block = jax.lax.dynamic_slice_in_dim(
                     metric_reads, space_start,
                     bundle_size, axis=0)

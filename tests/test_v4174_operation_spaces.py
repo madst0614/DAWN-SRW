@@ -278,7 +278,7 @@ def _fp32_separate_sharded(mesh):
 def _make_post_rw_collective_probe(mesh, *, u_before_psum):
     def core(
             sharded_raw_out, sharded_gate_mass,
-            space_weights, space_state_writeback,
+            space_weights, space_write_proj,
             route_scales, den_powers):
         raw_out = sharded_raw_out[0]
         gate_mass = sharded_gate_mass[0]
@@ -289,7 +289,7 @@ def _make_post_rw_collective_probe(mesh, *, u_before_psum):
             local_output = v4174._control_einsum_f32(
                 "amtr,mrd->atd",
                 raw_out / gate_den * space_weights * route_scales,
-                space_state_writeback).astype(jnp.float32)
+                space_write_proj).astype(jnp.float32)
             output = jax.lax.psum(local_output, "model")
         else:
             space_results = jax.lax.psum(
@@ -297,7 +297,7 @@ def _make_post_rw_collective_probe(mesh, *, u_before_psum):
             output = v4174._control_einsum_f32(
                 "amtr,mrd->atd",
                 space_results * space_weights * route_scales,
-                space_state_writeback).astype(jnp.float32)
+                space_write_proj).astype(jnp.float32)
         return global_gate_mass, gate_den, output
 
     return shard_map(
@@ -356,7 +356,7 @@ def test_nonfactorized_operation_spaces_initialize_independent_coordinates():
         n_rst=30,
     )
     _, _, variables = _variables(model=model, seed=5)
-    projection = variables["params"]["router"]["space_state_proj"]
+    projection = variables["params"]["space_interface"]["space_read_proj"]
     assert projection.shape == (3, 16, 4)
     gram = jnp.einsum("mdr,mds->mrs", projection, projection)
     np.testing.assert_allclose(
@@ -377,36 +377,39 @@ def test_nonfactorized_operation_spaces_initialize_independent_coordinates():
     assert counts["total"] == _count(variables["params"])
 
 
-def test_parameter_tree_is_exact_direct_read_schema():
+def test_parameter_tree_is_exact_operation_space_schema():
     _, _, variables = _variables()
     params = variables["params"]
-    router = params["router"]
-    assert set(router) == {
-        "space_route_proj",
-        "space_read_vectors",
-        "space_state_proj",
-        "space_state_writeback",
-        "q_operator_tau_proj",
-        "k_operator_tau_proj",
-        "v_operator_tau_proj",
-        "rst_operator_tau_proj",
+    selector = params["space_selector"]
+    interface = params["space_interface"]
+    controller = params["operator_controller"]
+    assert set(selector) == {
+        "space_query_proj",
+        "space_route_keys",
     }
-    assert router["space_route_proj"]["kernel"].shape == (16, 4)
-    assert router["space_read_vectors"].shape == (4, 4)
-    assert router["space_state_proj"].shape == (4, 16, 4)
-    assert router["space_state_writeback"].shape == (4, 4, 16)
+    assert set(interface) == {"space_read_proj", "space_write_proj"}
+    assert set(controller) == {
+        f"{route}_{kind}"
+        for route in ("q", "k", "v", "rst")
+        for kind in ("tau_kernel", "tau_bias")
+    }
+    assert selector["space_query_proj"]["kernel"].shape == (16, 4)
+    assert selector["space_route_keys"].shape == (4, 4)
+    assert interface["space_read_proj"].shape == (4, 16, 4)
+    assert interface["space_write_proj"].shape == (4, 4, 16)
     np.testing.assert_allclose(
-        router["space_state_writeback"],
-        jnp.swapaxes(router["space_state_proj"], -1, -2),
+        interface["space_write_proj"],
+        jnp.swapaxes(interface["space_read_proj"], -1, -2),
         atol=0,
         rtol=0,
     )
-    space_read_gram = (
-        router["space_read_vectors"] @ router["space_read_vectors"].T)
+    space_route_key_gram = (
+        selector["space_route_keys"] @ selector["space_route_keys"].T)
     np.testing.assert_allclose(
-        space_read_gram, np.eye(4), atol=2e-5, rtol=2e-5)
+        np.diag(space_route_key_gram), np.ones(4),
+        atol=2e-5, rtol=2e-5)
 
-    pool = params["neuron_pool"]
+    pool = params["operator_bank"]
     assert set(pool) == {
         f"{route}_{kind}_vectors"
         for route in ("q", "k", "v", "rst")
@@ -423,8 +426,8 @@ def test_parameter_tree_is_exact_direct_read_schema():
         marker in path for path in paths for marker in forbidden)
     for route in ("q", "k", "v", "rst"):
         np.testing.assert_array_equal(
-            router[f"{route}_operator_tau_proj"]["kernel"],
-            np.zeros((4, 1), dtype=np.float32))
+            controller[f"{route}_tau_kernel"],
+            np.zeros((4, 4, 1), dtype=np.float32))
 
 
 def test_tau_calibration_bias_attains_each_route_target():
@@ -460,20 +463,24 @@ def test_tau_calibration_bias_attains_each_route_target():
         calibrated, tokens, **score_kwargs)
     attention_state, rst_state = v4174._sampled_layer_states(
         calibrated, tokens, **score_kwargs)
-    router = calibrated["router"]
+    interface = calibrated["space_interface"]
+    controller = calibrated["operator_controller"]
     for route, target in (
             ("q", targets["qk"]),
             ("k", targets["qk"]),
             ("v", targets["v"]),
             ("rst", targets["rst"])):
         np.testing.assert_array_equal(
-            router[f"{route}_operator_tau_proj"]["kernel"],
-            np.zeros((4, 1), dtype=np.float32))
+            controller[f"{route}_tau_kernel"],
+            np.zeros((4, 4, 1), dtype=np.float32))
         state = rst_state if route == "rst" else attention_state
-        local = v4174._project_space_local_states(
-            state, router["space_state_proj"])
-        actual_tau = v4174._shared_tau_from_param(v4174._linear(
-            router[f"{route}_operator_tau_proj"], local))
+        local = v4174._read_operation_space_states(
+            state, interface["space_read_proj"])
+        actual_tau = v4174._shared_tau_from_param(
+            v4174._apply_operation_space_tau_map(
+                local,
+                controller[f"{route}_tau_kernel"],
+                controller[f"{route}_tau_bias"]))
         active = float(jnp.mean(scores[route] > actual_tau))
         tolerance = max(0.02, 2.0 / scores[route].size)
         assert abs(active - target) <= tolerance, (
@@ -495,7 +502,7 @@ def test_projection_and_direct_read_shapes_and_equivalence():
     state = jax.random.normal(jax.random.PRNGKey(1), (7, 16))
     projection = jax.random.normal(
         jax.random.PRNGKey(2), (4, 16, 4))
-    local = v4174._project_space_local_states(state, projection)
+    local = v4174._read_operation_space_states(state, projection)
     assert local.shape == (4, 7, 4)
     reads = jax.random.normal(jax.random.PRNGKey(3), (4, 8, 4))
     read_value, rho_reused, local_norm = v4174._direct_read_match(
@@ -524,18 +531,25 @@ def test_space_gate_is_fixed_nonsoftmax_topk_relu_squared_gate():
         np.asarray(gate[0] == 0.0),
         np.asarray([True, False, True, False]))
     assert float(gate[1].sum()) == 0.0
-    assert float(weights[1].sum()) == 0.0
-    assert not np.isclose(float(weights[0].sum()), 1.0)
+    np.testing.assert_allclose(
+        np.asarray(weights.sum(axis=-1)),
+        np.ones((2,), dtype=np.float32),
+        atol=1.0e-7,
+        rtol=0.0)
+    np.testing.assert_array_equal(
+        np.asarray(weights[1]),
+        np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32))
     assert bool(jnp.all(jnp.isfinite(weights)))
     source = inspect.getsource(v4174._space_gate_from_scores)
     assert "softmax" not in source
     assert "top_k" in source
     assert "relu" in source
-    assert "sqrt" in source
+    assert "top1_fallback" in source
+    assert "sqrt" not in source
 
     local_output = jnp.ones((4, 2, 3))
     writeback = jnp.ones((4, 3, 5))
-    zero_route = v4174._space_weighted_writeback(
+    zero_route = v4174._write_space_outputs_to_global(
         local_output,
         jnp.zeros((2, 4)),
         writeback,
@@ -548,7 +562,7 @@ def test_qk_banks_are_independent_and_production_execution_is_paired():
     assert hasattr(v4174, "make_sharded_attention_space_dense_minimal")
     _, _, variables = _variables(seed=7)
     params = variables["params"]
-    pool = params["neuron_pool"]
+    pool = params["operator_bank"]
     assert "q_read_vectors" in pool and "k_read_vectors" in pool
     assert "q_write_vectors" in pool and "k_write_vectors" in pool
     assert not np.array_equal(
@@ -558,9 +572,11 @@ def test_qk_banks_are_independent_and_production_execution_is_paired():
         np.asarray(pool["q_write_vectors"]),
         np.asarray(pool["k_write_vectors"]))
     local = jax.random.normal(jax.random.PRNGKey(8), (4, 6, 4))
-    router = params["router"]
-    q_tau = v4174._linear(router["q_operator_tau_proj"], local)
-    k_tau = v4174._linear(router["k_operator_tau_proj"], local)
+    controller = params["operator_controller"]
+    q_tau = v4174._apply_operation_space_tau_map(
+        local, controller["q_tau_kernel"], controller["q_tau_bias"])
+    k_tau = v4174._apply_operation_space_tau_map(
+        local, controller["k_tau_kernel"], controller["k_tau_bias"])
     q_output = v4174._rw_compose_space_dense(
         local, pool["q_read_vectors"], pool["q_write_vectors"],
         q_tau, **_execution_kwargs())
@@ -583,28 +599,28 @@ def test_qk_banks_are_independent_and_production_execution_is_paired():
 def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
     _, _, variables = _variables(seed=9)
     params = variables["params"]
-    router = params["router"]
-    pool = params["neuron_pool"]
+    selector = params["space_selector"]
+    interface = params["space_interface"]
+    controller = params["operator_controller"]
+    pool = params["operator_bank"]
     state_before = jax.random.normal(jax.random.PRNGKey(10), (8, 16))
     state_after = state_before + jnp.linspace(
         -0.4, 0.5, state_before.size).reshape(state_before.shape)
-    learned_tau = {
-        "kernel": jax.random.normal(
-            jax.random.PRNGKey(11),
-            router["rst_operator_tau_proj"]["kernel"].shape) * 0.1,
-        "bias": router["rst_operator_tau_proj"]["bias"],
-    }
+    learned_tau_kernel = jax.random.normal(
+        jax.random.PRNGKey(11),
+        controller["rst_tau_kernel"].shape) * 0.1
 
     def rst_values(state):
-        routing = v4174._compute_space_routing(
+        routing = v4174._select_operation_spaces(
             state,
-            router["space_route_proj"]["kernel"],
-            router["space_read_vectors"],
+            selector["space_query_proj"]["kernel"],
+            selector["space_route_keys"],
             2,
         )
-        local = v4174._project_space_local_states(
-            state, router["space_state_proj"])
-        tau = v4174._linear(learned_tau, local)
+        local = v4174._read_operation_space_states(
+            state, interface["space_read_proj"])
+        tau = v4174._apply_operation_space_tau_map(
+            local, learned_tau_kernel, controller["rst_tau_bias"])
         output = v4174._rw_compose_space_dense(
             local,
             pool["rst_read_vectors"],
@@ -620,7 +636,8 @@ def test_rst_routing_local_tau_and_output_use_fresh_post_attention_state():
         not np.allclose(left, right)
         for left, right in zip(before, after))
     source = inspect.getsource(v4174._make_sharded_rst_space_dense)
-    assert "_compute_space_routing" in source
+    assert "_select_operation_spaces" in source
+    assert "_apply_operation_space_tau_map" in source
     assert "throughput_dot_bf16_f32" in source
     assert '"mtr,mrd->td"' in source
     assert "return update, metrics" in source
@@ -671,9 +688,9 @@ def test_one_layer_checkpointing_is_numerically_equivalent():
         remat_loss, plain_loss, atol=2.0e-6, rtol=2.0e-6)
     for path in (
             ("block_0", "attn", "expand_O", "kernel"),
-            ("router", "space_state_proj"),
-            ("neuron_pool", "q_read_vectors"),
-            ("neuron_pool", "rst_write_vectors")):
+            ("space_interface", "space_read_proj"),
+            ("operator_bank", "q_read_vectors"),
+            ("operator_bank", "rst_write_vectors")):
         np.testing.assert_allclose(
             _path(remat_grads, *path),
             _path(plain_grads, *path),
@@ -762,22 +779,22 @@ def test_forward_loss_gradient_jit_diagnostics_and_analysis_smoke():
         bool(jnp.all(jnp.isfinite(value)))
         for value in jax.tree.leaves(gradients))
     required_paths = (
-        ("router", "space_route_proj", "kernel"),
-        ("router", "space_read_vectors"),
-        ("router", "space_state_proj"),
-        ("router", "space_state_writeback"),
-        ("neuron_pool", "q_read_vectors"),
-        ("neuron_pool", "q_write_vectors"),
-        ("neuron_pool", "k_read_vectors"),
-        ("neuron_pool", "k_write_vectors"),
-        ("neuron_pool", "v_read_vectors"),
-        ("neuron_pool", "v_write_vectors"),
-        ("neuron_pool", "rst_read_vectors"),
-        ("neuron_pool", "rst_write_vectors"),
-        ("router", "q_operator_tau_proj", "kernel"),
-        ("router", "k_operator_tau_proj", "kernel"),
-        ("router", "v_operator_tau_proj", "kernel"),
-        ("router", "rst_operator_tau_proj", "kernel"),
+        ("space_selector", "space_query_proj", "kernel"),
+        ("space_selector", "space_route_keys"),
+        ("space_interface", "space_read_proj"),
+        ("space_interface", "space_write_proj"),
+        ("operator_bank", "q_read_vectors"),
+        ("operator_bank", "q_write_vectors"),
+        ("operator_bank", "k_read_vectors"),
+        ("operator_bank", "k_write_vectors"),
+        ("operator_bank", "v_read_vectors"),
+        ("operator_bank", "v_write_vectors"),
+        ("operator_bank", "rst_read_vectors"),
+        ("operator_bank", "rst_write_vectors"),
+        ("operator_controller", "q_tau_kernel"),
+        ("operator_controller", "k_tau_kernel"),
+        ("operator_controller", "v_tau_kernel"),
+        ("operator_controller", "rst_tau_kernel"),
     )
     for path in required_paths:
         gradient = _path(gradients, *path).astype(jnp.float32)
@@ -804,10 +821,12 @@ def test_forward_loss_gradient_jit_diagnostics_and_analysis_smoke():
 
     analysis = v4174.analysis_forward(
         params, _model_config(), tokens)
-    assert analysis["space_read_norm"].shape == (4,)
+    assert analysis["operation_space_state_norm"].shape == (4,)
+    assert analysis["space_roundtrip_identity_error"].shape == (4,)
+    assert analysis["cross_space_transfer_norm"].shape == (12,)
     assert analysis["q_read_vector_covariance_effective_rank"].shape == (4,)
     assert bool(jnp.all(jnp.isfinite(
-        analysis["space_read_pairwise_cosine"])))
+        analysis["space_read_projection_overlap"])))
 
 
 def test_symbolic_count_matches_tree_and_canonical_budget():
@@ -823,7 +842,7 @@ def test_symbolic_count_matches_tree_and_canonical_budget():
     canonical = canonical_config["model"]
     training = canonical_config["training"]
     counts = v4174.symbolic_parameter_count(canonical)
-    assert counts["total"] == 393_755_652
+    assert counts["total"] == 393_803_872
     assert canonical["d_model"] == 2048
     assert canonical["d_route"] == 256
     assert canonical["n_layers"] == 18
@@ -834,19 +853,19 @@ def test_symbolic_count_matches_tree_and_canonical_budget():
     assert canonical["n_q"] == canonical["n_k"] == 21_504
     assert canonical["n_q"] + canonical["n_k"] == 43_008
     assert canonical["n_v"] == 134_016
-    assert canonical["n_rst"] == 269_952
+    assert canonical["n_rst"] == 270_000
     assert (
         canonical["n_q"] // canonical["n_operation_spaces"],
         canonical["n_k"] // canonical["n_operation_spaces"],
         canonical["n_v"] // canonical["n_operation_spaces"],
         canonical["n_rst"] // canonical["n_operation_spaces"],
-    ) == (896, 896, 5_584, 11_248)
+    ) == (896, 896, 5_584, 11_250)
     assert (
         canonical["n_q"] // canonical["n_operation_spaces"] // 2,
         canonical["n_k"] // canonical["n_operation_spaces"] // 2,
         canonical["n_v"] // canonical["n_operation_spaces"] // 2,
         canonical["n_rst"] // canonical["n_operation_spaces"] // 2,
-    ) == (448, 448, 2_792, 5_624)
+    ) == (448, 448, 2_792, 5_625)
     assert training["batch_size"] == 1_024
     assert training["mesh_data"] == 16
     assert training["mesh_model"] == 2
@@ -944,22 +963,24 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
 
     _, tokens, variables = _variables()
     params = variables["params"]
-    router = params["router"]
-    pool = params["neuron_pool"]
+    selector = params["space_selector"]
+    interface = params["space_interface"]
+    controller = params["operator_controller"]
+    pool = params["operator_bank"]
     flat = jax.random.normal(jax.random.PRNGKey(21), (6, 16))
     qk_scale, v_scale, rst_scale = v4174._shared_pool_output_scales(16, 1)
     attention_args = (
         flat,
-        router["space_route_proj"]["kernel"],
-        router["space_read_vectors"],
-        router["space_state_proj"],
-        router["space_state_writeback"],
-        router["q_operator_tau_proj"]["kernel"],
-        router["q_operator_tau_proj"]["bias"],
-        router["k_operator_tau_proj"]["kernel"],
-        router["k_operator_tau_proj"]["bias"],
-        router["v_operator_tau_proj"]["kernel"],
-        router["v_operator_tau_proj"]["bias"],
+        selector["space_query_proj"]["kernel"],
+        selector["space_route_keys"],
+        interface["space_read_proj"],
+        interface["space_write_proj"],
+        controller["q_tau_kernel"],
+        controller["q_tau_bias"],
+        controller["k_tau_kernel"],
+        controller["k_tau_bias"],
+        controller["v_tau_kernel"],
+        controller["v_tau_bias"],
         pool["q_read_vectors"], pool["q_write_vectors"],
         pool["k_read_vectors"], pool["k_write_vectors"],
         pool["v_read_vectors"], pool["v_write_vectors"],
@@ -1002,22 +1023,24 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
             q_output, k_output, v_output,
             q_output_fp32, k_output_fp32, v_output_fp32))
 
-    routing = v4174._compute_space_routing(
-        flat, router["space_route_proj"]["kernel"],
-        router["space_read_vectors"], 2)
+    routing = v4174._select_operation_spaces(
+        flat, selector["space_query_proj"]["kernel"],
+        selector["space_route_keys"], 2)
     np.testing.assert_allclose(
         attention_metrics["attention_space_gate_mass_mean"],
         routing["space_gate_mass"].mean(),
         atol=1e-5, rtol=1e-5)
     local = v4174._control_einsum_f32(
-        "td,mdr->mtr", flat, router["space_state_proj"])
+        "td,mdr->mtr", flat, interface["space_read_proj"])
     reference_outputs = {}
     for route, scale, den in (
             ("q", qk_scale, 0.5),
             ("k", qk_scale, 0.5),
             ("v", v_scale, 1.0)):
-        raw_tau = v4174._control_linear_f32(
-            router[f"{route}_operator_tau_proj"], local)
+        raw_tau = v4174._apply_operation_space_tau_map(
+            local,
+            controller[f"{route}_tau_kernel"],
+            controller[f"{route}_tau_bias"])
         direct_details = _fp32_rw_reference(
             local,
             pool[f"{route}_read_vectors"],
@@ -1038,7 +1061,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
             * jnp.float32(scale))
         reference_outputs[route] = v4174._control_einsum_f32(
             "mtr,mrd->td", weighted,
-            router["space_state_writeback"])
+            interface["space_write_proj"])
         assert abs(float(
             attention_metrics[
                 f"{route}_operator_active_tau_frac"]
@@ -1076,10 +1099,10 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
             post_attention,
             block["norm2"]["scale"],
             block["norm2"]["bias"]).reshape(6, 16)
-        return v4174._compute_space_routing(
+        return v4174._select_operation_spaces(
             rst_state,
-            router["space_route_proj"]["kernel"],
-            router["space_read_vectors"],
+            selector["space_query_proj"]["kernel"],
+            selector["space_route_keys"],
             2)
 
     mixed_rst_routing = rst_routing_after_attention(
@@ -1095,12 +1118,12 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
 
     rst_args = (
         flat,
-        router["space_route_proj"]["kernel"],
-        router["space_read_vectors"],
-        router["space_state_proj"],
-        router["space_state_writeback"],
-        router["rst_operator_tau_proj"]["kernel"],
-        router["rst_operator_tau_proj"]["bias"],
+        selector["space_query_proj"]["kernel"],
+        selector["space_route_keys"],
+        interface["space_read_proj"],
+        interface["space_write_proj"],
+        controller["rst_tau_kernel"],
+        controller["rst_tau_bias"],
         pool["rst_read_vectors"], pool["rst_write_vectors"],
         0.07, 2.0, 0.0, rst_scale,
         jnp.asarray(True, dtype=jnp.bool_))
@@ -1115,8 +1138,10 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
     assert rst_output.shape == (6, 16)
     assert all(value.shape == () for value in rst_metrics.values())
     assert rst_output.dtype == rst_output_fp32.dtype == jnp.float32
-    rst_tau = v4174._control_linear_f32(
-        router["rst_operator_tau_proj"], local)
+    rst_tau = v4174._apply_operation_space_tau_map(
+        local,
+        controller["rst_tau_kernel"],
+        controller["rst_tau_bias"])
     rst_reference_details = _fp32_rw_reference(
         local,
         pool["rst_read_vectors"],
@@ -1132,7 +1157,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         * jnp.float32(rst_scale))
     rst_reference = v4174._control_einsum_f32(
         "mtr,mrd->td", rst_reference_weighted,
-        router["space_state_writeback"])
+        interface["space_write_proj"])
     np.testing.assert_allclose(
         rst_output_fp32, rst_reference, atol=1e-5, rtol=0.0)
     assert abs(float(
@@ -1339,7 +1364,7 @@ def test_trainer_builds_only_new_v4174_schema_and_direct_diagnostics():
         model_version=v4174.MODEL_VERSION,
     )(variables["params"])
     pool_diagnostics = train_jax._pool_param_diagnostics(
-        {"neuron_pool": variables["params"]["neuron_pool"]},
+        {"operator_bank": variables["params"]["operator_bank"]},
         full=True,
         model=built,
     )
@@ -1376,7 +1401,7 @@ def test_u_before_psum_fp32_math_gradient_optimizer_and_partition_parity():
     space_weights = jax.nn.softmax(
         jax.random.normal(jax.random.PRNGKey(103), (4, 6)),
         axis=0)[None, ..., None]
-    space_state_writeback = jax.random.normal(
+    space_write_proj = jax.random.normal(
         jax.random.PRNGKey(104), (4, 4, 16))
     route_scales = jnp.asarray(
         (0.5, 0.5, 0.75), dtype=jnp.float32).reshape((3, 1, 1, 1))
@@ -1384,7 +1409,7 @@ def test_u_before_psum_fp32_math_gradient_optimizer_and_partition_parity():
         (0.5, 0.5, 1.0), dtype=jnp.float32).reshape((3, 1, 1, 1))
     operands_two = (
         raw_out, gate_mass, space_weights,
-        space_state_writeback, route_scales, den_powers)
+        space_write_proj, route_scales, den_powers)
     legacy_two_result = legacy_two(*operands_two)
     changed_two_result = changed_two(*operands_two)
     np.testing.assert_allclose(
@@ -1401,7 +1426,7 @@ def test_u_before_psum_fp32_math_gradient_optimizer_and_partition_parity():
         raw_out.sum(axis=0, keepdims=True),
         gate_mass.sum(axis=0, keepdims=True),
         space_weights,
-        space_state_writeback,
+        space_write_proj,
         route_scales,
         den_powers,
     )
@@ -1422,7 +1447,7 @@ def test_u_before_psum_fp32_math_gradient_optimizer_and_partition_parity():
         raw_out[:, :1],
         gate_mass[:, :1],
         space_weights,
-        space_state_writeback,
+        space_write_proj,
         route_scales[:1],
         jnp.float32(1.2).reshape((1, 1, 1, 1)),
     )[2]
@@ -1430,7 +1455,7 @@ def test_u_before_psum_fp32_math_gradient_optimizer_and_partition_parity():
         raw_out[:, :1],
         gate_mass[:, :1],
         space_weights,
-        space_state_writeback,
+        space_write_proj,
         route_scales[:1],
         jnp.float32(1.2).reshape((1, 1, 1, 1)),
     )[2]
@@ -1506,22 +1531,24 @@ def test_v4174_production_hlo_collective_shapes_and_kernel_partition_parity():
     collective_reference_two = _mixed_fp32_collective_sharded(mesh_two)
     _, _, variables = _variables(seed=106)
     params = variables["params"]
-    router = params["router"]
-    pool = params["neuron_pool"]
+    selector = params["space_selector"]
+    interface = params["space_interface"]
+    controller = params["operator_controller"]
+    pool = params["operator_bank"]
     flat = jax.random.normal(jax.random.PRNGKey(107), (6, 16))
     qk_scale, v_scale, rst_scale = v4174._shared_pool_output_scales(16, 1)
     attention_operands = (
         flat,
-        router["space_route_proj"]["kernel"],
-        router["space_read_vectors"],
-        router["space_state_proj"],
-        router["space_state_writeback"],
-        router["q_operator_tau_proj"]["kernel"],
-        router["q_operator_tau_proj"]["bias"],
-        router["k_operator_tau_proj"]["kernel"],
-        router["k_operator_tau_proj"]["bias"],
-        router["v_operator_tau_proj"]["kernel"],
-        router["v_operator_tau_proj"]["bias"],
+        selector["space_query_proj"]["kernel"],
+        selector["space_route_keys"],
+        interface["space_read_proj"],
+        interface["space_write_proj"],
+        controller["q_tau_kernel"],
+        controller["q_tau_bias"],
+        controller["k_tau_kernel"],
+        controller["k_tau_bias"],
+        controller["v_tau_kernel"],
+        controller["v_tau_bias"],
         pool["q_read_vectors"], pool["q_write_vectors"],
         pool["k_read_vectors"], pool["k_write_vectors"],
         pool["v_read_vectors"], pool["v_write_vectors"],
@@ -1541,12 +1568,12 @@ def test_v4174_production_hlo_collective_shapes_and_kernel_partition_parity():
 
     rst_operands = (
         flat,
-        router["space_route_proj"]["kernel"],
-        router["space_read_vectors"],
-        router["space_state_proj"],
-        router["space_state_writeback"],
-        router["rst_operator_tau_proj"]["kernel"],
-        router["rst_operator_tau_proj"]["bias"],
+        selector["space_query_proj"]["kernel"],
+        selector["space_route_keys"],
+        interface["space_read_proj"],
+        interface["space_write_proj"],
+        controller["rst_tau_kernel"],
+        controller["rst_tau_bias"],
         pool["rst_read_vectors"], pool["rst_write_vectors"],
         jnp.float32(0.07), jnp.float32(2.0), jnp.float32(0.0),
         rst_scale,
@@ -1773,8 +1800,10 @@ def test_dynamic_metric_flag_preserves_logits_loss_gradients_and_jit_cache():
     current_state = jax.random.normal(
         jax.random.PRNGKey(89), (1, tokens.shape[1], 16))
     block_params = params["block_0"]
-    router_params = params["router"]
-    pool_params = params["neuron_pool"]
+    selector_params = params["space_selector"]
+    interface_params = params["space_interface"]
+    controller_params = params["operator_controller"]
+    pool_params = params["operator_bank"]
     qk_scale, v_scale, rst_scale = v4174._shared_pool_output_scales(16, 1)
 
     def layer_intermediates(collect_metrics):
@@ -1786,16 +1815,16 @@ def test_dynamic_metric_flag_preserves_logits_loss_gradients_and_jit_cache():
         q_output, k_output, v_output, _ = (
             sharded["attention_space_dense"](
                 flat_attention,
-                router_params["space_route_proj"]["kernel"],
-                router_params["space_read_vectors"],
-                router_params["space_state_proj"],
-                router_params["space_state_writeback"],
-                router_params["q_operator_tau_proj"]["kernel"],
-                router_params["q_operator_tau_proj"]["bias"],
-                router_params["k_operator_tau_proj"]["kernel"],
-                router_params["k_operator_tau_proj"]["bias"],
-                router_params["v_operator_tau_proj"]["kernel"],
-                router_params["v_operator_tau_proj"]["bias"],
+                selector_params["space_query_proj"]["kernel"],
+                selector_params["space_route_keys"],
+                interface_params["space_read_proj"],
+                interface_params["space_write_proj"],
+                controller_params["q_tau_kernel"],
+                controller_params["q_tau_bias"],
+                controller_params["k_tau_kernel"],
+                controller_params["k_tau_bias"],
+                controller_params["v_tau_kernel"],
+                controller_params["v_tau_bias"],
                 pool_params["q_read_vectors"],
                 pool_params["q_write_vectors"],
                 pool_params["k_read_vectors"],
@@ -1830,12 +1859,12 @@ def test_dynamic_metric_flag_preserves_logits_loss_gradients_and_jit_cache():
             block_params["norm2"]["bias"])
         rst_output, _ = sharded["rst_space_dense"](
             rst_normalized.reshape((-1, 16)),
-            router_params["space_route_proj"]["kernel"],
-            router_params["space_read_vectors"],
-            router_params["space_state_proj"],
-            router_params["space_state_writeback"],
-            router_params["rst_operator_tau_proj"]["kernel"],
-            router_params["rst_operator_tau_proj"]["bias"],
+            selector_params["space_query_proj"]["kernel"],
+            selector_params["space_route_keys"],
+            interface_params["space_read_proj"],
+            interface_params["space_write_proj"],
+            controller_params["rst_tau_kernel"],
+            controller_params["rst_tau_bias"],
             pool_params["rst_read_vectors"],
             pool_params["rst_write_vectors"],
             jnp.float32(0.07),
@@ -2081,7 +2110,19 @@ def test_v4174_mixed_precision_20_step_trajectory_is_stable():
     active_diffs = np.abs(
         np.stack([value[2] for value in mixed_history])
         - np.stack([value[2] for value in fp32_history]))
-    assert np.max(active_diffs[0]) <= 0.001
+    active_resolution = np.asarray([
+        1.0 / (
+            tokens.size
+            * int(initial_params["operator_bank"][
+                f"{route}_read_vectors"].shape[0])
+            * int(initial_params["operator_bank"][
+                f"{route}_read_vectors"].shape[1]))
+        for route in ("q", "k", "v", "rst")])
+    first_step_decision_budget = (
+        active_resolution
+        * np.asarray([1.0, 1.0, 1.0, 2.0], dtype=np.float32))
+    assert np.all(active_diffs[0] <= (
+        first_step_decision_budget + np.finfo(np.float32).eps))
     assert np.max(active_diffs) <= 0.01
 
 
@@ -2321,13 +2362,14 @@ def test_rare_analysis_step_uses_model_geometry_contract():
 def test_model_info_describes_only_canonical_architecture():
     info = "\n".join(_model().get_model_info())
     assert "D=16, M=4, R=4" in info
-    assert "explicit space read vectors" in info
+    assert "learned per-space route keys" in info
     assert "non-softmax" in info
-    assert "read vector itself is the operator key" in info
+    assert "route-specific RW composition" in info
+    assert "distinct tau map in every operation space" in info
     assert "Q/K/V/RST are fully separate" in info
-    assert "RST recomputes routing after attention" in info
+    assert "RST reselects after attention" in info
     assert "physical all-space dense" in info
-    assert "independent D->R coordinates" in info
+    assert "space-specific D->R read coordinates" in info
     assert "D=M*R" not in info
     assert "lax.scan" in info
     assert v4174.ATTENTION_CORE_NAME in info

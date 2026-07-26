@@ -3238,10 +3238,27 @@ def _tau_lr_mult_for_model(training_cfg, model_version):
 
 def _v4170_tau_update_max_abs(updates):
     """Read final post-cap raw_tau updates without scanning the full tree."""
-    router_updates = updates.get('router', {})
+    controller_updates = updates.get('operator_controller', {})
     canonical_tau_names = tuple(
+        f'{route}_tau_kernel' for route in ('q', 'k', 'v', 'rst')
+    ) + tuple(
+        f'{route}_tau_bias' for route in ('q', 'k', 'v', 'rst'))
+    if all(name in controller_updates for name in canonical_tau_names):
+        def _canonical_max(route):
+            return jnp.maximum(
+                jnp.max(jnp.abs(controller_updates[
+                    f'{route}_tau_kernel'].astype(jnp.float32))),
+                jnp.max(jnp.abs(controller_updates[
+                    f'{route}_tau_bias'].astype(jnp.float32))))
+        return tuple(jax.lax.stop_gradient(value) for value in (
+            jnp.maximum(_canonical_max('q'), _canonical_max('k')),
+            _canonical_max('v'),
+            _canonical_max('rst')))
+
+    router_updates = updates.get('router', {})
+    legacy_canonical_tau_names = tuple(
         f'{route}_operator_tau_proj' for route in ('q', 'k', 'v', 'rst'))
-    if all(name in router_updates for name in canonical_tau_names):
+    if all(name in router_updates for name in legacy_canonical_tau_names):
         def _canonical_max(name):
             values = router_updates[name]
             return jnp.maximum(
@@ -3653,7 +3670,7 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
     # Keep the one-time JIT signature small: calibration needs only selection
     # geometry, not tau params or LM output weights.
     if str(version) == V4174_MODEL_VERSION:
-        pool_params = params['neuron_pool']
+        pool_params = params['operator_bank']
     elif str(version) == V4167_MODEL_VERSION:
         pool_operator_keys = _pool_operator_keys_for_version(version)
         pool_params = {k: v for k, v in params['neuron_pool'].items()}
@@ -3674,30 +3691,41 @@ def _srw_selection_score_setup(params, cfg, max_tokens):
             'norm1': params['block_0']['norm1'],
             'norm2': params['block_0']['norm2'],
         },
-        'router': ({
-            'space_state_proj': params['router']['space_state_proj'],
-        } if str(version) == V4174_MODEL_VERSION else {
-            'proj_attn': params['router']['proj_attn'],
-            'proj_rst': params['router']['proj_rst'],
-        }),
-        'neuron_pool': pool_params,
+        ('operator_bank' if str(version) == V4174_MODEL_VERSION
+         else 'neuron_pool'): pool_params,
     }
     if str(version) == V4174_MODEL_VERSION:
         score_params['block_0']['attn'] = {
             'expand_O': params['block_0']['attn']['expand_O'],
         }
-        score_params['router'].update({
-            'space_route_proj': params['router']['space_route_proj'],
-            'space_read_vectors': params['router']['space_read_vectors'],
-            'space_state_writeback':
-                params['router']['space_state_writeback'],
-            'q_operator_tau_proj':
-                params['router']['q_operator_tau_proj'],
-            'k_operator_tau_proj':
-                params['router']['k_operator_tau_proj'],
-            'v_operator_tau_proj':
-                params['router']['v_operator_tau_proj'],
+        score_params.update({
+            'space_selector': params['space_selector'],
+            'space_interface': {
+                'space_read_proj':
+                    params['space_interface']['space_read_proj'],
+                'space_write_proj':
+                    params['space_interface']['space_write_proj'],
+            },
+            'operator_controller': {
+                'q_tau_kernel':
+                    params['operator_controller']['q_tau_kernel'],
+                'q_tau_bias':
+                    params['operator_controller']['q_tau_bias'],
+                'k_tau_kernel':
+                    params['operator_controller']['k_tau_kernel'],
+                'k_tau_bias':
+                    params['operator_controller']['k_tau_bias'],
+                'v_tau_kernel':
+                    params['operator_controller']['v_tau_kernel'],
+                'v_tau_bias':
+                    params['operator_controller']['v_tau_bias'],
+            },
         })
+    else:
+        score_params['router'] = {
+            'proj_attn': params['router']['proj_attn'],
+            'proj_rst': params['router']['proj_rst'],
+        }
     if (_is_rw_key_srw_version(version)
             and str(version) not in DIRECT_STATE_QUERY_MODEL_VERSIONS):
         score_params['router'].update({
@@ -3895,9 +3923,10 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
                                    tau_init_cfg):
     """Compute host-side quantiles from a small deterministic score sample."""
     version = cfg['model'].get('model_version', OFFICIAL_MODEL_VERSION)
+    is_v4174 = str(version) == V4174_MODEL_VERSION
     scores, sampled, page_stats = _sample_srw_selection_scores(
         params, input_ids, cfg, tau_init_cfg['calibration_tokens'],
-        production_rst=(str(version) != V4174_MODEL_VERSION))
+        production_rst=not is_v4174)
     per_space_rst = (
         str(version) == V4173_MODEL_VERSION
         and np.asarray(scores['rst']).ndim == 2)
@@ -3911,13 +3940,16 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
     for pool in ('qk', 'v', 'rst'):
         target = tau_init_cfg['targets'][pool]
         meta = page_stats[pool]
-        if pool == 'rst' and per_space_rst:
+        space_scores = np.asarray(scores[pool], dtype=np.float32)
+        per_space_pool = (
+            (is_v4174 and space_scores.ndim == 2)
+            or (pool == 'rst' and per_space_rst))
+        if per_space_pool:
             if bool(meta.get('pages_enabled', False)):
                 raise ValueError(
                     "per-space operator tau calibration requires the full "
                     "operator pool")
             local_target = float(target)
-            space_scores = np.asarray(scores[pool], dtype=np.float32)
             quantile_tau = [
                 float(np.clip(
                     _array_quantile(values, 1.0 - local_target),
@@ -3958,23 +3990,38 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         tau_calibration[pool] = _tau_calibration_diag(
             pool, scores[pool], meta, target, local_target, quantile_tau)
 
-    if str(version) == V4174_MODEL_VERSION:
-        # Each route owns one shared R->1 tau projection.  Calibrate its scalar
-        # zero-kernel bias from the full all-space score population.
+    if is_v4174:
+        # Each route owns an independent R->1 tau map in every operation
+        # space.  Calibrate each zero-kernel bias from that space's score
+        # population instead of collapsing the spaces to one scalar.
         qk_target = float(tau_init_cfg['targets']['qk'])
         for route in ('q', 'k'):
             route_scores = np.asarray(scores[route], dtype=np.float32)
-            route_tau = float(np.clip(
-                _array_quantile(route_scores, 1.0 - qk_target),
-                tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+            if route_scores.ndim != 2:
+                raise ValueError(
+                    "v4174 tau calibration requires per-space route scores: "
+                    f"route={route} shape={route_scores.shape}")
+            route_tau = [
+                float(np.clip(
+                    _array_quantile(values, 1.0 - qk_target),
+                    tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+                for values in route_scores
+            ]
             tau[route] = route_tau
-            route_active = float(np.mean(route_scores > route_tau))
+            route_active = [
+                float(np.mean(values > space_tau))
+                for values, space_tau in zip(route_scores, route_tau)
+            ]
             estimated_active[route] = route_active
             estimated_active_local[route] = route_active
             estimated_active_pool[route] = route_active
-            tau_calibration[route] = _tau_calibration_diag(
-                route, route_scores, page_stats[route],
-                qk_target, qk_target, route_tau)
+            tau_calibration[route] = [
+                _tau_calibration_diag(
+                    f'{route}[{space_id}]', values, page_stats[route],
+                    qk_target, qk_target, space_tau)
+                for space_id, (values, space_tau) in enumerate(
+                    zip(route_scores, route_tau))
+            ]
 
         # RST observes Norm2(state + production attention).  Re-run its score
         # sample after applying the calibrated Q/K/V biases so the measured
@@ -3987,19 +4034,45 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
             attention_calibrated_params, input_ids, cfg,
             tau_init_cfg['calibration_tokens'])
         rst_scores = np.asarray(rerun_scores['rst'], dtype=np.float32)
+        if rst_scores.ndim != 2:
+            raise ValueError(
+                "v4174 tau calibration requires per-space RST scores: "
+                f"shape={rst_scores.shape}")
         rst_target = float(tau_init_cfg['targets']['rst'])
-        rst_tau = float(np.clip(
-            _array_quantile(rst_scores, 1.0 - rst_target),
-            tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
-        rst_active = float(np.mean(rst_scores > rst_tau))
+        rst_tau = [
+            float(np.clip(
+                _array_quantile(values, 1.0 - rst_target),
+                tau_init_cfg['tau_min'], tau_init_cfg['tau_max']))
+            for values in rst_scores
+        ]
+        rst_active = [
+            float(np.mean(values > space_tau))
+            for values, space_tau in zip(rst_scores, rst_tau)
+        ]
         tau['rst'] = rst_tau
         target_local['rst'] = rst_target
         estimated_active['rst'] = rst_active
         estimated_active_local['rst'] = rst_active
         estimated_active_pool['rst'] = rst_active
-        tau_calibration['rst'] = _tau_calibration_diag(
-            'rst', rst_scores, rerun_page_stats['rst'],
-            rst_target, rst_target, rst_tau)
+        tau_calibration['rst'] = [
+            _tau_calibration_diag(
+                f'rst[{space_id}]', values, rerun_page_stats['rst'],
+                rst_target, rst_target, space_tau)
+            for space_id, (values, space_tau) in enumerate(
+                zip(rst_scores, rst_tau))
+        ]
+
+    def _mean_route_active(route, threshold):
+        route_scores = np.asarray(scores[route], dtype=np.float32)
+        route_threshold = np.asarray(threshold, dtype=np.float32)
+        if route_scores.ndim == 2 and route_threshold.ndim == 1:
+            if route_scores.shape[0] != route_threshold.shape[0]:
+                raise ValueError(
+                    "per-space tau/score count mismatch: "
+                    f"route={route} scores={route_scores.shape} "
+                    f"tau={route_threshold.shape}")
+            route_threshold = route_threshold[:, None]
+        return float(np.mean(route_scores > route_threshold))
 
     return {
         'type': 'tau_init',
@@ -4026,23 +4099,23 @@ def _compute_srw_quantile_tau_init(params, input_ids, cfg,
         'tau_init_est_active_local_v': estimated_active_local['v'],
         'tau_init_est_active_local_rst': estimated_active_local['rst'],
         'tau_init_est_active_q': (
-            float(np.mean(scores['q'] > (
+            _mean_route_active('q', (
                 tau['q'] if str(version) == V4174_MODEL_VERSION
-                else tau['qk'])))
+                else tau['qk']))
             * float(page_stats['q'].get('candidate_frac', 1.0))),
         'tau_init_est_active_k': (
-            float(np.mean(scores['k'] > (
+            _mean_route_active('k', (
                 tau['k'] if str(version) == V4174_MODEL_VERSION
-                else tau['qk'])))
+                else tau['qk']))
             * float(page_stats['k'].get('candidate_frac', 1.0))),
-        'tau_init_est_active_local_q': float(
-            np.mean(scores['q'] > (
+        'tau_init_est_active_local_q': _mean_route_active(
+            'q', (
                 tau['q'] if str(version) == V4174_MODEL_VERSION
-                else tau['qk']))),
-        'tau_init_est_active_local_k': float(
-            np.mean(scores['k'] > (
+                else tau['qk'])),
+        'tau_init_est_active_local_k': _mean_route_active(
+            'k', (
                 tau['k'] if str(version) == V4174_MODEL_VERSION
-                else tau['qk']))),
+                else tau['qk'])),
         'tau_calibration': tau_calibration,
         'tau_init_calibration': {
             'batch': 'first_train_batch_host0',
@@ -5107,18 +5180,27 @@ def _set_srw_quantile_tau_biases(params, tau_summary, model_version=OFFICIAL_MOD
             for p in path)
         if str(model_version) == V4174_MODEL_VERSION:
             route_raw = {
-                'q_operator_tau_proj': raw_q,
-                'k_operator_tau_proj': raw_k,
-                'v_operator_tau_proj': raw_v,
-                'rst_operator_tau_proj': raw_rst,
+                'q_tau_bias': raw_q,
+                'k_tau_bias': raw_k,
+                'v_tau_bias': raw_v,
+                'rst_tau_bias': raw_rst,
             }
-            if len(keys) >= 3 and keys[-1] == 'bias' and keys[-2] in route_raw:
-                raw_value = jnp.asarray(route_raw[keys[-2]], dtype=value.dtype)
-                # Canonical v4174 uses one route program over every shared
-                # local state.  Initial route bias is the pooled mean of the
-                # independently measured space quantiles; the shared R->1
-                # kernel subsequently makes tau state- and space-dependent.
-                return jnp.full_like(value, raw_value.mean())
+            if (len(keys) >= 2
+                    and keys[-2] == 'operator_controller'
+                    and keys[-1] in route_raw):
+                raw_value = jnp.asarray(
+                    route_raw[keys[-1]], dtype=value.dtype)
+                if raw_value.ndim == 0:
+                    raw_value = jnp.broadcast_to(
+                        raw_value, (value.shape[0],))
+                if (value.ndim != 2
+                        or raw_value.ndim != 1
+                        or value.shape != (raw_value.shape[0], 1)):
+                    raise ValueError(
+                        "v4174 per-space tau bias shape mismatch: "
+                        f"route={keys[-1]} tau={raw_value.shape} "
+                        f"bias={value.shape}")
+                return raw_value[:, None].astype(value.dtype)
         if keys[-3:] == ('router', 'raw_tau_attn', 'bias'):
             return jnp.stack([raw_qk, raw_qk, raw_v]).astype(value.dtype)
         if keys[-3:] == ('router', 'raw_tau_rst', 'bias'):
@@ -5545,7 +5627,9 @@ def compute_spatial_diversity_loss(params):
     For large pools (>4096), uses deterministic strided sampling to avoid O(N^2).
     Supports current DAWN-SRW pool param names.
     """
-    pool = params['neuron_pool']
+    pool = (
+        params['operator_bank']
+        if 'operator_bank' in params else params['neuron_pool'])
 
     def _pool_div(neurons, max_sample=4096):
         N = neurons.shape[0]
@@ -6244,12 +6328,15 @@ def _canonical_pool_schema(model_version):
 
 def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     """Observational pool norm/gain diagnostics; never feeds loss."""
-    pool = params.get('neuron_pool', {})
-    out = {}
-    fixed_scales = _depth_pool_scales_for(model, model_cfg)
     model_version = getattr(model, '__version__', None)
     if model_version is None and model_cfg is not None:
         model_version = model_cfg.get('model_version')
+    pool_root = (
+        'operator_bank'
+        if str(model_version) == V4174_MODEL_VERSION else 'neuron_pool')
+    pool = params.get(pool_root, {})
+    out = {}
+    fixed_scales = _depth_pool_scales_for(model, model_cfg)
     pool_schema = _canonical_pool_schema(model_version)
     if str(model_version) == V4174_MODEL_VERSION:
         for route in ('q', 'k', 'v', 'rst'):
@@ -6476,8 +6563,11 @@ def _canonical_pool_op_key_grad_norms(pool_grads, model_version):
 
 def _pool_update_diagnostics(params, grads, model_version=None):
     """Approximate per-group update observability: grad_norm / param_norm."""
-    pool_p = params.get('neuron_pool', {})
-    pool_g = grads.get('neuron_pool', {})
+    pool_root = (
+        'operator_bank'
+        if str(model_version) == V4174_MODEL_VERSION else 'neuron_pool')
+    pool_p = params.get(pool_root, {})
+    pool_g = grads.get(pool_root, {})
     out = {}
     pool_schema = _canonical_pool_schema(model_version)
     specs = tuple(
@@ -7681,8 +7771,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return _has_path_part(ps, 'raw_tau')
 
         def _is_operator_tau_path(ps):
-            return any(_has_path_part(ps, f'{route}_operator_tau_proj')
-                       for route in ('q', 'k', 'v', 'rst'))
+            return (
+                any(_has_path_part(ps, f'{route}_operator_tau_proj')
+                    for route in ('q', 'k', 'v', 'rst'))
+                or (
+                    ps.startswith('operator_controller/')
+                    and any(_has_path_part(
+                        ps, f'{route}_tau_kernel', f'{route}_tau_bias')
+                        for route in ('q', 'k', 'v', 'rst'))))
 
         def _is_tau_attn_bias_path(ps):
             return _has_path_part(ps, 'tau_attn')
@@ -7725,8 +7821,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
-                    return (ps.startswith('router/')
-                            and not _is_operator_tau_path(ps))
+                    return (
+                        ps.startswith('space_selector/')
+                        or ps.startswith('space_interface/'))
                 return (('router/proj_attn' in ps)
                         or ('router/proj_rst' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
@@ -7773,10 +7870,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_attn_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
-                    names = (
-                        'space_route_proj', 'space_read_vectors',
-                        'space_state_proj', 'space_state_writeback')
-                    return any(f'router/{name}' in ps for name in names)
+                    return (
+                        ps.startswith('space_selector/')
+                        or ps.startswith('space_interface/'))
                 return (('router/proj_attn' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
                             and (('router/up_qk' in ps)
@@ -7789,10 +7885,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _is_router_proj_rst_path(ps):
             if str(_model_version) in DIRECT_STATE_QUERY_MODEL_VERSIONS:
                 if str(_model_version) == V4174_MODEL_VERSION:
-                    names = (
-                        'space_route_proj', 'space_read_vectors',
-                        'space_state_proj', 'space_state_writeback')
-                    return any(f'router/{name}' in ps for name in names)
+                    return (
+                        ps.startswith('space_selector/')
+                        or ps.startswith('space_interface/'))
                 return (('router/proj_rst' in ps)
                         or (str(_model_version) == V4173_MODEL_VERSION
                             and (('router/up_rst' in ps)
@@ -7811,7 +7906,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/k_read_vectors' in ps)
                     or ('neuron_pool/k_write_vectors' in ps)
                     or ('neuron_pool/qk_read_vectors' in ps)
-                    or ('neuron_pool/qk_write_vectors' in ps))
+                    or ('neuron_pool/qk_write_vectors' in ps)
+                    or ('operator_bank/q_read_vectors' in ps)
+                    or ('operator_bank/q_write_vectors' in ps)
+                    or ('operator_bank/k_read_vectors' in ps)
+                    or ('operator_bank/k_write_vectors' in ps))
 
         def _is_op_key_v_path(ps):
             return (('neuron_pool/attn_v_emb' in ps)
@@ -7820,7 +7919,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/attn_v_op_read_proj' in ps)
                     or ('neuron_pool/attn_v_op_write_proj' in ps)
                     or ('neuron_pool/v_read_vectors' in ps)
-                    or ('neuron_pool/v_write_vectors' in ps))
+                    or ('neuron_pool/v_write_vectors' in ps)
+                    or ('operator_bank/v_read_vectors' in ps)
+                    or ('operator_bank/v_write_vectors' in ps))
 
         def _is_op_key_rst_path(ps):
             return (('neuron_pool/rst_emb' in ps)
@@ -7829,7 +7930,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/rst_op_read_proj' in ps)
                     or ('neuron_pool/rst_op_write_proj' in ps)
                     or ('neuron_pool/rst_read_vectors' in ps)
-                    or ('neuron_pool/rst_write_vectors' in ps))
+                    or ('neuron_pool/rst_write_vectors' in ps)
+                    or ('operator_bank/rst_read_vectors' in ps)
+                    or ('operator_bank/rst_write_vectors' in ps))
 
         def _is_tau_attn_path(ps):
             return (_is_tau_attn_bias_path(ps)
@@ -7837,12 +7940,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or _is_raw_tau_qk_path(ps)
                     or _is_raw_tau_v_path(ps)
                     or (_is_operator_tau_path(ps)
-                        and not _has_path_part(ps, 'rst_operator_tau_proj'))
+                        and not _has_path_part(
+                            ps, 'rst_operator_tau_proj',
+                            'rst_tau_kernel', 'rst_tau_bias'))
                     or _is_generic_raw_tau_path(ps))
 
         def _is_tau_rst_path(ps):
             return (_is_tau_rst_bias_path(ps) or _is_raw_tau_rst_path(ps)
-                    or _has_path_part(ps, 'rst_operator_tau_proj'))
+                    or _has_path_part(
+                        ps, 'rst_operator_tau_proj',
+                        'rst_tau_kernel', 'rst_tau_bias'))
 
         def _is_scan_attn_path(ps):
             return (('router/raw_scan_offset_attn' in ps)
@@ -7869,12 +7976,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             x = leaf.astype(jnp.float32)
             if _is_operator_tau_path(ps):
                 parts = _path_parts(ps)
-                if 'rst_operator_tau_proj' in parts:
+                if ('rst_operator_tau_proj' in parts
+                        or 'rst_tau_kernel' in parts
+                        or 'rst_tau_bias' in parts):
                     return x if component == 'rst' else None
-                if 'v_operator_tau_proj' in parts:
+                if ('v_operator_tau_proj' in parts
+                        or 'v_tau_kernel' in parts
+                        or 'v_tau_bias' in parts):
                     return x if component == 'v' else None
                 if ('q_operator_tau_proj' in parts
-                        or 'k_operator_tau_proj' in parts):
+                        or 'k_operator_tau_proj' in parts
+                        or 'q_tau_kernel' in parts
+                        or 'q_tau_bias' in parts
+                        or 'k_tau_kernel' in parts
+                        or 'k_tau_bias' in parts):
                     return x if component == 'qk' else None
             if _is_raw_tau_attn_combined_path(ps):
                 if x.ndim > 0 and x.shape[-1] >= 3:
@@ -8097,6 +8212,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
             def _cap_control_update(path, u):
                 ps = _path_to_str(path)
+                if _is_operator_tau_path(ps):
+                    parts = _path_parts(ps)
+                    if any(name in parts for name in (
+                            'rst_operator_tau_proj',
+                            'rst_tau_kernel', 'rst_tau_bias')):
+                        scale = upd_raw_tau_rst_scale
+                    elif any(name in parts for name in (
+                            'v_operator_tau_proj',
+                            'v_tau_kernel', 'v_tau_bias')):
+                        scale = upd_raw_tau_v_scale
+                    else:
+                        scale = upd_raw_tau_qk_scale
+                    return u * scale.astype(u.dtype)
                 if _is_raw_tau_attn_combined_path(ps):
                     if u.ndim > 0 and u.shape[-1] >= 3:
                         out = u
@@ -8218,19 +8346,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cur = cur[key]
             return cur
 
-        _gpool = grads.get('neuron_pool', {})
-        _ppool = params.get('neuron_pool', {})
+        _pool_root = (
+            'operator_bank'
+            if str(_model_version) == V4174_MODEL_VERSION else 'neuron_pool')
+        _gpool = grads.get(_pool_root, {})
+        _ppool = params.get(_pool_root, {})
         if str(_model_version) == V4174_MODEL_VERSION:
             _shared_probe_metrics = {}
             # Regular v4174 logging intentionally avoids full-bank read/write
             # gradient reductions. Raw tau update metrics are taken from the
-            # small router tau subtree after optimizer scaling/capping.
+            # compact operator-controller subtree after scaling/capping.
             _direct_rw_gradient_metrics = {}
         else:
             _shared_probe_metrics = _shared_probe_gradient_diagnostics(
                 _ppool, _gpool, _model_version)
             _direct_rw_gradient_metrics = {}
         _grouter = grads.get('router', {})
+        _gspace_selector = grads.get('space_selector', {})
+        _gspace_interface = grads.get('space_interface', {})
         if str(_model_version) == V4173_MODEL_VERSION:
             up_proj_grad = jnp.sqrt(sum(
                 jnp.square(_child_norm(_grouter, name))
@@ -8296,16 +8429,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
             grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
             if str(_model_version) == V4174_MODEL_VERSION:
-                grad_router_proj_attn = jnp.sqrt(sum(
-                    jnp.square(_child_norm(_grouter, name))
-                    for name in (
-                        'space_route_proj', 'space_read_vectors',
-                        'space_state_proj', 'space_state_writeback')))
-                grad_router_proj_rst = jnp.sqrt(sum(
-                    jnp.square(_child_norm(_grouter, name))
-                    for name in (
-                        'space_route_proj', 'space_read_vectors',
-                        'space_state_proj', 'space_state_writeback')))
+                operation_space_interface_grad = _tree_norm(
+                    _gspace_interface)
+                space_addressing_grad = _tree_norm(_gspace_selector)
+                operation_space_system_grad = jnp.sqrt(
+                    jnp.square(operation_space_interface_grad)
+                    + jnp.square(space_addressing_grad))
+                grad_router_proj_attn = operation_space_system_grad
+                grad_router_proj_rst = operation_space_system_grad
             if str(_model_version) == V4173_MODEL_VERSION:
                 grad_router_proj_attn = jnp.sqrt(
                     jnp.square(grad_router_proj_attn)
@@ -8498,12 +8629,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             drift_attn_qk_op_key = jnp.float32(0.0)
             drift_attn_v_op_key = jnp.float32(0.0)
             drift_rst_op_key = jnp.float32(0.0)
-        elif 'neuron_pool' not in new_params:
+        elif (
+                ('operator_bank' not in new_params)
+                if str(_model_version) == V4174_MODEL_VERSION
+                else ('neuron_pool' not in new_params)):
             drift_attn_qk_op_key = jnp.float32(0.0)
             drift_attn_v_op_key = jnp.float32(0.0)
             drift_rst_op_key = jnp.float32(0.0)
         else:
-            _pool = new_params['neuron_pool']
+            _pool = (
+                new_params['operator_bank']
+                if str(_model_version) == V4174_MODEL_VERSION
+                else new_params['neuron_pool'])
             def _drift_unit(x):
                 x = jnp.asarray(x, dtype=jnp.float32)
                 return x / (
@@ -10411,7 +10548,10 @@ def create_geometry_step(max_sample=512, model_version=None):
 
     @jax.jit
     def geometry_step(params):
-        pool = params.get('neuron_pool', {})
+        pool_root = (
+            'operator_bank'
+            if str(model_version) == V4174_MODEL_VERSION else 'neuron_pool')
+        pool = params.get(pool_root, {})
         out = {}
         v4170_keys = (
             _v4170_pool_operator_keys(pool)
@@ -10514,7 +10654,12 @@ def get_param_shardings(params, mesh, model_version=None,
     version = str(model_version) if model_version is not None else None
     mesh_model = int(mesh.shape['model'])
     has_padded_vocab = vocab_size_padded is not None
-    pool_root = params.get('neuron_pool', {}) if hasattr(params, 'get') else {}
+    pool_param_root = (
+        'operator_bank'
+        if version == V4174_MODEL_VERSION else 'neuron_pool')
+    pool_root = (
+        params.get(pool_param_root, {})
+        if hasattr(params, 'get') else {})
     is_stage_partitioned_pool = (
         'attn_qk_read_shared' in pool_root
         or 'attn_qk_read_global' in pool_root)
@@ -10575,8 +10720,9 @@ def get_param_shardings(params, mesh, model_version=None,
                     and str(key_path[0]).startswith('block_')
                     and key_path[1:] == ('attn', 'expand_O', 'kernel')):
                 return row_sharded
-        # NeuronPool params: shard N axis (first dim) on 'model'
-        if 'neuron_pool' in path_str:
+        # Operator-bank/pool params: shard the operator axis on 'model'.
+        if (path_str.startswith('neuron_pool/')
+                or path_str.startswith('operator_bank/')):
             if leaf in (
                     'rw_key_read_probe', 'rw_key_write_probe',
                     'operator_key_read_probe', 'operator_key_write_probe'):
@@ -10606,9 +10752,12 @@ def get_param_shardings(params, mesh, model_version=None,
                 return n_sharded_3d    # [N, D, R] tensor pools
             else:
                 return replicated
-        if version == V4174_MODEL_VERSION and path_str.startswith('router/'):
-            # Explicit space reads, the shared D->R routing projection, and
-            # the P_m/U_m coordinate system are intentionally replicated.
+        if (version == V4174_MODEL_VERSION
+                and path_str.startswith((
+                    'space_selector/',
+                    'space_interface/',
+                    'operator_controller/'))):
+            # Space addressing, P_m/U_m, and per-space tau maps are replicated.
             return replicated
         return replicated
 
@@ -10667,6 +10816,24 @@ def _print_param_sharding_summary(param_shardings, model_version):
                     'neuron_pool/rst_write',
                     'neuron_pool/attn_qk_read',
                     'neuron_pool/attn_qk_write'):
+                interesting.append((ps, sharding))
+        elif version == V4174_MODEL_VERSION:
+            if ps in (
+                    'token_emb/embedding',
+                    'space_selector/space_query_proj/kernel',
+                    'space_selector/space_route_keys',
+                    'space_interface/space_read_proj',
+                    'space_interface/space_write_proj',
+                    'operator_controller/q_tau_kernel',
+                    'operator_controller/q_tau_bias',
+                    'operator_controller/k_tau_kernel',
+                    'operator_controller/k_tau_bias',
+                    'operator_controller/v_tau_kernel',
+                    'operator_controller/v_tau_bias',
+                    'operator_controller/rst_tau_kernel',
+                    'operator_controller/rst_tau_bias'):
+                interesting.append((ps, sharding))
+            elif ps.startswith('operator_bank/') and len(interesting) < 24:
                 interesting.append((ps, sharding))
         elif version in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS:
             if ps in (
@@ -18778,17 +18945,31 @@ def main():
             flush=True,
         )
         if _is_v417x_version(model_version_cfg):
-            breakdown_labels = (
-                ('token embedding', 'token_embedding'),
-                ('position embedding', 'position_embedding'),
-                ('layer stack', 'layer_stack'),
-                ('router', 'router'),
-                ('read/write pools', 'read_write_pools'),
-                ('learned key tables', 'learned_key_tables'),
-                ('bilinear probe matrices', 'bilinear_probe_matrices'),
-                ('final norm', 'final_norm'),
-                ('total', 'total'),
-            )
+            if str(model_version_cfg) == V4174_MODEL_VERSION:
+                breakdown_labels = (
+                    ('token embedding', 'token_embedding'),
+                    ('position embedding', 'position_embedding'),
+                    ('layer stack', 'layer_stack'),
+                    ('operation-space interface',
+                     'operation_space_interface'),
+                    ('space addressing', 'space_addressing'),
+                    ('space operator control', 'space_operator_control'),
+                    ('operator bank', 'operator_bank'),
+                    ('final norm', 'final_norm'),
+                    ('total', 'total'),
+                )
+            else:
+                breakdown_labels = (
+                    ('token embedding', 'token_embedding'),
+                    ('position embedding', 'position_embedding'),
+                    ('layer stack', 'layer_stack'),
+                    ('router', 'router'),
+                    ('read/write pools', 'read_write_pools'),
+                    ('learned key tables', 'learned_key_tables'),
+                    ('bilinear probe matrices', 'bilinear_probe_matrices'),
+                    ('final norm', 'final_norm'),
+                    ('total', 'total'),
+                )
             print("Symbolic parameter breakdown:")
             for label, key in breakdown_labels:
                 print(f"  {label}: {symbolic_counts[key]:,}")
@@ -18801,7 +18982,8 @@ def main():
                 removed_architecture_delta = (
                     3 * d_model * d_route
                     + 2 * d_route * d_route
-                    - n_spaces * d_route)
+                    - n_spaces * d_route
+                    - 4 * (n_spaces - 1) * (d_route + 1))
                 v4171_reference_total = (
                     int(symbolic_counts['total'])
                     + removed_architecture_delta)
@@ -18857,7 +19039,7 @@ def main():
                  else "Actual initialized params: ")
                 + str(n_params))
             print(
-                ("Parameter delta vs removed v4174 operator-field: "
+                ("Parameter delta vs v4171-derived reference: "
                  if str(model_version_cfg) == V4174_MODEL_VERSION
                  else "Parameter-match delta vs v4171: ")
                 + str(
@@ -20734,7 +20916,11 @@ def main():
             w_key = _unit(write) @ write_proj
             return _unit(_unit(r_key) * _unit(w_key))
 
-        if 'neuron_pool' not in p:
+        pool_root = (
+            'operator_bank'
+            if str(model_version_cfg) == V4174_MODEL_VERSION
+            else 'neuron_pool')
+        if pool_root not in p:
             z = jnp.float32(0.0)
             return {
                 'attn_qk_op_key': z,
@@ -20742,7 +20928,7 @@ def main():
                 'rst_op_key': z,
             }
 
-        pool = p['neuron_pool']
+        pool = p[pool_root]
         if str(model_version_cfg) == V4174_MODEL_VERSION:
             return {
                 'attn_qk_op_key': jnp.concatenate((
@@ -21653,26 +21839,29 @@ def main():
                         token_block_size = int(cfg["model"][
                             "operation_space_bundle_token_block_size"])
                         log_message(
-                            "Execution: one shared operation-coordinate "
-                            "system with compact fixed "
+                            "Execution: independent operation-space "
+                            "coordinates with compact fixed "
                             f"{bundle_size}"
                             "-space Q/K/V/RST bundles and token blocks of "
                             f"{token_block_size}")
                     else:
                         log_message(
-                            "Execution: one shared operation-coordinate "
-                            "system with all-space dense Q/K/V/RST routes")
+                            "Execution: independent operation-space "
+                            "coordinates with all-space dense Q/K/V/RST "
+                            "routes")
                     log_message(
                         "Operation spaces: "
                         f"M={cfg['model']['n_operation_spaces']} "
                         f"K={cfg['model']['operation_space_top_k']} "
                         f"d_space=d_route={cfg['model']['d_route']}")
                     log_message(
-                        "Addressing: projected local state directly matches "
-                        "normalized read vectors; Q/K/V/RST banks are separate")
+                        "Addressing: shared query selects route keys; separate "
+                        "D->R maps read operation-space states; "
+                        "Q/K/V/RST banks are separate")
                     log_message(
                         "Space gate: hard top-k ReLU^2, non-softmax, "
-                        "sqrt-mass denominator; RST routing is post-attention")
+                        "selected-space L1 sum=1 with deterministic top-1 "
+                        "zero-mass fallback; RST routing is post-attention")
                 elif str(model_version_cfg) == V4173_MODEL_VERSION:
                     log_message("DAWN spatial-r1-v4.1.7.3")
                     log_message(
