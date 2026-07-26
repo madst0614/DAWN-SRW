@@ -409,6 +409,14 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Decision/next: keep this from-scratch run active. Treat step 5 only as startup evidence, not a steady-state performance acceptance; inspect step 100, validation, and checkpoint boundaries before drawing longer-run conclusions.
 - Evidence: remote `~/train.log` on all eight `spatial-se-400m` workers; primary log on gcloud worker 6; GCS run folder above; local untracked launcher captures `launch_spatial-se-400m_20260726_135522_worker_{0..7}.log` are raw operational evidence and must not be committed.
 
+#### #17 — Confirm continued early stability through step 20
+
+- Status: TPU measured; the same from-scratch process remains active.
+- Run identity: unchanged from `2026-07-26/#16`; `spatial-se-400m`, commit `db16ffdf9ecb1a65cdf5ea0cfe3702b790430055`, canonical 20B config, GCS run `run_vspatial-r1-v4.1.7.4_20260726_135537_3201`, mesh `16x2`/32 devices, and no checkpoint restore.
+- Result: step 10 completed at loss 10.5675, 10.195 s/it, and 51,323.1 tokens/s. Step 20 completed at loss 10.3221, finite grad norm 17.11, 10.079 s/it, and 51,917.6 tokens/s. Attention/RST raw space mass remained 0.024 while both selected active-space counts remained 2.000; attention, RST, and residual norms were 0.291, 2.027, and 9.990. The primary `train_jax.py --from-scratch` process was still live and no fatal error was present.
+- Decision/next: leave training untouched and wait for the regular step-100 report before treating throughput or numerical behavior as a stable window.
+- Evidence: primary `~/train.log` on gcloud worker 6, observed 2026-07-26 KST.
+
 ## Backfill Boundary
 
 - The initial notebook covered evidence-backed work from 2026-07-21 through the step-1500 resume attempt.
