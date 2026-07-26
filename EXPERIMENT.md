@@ -5,13 +5,13 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 ## Current State
 
-- Current goal: publish the fresh v4174 operation-space schema and selected-space L1 gate, then start the canonical 20B 400M run from scratch on the explicitly authorized existing TPU `spatial-se-400m`.
-- Publication state: branch `codex/v4167-poc`, source parent `462202863a91b9f000c7725d16794215de854b86`; the implementation is locally validated in the dirty tree recorded by `2026-07-26/#15` and is pending its associated commit/push.
+- Current goal: keep the canonical v4174 20B 400M from-scratch run active on the explicitly authorized existing TPU `spatial-se-400m` and monitor its early training stability.
+- Publication state: branch `codex/v4167-poc`; implementation commit `db16ffdf9ecb1a65cdf5ea0cfe3702b790430055` and the notebook commit containing `2026-07-26/#16` are published to `origin/codex/v4167-poc`.
 - Active optimization config: `spatial-r1-v4.1.7.4`, `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`, 393,803,872 parameters, batch 1024, sequence 512, mesh `16x2` on 32 devices, and 38,146 full global steps. It is 3,164 parameters above the v4172 393,800,708 reference.
 - Best measured accepted result: exact selected-top-2 backward with compact exact overflow and `Tcap=3072` at commit `8187c00d4b767a743c3178a5bcb8caac1c6124c5` reached 10.181 s/it at step 10, 10.223 s/it at step 20, and 10.924 s/it with 47,902 tokens/s at step 50. This is about 32.0% faster than the matched pre-exact-backward 16.072 s/it result.
 - Current conclusion: bundle4 dense forward and exact selected-top-2 backward remain the execution topology. The canonical model now separates selector/interface/controller/operator-bank parameters, uses one tau map per route and space, L1-normalizes selected-space weights to sum to one, and uses a deterministic top-1 fallback when all selected ReLU-squared scores vanish.
-- Current blocker: no local implementation blocker. TPU runtime, compilation, HBM, and first-step behavior for the new parameter tree and L1 gate are not measured yet.
-- Next experiment: commit and push the locally validated source, launch `scripts/train_jax.py --from-scratch` on `spatial-se-400m` through the fixed `tmux train` / `~/train.log` launcher path, and verify exact remote commit/config identity plus a real optimizer step.
+- Current blocker: no immediate implementation or runtime blocker; long-window throughput, validation quality, and checkpoint behavior for this fresh run are not measured yet.
+- Next experiment: leave the current `tmux train` process running, inspect the regular step-100 window and the first validation/checkpoint boundaries, and compare steady-state behavior without changing the accepted topology or parameter tree.
 
 ## Fixed Context
 
@@ -396,6 +396,18 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Lesson: raw space score mass and within-space RW mass normalize different axes. With selected-space L1 normalization, the selector no longer closes the whole residual update when initial raw mass is small; the RW denominator and fixed route/residual scales retain responsibility for absolute update magnitude.
 - Decision/next: commit and push this exact tree, launch the canonical 20B config from scratch on `spatial-se-400m`, and record remote commit/config/mesh plus first real optimizer-step evidence in a later entry.
 - Evidence: `models/dawn_srw_v4174.py`; `scripts/train_jax.py`; `scripts/benchmark_srw_tpu.py`; `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`; `tests/test_v4174_operation_spaces.py`; local validation output from 2026-07-26 KST.
+
+#### #16 — Publish and start the canonical v4174 run from scratch
+
+- Status: implementation published; TPU measured through optimizer step 5; training remains active.
+- Hypothesis/change: publish the explicit operation-space tree and selected-space L1 gate without a compatibility mode, then replace the existing workload on the user-authorized `spatial-se-400m` with a fresh canonical 20B run. A real step with raw space mass still near initialization should demonstrate that selector mass no longer closes the whole update.
+- Run identity: existing READY `v4-64` TPU `spatial-se-400m`; branch `codex/v4167-poc`; clean source commit `db16ffdf9ecb1a65cdf5ea0cfe3702b790430055` on all eight workers; config `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`; selected full-config SHA-256 `b3b7995ec09571e80bf2da54d1d8234f3fb1e1c6ae91ba5bbec764fe0b39cd38`; `--from-scratch`; no restore checkpoint; batch 1024, sequence 512, mesh `16x2`/32 devices; Python 3.10.12, JAX 0.6.2, Flax 0.10.7, Orbax 0.11.24.
+- Launch: the first local launcher invocation stopped before TPU contact because Git Bash selected unsupported gcloud Python 3.9. Re-running the same fixed launcher with `CLOUDSDK_PYTHON=C:\Users\MADST\gcloud\google-cloud-sdk\platform\bundledpython\python.exe` passed all eight SSH preflights and verified no live accelerator holder before starting `scripts/train_jax.py` in `tmux train` at 2026-07-26 13:55:32 KST. Each worker uses `~/train.log`; the JAX primary is gcloud worker 6 / process 0.
+- Runtime result: scratch initialization produced exactly 393,803,872 concrete and symbolic parameters, matching the config expectation. It created `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_20B_v4_64/run_vspatial-r1-v4.1.7.4_20260726_135537_3201`, completed per-space quantile calibration, passed the eight-host `global_step=0` consistency barrier, and entered canonical shard-map training without HBM or compilation failure.
+- Step evidence: step 1 completed with loss/CE 10.7297, finite grad norm 11.74, attention/RST raw space mass both 0.024, selected active-space count 2.000, zero-mass fallback rate 0.000, attention norm 0.197, RST norm 1.989, and residual norm 9.581. The first compiled step took 113.163 s. Step 5 completed with loss 10.6744 and a four-step window of 11.534 s/it / 45,368.7 tokens/s; the process was still live with no fatal error.
+- Lesson: the new tree initializes and trains on the canonical 32-device topology. The key scale check is satisfied: despite raw selector mass of only about 0.024, normalized top-2 routing remains fully active and produces non-negligible attention/RST updates, while raw mass remains an observable diagnostic.
+- Decision/next: keep this from-scratch run active. Treat step 5 only as startup evidence, not a steady-state performance acceptance; inspect step 100, validation, and checkpoint boundaries before drawing longer-run conclusions.
+- Evidence: remote `~/train.log` on all eight `spatial-se-400m` workers; primary log on gcloud worker 6; GCS run folder above; local untracked launcher captures `launch_spatial-se-400m_20260726_135522_worker_{0..7}.log` are raw operational evidence and must not be committed.
 
 ## Backfill Boundary
 
