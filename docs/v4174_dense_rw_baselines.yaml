@@ -1,11 +1,11 @@
 schema_version: 1
 registry_id: v4174-400m-dense-rw
 updated_kst: "2026-07-26"
-active_generation: g3
+active_generation: g4
 
 canonical_source:
   branch: codex/v4167-poc
-  audited_commit: 8313cb07711b8a29163503abefde28227588e73a
+  audited_commit: 62417b239d5b79c5dfa8684563532958ed212385
   baseline_source_branch: codex/v4167-poc
   experimental_branches_are_candidate_only: true
   accepted_changes_require_sync_to_canonical_branch: true
@@ -269,7 +269,7 @@ generations:
       full_step_peak_hbm_gib_delta: -0.002720767999999651
 
   g3:
-    status: active
+    status: superseded
     role: "Canonical independent per-space initialization control."
     rebaseline_reason: "The accepted source changed from shared-base/row-sign-derived projections to independently keyed semi-orthogonal bases."
     branch: codex/v4167-poc
@@ -319,3 +319,59 @@ generations:
       throughput_change_percent: -1.1481642697147043
       full_step_compile_time_change_percent: -3.1468253467906533
       full_step_peak_hbm_gib_delta: 0.007598080000000174
+
+  g4:
+    status: active
+    role: "Accepted QKV+RST outer P/RW/U analytic pullback with bundle4 forward and exact top-2 backward."
+    promoted_from_generation: g3
+    branch: codex/v4174-p-rw-u-analytic-vjp-rst
+    commit: aa7ed52117d5dc4427454815b70ca6533dab3589
+    model_git_blob: aaee2b34815a5867b9cc0d8f3b718fb71a0d56d8
+    canonical_integration_branch: codex/v4167-poc
+    canonical_integration_commit: 62417b239d5b79c5dfa8684563532958ed212385
+    dirty_worktree_state:
+      at_launch: "tracked clean; pre-existing untracked benchmark_runs/ only"
+      after_metrics_write: "tracked clean; untracked benchmark_runs/ only"
+    measured_on_tpu: spatial-se-400m
+    two_layer_backward_gate:
+      fast_forward_compile_seconds: 50.15932015198632
+      fast_forward_mean_seconds: 2.442458496981999
+      qkv_forward_seconds: 0.12511268400703557
+      qkv_forward_backward_seconds: 0.3261934479814954
+      rst_forward_seconds: 0.10542849599733017
+      rst_forward_backward_seconds: 0.3023363079992123
+      combined_forward_backward_seconds: 0.6285297559807077
+      combined_backward_only_seconds: 0.39798857597634196
+      detailed_split_seconds: 0.9078423940518405
+      detailed_compile_seconds: 95.06001808404108
+      peak_hbm_gib: 4.95752448
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_p_rw_u_analytic_qkv_rst_aa7ed521_gate/benchmark_metrics_host_6.jsonl
+    five_step_full_train:
+      compile_seconds: 94.13738664300763
+      measured_step_seconds:
+        - 9.00693380497978
+        - 8.934873127989704
+        - 8.937076717003947
+        - 8.939691838022554
+        - 8.898477919021389
+      mean_step_seconds: 8.943410681403474
+      median_step_seconds: 8.937076717003947
+      p90_step_seconds: 8.98003701819689
+      mean_tokens_per_second: 58623.728459176156
+      peak_hbm_gib: 7.929470464
+      evidence: /home/madst0614/DAWN-SRW/benchmark_runs/v4174_p_rw_u_analytic_qkv_rst_aa7ed521_fullstep/benchmark_metrics_host_6.jsonl
+    improvement_over_g3:
+      qkv_forward_backward_percent: 12.765813156231115
+      rst_forward_backward_percent: 14.254496959040248
+      two_layer_combined_forward_backward_percent: 13.488300785439389
+      two_layer_backward_only_percent: 19.776013201502824
+      detailed_split_percent: 9.718826246837823
+      fast_forward_compile_percent: 2.6333758138550807
+      detailed_compile_percent: 1.8808021352626243
+      five_step_mean_percent: 9.620613408383592
+      five_step_median_percent: 9.56539345263217
+      five_step_p90_percent: 9.626371386908362
+      throughput_percent: 10.645099768249066
+      full_step_compile_percent: 2.408069218384421
+      two_layer_peak_hbm_gib_delta: -0.009046016000000101
+      full_step_peak_hbm_gib_delta: -0.017450495999999482
