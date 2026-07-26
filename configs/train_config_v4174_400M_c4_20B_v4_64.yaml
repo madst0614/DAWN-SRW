@@ -1,7 +1,7 @@
 # DAWN-SRW v4.1.7.4 canonical 400M production configuration.
 #
-# Execution topology retained from the accepted exact-backward path:
-#   forward: bundle4
+# Exact selected-space candidate topology:
+#   forward: exact selected-top-2 spaces
 #   backward: exact selected-top-2 spaces
 #   bucket capacity: 3072 with compact exact overflow
 #
@@ -47,9 +47,7 @@ model:
 
   n_operation_spaces: 24
   operation_space_top_k: 2
-  operation_space_execution_mode: bundle_dense
-  operation_space_bundle_size: 4
-  operation_space_bundle_token_block_size: 2048
+  operation_space_execution_mode: exact_top2
 
   n_q: 21504
   n_k: 21504

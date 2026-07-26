@@ -16497,6 +16497,11 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
                     'make_sharded_attention_space_bundle_dense_minimal')
                 rst_factory_name = (
                     'make_sharded_rst_space_bundle_dense_minimal')
+            elif execution_mode == 'exact_top2':
+                attention_factory_name = (
+                    'make_sharded_attention_space_exact_top2_minimal')
+                rst_factory_name = (
+                    'make_sharded_rst_space_exact_top2_minimal')
             elif execution_mode == 'dense_all_space':
                 attention_factory_name = (
                     'make_sharded_attention_space_dense_minimal')
@@ -16504,7 +16509,7 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
             else:
                 raise ValueError(
                     "v4174 operation_space_execution_mode must be "
-                    "'dense_all_space' or 'bundle_dense', got "
+                    "'dense_all_space', 'bundle_dense', or 'exact_top2', got "
                     f"{execution_mode!r}")
             attention_factory = getattr(
                 module, attention_factory_name, None)
@@ -21849,6 +21854,16 @@ def main():
                             f"{bundle_size}"
                             "-space Q/K/V/RST bundles and token blocks of "
                             f"{token_block_size}")
+                    elif (
+                            str(cfg["model"].get(
+                                "operation_space_execution_mode",
+                                "dense_all_space"))
+                            == "exact_top2"):
+                        log_message(
+                            "Execution: independent operation-space "
+                            "coordinates with exact selected-top-2 "
+                            "Q/K/V/RST buckets, Tcap=3072, and compact "
+                            "exact overflow")
                     else:
                         log_message(
                             "Execution: independent operation-space "
