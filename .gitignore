@@ -52,6 +52,10 @@ logs/
 outputs/
 .generated/
 
+# Local TPU launcher captures (canonical runtime logs stay on the TPU/GCS)
+/launch_*_worker_*.log
+/launch_stage_attribution_*.log
+
 # OS
 .DS_Store
 Thumbs.db
