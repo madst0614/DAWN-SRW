@@ -438,6 +438,36 @@ def forward_unit_direction(value: jax.Array) -> jax.Array:
     return _shared_forward_unit_direction(jnp.asarray(value, dtype=jnp.float32))
 
 
+def _forward_unit_direction_from_row_norm(
+        value: jax.Array,
+        row_norm: jax.Array) -> jax.Array:
+    """Normalize rows from a precomputed FP32 scalar norm cache."""
+    value_f32 = jnp.asarray(value, dtype=jnp.float32)
+    norm_f32 = jnp.asarray(row_norm, dtype=jnp.float32)
+    expected_shape = value_f32.shape[:-1] + (1,)
+    if norm_f32.shape != expected_shape:
+        raise ValueError(
+            "cached row norm shape mismatch: "
+            f"value={value_f32.shape}, norm={norm_f32.shape}, "
+            f"expected={expected_shape}")
+    return value_f32 / (
+        norm_f32 + jnp.float32(RW_FORWARD_NORM_EPS))
+
+
+def _operator_bank_row_norm_cache(
+        operator_bank_params: Mapping[str, jax.Array]
+) -> dict[str, jax.Array]:
+    """Build the shared scalar read/write norm cache outside the layer scan."""
+    cache: dict[str, jax.Array] = {}
+    for route in ROUTES:
+        for direction in ("read", "write"):
+            key = f"{route}_{direction}_vectors"
+            raw = jnp.asarray(operator_bank_params[key], dtype=jnp.float32)
+            cache[f"{route}_{direction}_row_norm"] = jax.lax.stop_gradient(
+                jnp.linalg.norm(raw, axis=-1, keepdims=True))
+    return cache
+
+
 def _read_operation_space_states(
         global_state: jax.Array, space_read_proj: jax.Array) -> jax.Array:
     """Read a global ``[T,D]`` representation into ``[M,T,R]`` spaces."""
@@ -1320,6 +1350,23 @@ class DAWN_SRW_V4174(nn.Module):
                 f"{fused_execution_mode!r}")
         fused_throughput_bf16 = (
             fused_throughput_precision == "bf16_operands_f32_accum")
+        operator_bank_row_norms = None
+        if fused_production and fused_execution_mode == "bundle_dense":
+            cache_contract = (
+                "fp32_scalar_row_norm_stop_gradient")
+            if (getattr(
+                    attention_dense,
+                    "_v4174_operator_bank_row_norm_cache",
+                    None) != cache_contract
+                    or getattr(
+                        rst_dense,
+                        "_v4174_operator_bank_row_norm_cache",
+                        None) != cache_contract):
+                raise ValueError(
+                    "v4174 bundle_dense executors require the shared "
+                    "operator-bank FP32 scalar row-norm cache contract")
+            operator_bank_row_norms = _operator_bank_row_norm_cache(
+                operator_bank)
         regular_lists: dict[str, list[jax.Array]] = {}
         analysis_lists: dict[str, list[jax.Array]] = {}
         last_global_state_for_space_diagnostics = None
@@ -1357,6 +1404,7 @@ class DAWN_SRW_V4174(nn.Module):
 
         def layer_forward(
                 global_state, block_params, operator_bank_params,
+                operator_bank_row_norm_params,
                 space_selector_params, space_interface_params,
                 operator_controller_params, layer_rng):
             """One complete checkpointable Q/K/V-attention-RST layer."""
@@ -1373,6 +1421,30 @@ class DAWN_SRW_V4174(nn.Module):
                 (-1, self.d_model))
             attention_space_routing = None
             if fused_production:
+                attention_operator_args = (
+                    operator_bank_params["q_read_vectors"],
+                    operator_bank_params["q_write_vectors"],
+                    operator_bank_params["k_read_vectors"],
+                    operator_bank_params["k_write_vectors"],
+                    operator_bank_params["v_read_vectors"],
+                    operator_bank_params["v_write_vectors"],
+                )
+                if operator_bank_row_norm_params is not None:
+                    attention_operator_args = (
+                        *attention_operator_args,
+                        operator_bank_row_norm_params[
+                            "q_read_row_norm"],
+                        operator_bank_row_norm_params[
+                            "q_write_row_norm"],
+                        operator_bank_row_norm_params[
+                            "k_read_row_norm"],
+                        operator_bank_row_norm_params[
+                            "k_write_row_norm"],
+                        operator_bank_row_norm_params[
+                            "v_read_row_norm"],
+                        operator_bank_row_norm_params[
+                            "v_write_row_norm"],
+                    )
                 (q_global_interface_flat,
                  k_global_interface_flat,
                  v_global_interface_flat,
@@ -1390,12 +1462,7 @@ class DAWN_SRW_V4174(nn.Module):
                         operator_controller_params["k_tau_bias"],
                         operator_controller_params["v_tau_kernel"],
                         operator_controller_params["v_tau_bias"],
-                        operator_bank_params["q_read_vectors"],
-                        operator_bank_params["q_write_vectors"],
-                        operator_bank_params["k_read_vectors"],
-                        operator_bank_params["k_write_vectors"],
-                        operator_bank_params["v_read_vectors"],
-                        operator_bank_params["v_write_vectors"],
+                        *attention_operator_args,
                         temperatures["q"], temperatures["v"],
                         soft_gate_boundary_power, execution_prune_eps,
                         route_scales["q"], route_scales["v"],
@@ -1489,6 +1556,18 @@ class DAWN_SRW_V4174(nn.Module):
                 (-1, self.d_model))
             rst_space_routing = None
             if fused_production:
+                rst_operator_args = (
+                    operator_bank_params["rst_read_vectors"],
+                    operator_bank_params["rst_write_vectors"],
+                )
+                if operator_bank_row_norm_params is not None:
+                    rst_operator_args = (
+                        *rst_operator_args,
+                        operator_bank_row_norm_params[
+                            "rst_read_row_norm"],
+                        operator_bank_row_norm_params[
+                            "rst_write_row_norm"],
+                    )
                 rst_global_update_flat, rst_metrics = rst_dense(
                     rst_global_state_flat,
                     space_selector_params[
@@ -1498,8 +1577,7 @@ class DAWN_SRW_V4174(nn.Module):
                     space_interface_params["space_write_proj"],
                     operator_controller_params["rst_tau_kernel"],
                     operator_controller_params["rst_tau_bias"],
-                    operator_bank_params["rst_read_vectors"],
-                    operator_bank_params["rst_write_vectors"],
+                    *rst_operator_args,
                     temperatures["rst"], soft_gate_boundary_power,
                     execution_prune_eps, route_scales["rst"],
                     collect_regular_metrics)
@@ -1641,6 +1719,7 @@ class DAWN_SRW_V4174(nn.Module):
                     global_state,
                     layer_inputs["params"],
                     operator_bank,
+                    operator_bank_row_norms,
                     space_selector,
                     space_interface,
                     operator_controller,
@@ -1665,6 +1744,7 @@ class DAWN_SRW_V4174(nn.Module):
                     state,
                     layer_block_params,
                     operator_bank,
+                    operator_bank_row_norms,
                     space_selector,
                     space_interface,
                     operator_controller,
@@ -2731,6 +2811,8 @@ def _dense_rw_output_sharded_autodiff(
         read_vectors: jax.Array,
         write_vectors: jax.Array,
         raw_tau: jax.Array, *,
+        read_row_norm: jax.Array | None = None,
+        write_row_norm: jax.Array | None = None,
         max_chunk_size: int,
         soft_gate_temperature: jax.Array,
         soft_gate_boundary_power: jax.Array,
@@ -2749,8 +2831,22 @@ def _dense_rw_output_sharded_autodiff(
     n_padded = n_chunks * chunk_size
     pad_n = n_padded - n_local
     pad_spec = ((0, 0), (0, 0), (0, pad_n), (0, 0))
-    reads = forward_unit_direction(jnp.pad(read_vectors, pad_spec))
-    writes = forward_unit_direction(jnp.pad(write_vectors, pad_spec))
+    padded_reads = jnp.pad(read_vectors, pad_spec)
+    padded_writes = jnp.pad(write_vectors, pad_spec)
+    if read_row_norm is None:
+        reads = forward_unit_direction(padded_reads)
+    else:
+        padded_read_norm = jnp.pad(
+            read_row_norm, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+        reads = _forward_unit_direction_from_row_norm(
+            padded_reads, padded_read_norm)
+    if write_row_norm is None:
+        writes = forward_unit_direction(padded_writes)
+    else:
+        padded_write_norm = jnp.pad(
+            write_row_norm, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+        writes = _forward_unit_direction_from_row_norm(
+            padded_writes, padded_write_norm)
     valid_rows = jnp.arange(n_padded) < n_local
     tau = _shared_tau_from_param(raw_tau)
     aggregate_shape = (n_routes, n_spaces, token_capacity, 1)
@@ -2856,6 +2952,34 @@ def _forward_unit_direction_vjp(
         + denominator_cotangent * norm_direction)
 
 
+def _forward_unit_direction_cached_vjp(
+        raw_value: jax.Array,
+        row_norm: jax.Array,
+        unit_cotangent: jax.Array) -> jax.Array:
+    """Analytic unit-row pullback using a shared stop-gradient norm cache."""
+    raw_f32 = jnp.asarray(raw_value, dtype=jnp.float32)
+    norm_f32 = jnp.asarray(row_norm, dtype=jnp.float32)
+    cotangent_f32 = jnp.asarray(unit_cotangent, dtype=jnp.float32)
+    expected_shape = raw_f32.shape[:-1] + (1,)
+    if norm_f32.shape != expected_shape:
+        raise ValueError(
+            "cached row norm VJP shape mismatch: "
+            f"value={raw_f32.shape}, norm={norm_f32.shape}, "
+            f"expected={expected_shape}")
+    denominator = norm_f32 + jnp.float32(RW_FORWARD_NORM_EPS)
+    denominator_cotangent = -(
+        cotangent_f32 * raw_f32
+    ).sum(axis=-1, keepdims=True) / jnp.square(denominator)
+    norm_direction = jnp.where(
+        norm_f32 > 0.0,
+        raw_f32 / jnp.maximum(
+            norm_f32, jnp.finfo(jnp.float32).tiny),
+        jnp.float32(0.0))
+    return (
+        cotangent_f32 / denominator
+        + denominator_cotangent * norm_direction)
+
+
 def _dense_rw_vjp_dot(
         equation: str,
         lhs: jax.Array,
@@ -2880,7 +3004,7 @@ def _dense_rw_vjp_dot(
 
 @partial(
     jax.custom_vjp,
-    nondiff_argnums=(6, 10, 11, 12),
+    nondiff_argnums=(8, 12, 13, 14),
 )
 def _dense_rw_output_sharded_linear_analytic(
         local_f32: jax.Array,
@@ -2888,6 +3012,8 @@ def _dense_rw_output_sharded_linear_analytic(
         token_valid: jax.Array,
         read_vectors: jax.Array,
         write_vectors: jax.Array,
+        read_row_norm: jax.Array,
+        write_row_norm: jax.Array,
         raw_tau: jax.Array,
         max_chunk_size: int,
         soft_gate_temperature: jax.Array,
@@ -2904,6 +3030,8 @@ def _dense_rw_output_sharded_linear_analytic(
         read_vectors,
         write_vectors,
         raw_tau,
+        read_row_norm=read_row_norm,
+        write_row_norm=write_row_norm,
         max_chunk_size=max_chunk_size,
         soft_gate_temperature=soft_gate_temperature,
         soft_gate_boundary_power=soft_gate_boundary_power,
@@ -2920,6 +3048,8 @@ def _dense_rw_output_sharded_linear_analytic_fwd(
         token_valid: jax.Array,
         read_vectors: jax.Array,
         write_vectors: jax.Array,
+        read_row_norm: jax.Array,
+        write_row_norm: jax.Array,
         raw_tau: jax.Array,
         max_chunk_size: int,
         soft_gate_temperature: jax.Array,
@@ -2935,6 +3065,8 @@ def _dense_rw_output_sharded_linear_analytic_fwd(
         read_vectors,
         write_vectors,
         raw_tau,
+        read_row_norm=read_row_norm,
+        write_row_norm=write_row_norm,
         max_chunk_size=max_chunk_size,
         soft_gate_temperature=soft_gate_temperature,
         soft_gate_boundary_power=soft_gate_boundary_power,
@@ -2949,6 +3081,8 @@ def _dense_rw_output_sharded_linear_analytic_fwd(
         token_valid,
         read_vectors,
         write_vectors,
+        read_row_norm,
+        write_row_norm,
         raw_tau,
         soft_gate_temperature,
         soft_gate_boundary_power,
@@ -2970,6 +3104,8 @@ def _dense_rw_output_sharded_linear_analytic_bwd(
      token_valid,
      read_vectors,
      write_vectors,
+     read_row_norm,
+     write_row_norm,
      raw_tau,
      soft_gate_temperature,
      soft_gate_boundary_power,
@@ -2986,8 +3122,14 @@ def _dense_rw_output_sharded_linear_analytic_bwd(
     pad_spec = ((0, 0), (0, 0), (0, pad_n), (0, 0))
     padded_reads = jnp.pad(read_vectors, pad_spec)
     padded_writes = jnp.pad(write_vectors, pad_spec)
-    normalized_reads = forward_unit_direction(padded_reads)
-    normalized_writes = forward_unit_direction(padded_writes)
+    padded_read_norm = jnp.pad(
+        read_row_norm, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+    padded_write_norm = jnp.pad(
+        write_row_norm, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+    normalized_reads = _forward_unit_direction_from_row_norm(
+        padded_reads, padded_read_norm)
+    normalized_writes = _forward_unit_direction_from_row_norm(
+        padded_writes, padded_write_norm)
     valid_rows = jnp.arange(n_padded) < n_local
     sigmoid_tau = jax.nn.sigmoid(
         jnp.asarray(raw_tau, dtype=jnp.float32))
@@ -3021,6 +3163,10 @@ def _dense_rw_output_sharded_linear_analytic_bwd(
             padded_reads, start, chunk_size, axis=2)
         raw_write = jax.lax.dynamic_slice_in_dim(
             padded_writes, start, chunk_size, axis=2)
+        read_norm = jax.lax.dynamic_slice_in_dim(
+            padded_read_norm, start, chunk_size, axis=2)
+        write_norm = jax.lax.dynamic_slice_in_dim(
+            padded_write_norm, start, chunk_size, axis=2)
         read = jax.lax.dynamic_slice_in_dim(
             normalized_reads, start, chunk_size, axis=2)
         write = jax.lax.dynamic_slice_in_dim(
@@ -3138,10 +3284,10 @@ def _dense_rw_output_sharded_linear_analytic_bwd(
             read_value_cotangent,
             local_operand,
             throughput_bf16=throughput_bf16)
-        raw_read_cotangent = _forward_unit_direction_vjp(
-            raw_read, read_unit_cotangent)
-        raw_write_cotangent = _forward_unit_direction_vjp(
-            raw_write, write_unit_cotangent)
+        raw_read_cotangent = _forward_unit_direction_cached_vjp(
+            raw_read, read_norm, read_unit_cotangent)
+        raw_write_cotangent = _forward_unit_direction_cached_vjp(
+            raw_write, write_norm, write_unit_cotangent)
         return (
             local_cotangent + chunk_local_cotangent,
             norm_cotangent + chunk_norm_cotangent.sum(
@@ -3170,6 +3316,8 @@ def _dense_rw_output_sharded_linear_analytic_bwd(
         None,
         read_cotangent,
         write_cotangent,
+        jnp.zeros_like(read_row_norm),
+        jnp.zeros_like(write_row_norm),
         raw_tau_cotangent,
         jnp.zeros_like(soft_gate_temperature),
         jnp.zeros_like(soft_gate_boundary_power),
@@ -3189,6 +3337,8 @@ def _dense_rw_output_sharded(
         read_vectors: jax.Array,
         write_vectors: jax.Array,
         raw_tau: jax.Array, *,
+        read_row_norm: jax.Array | None = None,
+        write_row_norm: jax.Array | None = None,
         max_chunk_size: int,
         soft_gate_temperature: jax.Array,
         soft_gate_boundary_power: jax.Array,
@@ -3199,12 +3349,22 @@ def _dense_rw_output_sharded(
         throughput_bf16: bool) -> tuple[jax.Array, jax.Array]:
     """Use the analytic dense RW pullback for canonical linear-angular runs."""
     if str(srw_composition_mode) == "linear_angular":
+        if read_row_norm is None:
+            read_row_norm = jnp.linalg.norm(
+                jnp.asarray(read_vectors, dtype=jnp.float32),
+                axis=-1, keepdims=True)
+        if write_row_norm is None:
+            write_row_norm = jnp.linalg.norm(
+                jnp.asarray(write_vectors, dtype=jnp.float32),
+                axis=-1, keepdims=True)
         return _dense_rw_output_sharded_linear_analytic(
             local_f32,
             local_norm,
             token_valid,
             read_vectors,
             write_vectors,
+            jax.lax.stop_gradient(read_row_norm),
+            jax.lax.stop_gradient(write_row_norm),
             raw_tau,
             max_chunk_size,
             soft_gate_temperature,
@@ -3277,6 +3437,7 @@ def _attention_exact_space_linear_group_pullback(
         routing_weight: jax.Array,
         state_params: tuple[jax.Array, ...],
         operator_params: tuple[jax.Array, ...],
+        operator_row_norms: tuple[jax.Array, ...],
         controls: tuple[jax.Array, ...],
         block_output_cotangent: jax.Array, *,
         max_chunk_size_qk: int,
@@ -3299,6 +3460,10 @@ def _attention_exact_space_linear_group_pullback(
      v_tau_kernel,
      v_tau_bias) = state_params
     qk_reads, qk_writes, v_read, v_write = operator_params
+    (qk_read_row_norm,
+     qk_write_row_norm,
+     v_read_row_norm,
+     v_write_row_norm) = operator_row_norms
     (qk_temperature,
      v_temperature,
      boundary_power,
@@ -3331,6 +3496,8 @@ def _attention_exact_space_linear_group_pullback(
             token_valid,
             qk_reads,
             qk_writes,
+            qk_read_row_norm,
+            qk_write_row_norm,
             qk_raw_tau,
             max_chunk_size_qk,
             qk_temperature,
@@ -3347,6 +3514,8 @@ def _attention_exact_space_linear_group_pullback(
             token_valid,
             v_read[None, ...],
             v_write[None, ...],
+            v_read_row_norm[None, ...],
+            v_write_row_norm[None, ...],
             v_raw_tau[None, ...],
             max_chunk_size_v,
             v_temperature,
@@ -3436,6 +3605,8 @@ def _attention_exact_space_linear_group_pullback(
      _,
      qk_reads_cotangent,
      qk_writes_cotangent,
+     _,
+     _,
      qk_raw_tau_cotangent,
      qk_temperature_cotangent,
      qk_boundary_cotangent,
@@ -3452,6 +3623,8 @@ def _attention_exact_space_linear_group_pullback(
      _,
      v_reads_cotangent,
      v_writes_cotangent,
+     _,
+     _,
      v_raw_tau_cotangent,
      v_temperature_cotangent,
      v_boundary_cotangent,
@@ -3550,6 +3723,7 @@ def _rst_exact_space_linear_group_pullback(
         routing_weight: jax.Array,
         state_params: tuple[jax.Array, ...],
         operator_params: tuple[jax.Array, ...],
+        operator_row_norms: tuple[jax.Array, ...],
         controls: tuple[jax.Array, ...],
         block_output_cotangent: jax.Array, *,
         max_chunk_size: int,
@@ -3569,6 +3743,7 @@ def _rst_exact_space_linear_group_pullback(
      tau_kernel,
      tau_bias) = state_params
     read_vectors, write_vectors = operator_params
+    read_row_norm, write_row_norm = operator_row_norms
     (temperature,
      boundary_power,
      execution_prune_eps,
@@ -3594,6 +3769,8 @@ def _rst_exact_space_linear_group_pullback(
             token_valid,
             read_vectors[None, ...],
             write_vectors[None, ...],
+            read_row_norm[None, ...],
+            write_row_norm[None, ...],
             raw_tau[None, ...],
             max_chunk_size,
             temperature,
@@ -3664,6 +3841,8 @@ def _rst_exact_space_linear_group_pullback(
      _,
      reads_cotangent,
      writes_cotangent,
+     _,
+     _,
      raw_tau_cotangent,
      temperature_cotangent,
      boundary_cotangent,
@@ -3743,6 +3922,7 @@ def _dense_rw_metric_stats_sharded(
         token_valid: jax.Array,
         read_vectors: jax.Array,
         raw_tau: jax.Array, *,
+        read_row_norm: jax.Array | None = None,
         max_chunk_size: int,
         soft_gate_temperature: jax.Array,
         soft_gate_boundary_power: jax.Array,
@@ -3764,8 +3944,16 @@ def _dense_rw_metric_stats_sharded(
     n_chunks = math.ceil(n_local / chunk_size)
     n_padded = n_chunks * chunk_size
     pad_n = n_padded - n_local
-    reads = forward_unit_direction(jnp.pad(
-        metric_reads, ((0, 0), (0, 0), (0, pad_n), (0, 0))))
+    padded_reads = jnp.pad(
+        metric_reads, ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+    if read_row_norm is None:
+        reads = forward_unit_direction(padded_reads)
+    else:
+        padded_read_norm = jnp.pad(
+            jax.lax.stop_gradient(read_row_norm),
+            ((0, 0), (0, 0), (0, pad_n), (0, 0)))
+        reads = _forward_unit_direction_from_row_norm(
+            padded_reads, padded_read_norm)
     valid_rows = jnp.arange(n_padded) < n_local
     tau = _shared_tau_from_param(metric_tau)
     aggregate_zero = jnp.zeros(
@@ -4364,6 +4552,12 @@ def _make_sharded_attention_space_bundle_dense(
          v_tau_kernel, v_tau_bias) = state_params
         (q_read, q_write, k_read, k_write,
          v_read, v_write) = operator_params
+        q_read_row_norm = packing["q_read_row_norm"]
+        q_write_row_norm = packing["q_write_row_norm"]
+        k_read_row_norm = packing["k_read_row_norm"]
+        k_write_row_norm = packing["k_write_row_norm"]
+        v_read_row_norm = packing["v_read_row_norm"]
+        v_write_row_norm = packing["v_write_row_norm"]
         (qk_temperature, v_temperature,
          boundary_power, execution_prune_eps,
          qk_scale, v_scale) = controls
@@ -4375,6 +4569,10 @@ def _make_sharded_attention_space_bundle_dense(
             int(packing["token_id"].shape[0]) // token_block_size)
         qk_reads = jnp.stack((q_read, k_read), axis=0)
         qk_writes = jnp.stack((q_write, k_write), axis=0)
+        qk_read_row_norms = jnp.stack(
+            (q_read_row_norm, k_read_row_norm), axis=0)
+        qk_write_row_norms = jnp.stack(
+            (q_write_row_norm, k_write_row_norm), axis=0)
         qk_tau_kernels = jnp.stack(
             (q_tau_kernel, k_tau_kernel), axis=0)
         qk_tau_biases = jnp.stack(
@@ -4430,9 +4628,17 @@ def _make_sharded_attention_space_bundle_dense(
                     qk_reads, space_start, bundle_size, axis=1)
                 block_qk_write = jax.lax.dynamic_slice_in_dim(
                     qk_writes, space_start, bundle_size, axis=1)
+                block_qk_read_row_norm = jax.lax.dynamic_slice_in_dim(
+                    qk_read_row_norms,
+                    space_start, bundle_size, axis=1)
+                block_qk_write_row_norm = jax.lax.dynamic_slice_in_dim(
+                    qk_write_row_norms,
+                    space_start, bundle_size, axis=1)
                 qk_raw_out, qk_gate_mass = _dense_rw_output_sharded(
                     local, local_norm, token_space_valid,
                     block_qk_read, block_qk_write, qk_raw_tau,
+                    read_row_norm=block_qk_read_row_norm,
+                    write_row_norm=block_qk_write_row_norm,
                     max_chunk_size=max_chunk_size_qk,
                     soft_gate_temperature=qk_temperature,
                     soft_gate_boundary_power=boundary_power,
@@ -4452,10 +4658,18 @@ def _make_sharded_attention_space_bundle_dense(
                     v_read, space_start, bundle_size, axis=0)
                 block_v_write = jax.lax.dynamic_slice_in_dim(
                     v_write, space_start, bundle_size, axis=0)
+                block_v_read_row_norm = jax.lax.dynamic_slice_in_dim(
+                    v_read_row_norm,
+                    space_start, bundle_size, axis=0)
+                block_v_write_row_norm = jax.lax.dynamic_slice_in_dim(
+                    v_write_row_norm,
+                    space_start, bundle_size, axis=0)
                 v_raw_out, v_gate_mass = _dense_rw_output_sharded(
                     local, local_norm, token_space_valid,
                     block_v_read[None, ...], block_v_write[None, ...],
                     v_raw_tau[None, ...],
+                    read_row_norm=block_v_read_row_norm[None, ...],
+                    write_row_norm=block_v_write_row_norm[None, ...],
                     max_chunk_size=max_chunk_size_v,
                     soft_gate_temperature=v_temperature,
                     soft_gate_boundary_power=boundary_power,
@@ -4741,6 +4955,7 @@ def _make_sharded_attention_space_bundle_dense(
             global_state,
             state_params,
             operator_params,
+            operator_row_norms,
             controls,
             packed_metadata,
             primary_weight,
@@ -4753,6 +4968,12 @@ def _make_sharded_attention_space_bundle_dense(
          v_tau_kernel, v_tau_bias) = state_params
         (q_read, q_write, k_read, k_write,
          v_read, v_write) = operator_params
+        (q_read_row_norm,
+         q_write_row_norm,
+         k_read_row_norm,
+         k_write_row_norm,
+         v_read_row_norm,
+         v_write_row_norm) = operator_row_norms
         token_count = int(global_state.shape[0])
         n_spaces = int(space_read_proj.shape[0])
         task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
@@ -4765,6 +4986,10 @@ def _make_sharded_attention_space_bundle_dense(
             (q_tau_bias, k_tau_bias), axis=0)
         qk_reads = jnp.stack((q_read, k_read), axis=0)
         qk_writes = jnp.stack((q_write, k_write), axis=0)
+        qk_read_row_norms = jnp.stack(
+            (q_read_row_norm, k_read_row_norm), axis=0)
+        qk_write_row_norms = jnp.stack(
+            (q_write_row_norm, k_write_row_norm), axis=0)
         local_output_cotangent = (
             _psum_dense_rw_representation_sharded(
                 grouped_output_cotangent,
@@ -4797,6 +5022,12 @@ def _make_sharded_attention_space_bundle_dense(
                     qk_writes,
                     v_read,
                     v_write,
+                ),
+                (
+                    qk_read_row_norms,
+                    qk_write_row_norms,
+                    v_read_row_norm,
+                    v_write_row_norm,
                 ),
                 controls,
                 primary_output_cotangent,
@@ -4915,6 +5146,12 @@ def _make_sharded_attention_space_bundle_dense(
                             qk_writes[:, safe_task_space],
                             v_read[safe_task_space],
                             v_write[safe_task_space],
+                        ),
+                        (
+                            qk_read_row_norms[:, safe_task_space],
+                            qk_write_row_norms[:, safe_task_space],
+                            v_read_row_norm[safe_task_space],
+                            v_write_row_norm[safe_task_space],
                         ),
                         controls,
                         task_output_cotangent,
@@ -5151,10 +5388,19 @@ def _make_sharded_attention_space_bundle_dense(
             flat_state, state_params, operator_params, controls, packing)
         selected_weights = jnp.take_along_axis(
             dense_space_weights, selected_ids, axis=1)
+        operator_row_norms = (
+            packing["q_read_row_norm"],
+            packing["q_write_row_norm"],
+            packing["k_read_row_norm"],
+            packing["k_write_row_norm"],
+            packing["v_read_row_norm"],
+            packing["v_write_row_norm"],
+        )
         residual = (
             flat_state,
             state_params,
             operator_params,
+            operator_row_norms,
             controls,
             selected_ids,
             selected_weights,
@@ -5167,6 +5413,7 @@ def _make_sharded_attention_space_bundle_dense(
         (flat_state,
          state_params,
          operator_params,
+         operator_row_norms,
          controls,
          selected_ids,
          selected_weights) = residual
@@ -5215,6 +5462,7 @@ def _make_sharded_attention_space_bundle_dense(
                     flat_state,
                     state_params,
                     operator_params,
+                    operator_row_norms,
                     controls,
                     packed_metadata,
                     packed["primary_routing_weight"],
@@ -5265,6 +5513,9 @@ def _make_sharded_attention_space_bundle_dense(
             k_tau_kernel, k_tau_bias,
             v_tau_kernel, v_tau_bias,
             q_read, q_write, k_read, k_write, v_read, v_write,
+            q_read_row_norm, q_write_row_norm,
+            k_read_row_norm, k_write_row_norm,
+            v_read_row_norm, v_write_row_norm,
             qk_temperature, v_temperature,
             boundary_power, execution_prune_eps,
             qk_scale, v_scale, collect_metrics):
@@ -5275,6 +5526,15 @@ def _make_sharded_attention_space_bundle_dense(
             bundle_size=bundle_size,
             token_block_size=token_block_size,
             stage="attention")
+        packing = {
+            **packing,
+            "q_read_row_norm": q_read_row_norm,
+            "q_write_row_norm": q_write_row_norm,
+            "k_read_row_norm": k_read_row_norm,
+            "k_write_row_norm": k_write_row_norm,
+            "v_read_row_norm": v_read_row_norm,
+            "v_write_row_norm": v_write_row_norm,
+        }
         token_count = int(global_state.shape[0])
         n_spaces = int(space_read_proj.shape[0])
         if n_spaces % bundle_size:
@@ -5282,6 +5542,8 @@ def _make_sharded_attention_space_bundle_dense(
                 "bundle_dense attention space count is not divisible by 4")
         n_bundles = n_spaces // bundle_size
         qk_reads = jnp.stack((q_read, k_read), axis=0)
+        qk_read_row_norms = jnp.stack(
+            (q_read_row_norm, k_read_row_norm), axis=0)
         qk_tau_kernels = jnp.stack(
             (q_tau_kernel, k_tau_kernel), axis=0)
         qk_tau_biases = jnp.stack(
@@ -5325,6 +5587,8 @@ def _make_sharded_attention_space_bundle_dense(
             jax.lax.stop_gradient(v_tau_bias),
             jax.lax.stop_gradient(qk_reads),
             jax.lax.stop_gradient(v_read),
+            jax.lax.stop_gradient(qk_read_row_norms),
+            jax.lax.stop_gradient(v_read_row_norm),
             jax.tree.map(jax.lax.stop_gradient, routing),
             jax.lax.stop_gradient(qk_temperature),
             jax.lax.stop_gradient(v_temperature),
@@ -5341,6 +5605,8 @@ def _make_sharded_attention_space_bundle_dense(
              metric_v_tau_bias,
              metric_qk_reads,
              metric_v_reads,
+             metric_qk_read_row_norms,
+             metric_v_read_row_norm,
              metric_routing,
              metric_qk_temperature,
              metric_v_temperature,
@@ -5391,9 +5657,14 @@ def _make_sharded_attention_space_bundle_dense(
                 qk_read_block = jax.lax.dynamic_slice_in_dim(
                     metric_qk_reads, space_start,
                     bundle_size, axis=1)
+                qk_read_row_norm_block = (
+                    jax.lax.dynamic_slice_in_dim(
+                        metric_qk_read_row_norms,
+                        space_start, bundle_size, axis=1))
                 qk_stats = _dense_rw_metric_stats_sharded(
                     local, local_norm, token_space_valid,
                     qk_read_block, qk_tau,
+                    read_row_norm=qk_read_row_norm_block,
                     max_chunk_size=max_chunk_size_qk,
                     soft_gate_temperature=metric_qk_temperature,
                     soft_gate_boundary_power=metric_boundary_power,
@@ -5417,9 +5688,13 @@ def _make_sharded_attention_space_bundle_dense(
                 v_read_block = jax.lax.dynamic_slice_in_dim(
                     metric_v_reads, space_start,
                     bundle_size, axis=0)
+                v_read_row_norm_block = jax.lax.dynamic_slice_in_dim(
+                    metric_v_read_row_norm,
+                    space_start, bundle_size, axis=0)
                 v_stats = _dense_rw_metric_stats_sharded(
                     local, local_norm, token_space_valid,
                     v_read_block[None, ...], v_tau[None, ...],
+                    read_row_norm=v_read_row_norm_block[None, ...],
                     max_chunk_size=max_chunk_size_v,
                     soft_gate_temperature=metric_v_temperature,
                     soft_gate_boundary_power=metric_boundary_power,
@@ -5464,6 +5739,9 @@ def _make_sharded_attention_space_bundle_dense(
             P(None, "model", None), P(None, "model", None),
             P(None, "model", None), P(None, "model", None),
             P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
             P(), P(), P(), P(), P(), P(),
             P(),
         ),
@@ -5499,6 +5777,8 @@ def _make_sharded_attention_space_bundle_dense(
         "linear_analytic_exact_group")
     kernel._v4174_attention_p_rw_u_generic_fallback = (
         "non_linear_composition_modes")
+    kernel._v4174_operator_bank_row_norm_cache = (
+        "fp32_scalar_row_norm_stop_gradient")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -5761,6 +6041,8 @@ def _make_sharded_rst_space_bundle_dense(
         (space_read_proj, space_write_proj,
          tau_kernel, tau_bias) = state_params
         read_vectors, write_vectors = operator_params
+        read_row_norm = packing["read_row_norm"]
+        write_row_norm = packing["write_row_norm"]
         (temperature, boundary_power,
          execution_prune_eps, route_scale) = controls
         token_count = int(global_state.shape[0])
@@ -5814,10 +6096,16 @@ def _make_sharded_rst_space_bundle_dense(
                     read_vectors, space_start, bundle_size, axis=0)
                 block_write = jax.lax.dynamic_slice_in_dim(
                     write_vectors, space_start, bundle_size, axis=0)
+                block_read_row_norm = jax.lax.dynamic_slice_in_dim(
+                    read_row_norm, space_start, bundle_size, axis=0)
+                block_write_row_norm = jax.lax.dynamic_slice_in_dim(
+                    write_row_norm, space_start, bundle_size, axis=0)
                 raw_out, gate_mass = _dense_rw_output_sharded(
                     local, local_norm, token_space_valid,
                     block_read[None, ...], block_write[None, ...],
                     raw_tau[None, ...],
+                    read_row_norm=block_read_row_norm[None, ...],
+                    write_row_norm=block_write_row_norm[None, ...],
                     max_chunk_size=max_chunk_size,
                     soft_gate_temperature=temperature,
                     soft_gate_boundary_power=boundary_power,
@@ -6023,6 +6311,7 @@ def _make_sharded_rst_space_bundle_dense(
             global_state,
             state_params,
             operator_params,
+            operator_row_norms,
             controls,
             packed_metadata,
             primary_weight,
@@ -6032,6 +6321,7 @@ def _make_sharded_rst_space_bundle_dense(
         (space_read_proj, space_write_proj,
          tau_kernel, tau_bias) = state_params
         read_vectors, write_vectors = operator_params
+        read_row_norm, write_row_norm = operator_row_norms
         token_count = int(global_state.shape[0])
         n_spaces = int(space_read_proj.shape[0])
         task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
@@ -6065,6 +6355,10 @@ def _make_sharded_rst_space_bundle_dense(
                 (
                     read_vectors,
                     write_vectors,
+                ),
+                (
+                    read_row_norm,
+                    write_row_norm,
                 ),
                 controls,
                 primary_output_cotangent,
@@ -6159,6 +6453,10 @@ def _make_sharded_rst_space_bundle_dense(
                         (
                             read_vectors[safe_task_space],
                             write_vectors[safe_task_space],
+                        ),
+                        (
+                            read_row_norm[safe_task_space],
+                            write_row_norm[safe_task_space],
                         ),
                         controls,
                         task_output_cotangent,
@@ -6334,10 +6632,15 @@ def _make_sharded_rst_space_bundle_dense(
             flat_state, state_params, operator_params, controls, packing)
         selected_weights = jnp.take_along_axis(
             dense_space_weights, selected_ids, axis=1)
+        operator_row_norms = (
+            packing["read_row_norm"],
+            packing["write_row_norm"],
+        )
         residual = (
             flat_state,
             state_params,
             operator_params,
+            operator_row_norms,
             controls,
             selected_ids,
             selected_weights,
@@ -6350,6 +6653,7 @@ def _make_sharded_rst_space_bundle_dense(
         (flat_state,
          state_params,
          operator_params,
+         operator_row_norms,
          controls,
          selected_ids,
          selected_weights) = residual
@@ -6398,6 +6702,7 @@ def _make_sharded_rst_space_bundle_dense(
                     flat_state,
                     state_params,
                     operator_params,
+                    operator_row_norms,
                     controls,
                     packed_metadata,
                     packed["primary_routing_weight"],
@@ -6445,6 +6750,7 @@ def _make_sharded_rst_space_bundle_dense(
             space_read_proj, space_write_proj,
             tau_kernel, tau_bias,
             read_vectors, write_vectors,
+            read_row_norm, write_row_norm,
             temperature, boundary_power, execution_prune_eps,
             route_scale, collect_metrics):
         routing = _select_operation_spaces(
@@ -6454,6 +6760,11 @@ def _make_sharded_rst_space_bundle_dense(
             bundle_size=bundle_size,
             token_block_size=token_block_size,
             stage="rst")
+        packing = {
+            **packing,
+            "read_row_norm": read_row_norm,
+            "write_row_norm": write_row_norm,
+        }
         token_count = int(global_state.shape[0])
         n_spaces = int(space_read_proj.shape[0])
         if n_spaces % bundle_size:
@@ -6486,6 +6797,7 @@ def _make_sharded_rst_space_bundle_dense(
             jax.lax.stop_gradient(tau_kernel),
             jax.lax.stop_gradient(tau_bias),
             jax.lax.stop_gradient(read_vectors),
+            jax.lax.stop_gradient(read_row_norm),
             jax.tree.map(jax.lax.stop_gradient, routing),
             jax.lax.stop_gradient(temperature),
             jax.lax.stop_gradient(boundary_power),
@@ -6498,6 +6810,7 @@ def _make_sharded_rst_space_bundle_dense(
              metric_tau_kernel,
              metric_tau_bias,
              metric_reads,
+             metric_read_row_norm,
              metric_routing,
              metric_temperature,
              metric_boundary_power,
@@ -6544,9 +6857,13 @@ def _make_sharded_rst_space_bundle_dense(
                 read_block = jax.lax.dynamic_slice_in_dim(
                     metric_reads, space_start,
                     bundle_size, axis=0)
+                read_row_norm_block = jax.lax.dynamic_slice_in_dim(
+                    metric_read_row_norm,
+                    space_start, bundle_size, axis=0)
                 stats = _dense_rw_metric_stats_sharded(
                     local, local_norm, token_space_valid,
                     read_block[None, ...], raw_tau[None, ...],
+                    read_row_norm=read_row_norm_block[None, ...],
                     max_chunk_size=max_chunk_size,
                     soft_gate_temperature=metric_temperature,
                     soft_gate_boundary_power=metric_boundary_power,
@@ -6586,6 +6903,7 @@ def _make_sharded_rst_space_bundle_dense(
             P("data", None),
             P(), P(), P(), P(), P(), P(),
             P(None, "model", None), P(None, "model", None),
+            P(None, "model", None), P(None, "model", None),
             P(), P(), P(), P(),
             P(),
         ),
@@ -6619,6 +6937,8 @@ def _make_sharded_rst_space_bundle_dense(
         "linear_analytic_exact_group")
     kernel._v4174_rst_p_rw_u_generic_fallback = (
         "non_linear_composition_modes")
+    kernel._v4174_operator_bank_row_norm_cache = (
+        "fp32_scalar_row_norm_stop_gradient")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
