@@ -2821,6 +2821,21 @@ def _closed_interval_clip_vjp_multiplier(
         + jnp.float32(0.5) * boundary.astype(jnp.float32))
 
 
+def _maximum_floor_vjp_multiplier(
+        value: jax.Array,
+        floor: jax.Array | float) -> jax.Array:
+    """Match JAX's half-gradient convention for ``maximum(value, floor)``."""
+    value_f32 = jnp.asarray(value, dtype=jnp.float32)
+    floor_f32 = jnp.asarray(floor, dtype=jnp.float32)
+    return jnp.where(
+        value_f32 > floor_f32,
+        jnp.float32(1.0),
+        jnp.where(
+            value_f32 == floor_f32,
+            jnp.float32(0.5),
+            jnp.float32(0.0)))
+
+
 def _forward_unit_direction_vjp(
         raw_value: jax.Array,
         unit_cotangent: jax.Array) -> jax.Array:
@@ -3234,6 +3249,492 @@ def _psum_dense_rw_representation_sharded(
     collective_dtype = jnp.bfloat16 if collective_bf16 else jnp.float32
     return jax.lax.psum(
         local_output.astype(collective_dtype), "model").astype(jnp.float32)
+
+
+def _composition_den_mass_pullback(
+        global_gate_mass: jax.Array,
+        gate_den_cotangent: jax.Array,
+        admission_den_power: jax.Array,
+        srw_composition_mode: str) -> jax.Array:
+    """Analytic gradient of the live global composition denominator."""
+    floor_mass = jnp.float32(
+        _shared_composition_den_floor_mass(srw_composition_mode))
+    mass_f32 = jnp.asarray(global_gate_mass, dtype=jnp.float32)
+    power_f32 = jnp.asarray(admission_den_power, dtype=jnp.float32)
+    base = jnp.maximum(mass_f32, floor_mass)
+    base_cotangent = (
+        jnp.asarray(gate_den_cotangent, dtype=jnp.float32)
+        * power_f32
+        * jnp.power(base, power_f32 - jnp.float32(1.0)))
+    return (
+        base_cotangent
+        * _maximum_floor_vjp_multiplier(mass_f32, floor_mass))
+
+
+def _attention_exact_space_linear_group_pullback(
+        packed_state: jax.Array,
+        token_valid: jax.Array,
+        routing_weight: jax.Array,
+        state_params: tuple[jax.Array, ...],
+        operator_params: tuple[jax.Array, ...],
+        controls: tuple[jax.Array, ...],
+        block_output_cotangent: jax.Array, *,
+        max_chunk_size_qk: int,
+        max_chunk_size_v: int,
+        den_powers: jax.Array,
+        heat_kernel_beta: float,
+        soft_gate_effective_active_eps: float,
+        throughput_bf16: bool
+) -> tuple[
+        jax.Array,
+        tuple[jax.Array, ...],
+        tuple[jax.Array, ...],
+        tuple[jax.Array, ...],
+        jax.Array]:
+    """Pull back one exact-space Q/K/V group without an outer AD graph."""
+    (space_read_proj,
+     space_write_proj,
+     qk_tau_kernels,
+     qk_tau_biases,
+     v_tau_kernel,
+     v_tau_bias) = state_params
+    qk_reads, qk_writes, v_read, v_write = operator_params
+    (qk_temperature,
+     v_temperature,
+     boundary_power,
+     execution_prune_eps,
+     qk_scale,
+     v_scale) = controls
+    projection_dot = (
+        _throughput_einsum_bf16_f32
+        if throughput_bf16 else _control_einsum_f32)
+
+    local = projection_dot(
+        "mtd,mdr->mtr", packed_state, space_read_proj
+    ).astype(jnp.float32)
+    raw_local_norm = jnp.linalg.norm(
+        local, axis=-1, keepdims=True)
+    local_norm = jnp.maximum(
+        raw_local_norm, jnp.float32(RW_FORWARD_NORM_EPS))
+    qk_raw_tau = (
+        _control_einsum_f32(
+            "mtr,amri->amti", local, qk_tau_kernels)
+        + qk_tau_biases[:, :, None, :])
+    v_raw_tau = _apply_operation_space_tau_map(
+        local, v_tau_kernel, v_tau_bias)
+
+    (qk_raw_out,
+     qk_gate_mass), qk_rw_residual = (
+        _dense_rw_output_sharded_linear_analytic_fwd(
+            local,
+            local_norm,
+            token_valid,
+            qk_reads,
+            qk_writes,
+            qk_raw_tau,
+            max_chunk_size_qk,
+            qk_temperature,
+            boundary_power,
+            execution_prune_eps,
+            heat_kernel_beta,
+            soft_gate_effective_active_eps,
+            throughput_bf16))
+    (v_raw_out,
+     v_gate_mass), v_rw_residual = (
+        _dense_rw_output_sharded_linear_analytic_fwd(
+            local,
+            local_norm,
+            token_valid,
+            v_read[None, ...],
+            v_write[None, ...],
+            v_raw_tau[None, ...],
+            max_chunk_size_v,
+            v_temperature,
+            boundary_power,
+            execution_prune_eps,
+            heat_kernel_beta,
+            soft_gate_effective_active_eps,
+            throughput_bf16))
+    grouped_raw_out = jnp.concatenate(
+        (qk_raw_out, v_raw_out), axis=0)
+    grouped_gate_mass = jnp.concatenate(
+        (qk_gate_mass, v_gate_mass), axis=0)
+    global_gate_mass, grouped_gate_den = (
+        _global_dense_rw_den_sharded(
+            grouped_gate_mass,
+            den_powers,
+            "linear_angular"))
+    local_results = (
+        grouped_raw_out / grouped_gate_den).astype(jnp.float32)
+
+    route_scales = jnp.asarray(
+        (qk_scale, qk_scale, v_scale),
+        dtype=jnp.float32).reshape((3, 1, 1, 1))
+    weight_f32 = jnp.asarray(
+        routing_weight, dtype=jnp.float32)[None, ..., None]
+    weighted_results = local_results * weight_f32 * route_scales
+    valid_output_cotangent = jnp.where(
+        token_valid[None, ..., None],
+        jnp.asarray(block_output_cotangent, dtype=jnp.float32),
+        jnp.float32(0.0))
+    writeback_operand = (
+        space_write_proj.astype(jnp.bfloat16)
+        if throughput_bf16 else space_write_proj)
+    weighted_operand = (
+        weighted_results.astype(jnp.bfloat16)
+        if throughput_bf16 else weighted_results)
+    weighted_results_cotangent = _dense_rw_vjp_dot(
+        "amtd,mrd->amtr",
+        valid_output_cotangent,
+        writeback_operand,
+        throughput_bf16=throughput_bf16)
+    space_write_proj_cotangent = _dense_rw_vjp_dot(
+        "amtr,amtd->mrd",
+        weighted_operand,
+        valid_output_cotangent,
+        throughput_bf16=throughput_bf16)
+
+    local_results_cotangent = (
+        weighted_results_cotangent * weight_f32 * route_scales)
+    routing_weight_cotangent = (
+        weighted_results_cotangent
+        * local_results
+        * route_scales
+    ).sum(axis=(0, 3))
+    route_scale_cotangent = (
+        weighted_results_cotangent
+        * local_results
+        * weight_f32
+    ).sum(axis=(1, 2, 3))
+    qk_scale_cotangent = (
+        route_scale_cotangent[0] + route_scale_cotangent[1])
+    v_scale_cotangent = route_scale_cotangent[2]
+
+    grouped_raw_out_cotangent = (
+        local_results_cotangent / grouped_gate_den)
+    grouped_gate_den_cotangent = -(
+        local_results_cotangent
+        * grouped_raw_out
+        / jnp.square(grouped_gate_den)
+    ).sum(axis=-1, keepdims=True)
+    global_gate_mass_cotangent = _composition_den_mass_pullback(
+        global_gate_mass,
+        grouped_gate_den_cotangent,
+        den_powers,
+        "linear_angular")
+    grouped_gate_mass_cotangent = jax.lax.psum(
+        global_gate_mass_cotangent, "model")
+
+    qk_rw_cotangents = (
+        grouped_raw_out_cotangent[:2],
+        grouped_gate_mass_cotangent[:2])
+    v_rw_cotangents = (
+        grouped_raw_out_cotangent[2:],
+        grouped_gate_mass_cotangent[2:])
+    (qk_local_cotangent,
+     qk_local_norm_cotangent,
+     _,
+     qk_reads_cotangent,
+     qk_writes_cotangent,
+     qk_raw_tau_cotangent,
+     qk_temperature_cotangent,
+     qk_boundary_cotangent,
+     qk_prune_cotangent) = (
+        _dense_rw_output_sharded_linear_analytic_bwd(
+            max_chunk_size_qk,
+            heat_kernel_beta,
+            soft_gate_effective_active_eps,
+            throughput_bf16,
+            qk_rw_residual,
+            qk_rw_cotangents))
+    (v_local_cotangent,
+     v_local_norm_cotangent,
+     _,
+     v_reads_cotangent,
+     v_writes_cotangent,
+     v_raw_tau_cotangent,
+     v_temperature_cotangent,
+     v_boundary_cotangent,
+     v_prune_cotangent) = (
+        _dense_rw_output_sharded_linear_analytic_bwd(
+            max_chunk_size_v,
+            heat_kernel_beta,
+            soft_gate_effective_active_eps,
+            throughput_bf16,
+            v_rw_residual,
+            v_rw_cotangents))
+
+    qk_tau_kernel_cotangent = _control_einsum_f32(
+        "mtr,amti->amri", local, qk_raw_tau_cotangent)
+    qk_tau_bias_cotangent = qk_raw_tau_cotangent.sum(axis=2)
+    qk_tau_local_cotangent = _control_einsum_f32(
+        "amti,amri->mtr",
+        qk_raw_tau_cotangent,
+        qk_tau_kernels)
+    v_raw_tau_cotangent = v_raw_tau_cotangent[0]
+    v_tau_kernel_cotangent = _control_einsum_f32(
+        "mtr,mti->mri", local, v_raw_tau_cotangent)
+    v_tau_bias_cotangent = v_raw_tau_cotangent.sum(axis=1)
+    v_tau_local_cotangent = _control_einsum_f32(
+        "mti,mri->mtr",
+        v_raw_tau_cotangent,
+        v_tau_kernel)
+
+    local_norm_cotangent = (
+        qk_local_norm_cotangent + v_local_norm_cotangent)
+    norm_direction = jnp.where(
+        raw_local_norm > 0.0,
+        local / jnp.maximum(
+            raw_local_norm, jnp.finfo(jnp.float32).tiny),
+        jnp.float32(0.0))
+    local_cotangent = (
+        qk_local_cotangent
+        + v_local_cotangent
+        + qk_tau_local_cotangent
+        + v_tau_local_cotangent
+        + local_norm_cotangent
+        * _maximum_floor_vjp_multiplier(
+            raw_local_norm, RW_FORWARD_NORM_EPS)
+        * norm_direction)
+
+    projection_operand = (
+        space_read_proj.astype(jnp.bfloat16)
+        if throughput_bf16 else space_read_proj)
+    state_operand = (
+        packed_state.astype(jnp.bfloat16)
+        if throughput_bf16 else packed_state)
+    packed_state_cotangent = _dense_rw_vjp_dot(
+        "mtr,mdr->mtd",
+        local_cotangent,
+        projection_operand,
+        throughput_bf16=throughput_bf16)
+    space_read_proj_cotangent = _dense_rw_vjp_dot(
+        "mtd,mtr->mdr",
+        state_operand,
+        local_cotangent,
+        throughput_bf16=throughput_bf16)
+
+    return (
+        packed_state_cotangent,
+        (
+            space_read_proj_cotangent,
+            space_write_proj_cotangent,
+            qk_tau_kernel_cotangent,
+            qk_tau_bias_cotangent,
+            v_tau_kernel_cotangent,
+            v_tau_bias_cotangent,
+        ),
+        (
+            qk_reads_cotangent,
+            qk_writes_cotangent,
+            v_reads_cotangent[0],
+            v_writes_cotangent[0],
+        ),
+        (
+            qk_temperature_cotangent,
+            v_temperature_cotangent,
+            qk_boundary_cotangent + v_boundary_cotangent,
+            qk_prune_cotangent + v_prune_cotangent,
+            qk_scale_cotangent,
+            v_scale_cotangent,
+        ),
+        jnp.where(
+            token_valid,
+            routing_weight_cotangent,
+            jnp.float32(0.0)))
+
+
+def _rst_exact_space_linear_group_pullback(
+        packed_state: jax.Array,
+        token_valid: jax.Array,
+        routing_weight: jax.Array,
+        state_params: tuple[jax.Array, ...],
+        operator_params: tuple[jax.Array, ...],
+        controls: tuple[jax.Array, ...],
+        block_output_cotangent: jax.Array, *,
+        max_chunk_size: int,
+        den_power: jax.Array,
+        heat_kernel_beta: float,
+        soft_gate_effective_active_eps: float,
+        throughput_bf16: bool
+) -> tuple[
+        jax.Array,
+        tuple[jax.Array, ...],
+        tuple[jax.Array, ...],
+        tuple[jax.Array, ...],
+        jax.Array]:
+    """Pull back one exact-space RST group without an outer AD graph."""
+    (space_read_proj,
+     space_write_proj,
+     tau_kernel,
+     tau_bias) = state_params
+    read_vectors, write_vectors = operator_params
+    (temperature,
+     boundary_power,
+     execution_prune_eps,
+     route_scale) = controls
+    projection_dot = (
+        _throughput_einsum_bf16_f32
+        if throughput_bf16 else _control_einsum_f32)
+
+    local = projection_dot(
+        "mtd,mdr->mtr", packed_state, space_read_proj
+    ).astype(jnp.float32)
+    raw_local_norm = jnp.linalg.norm(
+        local, axis=-1, keepdims=True)
+    local_norm = jnp.maximum(
+        raw_local_norm, jnp.float32(RW_FORWARD_NORM_EPS))
+    raw_tau = _apply_operation_space_tau_map(
+        local, tau_kernel, tau_bias)
+    (raw_out,
+     gate_mass), rw_residual = (
+        _dense_rw_output_sharded_linear_analytic_fwd(
+            local,
+            local_norm,
+            token_valid,
+            read_vectors[None, ...],
+            write_vectors[None, ...],
+            raw_tau[None, ...],
+            max_chunk_size,
+            temperature,
+            boundary_power,
+            execution_prune_eps,
+            heat_kernel_beta,
+            soft_gate_effective_active_eps,
+            throughput_bf16))
+    global_gate_mass, gate_den = _global_dense_rw_den_sharded(
+        gate_mass, den_power, "linear_angular")
+    local_results = (raw_out / gate_den).astype(jnp.float32)
+
+    weight_f32 = jnp.asarray(
+        routing_weight, dtype=jnp.float32)[..., None]
+    route_scale_f32 = jnp.asarray(route_scale, dtype=jnp.float32)
+    weighted_results = (
+        local_results[0] * weight_f32 * route_scale_f32)
+    valid_output_cotangent = jnp.where(
+        token_valid[..., None],
+        jnp.asarray(block_output_cotangent, dtype=jnp.float32),
+        jnp.float32(0.0))
+    writeback_operand = (
+        space_write_proj.astype(jnp.bfloat16)
+        if throughput_bf16 else space_write_proj)
+    weighted_operand = (
+        weighted_results.astype(jnp.bfloat16)
+        if throughput_bf16 else weighted_results)
+    weighted_results_cotangent = _dense_rw_vjp_dot(
+        "mtd,mrd->mtr",
+        valid_output_cotangent,
+        writeback_operand,
+        throughput_bf16=throughput_bf16)
+    space_write_proj_cotangent = _dense_rw_vjp_dot(
+        "mtr,mtd->mrd",
+        weighted_operand,
+        valid_output_cotangent,
+        throughput_bf16=throughput_bf16)
+
+    local_results_cotangent = (
+        weighted_results_cotangent * weight_f32 * route_scale_f32)
+    routing_weight_cotangent = (
+        weighted_results_cotangent
+        * local_results[0]
+        * route_scale_f32
+    ).sum(axis=-1)
+    route_scale_cotangent = (
+        weighted_results_cotangent
+        * local_results[0]
+        * weight_f32
+    ).sum()
+
+    raw_out_cotangent = local_results_cotangent[None, ...] / gate_den
+    gate_den_cotangent = -(
+        local_results_cotangent[None, ...]
+        * raw_out
+        / jnp.square(gate_den)
+    ).sum(axis=-1, keepdims=True)
+    global_gate_mass_cotangent = _composition_den_mass_pullback(
+        global_gate_mass,
+        gate_den_cotangent,
+        den_power,
+        "linear_angular")
+    gate_mass_cotangent = jax.lax.psum(
+        global_gate_mass_cotangent, "model")
+
+    (local_cotangent,
+     local_norm_cotangent,
+     _,
+     reads_cotangent,
+     writes_cotangent,
+     raw_tau_cotangent,
+     temperature_cotangent,
+     boundary_cotangent,
+     prune_cotangent) = (
+        _dense_rw_output_sharded_linear_analytic_bwd(
+            max_chunk_size,
+            heat_kernel_beta,
+            soft_gate_effective_active_eps,
+            throughput_bf16,
+            rw_residual,
+            (raw_out_cotangent, gate_mass_cotangent)))
+
+    raw_tau_cotangent = raw_tau_cotangent[0]
+    tau_kernel_cotangent = _control_einsum_f32(
+        "mtr,mti->mri", local, raw_tau_cotangent)
+    tau_bias_cotangent = raw_tau_cotangent.sum(axis=1)
+    tau_local_cotangent = _control_einsum_f32(
+        "mti,mri->mtr", raw_tau_cotangent, tau_kernel)
+
+    norm_direction = jnp.where(
+        raw_local_norm > 0.0,
+        local / jnp.maximum(
+            raw_local_norm, jnp.finfo(jnp.float32).tiny),
+        jnp.float32(0.0))
+    local_cotangent = (
+        local_cotangent
+        + tau_local_cotangent
+        + local_norm_cotangent
+        * _maximum_floor_vjp_multiplier(
+            raw_local_norm, RW_FORWARD_NORM_EPS)
+        * norm_direction)
+
+    projection_operand = (
+        space_read_proj.astype(jnp.bfloat16)
+        if throughput_bf16 else space_read_proj)
+    state_operand = (
+        packed_state.astype(jnp.bfloat16)
+        if throughput_bf16 else packed_state)
+    packed_state_cotangent = _dense_rw_vjp_dot(
+        "mtr,mdr->mtd",
+        local_cotangent,
+        projection_operand,
+        throughput_bf16=throughput_bf16)
+    space_read_proj_cotangent = _dense_rw_vjp_dot(
+        "mtd,mtr->mdr",
+        state_operand,
+        local_cotangent,
+        throughput_bf16=throughput_bf16)
+
+    return (
+        packed_state_cotangent,
+        (
+            space_read_proj_cotangent,
+            space_write_proj_cotangent,
+            tau_kernel_cotangent,
+            tau_bias_cotangent,
+        ),
+        (
+            reads_cotangent[0],
+            writes_cotangent[0],
+        ),
+        (
+            temperature_cotangent,
+            boundary_cotangent,
+            prune_cotangent,
+            route_scale_cotangent,
+        ),
+        jnp.where(
+            token_valid,
+            routing_weight_cotangent,
+            jnp.float32(0.0)))
 
 
 def _dense_rw_metric_stats_sharded(
@@ -4236,6 +4737,395 @@ def _make_sharded_attention_space_bundle_dense(
         return _psum_dense_rw_representation_sharded(
             local_grouped_output, output_collective_bf16)
 
+    def exact_space_linear_analytic_pullback(
+            global_state,
+            state_params,
+            operator_params,
+            controls,
+            packed_metadata,
+            primary_weight,
+            overflow_weight,
+            grouped_output_cotangent):
+        """Pull back exact Q/K/V P-RW-U groups with explicit outer algebra."""
+        (space_read_proj, space_write_proj,
+         q_tau_kernel, q_tau_bias,
+         k_tau_kernel, k_tau_bias,
+         v_tau_kernel, v_tau_bias) = state_params
+        (q_read, q_write, k_read, k_write,
+         v_read, v_write) = operator_params
+        token_count = int(global_state.shape[0])
+        n_spaces = int(space_read_proj.shape[0])
+        task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
+        task_capacity = int(
+            packed_metadata["overflow_task_space_id"].shape[0])
+        task_groups = task_capacity // task_group_size
+        qk_tau_kernels = jnp.stack(
+            (q_tau_kernel, k_tau_kernel), axis=0)
+        qk_tau_biases = jnp.stack(
+            (q_tau_bias, k_tau_bias), axis=0)
+        qk_reads = jnp.stack((q_read, k_read), axis=0)
+        qk_writes = jnp.stack((q_write, k_write), axis=0)
+        local_output_cotangent = (
+            _psum_dense_rw_representation_sharded(
+                grouped_output_cotangent,
+                output_collective_bf16))
+
+        primary_token = packed_metadata["primary_token_id"]
+        primary_valid = packed_metadata["primary_token_valid"]
+        primary_state = global_state[primary_token]
+        primary_output_cotangent = jnp.take(
+            local_output_cotangent, primary_token, axis=1)
+        (primary_state_cotangent,
+         primary_state_params_cotangent,
+         primary_operator_params_cotangent,
+         primary_controls_cotangent,
+         primary_weight_cotangent) = (
+            _attention_exact_space_linear_group_pullback(
+                primary_state,
+                primary_valid,
+                primary_weight,
+                (
+                    space_read_proj,
+                    space_write_proj,
+                    qk_tau_kernels,
+                    qk_tau_biases,
+                    v_tau_kernel,
+                    v_tau_bias,
+                ),
+                (
+                    qk_reads,
+                    qk_writes,
+                    v_read,
+                    v_write,
+                ),
+                controls,
+                primary_output_cotangent,
+                max_chunk_size_qk=max_chunk_size_qk,
+                max_chunk_size_v=max_chunk_size_v,
+                den_powers=den_powers,
+                heat_kernel_beta=heat_kernel_beta,
+                soft_gate_effective_active_eps=(
+                    soft_gate_effective_active_eps),
+                throughput_bf16=throughput_bf16))
+        primary_state_cotangent = jnp.where(
+            primary_valid[..., None],
+            primary_state_cotangent,
+            jnp.float32(0.0))
+        global_state_cotangent = jnp.zeros_like(
+            global_state, dtype=jnp.float32
+        ).at[primary_token].add(primary_state_cotangent)
+        (space_read_proj_cotangent,
+         space_write_proj_cotangent,
+         qk_tau_kernels_cotangent,
+         qk_tau_biases_cotangent,
+         v_tau_kernel_cotangent,
+         v_tau_bias_cotangent) = primary_state_params_cotangent
+        (qk_reads_cotangent,
+         qk_writes_cotangent,
+         v_read_cotangent,
+         v_write_cotangent) = primary_operator_params_cotangent
+        (qk_temperature_cotangent,
+         v_temperature_cotangent,
+         boundary_power_cotangent,
+         execution_prune_eps_cotangent,
+         qk_scale_cotangent,
+         v_scale_cotangent) = primary_controls_cotangent
+        overflow_weight_cotangent = jnp.zeros_like(
+            overflow_weight, dtype=jnp.float32)
+
+        initial_carry = (
+            global_state_cotangent,
+            space_read_proj_cotangent,
+            space_write_proj_cotangent,
+            qk_tau_kernels_cotangent,
+            qk_tau_biases_cotangent,
+            v_tau_kernel_cotangent,
+            v_tau_bias_cotangent,
+            qk_reads_cotangent,
+            qk_writes_cotangent,
+            v_read_cotangent,
+            v_write_cotangent,
+            qk_temperature_cotangent,
+            v_temperature_cotangent,
+            boundary_power_cotangent,
+            execution_prune_eps_cotangent,
+            qk_scale_cotangent,
+            v_scale_cotangent,
+            overflow_weight_cotangent,
+        )
+
+        def task_group_step(carry_value, group_index):
+            task_start = group_index * task_group_size
+            task_space = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_space_id"],
+                task_start, task_group_size, axis=0)
+            task_token = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_id"],
+                task_start, task_group_size, axis=0)
+            task_valid = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_valid"],
+                task_start, task_group_size, axis=0)
+            task_weight = jax.lax.dynamic_slice_in_dim(
+                overflow_weight,
+                task_start, task_group_size, axis=0)
+            safe_task_space = jnp.minimum(
+                task_space, jnp.int32(n_spaces - 1))
+
+            def execute_group(accumulator):
+                (global_state_ct,
+                 space_read_proj_ct,
+                 space_write_proj_ct,
+                 qk_tau_kernels_ct,
+                 qk_tau_biases_ct,
+                 v_tau_kernel_ct,
+                 v_tau_bias_ct,
+                 qk_reads_ct,
+                 qk_writes_ct,
+                 v_read_ct,
+                 v_write_ct,
+                 qk_temperature_ct,
+                 v_temperature_ct,
+                 boundary_power_ct,
+                 execution_prune_eps_ct,
+                 qk_scale_ct,
+                 v_scale_ct,
+                 overflow_weight_ct) = accumulator
+                task_state = global_state[task_token]
+                task_output_cotangent = jnp.take(
+                    local_output_cotangent, task_token, axis=1)
+                (task_state_cotangent,
+                 task_state_params_cotangent,
+                 task_operator_params_cotangent,
+                 task_controls_cotangent,
+                 task_weight_cotangent) = (
+                    _attention_exact_space_linear_group_pullback(
+                        task_state,
+                        task_valid,
+                        task_weight,
+                        (
+                            space_read_proj[safe_task_space],
+                            space_write_proj[safe_task_space],
+                            qk_tau_kernels[:, safe_task_space],
+                            qk_tau_biases[:, safe_task_space],
+                            v_tau_kernel[safe_task_space],
+                            v_tau_bias[safe_task_space],
+                        ),
+                        (
+                            qk_reads[:, safe_task_space],
+                            qk_writes[:, safe_task_space],
+                            v_read[safe_task_space],
+                            v_write[safe_task_space],
+                        ),
+                        controls,
+                        task_output_cotangent,
+                        max_chunk_size_qk=max_chunk_size_qk,
+                        max_chunk_size_v=max_chunk_size_v,
+                        den_powers=den_powers,
+                        heat_kernel_beta=heat_kernel_beta,
+                        soft_gate_effective_active_eps=(
+                            soft_gate_effective_active_eps),
+                        throughput_bf16=throughput_bf16))
+                (task_space_read_proj_ct,
+                 task_space_write_proj_ct,
+                 task_qk_tau_kernels_ct,
+                 task_qk_tau_biases_ct,
+                 task_v_tau_kernel_ct,
+                 task_v_tau_bias_ct) = (
+                    task_state_params_cotangent)
+                (task_qk_reads_ct,
+                 task_qk_writes_ct,
+                 task_v_read_ct,
+                 task_v_write_ct) = task_operator_params_cotangent
+                (task_qk_temperature_ct,
+                 task_v_temperature_ct,
+                 task_boundary_power_ct,
+                 task_execution_prune_eps_ct,
+                 task_qk_scale_ct,
+                 task_v_scale_ct) = task_controls_cotangent
+                task_active = jnp.any(task_valid, axis=1)
+                task_state_cotangent = jnp.where(
+                    task_valid[..., None],
+                    task_state_cotangent,
+                    jnp.float32(0.0))
+                space_matrix_mask = task_active[:, None, None]
+                qk_space_matrix_mask = task_active[None, :, None, None]
+                qk_space_bias_mask = task_active[None, :, None]
+                task_space_read_proj_ct = jnp.where(
+                    space_matrix_mask,
+                    task_space_read_proj_ct,
+                    jnp.float32(0.0))
+                task_space_write_proj_ct = jnp.where(
+                    space_matrix_mask,
+                    task_space_write_proj_ct,
+                    jnp.float32(0.0))
+                task_qk_tau_kernels_ct = jnp.where(
+                    qk_space_matrix_mask,
+                    task_qk_tau_kernels_ct,
+                    jnp.float32(0.0))
+                task_qk_tau_biases_ct = jnp.where(
+                    qk_space_bias_mask,
+                    task_qk_tau_biases_ct,
+                    jnp.float32(0.0))
+                task_v_tau_kernel_ct = jnp.where(
+                    space_matrix_mask,
+                    task_v_tau_kernel_ct,
+                    jnp.float32(0.0))
+                task_v_tau_bias_ct = jnp.where(
+                    task_active[:, None],
+                    task_v_tau_bias_ct,
+                    jnp.float32(0.0))
+                task_qk_reads_ct = jnp.where(
+                    qk_space_matrix_mask,
+                    task_qk_reads_ct,
+                    jnp.float32(0.0))
+                task_qk_writes_ct = jnp.where(
+                    qk_space_matrix_mask,
+                    task_qk_writes_ct,
+                    jnp.float32(0.0))
+                task_v_read_ct = jnp.where(
+                    space_matrix_mask,
+                    task_v_read_ct,
+                    jnp.float32(0.0))
+                task_v_write_ct = jnp.where(
+                    space_matrix_mask,
+                    task_v_write_ct,
+                    jnp.float32(0.0))
+                task_weight_cotangent = jnp.where(
+                    task_valid,
+                    task_weight_cotangent,
+                    jnp.float32(0.0))
+
+                global_state_ct = global_state_ct.at[
+                    task_token
+                ].add(task_state_cotangent)
+                space_read_proj_ct = space_read_proj_ct.at[
+                    safe_task_space
+                ].add(task_space_read_proj_ct)
+                space_write_proj_ct = space_write_proj_ct.at[
+                    safe_task_space
+                ].add(task_space_write_proj_ct)
+                qk_tau_kernels_ct = qk_tau_kernels_ct.at[
+                    :, safe_task_space
+                ].add(task_qk_tau_kernels_ct)
+                qk_tau_biases_ct = qk_tau_biases_ct.at[
+                    :, safe_task_space
+                ].add(task_qk_tau_biases_ct)
+                v_tau_kernel_ct = v_tau_kernel_ct.at[
+                    safe_task_space
+                ].add(task_v_tau_kernel_ct)
+                v_tau_bias_ct = v_tau_bias_ct.at[
+                    safe_task_space
+                ].add(task_v_tau_bias_ct)
+                qk_reads_ct = qk_reads_ct.at[
+                    :, safe_task_space
+                ].add(task_qk_reads_ct)
+                qk_writes_ct = qk_writes_ct.at[
+                    :, safe_task_space
+                ].add(task_qk_writes_ct)
+                v_read_ct = v_read_ct.at[
+                    safe_task_space
+                ].add(task_v_read_ct)
+                v_write_ct = v_write_ct.at[
+                    safe_task_space
+                ].add(task_v_write_ct)
+                overflow_weight_ct = (
+                    jax.lax.dynamic_update_slice_in_dim(
+                        overflow_weight_ct,
+                        task_weight_cotangent,
+                        task_start,
+                        axis=0))
+                return (
+                    global_state_ct,
+                    space_read_proj_ct,
+                    space_write_proj_ct,
+                    qk_tau_kernels_ct,
+                    qk_tau_biases_ct,
+                    v_tau_kernel_ct,
+                    v_tau_bias_ct,
+                    qk_reads_ct,
+                    qk_writes_ct,
+                    v_read_ct,
+                    v_write_ct,
+                    qk_temperature_ct + task_qk_temperature_ct,
+                    v_temperature_ct + task_v_temperature_ct,
+                    boundary_power_ct + task_boundary_power_ct,
+                    execution_prune_eps_ct
+                    + task_execution_prune_eps_ct,
+                    qk_scale_ct + task_qk_scale_ct,
+                    v_scale_ct + task_v_scale_ct,
+                    overflow_weight_ct,
+                )
+
+            return jax.lax.cond(
+                jnp.any(task_valid),
+                execute_group,
+                lambda accumulator: accumulator,
+                carry_value), None
+
+        def execute_overflow(carry_value):
+            return jax.lax.scan(
+                task_group_step,
+                carry_value,
+                jnp.arange(task_groups))[0]
+
+        final_carry = jax.lax.cond(
+            jnp.any(packed_metadata["overflow_task_token_valid"]),
+            execute_overflow,
+            lambda carry_value: carry_value,
+            initial_carry)
+        (global_state_cotangent,
+         space_read_proj_cotangent,
+         space_write_proj_cotangent,
+         qk_tau_kernels_cotangent,
+         qk_tau_biases_cotangent,
+         v_tau_kernel_cotangent,
+         v_tau_bias_cotangent,
+         qk_reads_cotangent,
+         qk_writes_cotangent,
+         v_read_cotangent,
+         v_write_cotangent,
+         qk_temperature_cotangent,
+         v_temperature_cotangent,
+         boundary_power_cotangent,
+         execution_prune_eps_cotangent,
+         qk_scale_cotangent,
+         v_scale_cotangent,
+         overflow_weight_cotangent) = final_carry
+        state_params_cotangent = (
+            space_read_proj_cotangent,
+            space_write_proj_cotangent,
+            qk_tau_kernels_cotangent[0],
+            qk_tau_biases_cotangent[0],
+            qk_tau_kernels_cotangent[1],
+            qk_tau_biases_cotangent[1],
+            v_tau_kernel_cotangent,
+            v_tau_bias_cotangent,
+        )
+        operator_params_cotangent = (
+            qk_reads_cotangent[0],
+            qk_writes_cotangent[0],
+            qk_reads_cotangent[1],
+            qk_writes_cotangent[1],
+            v_read_cotangent,
+            v_write_cotangent,
+        )
+        controls_cotangent = (
+            qk_temperature_cotangent,
+            v_temperature_cotangent,
+            boundary_power_cotangent,
+            execution_prune_eps_cotangent,
+            qk_scale_cotangent,
+            v_scale_cotangent,
+        )
+        return (
+            global_state_cotangent,
+            state_params_cotangent,
+            operator_params_cotangent,
+            controls_cotangent,
+            primary_weight_cotangent,
+            overflow_weight_cotangent,
+        )
+
     @jax.custom_vjp
     def execute_with_exact_space_backward(
             flat_state,
@@ -4314,20 +5204,38 @@ def _make_sharded_attention_space_bundle_dense(
                 exact_primary_weight,
                 exact_overflow_weight)
 
-        _, pullback = jax.vjp(
-            exact_primal,
-            flat_state,
-            state_params,
-            operator_params,
-            controls,
-            packed["primary_routing_weight"],
-            packed["overflow_task_routing_weight"])
-        (flat_state_grad,
-         state_params_grad,
-         operator_params_grad,
-         controls_grad,
-         primary_weight_grad,
-         overflow_weight_grad) = pullback(grouped_output_cotangent)
+        if composition_mode == "linear_angular":
+            (flat_state_grad,
+             state_params_grad,
+             operator_params_grad,
+             controls_grad,
+             primary_weight_grad,
+             overflow_weight_grad) = (
+                exact_space_linear_analytic_pullback(
+                    flat_state,
+                    state_params,
+                    operator_params,
+                    controls,
+                    packed_metadata,
+                    packed["primary_routing_weight"],
+                    packed["overflow_task_routing_weight"],
+                    grouped_output_cotangent))
+        else:
+            _, pullback = jax.vjp(
+                exact_primal,
+                flat_state,
+                state_params,
+                operator_params,
+                controls,
+                packed["primary_routing_weight"],
+                packed["overflow_task_routing_weight"])
+            (flat_state_grad,
+             state_params_grad,
+             operator_params_grad,
+             controls_grad,
+             primary_weight_grad,
+             overflow_weight_grad) = pullback(
+                 grouped_output_cotangent)
         dense_space_weights_grad = (
             _exact_space_bucket_weight_cotangents_to_dense(
                 packed,
@@ -4587,6 +5495,10 @@ def _make_sharded_attention_space_bundle_dense(
     kernel._v4174_backward_packed_entry_capacity = (
         "n_spaces*min(T,3072) + compact exact overflow tasks")
     kernel._v4174_qkv_shared_projection_vjp = True
+    kernel._v4174_attention_p_rw_u_pullback = (
+        "linear_analytic_exact_group")
+    kernel._v4174_attention_p_rw_u_generic_fallback = (
+        "non_linear_composition_modes")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
@@ -5107,6 +6019,296 @@ def _make_sharded_rst_space_bundle_dense(
         return _psum_dense_rw_representation_sharded(
             local_update, output_collective_bf16)
 
+    def exact_space_linear_analytic_pullback(
+            global_state,
+            state_params,
+            operator_params,
+            controls,
+            packed_metadata,
+            primary_weight,
+            overflow_weight,
+            output_cotangent):
+        """Pull back exact RST P-RW-U groups with explicit outer algebra."""
+        (space_read_proj, space_write_proj,
+         tau_kernel, tau_bias) = state_params
+        read_vectors, write_vectors = operator_params
+        token_count = int(global_state.shape[0])
+        n_spaces = int(space_read_proj.shape[0])
+        task_group_size = _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE
+        task_capacity = int(
+            packed_metadata["overflow_task_space_id"].shape[0])
+        task_groups = task_capacity // task_group_size
+        local_output_cotangent = (
+            _psum_dense_rw_representation_sharded(
+                output_cotangent,
+                output_collective_bf16))
+
+        primary_token = packed_metadata["primary_token_id"]
+        primary_valid = packed_metadata["primary_token_valid"]
+        primary_state = global_state[primary_token]
+        primary_output_cotangent = local_output_cotangent[primary_token]
+        (primary_state_cotangent,
+         primary_state_params_cotangent,
+         primary_operator_params_cotangent,
+         primary_controls_cotangent,
+         primary_weight_cotangent) = (
+            _rst_exact_space_linear_group_pullback(
+                primary_state,
+                primary_valid,
+                primary_weight,
+                (
+                    space_read_proj,
+                    space_write_proj,
+                    tau_kernel,
+                    tau_bias,
+                ),
+                (
+                    read_vectors,
+                    write_vectors,
+                ),
+                controls,
+                primary_output_cotangent,
+                max_chunk_size=max_chunk_size,
+                den_power=den_power,
+                heat_kernel_beta=heat_kernel_beta,
+                soft_gate_effective_active_eps=(
+                    soft_gate_effective_active_eps),
+                throughput_bf16=throughput_bf16))
+        primary_state_cotangent = jnp.where(
+            primary_valid[..., None],
+            primary_state_cotangent,
+            jnp.float32(0.0))
+        global_state_cotangent = jnp.zeros_like(
+            global_state, dtype=jnp.float32
+        ).at[primary_token].add(primary_state_cotangent)
+        (space_read_proj_cotangent,
+         space_write_proj_cotangent,
+         tau_kernel_cotangent,
+         tau_bias_cotangent) = primary_state_params_cotangent
+        (read_vectors_cotangent,
+         write_vectors_cotangent) = primary_operator_params_cotangent
+        (temperature_cotangent,
+         boundary_power_cotangent,
+         execution_prune_eps_cotangent,
+         route_scale_cotangent) = primary_controls_cotangent
+        overflow_weight_cotangent = jnp.zeros_like(
+            overflow_weight, dtype=jnp.float32)
+
+        initial_carry = (
+            global_state_cotangent,
+            space_read_proj_cotangent,
+            space_write_proj_cotangent,
+            tau_kernel_cotangent,
+            tau_bias_cotangent,
+            read_vectors_cotangent,
+            write_vectors_cotangent,
+            temperature_cotangent,
+            boundary_power_cotangent,
+            execution_prune_eps_cotangent,
+            route_scale_cotangent,
+            overflow_weight_cotangent,
+        )
+
+        def task_group_step(carry_value, group_index):
+            task_start = group_index * task_group_size
+            task_space = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_space_id"],
+                task_start, task_group_size, axis=0)
+            task_token = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_id"],
+                task_start, task_group_size, axis=0)
+            task_valid = jax.lax.dynamic_slice_in_dim(
+                packed_metadata["overflow_task_token_valid"],
+                task_start, task_group_size, axis=0)
+            task_weight = jax.lax.dynamic_slice_in_dim(
+                overflow_weight,
+                task_start, task_group_size, axis=0)
+            safe_task_space = jnp.minimum(
+                task_space, jnp.int32(n_spaces - 1))
+
+            def execute_group(accumulator):
+                (global_state_ct,
+                 space_read_proj_ct,
+                 space_write_proj_ct,
+                 tau_kernel_ct,
+                 tau_bias_ct,
+                 read_vectors_ct,
+                 write_vectors_ct,
+                 temperature_ct,
+                 boundary_power_ct,
+                 execution_prune_eps_ct,
+                 route_scale_ct,
+                 overflow_weight_ct) = accumulator
+                task_state = global_state[task_token]
+                task_output_cotangent = local_output_cotangent[task_token]
+                (task_state_cotangent,
+                 task_state_params_cotangent,
+                 task_operator_params_cotangent,
+                 task_controls_cotangent,
+                 task_weight_cotangent) = (
+                    _rst_exact_space_linear_group_pullback(
+                        task_state,
+                        task_valid,
+                        task_weight,
+                        (
+                            space_read_proj[safe_task_space],
+                            space_write_proj[safe_task_space],
+                            tau_kernel[safe_task_space],
+                            tau_bias[safe_task_space],
+                        ),
+                        (
+                            read_vectors[safe_task_space],
+                            write_vectors[safe_task_space],
+                        ),
+                        controls,
+                        task_output_cotangent,
+                        max_chunk_size=max_chunk_size,
+                        den_power=den_power,
+                        heat_kernel_beta=heat_kernel_beta,
+                        soft_gate_effective_active_eps=(
+                            soft_gate_effective_active_eps),
+                        throughput_bf16=throughput_bf16))
+                (task_space_read_proj_ct,
+                 task_space_write_proj_ct,
+                 task_tau_kernel_ct,
+                 task_tau_bias_ct) = task_state_params_cotangent
+                (task_read_vectors_ct,
+                 task_write_vectors_ct) = task_operator_params_cotangent
+                (task_temperature_ct,
+                 task_boundary_power_ct,
+                 task_execution_prune_eps_ct,
+                 task_route_scale_ct) = task_controls_cotangent
+                task_active = jnp.any(task_valid, axis=1)
+                task_state_cotangent = jnp.where(
+                    task_valid[..., None],
+                    task_state_cotangent,
+                    jnp.float32(0.0))
+                task_space_read_proj_ct = jnp.where(
+                    task_active[:, None, None],
+                    task_space_read_proj_ct,
+                    jnp.float32(0.0))
+                task_space_write_proj_ct = jnp.where(
+                    task_active[:, None, None],
+                    task_space_write_proj_ct,
+                    jnp.float32(0.0))
+                task_tau_kernel_ct = jnp.where(
+                    task_active[:, None, None],
+                    task_tau_kernel_ct,
+                    jnp.float32(0.0))
+                task_tau_bias_ct = jnp.where(
+                    task_active[:, None],
+                    task_tau_bias_ct,
+                    jnp.float32(0.0))
+                task_read_vectors_ct = jnp.where(
+                    task_active[:, None, None],
+                    task_read_vectors_ct,
+                    jnp.float32(0.0))
+                task_write_vectors_ct = jnp.where(
+                    task_active[:, None, None],
+                    task_write_vectors_ct,
+                    jnp.float32(0.0))
+                task_weight_cotangent = jnp.where(
+                    task_valid,
+                    task_weight_cotangent,
+                    jnp.float32(0.0))
+
+                global_state_ct = global_state_ct.at[
+                    task_token
+                ].add(task_state_cotangent)
+                space_read_proj_ct = space_read_proj_ct.at[
+                    safe_task_space
+                ].add(task_space_read_proj_ct)
+                space_write_proj_ct = space_write_proj_ct.at[
+                    safe_task_space
+                ].add(task_space_write_proj_ct)
+                tau_kernel_ct = tau_kernel_ct.at[
+                    safe_task_space
+                ].add(task_tau_kernel_ct)
+                tau_bias_ct = tau_bias_ct.at[
+                    safe_task_space
+                ].add(task_tau_bias_ct)
+                read_vectors_ct = read_vectors_ct.at[
+                    safe_task_space
+                ].add(task_read_vectors_ct)
+                write_vectors_ct = write_vectors_ct.at[
+                    safe_task_space
+                ].add(task_write_vectors_ct)
+                overflow_weight_ct = (
+                    jax.lax.dynamic_update_slice_in_dim(
+                        overflow_weight_ct,
+                        task_weight_cotangent,
+                        task_start,
+                        axis=0))
+                return (
+                    global_state_ct,
+                    space_read_proj_ct,
+                    space_write_proj_ct,
+                    tau_kernel_ct,
+                    tau_bias_ct,
+                    read_vectors_ct,
+                    write_vectors_ct,
+                    temperature_ct + task_temperature_ct,
+                    boundary_power_ct + task_boundary_power_ct,
+                    execution_prune_eps_ct
+                    + task_execution_prune_eps_ct,
+                    route_scale_ct + task_route_scale_ct,
+                    overflow_weight_ct,
+                )
+
+            return jax.lax.cond(
+                jnp.any(task_valid),
+                execute_group,
+                lambda accumulator: accumulator,
+                carry_value), None
+
+        def execute_overflow(carry_value):
+            return jax.lax.scan(
+                task_group_step,
+                carry_value,
+                jnp.arange(task_groups))[0]
+
+        final_carry = jax.lax.cond(
+            jnp.any(packed_metadata["overflow_task_token_valid"]),
+            execute_overflow,
+            lambda carry_value: carry_value,
+            initial_carry)
+        (global_state_cotangent,
+         space_read_proj_cotangent,
+         space_write_proj_cotangent,
+         tau_kernel_cotangent,
+         tau_bias_cotangent,
+         read_vectors_cotangent,
+         write_vectors_cotangent,
+         temperature_cotangent,
+         boundary_power_cotangent,
+         execution_prune_eps_cotangent,
+         route_scale_cotangent,
+         overflow_weight_cotangent) = final_carry
+        state_params_cotangent = (
+            space_read_proj_cotangent,
+            space_write_proj_cotangent,
+            tau_kernel_cotangent,
+            tau_bias_cotangent,
+        )
+        operator_params_cotangent = (
+            read_vectors_cotangent,
+            write_vectors_cotangent,
+        )
+        controls_cotangent = (
+            temperature_cotangent,
+            boundary_power_cotangent,
+            execution_prune_eps_cotangent,
+            route_scale_cotangent,
+        )
+        return (
+            global_state_cotangent,
+            state_params_cotangent,
+            operator_params_cotangent,
+            controls_cotangent,
+            primary_weight_cotangent,
+            overflow_weight_cotangent,
+        )
+
     @jax.custom_vjp
     def execute_with_exact_space_backward(
             flat_state,
@@ -5185,20 +6387,37 @@ def _make_sharded_rst_space_bundle_dense(
                 exact_primary_weight,
                 exact_overflow_weight)
 
-        _, pullback = jax.vjp(
-            exact_primal,
-            flat_state,
-            state_params,
-            operator_params,
-            controls,
-            packed["primary_routing_weight"],
-            packed["overflow_task_routing_weight"])
-        (flat_state_grad,
-         state_params_grad,
-         operator_params_grad,
-         controls_grad,
-         primary_weight_grad,
-         overflow_weight_grad) = pullback(update_cotangent)
+        if composition_mode == "linear_angular":
+            (flat_state_grad,
+             state_params_grad,
+             operator_params_grad,
+             controls_grad,
+             primary_weight_grad,
+             overflow_weight_grad) = (
+                exact_space_linear_analytic_pullback(
+                    flat_state,
+                    state_params,
+                    operator_params,
+                    controls,
+                    packed_metadata,
+                    packed["primary_routing_weight"],
+                    packed["overflow_task_routing_weight"],
+                    update_cotangent))
+        else:
+            _, pullback = jax.vjp(
+                exact_primal,
+                flat_state,
+                state_params,
+                operator_params,
+                controls,
+                packed["primary_routing_weight"],
+                packed["overflow_task_routing_weight"])
+            (flat_state_grad,
+             state_params_grad,
+             operator_params_grad,
+             controls_grad,
+             primary_weight_grad,
+             overflow_weight_grad) = pullback(update_cotangent)
         dense_space_weights_grad = (
             _exact_space_bucket_weight_cotangents_to_dense(
                 packed,
@@ -5396,6 +6615,10 @@ def _make_sharded_rst_space_bundle_dense(
         _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
     kernel._v4174_backward_packed_entry_capacity = (
         "n_spaces*min(T,3072) + compact exact overflow tasks")
+    kernel._v4174_rst_p_rw_u_pullback = (
+        "linear_analytic_exact_group")
+    kernel._v4174_rst_p_rw_u_generic_fallback = (
+        "non_linear_composition_modes")
     kernel._v4174_throughput_precision = (
         "bf16_operands_f32_accum"
         if throughput_bf16 else "fp32_reference")
