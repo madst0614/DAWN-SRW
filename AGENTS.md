@@ -7,6 +7,14 @@
 - The shared repository is `madst0614/DAWN-SRW`. Record the exact branch, commit, config, checkpoint, mesh, and dirty-worktree state for every material experiment; never rely on a moving branch name alone.
 - Keep every TPU launcher and watcher on tmux session `train` and remote log `~/train.log`. Do not add per-task session/log names or `--session`/`--log` override options. Clear and start `~/train.log` before remote repo/dependency setup, capture setup failures there, and append the tmux task stream with combined stdout/stderr so `tail -f ~/train.log` never shows a stale prior run.
 
+## Canonical POC integration policy
+
+- `codex/v4167-poc` is the canonical integration branch and canonical baseline-source branch for all POC work.
+- A feature, optimization, profiling, or comparison branch is candidate evidence only. A final accepted architecture, parameter/config schema, variable or metric name, runtime/launcher change, optimization, and baseline decision is not canonical or complete until it is synchronized back to `codex/v4167-poc` and pushed.
+- Rejected or inconclusive candidates stay on their experiment branches and are recorded in `EXPERIMENT.md`; do not merge them merely to make every branch an ancestor of POC.
+- Measure every new canonical baseline from a clean exact commit reachable from `origin/codex/v4167-poc`. Preserve the actual branch and commit of historical measurements instead of relabeling old evidence after synchronization.
+- Before starting or reporting a POC/baseline experiment, fetch the remote branches and verify that every accepted decision relevant to the run is present on `origin/codex/v4167-poc`. Record any intentional unmerged comparison snapshot or rejected branch in `EXPERIMENT.md`.
+
 ## TPU access policy
 
 - Use these connection defaults; they are connection settings, not authorization to choose a TPU:

@@ -3,12 +3,27 @@ registry_id: v4174-400m-dense-rw
 updated_kst: "2026-07-26"
 active_generation: g2
 
+canonical_source:
+  branch: codex/v4167-poc
+  audited_commit: ec744a2a095227b4d928cdc058816976d10e98f0
+  baseline_source_branch: codex/v4167-poc
+  experimental_branches_are_candidate_only: true
+  accepted_changes_require_sync_to_canonical_branch: true
+  historical_measurements_keep_actual_branch_and_commit: true
+  current_source_requires_new_generation: true
+  current_source_rebaseline_reason: "Fully independent per-space projection initialization changes the accepted initialization fingerprint."
+
 purpose:
   question: "Can a candidate make the same canonical dense v4174 computation cheaper?"
   default_control: "Reuse the active generation's stored measurements."
   default_measurement: "Run the candidate only."
 
 policy:
+  integration:
+    canonical_branch: codex/v4167-poc
+    canonical_baseline_source_branch: codex/v4167-poc
+    completion_rule: "An accepted candidate becomes canonical only after its final code, schema, optimization, and baseline decision are synchronized to codex/v4167-poc and pushed."
+    historical_identity_rule: "Keep the branch and commit actually measured; do not rewrite historical evidence after synchronization."
   reuse:
     rerun_control_by_default: false
     compare_candidate_to: active_generation
