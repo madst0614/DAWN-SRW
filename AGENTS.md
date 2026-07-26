@@ -11,7 +11,8 @@
 
 - `codex/v4167-poc` is the canonical integration branch and canonical baseline-source branch for all POC work.
 - A feature, optimization, profiling, or comparison branch is candidate evidence only. A final accepted architecture, parameter/config schema, variable or metric name, runtime/launcher change, optimization, and baseline decision is not canonical or complete until it is synchronized back to `codex/v4167-poc` and pushed.
-- Rejected or inconclusive candidates stay on their experiment branches and are recorded in `EXPERIMENT.md`; do not merge them merely to make every branch an ancestor of POC.
+- Experiments may run on candidate branches, but final reporting is centralized on `codex/v4167-poc`: after every material attempt, synchronize the resulting `EXPERIMENT.md` entry and current-state decision to POC as a reporting-only commit and push it, whether the candidate was accepted, rejected, blocked, or inconclusive.
+- Rejected or inconclusive candidate source stays on its experiment branch; synchronize its report to POC without merging the candidate code merely to make every branch an ancestor of POC.
 - Measure every new canonical baseline from a clean exact commit reachable from `origin/codex/v4167-poc`. Preserve the actual branch and commit of historical measurements instead of relabeling old evidence after synchronization.
 - Before starting or reporting a POC/baseline experiment, fetch the remote branches and verify that every accepted decision relevant to the run is present on `origin/codex/v4167-poc`. Record any intentional unmerged comparison snapshot or rejected branch in `EXPERIMENT.md`.
 
@@ -41,5 +42,5 @@
 - Update `Current State` only when the accepted conclusion, current blocker, or next experiment changes. Preserve old entries; record corrections in a later entry instead of rewriting history.
 - Separate TPU measurements, local validation, user-provided context, and inference. Never report an unrun validation as successful, and write `not measured` when evidence is absent.
 - Record the hypothesis, change, exact run identity, result, lesson, decision, next step, and stable evidence location. Keep raw logs out of Git; preserve them remotely and link their paths.
-- Commit the notebook with the related code or config change. For runtime-only results, use a notebook-only commit. An experiment is not complete until its notebook entry is committed and pushed to GitHub.
+- Candidate code/config may be committed on its experiment branch. Commit its final notebook report separately on `codex/v4167-poc`; for runtime-only or rejected/inconclusive results, use a POC reporting-only commit. An experiment is not complete until the centralized POC notebook entry is committed and pushed to GitHub.
 - Never stage or commit unrelated dirty-worktree changes while publishing an experiment record.
