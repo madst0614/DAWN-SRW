@@ -1,0 +1,124 @@
+# DAWN-SRW v4.1.7.5 40M shared-atlas route-selector POC.
+#
+# Parameter comparison:
+#   Transformer baseline D=432: 40,343,616
+#   This v4175 configuration:   40,344,160
+#   Difference:                       +544 (+0.00135%)
+#
+# Semantic contract:
+#   - M operation spaces own one shared atlas of read/write coordinates.
+#   - Q, K, V, and RST independently select spaces from that atlas.
+#   - The first implementation evaluates all spaces densely; execution
+#     optimization is intentionally deferred.
+#
+# Active targets at initialization:
+#   Q   ~= 200 operators/token
+#   K   ~= 200 operators/token
+#   V   ~= 600 operators/token
+#   RST ~= 1,200 operators/token
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: spatial-r1-v4.1.7.5
+
+  vocab_size: 30522
+  d_model: 432
+  d_route: 128
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+
+  dropout: 0.0
+  gradient_checkpointing: true
+
+  # One shared coordinate atlas, independently selected by Q/K/V/RST.
+  n_operation_spaces: 8
+  operation_space_top_k: 2
+
+  # Reference execution: semantic top-2 selection with dense evaluation of
+  # all eight spaces before each route's routing-weighted writeback.
+  operation_space_execution_mode: dense_all_space
+
+  # Parameter-matched operator banks after adding three extra selectors.
+  #
+  # Per operation space:
+  #   Q   =   554
+  #   K   =   554
+  #   V   = 3,449
+  #   RST = 6,948
+  #
+  # Top-2 visible operators:
+  #   Q   = 1,108
+  #   K   = 1,108
+  #   V   = 6,898
+  #   RST = 13,896
+  n_q: 4432
+  n_k: 4432
+  n_v: 27592
+  n_rst: 55584
+
+  # Data-calibrated direct-read tau initialization.
+  tau_init_mode: quantile_frac
+  tau_init_min: -0.95
+  tau_init_max: 0.95
+
+  # Expected initial active counts:
+  #
+  # Q:   1,108 * 0.1805054 ~= 200
+  # K:   1,108 * 0.1805054 ~= 200
+  # V:   6,898 * 0.0869817 ~= 600
+  # RST: 13,896 * 0.0863558 ~= 1,200
+  tau_init_target_qk_frac: 0.1805054
+  tau_init_target_v_frac: 0.0869817
+  tau_init_target_rst_frac: 0.0863558
+
+  srw_composition_mode: linear_angular
+
+  admission_den_power: 1.0
+  admission_den_power_qk: 0.5
+  admission_den_power_v: 1.0
+  admission_den_power_rst: 1.2
+
+training:
+  # TPU v4-4.
+  mesh_data: 4
+  mesh_model: 1
+
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+
+  # Operator chunking.
+  #
+  # Per-space chunk widths:
+  #   Q/K: 554
+  #   V:   ceil(3,449 / 2) = 1,725
+  #   RST: ceil(6,948 / 8) = 869
+  n_chunks_q: 1
+  n_chunks_k: 1
+  n_chunks_v: 2
+  n_chunks_rst: 8
+
+  # Established 40M optimization schedule.
+  lr: 0.00065
+  tau_lr_mult: 0.001
+  warmup_ratio: 0.06
+  weight_decay: 0.1
+
+  checkpoint_interval: 500
+  val_interval: 500
+  log_interval: 100
+
+  # Keep expensive diagnostics outside the training hot path.
+  log_analysis_multiplier: 1000000
+  heavy_geometry_multiplier: 1000000
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_40M_c4_5B
