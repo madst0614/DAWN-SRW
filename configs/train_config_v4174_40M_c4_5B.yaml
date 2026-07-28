@@ -39,7 +39,7 @@ model:
 
   # Operation-space topology.
   n_operation_spaces: 8
-  operation_space_top_k: 1
+  operation_space_top_k: 2
 
   # Config-only M=8 path.
   # Semantic routing remains hard top-2, but all eight spaces are
@@ -73,11 +73,11 @@ model:
   #
   # Q:   1,116 * 0.1792  ~= 200
   # K:   1,116 * 0.1792  ~= 200
-  # V:   6,948 * 0.08636 ~= 600
-  # RST: 13,994 * 0.08575 ~= 1,200
+  # V:   6,948 * 0.12 ~= 834
+  # RST: 13,994 * 0.14 ~= 1,959
   tau_init_target_qk_frac: 0.1792
-  tau_init_target_v_frac: 0.08636
-  tau_init_target_rst_frac: 0.08575
+  tau_init_target_v_frac: 0.12
+  tau_init_target_rst_frac: 0.14
 
   # Current linear-angular composition semantics.
   srw_composition_mode: linear_angular
@@ -121,4 +121,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_40M_c4_5B_K_1
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_40M_c4_5B_more_active
