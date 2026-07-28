@@ -39,7 +39,7 @@ model:
 
   # Operation-space topology.
   n_operation_spaces: 8
-  operation_space_top_k: 2
+  operation_space_top_k: 1
 
   # Config-only M=8 path.
   # Semantic routing remains hard top-2, but all eight spaces are
@@ -121,5 +121,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4174_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_40M_c4_5B_K_1
