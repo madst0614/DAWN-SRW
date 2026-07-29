@@ -983,8 +983,8 @@ def summarize_condition(
             seed=seed + 3,
         ),
         "unrelated_behavior_definition": (
-            "mean_next_token_log_probability_on_base_prompt_tokens_excluding_"
-            "all_IOI_name_spans_post_S2_and_answer_position"),
+            "mean_next_token_log_probability_on_pre_S2_base_prompt_tokens_"
+            "excluding_all_subject_and_indirect_object_name_spans"),
     }
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import numbers
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -479,36 +480,112 @@ class FrozenCircuitEvaluationBatch:
     phase: str
 
 
-def _ioi_unrelated_label_indices(example: BenchmarkExample) -> set[int]:
+def _ioi_unrelated_label_indices(
+        example: BenchmarkExample, tokenizer: Any) -> set[int]:
     spans = example.metadata.get("semantic_token_spans")
-    if not isinstance(spans, Mapping):
-        raise ValueError(
-            f"{example.example_id}: IOI unrelated-output audit requires "
-            "semantic_token_spans")
-    base = spans.get("base")
-    if not isinstance(base, Mapping):
-        raise ValueError(
-            f"{example.example_id}: IOI semantic spans omit base")
-    excluded: set[int] = set()
-    for role in (
-            "first_name_a", "first_name_b", "s2_counterfactual",
-            "post_s2", "answer_position"):
-        span = base.get(role)
-        if (not isinstance(span, Sequence) or isinstance(span, (str, bytes))
-                or len(span) != 2):
+    base_token_spans = (
+        spans.get("base") if isinstance(spans, Mapping) else None)
+    if isinstance(base_token_spans, Mapping):
+        name_token_spans = []
+        for role in (
+                "first_name_a", "first_name_b", "s2_counterfactual"):
+            span = base_token_spans.get(role)
+            if (not isinstance(span, Sequence)
+                    or isinstance(span, (str, bytes))
+                    or len(span) != 2):
+                raise ValueError(
+                    f"{example.example_id}: invalid IOI token span {role}")
+            start, end = int(span[0]), int(span[1])
+            if not 0 <= start < end <= len(example.input_ids_base):
+                raise ValueError(
+                    f"{example.example_id}: IOI token span {role} "
+                    "is out of range")
+            name_token_spans.append((start, end))
+        s2_start = name_token_spans[-1][0]
+    else:
+        char_spans = example.metadata.get("semantic_char_spans")
+        base_char_spans = (
+            char_spans.get("base")
+            if isinstance(char_spans, Mapping) else None)
+        if isinstance(base_char_spans, Mapping):
+            name_char_spans = []
+            for role in (
+                    "first_name_a", "first_name_b", "s2_counterfactual"):
+                span = base_char_spans.get(role)
+                if (not isinstance(span, Sequence)
+                        or isinstance(span, (str, bytes))
+                        or len(span) != 2):
+                    raise ValueError(
+                        f"{example.example_id}: invalid IOI char span {role}")
+                start, end = int(span[0]), int(span[1])
+                if not 0 <= start < end <= len(example.base_prompt):
+                    raise ValueError(
+                        f"{example.example_id}: IOI char span {role} "
+                        "is out of range")
+                name_char_spans.append((start, end))
+        else:
+            names = tuple(dict.fromkeys((
+                str(example.metadata.get("subject") or ""),
+                str(example.metadata.get("indirect_object") or ""),
+            )))
+            if len(names) != 2 or any(not name for name in names):
+                raise ValueError(
+                    f"{example.example_id}: IOI names are unavailable")
+            name_char_spans = sorted(
+                (match.start(), match.end())
+                for name in names
+                for match in re.finditer(
+                    rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])",
+                    example.base_prompt,
+                )
+            )
+            if len(name_char_spans) != 3:
+                raise ValueError(
+                    f"{example.example_id}: expected exactly three IOI "
+                    f"name mentions, found {len(name_char_spans)}")
+
+        encoded = tokenizer(
+            example.base_prompt,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        if tuple(int(value) for value in encoded["input_ids"]) != (
+                tuple(example.input_ids_base)):
             raise ValueError(
-                f"{example.example_id}: invalid IOI token span {role}")
-        start, end = int(span[0]), int(span[1])
+                f"{example.example_id}: tokenizer/input IDs drift in "
+                "unrelated-output audit")
+        offsets = [
+            (int(start), int(end))
+            for start, end in encoded["offset_mapping"]
+        ]
+        name_token_spans = []
+        for char_start, char_end in name_char_spans:
+            token_indices = [
+                index for index, (left, right) in enumerate(offsets)
+                if left < char_end and right > char_start
+            ]
+            if not token_indices:
+                raise ValueError(
+                    f"{example.example_id}: tokenizer offsets do not cover "
+                    "an IOI name span")
+            name_token_spans.append(
+                (token_indices[0], token_indices[-1] + 1))
+        s2_start = name_token_spans[-1][0]
+
+    excluded: set[int] = set(range(
+        int(s2_start), len(example.input_ids_base)))
+    for start, end in name_token_spans:
         if not 0 <= start < end <= len(example.input_ids_base):
             raise ValueError(
-                f"{example.example_id}: IOI token span {role} is out of range")
+                f"{example.example_id}: derived IOI token span is out of range")
         excluded.update(range(start, end))
     return excluded
 
 
 def _frozen_circuit_evaluation_arrays(
-        examples: Sequence[BenchmarkExample], *, pad_token_id: int,
-        multiple: int) -> tuple[np.ndarray, np.ndarray, int]:
+        examples: Sequence[BenchmarkExample], *, tokenizer: Any,
+        pad_token_id: int, multiple: int
+) -> tuple[np.ndarray, np.ndarray, int]:
     if not examples:
         raise ValueError("frozen circuit evaluation has no examples")
     if any(
@@ -530,7 +607,7 @@ def _frozen_circuit_evaluation_arrays(
         sequence = tuple(example.input_ids_base)
         labels = np.asarray(sequence, dtype=np.int32).copy()
         labels[0] = -100
-        for index in _ioi_unrelated_label_indices(example):
+        for index in _ioi_unrelated_label_indices(example, tokenizer):
             labels[index] = -100
         if int(np.count_nonzero(labels[1:] != -100)) <= 0:
             raise ValueError(
@@ -555,11 +632,13 @@ def _frozen_circuit_evaluation_arrays(
 
 def prepare_frozen_circuit_evaluation(
         ctx: Any, examples: Sequence[BenchmarkExample], *,
+        tokenizer: Any,
         pad_token_id: int) -> FrozenCircuitEvaluationBatch:
     """Stage the exact same validation rows once for all seven conditions."""
     multiple = max(1, int(ctx.mesh.shape["data"]))
     input_ids, labels, real_count = _frozen_circuit_evaluation_arrays(
-        examples, pad_token_id=pad_token_id, multiple=multiple)
+        examples, tokenizer=tokenizer,
+        pad_token_id=pad_token_id, multiple=multiple)
     ids_device, labels_device = _device_batch(ctx, input_ids, labels)
     return FrozenCircuitEvaluationBatch(
         input_ids=ids_device,

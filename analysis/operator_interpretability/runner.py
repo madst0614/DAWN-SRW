@@ -936,6 +936,7 @@ class OperatorInterpretabilityRunner:
 
         batch = prepare_frozen_circuit_evaluation(
             self.ctx, known_correct,
+            tokenizer=self.tokenizer,
             pad_token_id=int(self.tokenizer.pad_token_id))
         self._print(
             "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
