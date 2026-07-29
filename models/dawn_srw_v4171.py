@@ -3817,12 +3817,35 @@ def _make_sharded_srw_minimal_impl(
             execution_for_numerator = jnp.where(
                 suppress_mask | ~numerator_keep,
                 jnp.float32(0.0), execution_weight)
+            restoration_enabled = (
+                (retention_mode == jnp.int32(3)) & route_has_removal)
+            restoration_execution = jnp.where(
+                restoration_enabled & ~effective_keep,
+                execution_weight, jnp.float32(0.0))
             admission_for_den = jnp.where(
                 autonomous_retention & ~effective_keep,
                 jnp.float32(0.0), admission)
             xr = x_bf @ rc.T
             a = execution_for_numerator * xr.astype(jnp.float32)
             c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
+
+            def compute_restoration(_):
+                restoration_a = (
+                    restoration_execution * xr.astype(jnp.float32))
+                return (
+                    restoration_a.astype(jnp.bfloat16) @ wc
+                ).astype(jnp.float32)
+
+            restoration_c_out = jax.lax.cond(
+                jnp.any(restoration_enabled),
+                compute_restoration,
+                lambda _: jnp.zeros_like(c_out),
+                operand=None)
+            # Mode 3 first removes the frozen numerator under the production
+            # denominator, then reinserts that exact same-example numerator.
+            # Keeping the two matmuls distinct makes restoration an executed
+            # intervention rather than an alias for the intact mode.
+            c_out = c_out + restoration_c_out
             selected_execution = jnp.where(
                 token_match & operator_match & valid_bsn,
                 execution_weight, jnp.float32(0.0))
@@ -4920,6 +4943,11 @@ def _make_sharded_srw_paired_minimal_impl(
             execution_for_numerator = jnp.where(
                 suppress_mask | ~numerator_keep,
                 jnp.float32(0.0), execution_weight)
+            restoration_enabled = (
+                (retention_mode == jnp.int32(3)) & route_has_removal)
+            restoration_execution = jnp.where(
+                restoration_enabled & ~effective_keep,
+                execution_weight, jnp.float32(0.0))
             admission_for_den = jnp.where(
                 autonomous_retention & ~effective_keep,
                 jnp.float32(0.0), admission)
@@ -4929,6 +4957,26 @@ def _make_sharded_srw_paired_minimal_impl(
                 'bsrn,nd->bsrd',
                 a.astype(jnp.bfloat16),
                 wc).astype(jnp.float32)
+
+            def compute_restoration(_):
+                restoration_a = (
+                    restoration_execution
+                    * xr.astype(jnp.float32)[:, :, None, :])
+                return jnp.einsum(
+                    'bsrn,nd->bsrd',
+                    restoration_a.astype(jnp.bfloat16),
+                    wc).astype(jnp.float32)
+
+            restoration_c_out = jax.lax.cond(
+                jnp.any(restoration_enabled),
+                compute_restoration,
+                lambda _: jnp.zeros_like(c_out),
+                operand=None)
+            # Mode 3 first removes the frozen numerator under the production
+            # denominator, then reinserts that exact same-example numerator.
+            # Keeping the two matmuls distinct makes restoration an executed
+            # intervention rather than an alias for the intact mode.
+            c_out = c_out + restoration_c_out
             selected_execution = jnp.where(
                 token_match & operator_match & route_match & valid_bsrn,
                 execution_weight, jnp.float32(0.0))
@@ -10594,14 +10642,19 @@ class DAWN_SRW_V4171(nn.Module):
         ``conditional_execution_sufficiency`` keeps the selected execution
         numerator while retaining the production admission denominator.
         ``autonomous_subcircuit_sufficiency`` restricts both numerator and
-        admission denominator to the selected circuit.  Operator masks are
-        dense boolean arrays with shapes ``[L,2,Nqk]``, ``[L,Nv]``, and
-        ``[L,Nrst]``.  ``position_mask`` selects positions where retention is
-        active; unselected positions execute the full model.
+        admission denominator to the selected circuit.
+        ``exact_selected_numerator_restore_after_suppression`` removes the
+        complement of the keep mask under the production denominator and
+        reinserts its exact same-example numerator contribution before the
+        route is consumed. Operator masks are dense boolean arrays with shapes
+        ``[L,2,Nqk]``, ``[L,Nv]``, and ``[L,Nrst]``. ``position_mask`` selects
+        positions where retention or restoration is active; unselected
+        positions execute the full model.
         """
         modes = {
             "conditional_execution_sufficiency": 1,
             "autonomous_subcircuit_sufficiency": 2,
+            "exact_selected_numerator_restore_after_suppression": 3,
         }
         if mode not in modes:
             raise ValueError(

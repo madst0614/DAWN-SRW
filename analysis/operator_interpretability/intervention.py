@@ -252,6 +252,7 @@ def _retention_mode_code(mode: str) -> int:
     modes = {
         "conditional_execution_sufficiency": 1,
         "autonomous_subcircuit_sufficiency": 2,
+        "exact_selected_numerator_restore_after_suppression": 3,
     }
     if mode not in modes:
         raise ValueError(f"unknown circuit retention mode: {mode}")
@@ -464,6 +465,221 @@ def evaluate_circuit_necessity(
         "suppressed_site_count": circuit.site_count,
         "margin": (positive - negative).tolist(),
         "mean_margin": float(np.mean(positive - negative)),
+    }
+
+
+@dataclass(frozen=True)
+class FrozenCircuitEvaluationBatch:
+    """One validation-only device batch shared by every frozen condition."""
+
+    input_ids: jax.Array
+    labels: jax.Array
+    example_count: int
+    real_row_count: int
+    phase: str
+
+
+def _ioi_unrelated_label_indices(example: BenchmarkExample) -> set[int]:
+    spans = example.metadata.get("semantic_token_spans")
+    if not isinstance(spans, Mapping):
+        raise ValueError(
+            f"{example.example_id}: IOI unrelated-output audit requires "
+            "semantic_token_spans")
+    base = spans.get("base")
+    if not isinstance(base, Mapping):
+        raise ValueError(
+            f"{example.example_id}: IOI semantic spans omit base")
+    excluded: set[int] = set()
+    for role in (
+            "first_name_a", "first_name_b", "s2_counterfactual",
+            "post_s2", "answer_position"):
+        span = base.get(role)
+        if (not isinstance(span, Sequence) or isinstance(span, (str, bytes))
+                or len(span) != 2):
+            raise ValueError(
+                f"{example.example_id}: invalid IOI token span {role}")
+        start, end = int(span[0]), int(span[1])
+        if not 0 <= start < end <= len(example.input_ids_base):
+            raise ValueError(
+                f"{example.example_id}: IOI token span {role} is out of range")
+        excluded.update(range(start, end))
+    return excluded
+
+
+def _frozen_circuit_evaluation_arrays(
+        examples: Sequence[BenchmarkExample], *, pad_token_id: int,
+        multiple: int) -> tuple[np.ndarray, np.ndarray, int]:
+    if not examples:
+        raise ValueError("frozen circuit evaluation has no examples")
+    if any(
+            example.benchmark_id != "mib_ioi"
+            or example.phase != "validation"
+            for example in examples):
+        raise ValueError(
+            "frozen IOI circuit evaluation accepts validation examples only")
+    rows: list[tuple[tuple[int, ...], np.ndarray]] = []
+    for answer_field in ("positive_ids", "negative_ids"):
+        for example in examples:
+            prompt = tuple(example.input_ids_base)
+            answer = tuple(getattr(example, answer_field))
+            sequence = (*prompt, *answer)
+            labels = np.full((len(sequence),), -100, dtype=np.int32)
+            labels[len(prompt):] = np.asarray(answer, dtype=np.int32)
+            rows.append((sequence, labels))
+    for example in examples:
+        sequence = tuple(example.input_ids_base)
+        labels = np.asarray(sequence, dtype=np.int32).copy()
+        labels[0] = -100
+        for index in _ioi_unrelated_label_indices(example):
+            labels[index] = -100
+        if int(np.count_nonzero(labels[1:] != -100)) <= 0:
+            raise ValueError(
+                f"{example.example_id}: unrelated-output audit has no tokens")
+        rows.append((sequence, labels))
+
+    length = max(len(sequence) for sequence, _ in rows)
+    real_count = len(rows)
+    batch_size = ((real_count + multiple - 1) // multiple) * multiple
+    input_ids = np.full(
+        (batch_size, length), int(pad_token_id), dtype=np.int32)
+    labels = np.full((batch_size, length), -100, dtype=np.int32)
+    for index, (sequence, row_labels) in enumerate(rows):
+        input_ids[index, :len(sequence)] = np.asarray(
+            sequence, dtype=np.int32)
+        labels[index, :len(sequence)] = row_labels
+    for index in range(real_count, batch_size):
+        input_ids[index] = input_ids[0]
+        labels[index] = labels[0]
+    return input_ids, labels, real_count
+
+
+def prepare_frozen_circuit_evaluation(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        pad_token_id: int) -> FrozenCircuitEvaluationBatch:
+    """Stage the exact same validation rows once for all seven conditions."""
+    multiple = max(1, int(ctx.mesh.shape["data"]))
+    input_ids, labels, real_count = _frozen_circuit_evaluation_arrays(
+        examples, pad_token_id=pad_token_id, multiple=multiple)
+    ids_device, labels_device = _device_batch(ctx, input_ids, labels)
+    return FrozenCircuitEvaluationBatch(
+        input_ids=ids_device,
+        labels=labels_device,
+        example_count=len(examples),
+        real_row_count=real_count,
+        phase=str(examples[0].phase),
+    )
+
+
+def _frozen_circuit_score_executable(ctx: Any):
+    cache = getattr(ctx, "_operator_interpretability_executables", None)
+    if cache is None:
+        cache = {}
+        setattr(ctx, "_operator_interpretability_executables", cache)
+    key = ("frozen_circuit_score", "retention", "dynamic_mode")
+    if key in cache:
+        return cache[key]
+    kwargs = _runtime_kwargs(ctx, kernel_profile="retention")
+
+    @jax.jit
+    def score(params, input_ids, labels, keep_qk, keep_v, keep_rst,
+              retention_mode):
+        result = ctx.model.apply(
+            {"params": params}, input_ids, labels=labels,
+            attention_mask=jnp.ones_like(input_ids),
+            minimal_train=True,
+            analysis_keep_qk=keep_qk,
+            analysis_keep_v=keep_v,
+            analysis_keep_rst=keep_rst,
+            analysis_position_mask=jnp.ones_like(
+                input_ids, dtype=jnp.bool_),
+            analysis_retention_mode=jnp.asarray(
+                retention_mode, dtype=jnp.int32),
+            analysis_return_residual=False,
+            **kwargs)
+        valid = result["valid_mask"].astype(jnp.float32)
+        token_logp = -result["per_token_ce"].astype(jnp.float32) * valid
+        return token_logp.sum(axis=-1), valid.sum(axis=-1)
+
+    cache[key] = score
+    return score
+
+
+def evaluate_frozen_circuit_condition(
+        ctx: Any, batch: FrozenCircuitEvaluationBatch, *,
+        shape: OperatorSpaceShape, condition: str,
+        circuit: OperatorCircuit | None = None) -> dict[str, Any]:
+    """Score intact, suppression/control, or exact restoration in one graph."""
+    if batch.phase != "validation":
+        raise ValueError("frozen circuit condition must remain validation-only")
+    if condition == "intact":
+        keep_qk = np.ones(
+            (shape.n_layers, 2, shape.n_qk), dtype=np.bool_)
+        keep_v = np.ones(
+            (shape.n_layers, shape.n_v), dtype=np.bool_)
+        keep_rst = np.ones(
+            (shape.n_layers, shape.n_rst), dtype=np.bool_)
+        retention_mode = 0
+        site_count = 0
+        circuit_hash = None
+    elif condition in {"suppression", "restoration"}:
+        if circuit is None:
+            raise ValueError(
+                f"frozen circuit {condition} requires a circuit")
+        masks = circuit.dense_masks(shape)
+        keep_qk = ~masks["qk"]
+        keep_v = ~masks["v"]
+        keep_rst = ~masks["rst"]
+        retention_mode = _retention_mode_code(
+            "conditional_execution_sufficiency"
+            if condition == "suppression"
+            else "exact_selected_numerator_restore_after_suppression")
+        site_count = circuit.site_count
+        circuit_hash = circuit.circuit_hash
+    else:
+        raise ValueError(f"unknown frozen circuit condition: {condition}")
+
+    score = _frozen_circuit_score_executable(ctx)
+    totals, counts = materialize_global_tree(score(
+        ctx.params,
+        batch.input_ids,
+        batch.labels,
+        jnp.asarray(keep_qk),
+        jnp.asarray(keep_v),
+        jnp.asarray(keep_rst),
+        jnp.int32(retention_mode),
+    ))
+    totals = np.asarray(
+        totals[:batch.real_row_count], dtype=np.float64)
+    counts = np.asarray(
+        counts[:batch.real_row_count], dtype=np.float64)
+    expected_rows = 3 * batch.example_count
+    if totals.shape != (expected_rows,) or counts.shape != (expected_rows,):
+        raise ValueError(
+            "frozen circuit score shape mismatch: "
+            f"expected={(expected_rows,)} "
+            f"actual_totals={totals.shape} actual_counts={counts.shape}")
+    if not np.all(np.isfinite(totals)) or np.any(counts <= 0.0):
+        raise ValueError("frozen circuit scores are nonfinite or empty")
+    count = batch.example_count
+    positive = totals[:count]
+    negative = totals[count:2 * count]
+    unrelated = totals[2 * count:] / counts[2 * count:]
+    return {
+        "condition": condition,
+        "phase": batch.phase,
+        "example_count": count,
+        "site_count": site_count,
+        "circuit_hash": circuit_hash,
+        "retention_mode_code": retention_mode,
+        "admission_denominator": "full_production_denominator",
+        "positive_log_probability": positive,
+        "negative_log_probability": negative,
+        "unrelated_mean_log_probability": unrelated,
+        "unrelated_token_count_minimum": int(
+            np.min(counts[2 * count:])),
+        "unrelated_token_count_maximum": int(
+            np.max(counts[2 * count:])),
+        "raw_score_vectors_persisted": False,
     }
 
 

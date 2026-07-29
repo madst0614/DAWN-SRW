@@ -46,16 +46,30 @@ from analysis.operator_interpretability.circuit import (
 )
 from analysis.operator_interpretability.claim_gate import evaluate_claims
 from analysis.operator_interpretability.eligibility import tokenizer_vocab_hash
+from analysis.operator_interpretability.frozen_circuit import (
+    FROZEN_IOI_CONTROL_ALGORITHM_VERSION,
+    FROZEN_IOI_CONTROL_ORDER,
+    FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT,
+    FROZEN_IOI_VALIDATION_ROW_COUNT,
+    FrozenIOIControlSampler,
+    bootstrap_restoration_recovery,
+    compare_frozen_to_controls,
+    condition_effect_vectors,
+    load_frozen_ioi_circuit,
+    summarize_condition,
+)
 from analysis.operator_interpretability.interchange import score_interchange_rows
 from analysis.operator_interpretability.intervention import (
     all_ones_retention_parity,
     evaluate_behavior,
     evaluate_circuit_necessity,
     evaluate_circuit_retention,
+    evaluate_frozen_circuit_condition,
     evaluate_native_operator_program_causal_diagnostics,
     evaluate_native_operator_program_phase_baselines,
     evaluate_native_operator_program_selection_candidate,
     evaluate_operator_interchange,
+    prepare_frozen_circuit_evaluation,
 )
 from analysis.operator_interpretability.program import (
     PROGRAM_ALGORITHM_VERSION,
@@ -263,6 +277,7 @@ class OperatorInterpretabilityRunner:
         self._pool_host: dict[str, np.ndarray] | None = None
         self._requested_items: tuple[str, ...] = ()
         self._paired_trajectory_test_isolated = False
+        self._frozen_validation_test_isolated = False
 
     def _print(self, message: str) -> None:
         if self.ctx.is_primary:
@@ -588,6 +603,19 @@ class OperatorInterpretabilityRunner:
     def run(self, items: Sequence[str]) -> dict[str, Any]:
         self._requested_items = tuple(str(item) for item in items)
         requested_set = set(self._requested_items)
+        frozen_validation_only_items = {
+            "mib_ioi.input_contract",
+            "mib_ioi.frozen_circuit_validation",
+        }
+        frozen_validation_requested = (
+            "mib_ioi.frozen_circuit_validation" in requested_set)
+        if (frozen_validation_requested
+                and not requested_set <= frozen_validation_only_items):
+            raise ValueError(
+                "mib_ioi.frozen_circuit_validation must be requested only "
+                "with its dedicated input-contract item so held-out test "
+                "access remains isolated")
+        self._frozen_validation_test_isolated = frozen_validation_requested
         trajectory_only_items = {
             "mib_ioi.input_contract",
             "mib_ioi.behavioral_eligibility",
@@ -647,6 +675,8 @@ class OperatorInterpretabilityRunner:
             "artifact_warnings": artifact_warnings,
             "strongest_supported_claim": (
                 self.results.get("scientific_claims", {}).get(
+                    "strongest_supported_claim")
+                or self.results.get("frozen_circuit_validation", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("native_operator_program", {}).get(
                     "strongest_supported_claim")),
@@ -834,6 +864,490 @@ class OperatorInterpretabilityRunner:
                 "phases": phase_results,
             }
         return {"status": "ready", "benchmarks": output}
+
+    def _run_frozen_circuit_validation(self) -> dict[str, Any]:
+        """Run only the frozen 4,096-site IOI confirmatory validation."""
+        if self._scope("frozen_circuit_validation") != ("mib_ioi",):
+            raise ValueError(
+                "frozen circuit validation is registered only for mib_ioi")
+        if not self._frozen_validation_test_isolated:
+            raise RuntimeError(
+                "frozen IOI validation did not enter test-isolated execution")
+
+        frozen = load_frozen_ioi_circuit(self.shape)
+        frozen.validate_runtime(
+            shape=self.shape,
+            target_id=str(self.ctx.model_info.get("target_id") or ""),
+            model_version=self.model_version,
+            checkpoint_step=int(self.ctx.checkpoint_step),
+            checkpoint_identity=str(self.contract["checkpoint_identity"]),
+            checkpoint_config_hash=str(
+                self.ctx.model_info.get("checkpoint_config_hash") or ""),
+            model_config_hash=str(self.contract["model_config_hash"]),
+            benchmark_build_id=self.build.build_id,
+            benchmark_manifest_hash=self.build.manifest_hash,
+        )
+        evaluation = frozen.evaluation
+        bootstrap_samples = int(evaluation["bootstrap_samples"])
+        permutation_samples = int(evaluation["permutation_samples"])
+        alpha = float(evaluation["alpha"])
+        if self.config.max_examples_for("mib_ioi") != (
+                FROZEN_IOI_VALIDATION_ROW_COUNT):
+            raise ValueError(
+                "frozen IOI validation requires the exact 128-row phase")
+        if (self.config.bootstrap_samples != bootstrap_samples
+                or self.config.permutation_samples != permutation_samples
+                or not np.isclose(
+                    self.config.alpha, alpha, rtol=0.0, atol=0.0)):
+            raise ValueError(
+                "runtime resampling settings differ from the frozen IOI spec")
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            "stage=behavioral_eligibility status=running")
+        validation_rows = load_benchmark_examples(
+            self.build, "mib_ioi", phase="validation")
+        validation_rows.sort(key=lambda example: (
+            canonical_hash(example.example_id), example.example_id))
+        if len(validation_rows) != FROZEN_IOI_VALIDATION_ROW_COUNT:
+            raise ValueError(
+                "frozen IOI validation shard row count drift: "
+                f"expected={FROZEN_IOI_VALIDATION_ROW_COUNT} "
+                f"actual={len(validation_rows)}")
+        behavior = evaluate_behavior(
+            self.ctx, validation_rows,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        known_correct = [
+            example for example, keep in zip(
+                validation_rows, behavior["known_correct"])
+            if keep
+        ]
+        if len(known_correct) != (
+                FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT):
+            raise ValueError(
+                "frozen IOI paired-correct validation count drift: "
+                f"expected={FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT} "
+                f"actual={len(known_correct)}")
+        self._examples.setdefault("mib_ioi", {})["validation"] = validation_rows
+        eligible_example_ids_hash = canonical_hash([
+            example.example_id for example in known_correct
+        ])
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"stage=behavioral_eligibility status=ready "
+            f"paired_correct={len(known_correct)}")
+
+        batch = prepare_frozen_circuit_evaluation(
+            self.ctx, known_correct,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            "condition=intact status=running")
+        intact = evaluate_frozen_circuit_condition(
+            self.ctx, batch, shape=self.shape, condition="intact")
+        intact_positive = np.asarray(
+            intact["positive_log_probability"], dtype=np.float64)
+        intact_negative = np.asarray(
+            intact["negative_log_probability"], dtype=np.float64)
+        intact_margin = intact_positive - intact_negative
+        known_correct_mask = np.asarray(
+            behavior["known_correct"], dtype=np.bool_)
+        reference_positive = np.asarray(
+            behavior["base_positive_logp"],
+            dtype=np.float64)[known_correct_mask]
+        reference_negative = np.asarray(
+            behavior["base_negative_logp"],
+            dtype=np.float64)[known_correct_mask]
+        intact_reference_max_abs_error = float(max(
+            np.max(np.abs(intact_positive - reference_positive)),
+            np.max(np.abs(intact_negative - reference_negative)),
+        ))
+        intact_reference_tolerance = 1.0e-6
+        if intact_reference_max_abs_error > intact_reference_tolerance:
+            raise RuntimeError(
+                "frozen IOI intact retention graph does not match the "
+                "production-diagnostics behavioral reference: "
+                f"max_abs_error={intact_reference_max_abs_error}")
+        intact_summary = {
+            "mean_margin": float(np.mean(intact_margin)),
+            "mean_correct_log_probability": float(np.mean(intact_positive)),
+            "mean_source_log_probability": float(np.mean(intact_negative)),
+            "exact_accuracy": float(np.mean(intact_margin > 0.0)),
+            "mean_unrelated_log_probability": float(np.mean(
+                np.asarray(
+                    intact["unrelated_mean_log_probability"],
+                    dtype=np.float64))),
+            "unrelated_token_count_minimum": int(
+                intact["unrelated_token_count_minimum"]),
+            "unrelated_token_count_maximum": int(
+                intact["unrelated_token_count_maximum"]),
+            "production_reference_parity": {
+                "passed": True,
+                "max_absolute_log_probability_error": (
+                    intact_reference_max_abs_error),
+                "absolute_tolerance": intact_reference_tolerance,
+            },
+        }
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"condition=intact status=ready "
+            f"margin={intact_summary['mean_margin']:.8f} "
+            f"accuracy={intact_summary['exact_accuracy']:.8f}")
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            "condition=frozen_suppression status=running")
+        suppressed = evaluate_frozen_circuit_condition(
+            self.ctx, batch, shape=self.shape, condition="suppression",
+            circuit=frozen.circuit)
+        suppression_summary = summarize_condition(
+            intact, suppressed,
+            bootstrap_samples=bootstrap_samples,
+            alpha=alpha,
+            seed=self.config.seed + 10_000,
+        )
+        frozen_effects = condition_effect_vectors(intact, suppressed)
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"condition=frozen_suppression status=ready "
+            f"margin_drop={suppression_summary['mean_margin_drop']:.8f} "
+            f"accuracy={suppression_summary['exact_accuracy']:.8f}")
+
+        sampler = FrozenIOIControlSampler(frozen, self.shape)
+        controls_output: dict[str, Any] = {}
+        replicate_count = int(
+            frozen.controls["replicate_count_per_control"])
+        for family_index, control_name in enumerate(FROZEN_IOI_CONTROL_ORDER):
+            self._print(
+                "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+                f"control={control_name} replicate=0/{replicate_count} "
+                "status=running")
+            margin_drop_rows: list[np.ndarray] = []
+            mean_margin_drop: list[float] = []
+            exact_accuracy: list[float] = []
+            prediction_flip: list[float] = []
+            correct_logp_change: list[float] = []
+            source_direction_change: list[float] = []
+            unrelated_damage: list[float] = []
+            identity_hashes: list[str] = []
+            activation_mean_distance: list[float] = []
+            activation_max_distance: list[float] = []
+            activation_mean_bin_distance: list[float] = []
+            activation_max_bin_distance: list[int] = []
+            for replicate_index in range(replicate_count):
+                control_circuit, audit = sampler.generate(
+                    control_name, replicate_index)
+                control_scores = evaluate_frozen_circuit_condition(
+                    self.ctx, batch, shape=self.shape,
+                    condition="suppression", circuit=control_circuit)
+                effects = condition_effect_vectors(intact, control_scores)
+                margin_drop_rows.append(effects["margin_drop"])
+                mean_margin_drop.append(float(np.mean(
+                    effects["margin_drop"])))
+                exact_accuracy.append(float(np.mean(
+                    effects["margin"] > 0.0)))
+                prediction_flip.append(float(np.mean(
+                    (effects["intact_margin"] > 0.0)
+                    != (effects["margin"] > 0.0))))
+                correct_logp_change.append(float(np.mean(
+                    effects["correct_log_probability_change"])))
+                source_direction_change.append(float(np.mean(
+                    effects["source_minus_correct_margin_change"])))
+                unrelated_damage.append(float(np.mean(
+                    effects["unrelated_log_probability_damage"])))
+                identity_hashes.append(str(audit["site_identity_hash"]))
+                if control_name == "activation_matched":
+                    activation_mean_distance.append(float(audit[
+                        "mean_absolute_empirical_quantile_distance"]))
+                    activation_max_distance.append(float(audit[
+                        "maximum_absolute_empirical_quantile_distance"]))
+                    activation_mean_bin_distance.append(float(audit[
+                        "mean_absolute_empirical_quantile_bin_distance"]))
+                    activation_max_bin_distance.append(int(audit[
+                        "maximum_absolute_empirical_quantile_bin_distance"]))
+                if ((replicate_index + 1) % 10 == 0
+                        or replicate_index + 1 == replicate_count):
+                    self._print(
+                        "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+                        f"control={control_name} "
+                        f"replicate={replicate_index + 1}/"
+                        f"{replicate_count} status=running")
+                del control_scores, control_circuit
+            control_matrix = np.stack(margin_drop_rows, axis=0)
+            separation = compare_frozen_to_controls(
+                frozen_effects["margin_drop"],
+                control_matrix,
+                bootstrap_samples=bootstrap_samples,
+                permutation_samples=permutation_samples,
+                alpha=alpha,
+                seed=self.config.seed + 20_000 + family_index * 100,
+            )
+            config = dict(frozen.controls[control_name])
+            controls_output[control_name] = {
+                "replicate_count": replicate_count,
+                "base_seed": int(config["seed"]),
+                "sampling": config["sampling"],
+                "control_algorithm_version": (
+                    FROZEN_IOI_CONTROL_ALGORITHM_VERSION),
+                "site_count_per_replicate": frozen.selected_k,
+                "frozen_circuit_sites_excluded": True,
+                "site_identity_hashes": identity_hashes,
+                "mean_margin_drop_distribution": mean_margin_drop,
+                "exact_accuracy_distribution": exact_accuracy,
+                "prediction_flip_fraction_distribution": prediction_flip,
+                "mean_correct_log_probability_change_distribution": (
+                    correct_logp_change),
+                "mean_source_direction_change_distribution": (
+                    source_direction_change),
+                "mean_unrelated_log_probability_damage_distribution": (
+                    unrelated_damage),
+                "frozen_minus_control": separation,
+                **({
+                    "mean_absolute_empirical_quantile_distance_distribution": (
+                        activation_mean_distance),
+                    "maximum_absolute_empirical_quantile_distance_distribution": (
+                        activation_max_distance),
+                    "mean_absolute_empirical_quantile_bin_distance_distribution": (
+                        activation_mean_bin_distance),
+                    "maximum_absolute_empirical_quantile_bin_distance_distribution": (
+                        activation_max_bin_distance),
+                    "empirical_quantile_bin_count": int(
+                        frozen.controls["replicate_count_per_control"]),
+                    "activation_match_definition": (
+                        "within_exact_layer_and_route_nearest_equal_width_"
+                        "empirical_midrank_quantile_bin_of_discovery_mean_"
+                        "pre_scale_operator_output_norm_without_replacement;"
+                        "bin_count_equals_frozen_control_replicate_count"),
+                } if control_name == "activation_matched" else {}),
+            }
+            self._print(
+                "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+                f"control={control_name} status=ready "
+                f"mean_drop={float(np.mean(mean_margin_drop)):.8f} "
+                "frozen_minus_control="
+                f"{separation['mean_frozen_minus_control']:.8f}")
+            del margin_drop_rows, control_matrix
+            gc.collect()
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            "condition=exact_restoration status=running")
+        restored = evaluate_frozen_circuit_condition(
+            self.ctx, batch, shape=self.shape, condition="restoration",
+            circuit=frozen.circuit)
+        restoration_summary = summarize_condition(
+            intact, restored,
+            bootstrap_samples=bootstrap_samples,
+            alpha=alpha,
+            seed=self.config.seed + 30_000,
+        )
+        restored_effects = condition_effect_vectors(intact, restored)
+        recovery = bootstrap_restoration_recovery(
+            intact_margin,
+            frozen_effects["margin"],
+            restored_effects["margin"],
+            samples=bootstrap_samples,
+            alpha=alpha,
+            seed=self.config.seed + 31_000,
+        )
+        restoration_summary.update({
+            "restoration_recovery_fraction": recovery[
+                "recovery_fraction"],
+            "restoration_recovery_bootstrap_ci": recovery,
+            "restoration_mode": (
+                "exact_selected_numerator_restore_after_suppression"),
+            "restored_values_source": "same_example_intact_execution",
+        })
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"condition=exact_restoration status=ready "
+            "recovery="
+            f"{restoration_summary['restoration_recovery_fraction']}")
+
+        suppression_ci_low = suppression_summary[
+            "margin_drop_bootstrap_ci"]["ci_low"]
+        suppression_gate = (
+            suppression_ci_low is not None
+            and float(suppression_ci_low) > 0.0)
+        control_gates = {
+            control_name: (
+                row["frozen_minus_control"]["bootstrap_ci"]["ci_low"]
+                is not None
+                and float(row["frozen_minus_control"][
+                    "bootstrap_ci"]["ci_low"]) > 0.0
+            )
+            for control_name, row in controls_output.items()
+        }
+        controls_gate = all(control_gates.values())
+        recovery_ci_low = recovery["ci_low"]
+        recovery_minimum = float(evaluation[
+            "validation_gates"][
+                "restoration_recovery_ci_low_minimum"])
+        restoration_gate = (
+            recovery_ci_low is not None
+            and float(recovery_ci_low) >= recovery_minimum)
+        if suppression_gate and controls_gate and restoration_gate:
+            decision = "strong_success"
+            strongest_claim = (
+                "validation_level_causal_ioi_qk_centered_rw_operator_circuit")
+        elif suppression_gate and not controls_gate:
+            decision = (
+                "partial_success_general_attention_damage_not_excluded")
+            strongest_claim = (
+                "validation_level_frozen_suppression_without_control_"
+                "separation")
+        elif (not suppression_gate
+                and not controls_gate
+                and not restoration_gate):
+            decision = "failure_not_a_validated_causal_circuit"
+            strongest_claim = None
+        else:
+            decision = "mixed_inconclusive"
+            strongest_claim = None
+
+        correct_logp_damage = -float(
+            suppression_summary["mean_correct_log_probability_change"])
+        unrelated_damage = float(
+            suppression_summary[
+                "mean_unrelated_log_probability_damage"])
+        unrelated_damage_ratio = (
+            abs(unrelated_damage) / max(abs(correct_logp_damage), 1.0e-12))
+        result = {
+            "status": "ready",
+            "phase": "validation",
+            "decision": decision,
+            "strongest_supported_claim": strongest_claim,
+            "validation_record_status": "complete",
+            "frozen_specification": {
+                "path": frozen.spec_path,
+                "content_hash": frozen.spec_content_hash,
+                "status": frozen.spec["status"],
+                "selected_k": frozen.selected_k,
+                "selected_route_counts": dict(
+                    frozen.spec["selection"]["selected_route_counts"]),
+                "selected_site_identity_hash": (
+                    frozen.selected_site_identity_hash),
+                "selected_ranked_rows_hash": frozen.spec[
+                    "selection"]["selected_ranked_rows_hash"],
+                "ranked_sites_content_hash": frozen.spec[
+                    "discovery"]["ranked_sites_content_hash"],
+                "localization_artifact": frozen.localization_path,
+                "localization_protocol_hash": (
+                    frozen.localization_protocol_hash),
+                "selection_recomputed": False,
+                "operator_ids_changed": False,
+                "layers_or_routes_changed": False,
+            },
+            "validation_cohort": {
+                "physical_row_count": len(validation_rows),
+                "paired_correct_independent_count": len(known_correct),
+                "paired_correct_example_ids_hash": (
+                    eligible_example_ids_hash),
+                "base_accuracy_all_rows": behavior["accuracy"],
+                "source_accuracy_all_rows": behavior["source_accuracy"],
+                "pair_accuracy_all_rows": behavior["pair_accuracy"],
+                "candidate_score": (
+                    "positive_minus_negative_sum_log_probability"),
+            },
+            "primary_metrics": {
+                "intact_mean_margin": intact_summary["mean_margin"],
+                "intact_accuracy": intact_summary["exact_accuracy"],
+                "suppressed_mean_margin": suppression_summary["mean_margin"],
+                "suppressed_accuracy": suppression_summary["exact_accuracy"],
+                "mean_margin_drop": suppression_summary[
+                    "mean_margin_drop"],
+                "margin_drop_bootstrap_ci": suppression_summary[
+                    "margin_drop_bootstrap_ci"],
+                "mean_correct_log_probability_change": suppression_summary[
+                    "mean_correct_log_probability_change"],
+                "prediction_flip_fraction": suppression_summary[
+                    "prediction_flip_fraction"],
+                "mean_source_minus_correct_margin_change": (
+                    suppression_summary[
+                        "mean_source_minus_correct_margin_change"]),
+                "mean_unrelated_log_probability_damage": (
+                    suppression_summary[
+                        "mean_unrelated_log_probability_damage"]),
+                "control_margin_drop_distributions": {
+                    name: row["mean_margin_drop_distribution"]
+                    for name, row in controls_output.items()
+                },
+                "discovered_minus_control_paired_effects": {
+                    name: row["frozen_minus_control"]
+                    for name, row in controls_output.items()
+                },
+                "restored_mean_margin": restoration_summary["mean_margin"],
+                "restored_accuracy": restoration_summary["exact_accuracy"],
+                "restoration_recovery_fraction": recovery[
+                    "recovery_fraction"],
+                "restoration_recovery_bootstrap_ci": recovery,
+            },
+            "conditions": {
+                "intact": intact_summary,
+                "frozen_circuit_suppression": suppression_summary,
+                "matched_controls": controls_output,
+                "frozen_circuit_exact_restoration": restoration_summary,
+            },
+            "validation_gates": {
+                "suppression_margin_drop_ci_low_above_zero": {
+                    "passed": suppression_gate,
+                    "observed_ci_low": suppression_ci_low,
+                    "threshold": 0.0,
+                },
+                "discovered_drop_exceeds_each_control": {
+                    "passed": controls_gate,
+                    "per_control": control_gates,
+                    "rule": (
+                        "each_frozen_minus_control_bootstrap_ci_low_above_zero"),
+                },
+                "restoration_recovery_ci_low_minimum": {
+                    "passed": restoration_gate,
+                    "observed_ci_low": recovery_ci_low,
+                    "threshold": recovery_minimum,
+                },
+                "all_preregistered_gates_passed": bool(
+                    suppression_gate and controls_gate and restoration_gate),
+            },
+            "unrelated_behavior_audit": {
+                "mean_log_probability_damage": unrelated_damage,
+                "correct_log_probability_damage": correct_logp_damage,
+                "absolute_damage_ratio": unrelated_damage_ratio,
+                "formal_gate_defined_in_frozen_spec": False,
+                "used_for_preregistered_gate": False,
+            },
+            "split_isolation": {
+                "selection_phase": "discovery",
+                "evaluation_phase": "validation",
+                "validation_used_to_change_specification": False,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+                "held_out_test_opened": False,
+                "held_out_test_allowed_after_this_record": True,
+            },
+            "storage_audit": {
+                "status": "passed",
+                "aggregate_statistics_and_hashes_preserved": True,
+                "raw_per_example_logits_persisted": False,
+                "raw_per_example_margins_persisted": False,
+                "raw_per_example_operator_vectors_persisted": False,
+                "control_site_ids_persisted": False,
+                "control_site_identity_hashes_persisted": True,
+            },
+            "statistical_protocol": {
+                "bootstrap_samples": bootstrap_samples,
+                "permutation_samples": permutation_samples,
+                "alpha": alpha,
+                "seed": self.config.seed,
+            },
+        }
+        return {
+            "status": "ready",
+            "benchmarks": {"mib_ioi": result},
+            "strongest_supported_claim": strongest_claim,
+            "test_evaluated": False,
+            "test_data_accessor_called": False,
+        }
 
     def _capture_kwargs(self, benchmark_id: str) -> dict[str, Any]:
         return {

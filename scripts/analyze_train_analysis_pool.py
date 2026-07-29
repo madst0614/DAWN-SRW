@@ -500,7 +500,8 @@ def _build_context(
         args: argparse.Namespace, selection: ExecutionSelection,
         checkpoint_dir: str, checkpoint_step: int,
         checkpoint_metadata: dict, config: dict,
-        checkpoint_mesh: dict, store: AnalysisStore) -> AnalysisContext:
+        checkpoint_mesh: dict, checkpoint_config_hash: str,
+        store: AnalysisStore) -> AnalysisContext:
     mesh = create_mesh_from_cfg(config)
     params, restored_metadata, model = restore_params_and_cfg(
         config, checkpoint_dir, int(checkpoint_step), mesh)
@@ -534,6 +535,7 @@ def _build_context(
         "param_count": count_params(params),
         "checkpoint_step": int(checkpoint_step),
         "checkpoint_path_resolved": checkpoint_dir,
+        "checkpoint_config_hash": str(checkpoint_config_hash),
         "target_id": selection.target_id,
         "runtime_id": selection.mesh.runtime_id,
         "accelerator_type": selection.mesh.accelerator_type,
@@ -708,7 +710,8 @@ def main() -> int:
                 raise RuntimeError("mechanistic protocol was not initialized")
             context = _build_context(
                 args, selection, checkpoint_dir, checkpoint_step,
-                checkpoint_metadata, config, checkpoint_mesh, store)
+                checkpoint_metadata, config, checkpoint_mesh,
+                checkpoint_config_hash, store)
             sync_hosts("train_analysis_pool_loaded")
             runner = OperatorInterpretabilityRunner(
                 context,
