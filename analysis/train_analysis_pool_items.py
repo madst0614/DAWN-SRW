@@ -193,6 +193,19 @@ _register("ravel.operator_localization", _mechanistic_item(
     "Which sites carry captured contribution on independent official RAVEL base groups?",
     "Discovery-only production contribution ranking; independent cause groups are balanced by causal variable and official source, and every variable must pass split-rank stability.",
     "ravel.behavioral_eligibility"))
+_register("ravel.discovery_operator_localization", _mechanistic_item(
+    "ravel", "ravel_discovery_localization",
+    "RAVEL discovery-only variable-circuit localization",
+    "Which layer-route-operator sites track each preregistered RAVEL variable "
+    "on the 142 independent paired-correct discovery units?",
+    "Open discovery only; rank Continent/Country/Language separately from "
+    "production-precision contribution, require every variable's split-rank "
+    "stability to be at least 0.80, and freeze the smallest audited prefix "
+    "whose cumulative absolute importance is at least 0.70 and split top-k "
+    "overlap is at least 0.95. Validation and test access are forbidden.",
+    "ravel.input_contract",
+    claim_role="checkpoint_specific",
+    test_used=False))
 _register("ravel.operator_space_structure", _mechanistic_item(
     "ravel", "operator_space_structure", "RAVEL operator-space structure",
     "Do read/write maps form reproducible local functional families independent of address?",
@@ -264,6 +277,8 @@ TRAIN_ANALYSIS_POOL_PRESETS: dict[str, tuple[str, ...]] = {
     "ioi_native_program": ("mib_ioi.native_operator_program",),
     "ioi_paired_operator_trajectory": (
         "mib_ioi.paired_operator_trajectory",),
+    "ravel_discovery_localization": (
+        "ravel.discovery_operator_localization",),
     "mib_ioi_circuit": _mib_circuit_preset("mib_ioi"),
     "mib_mcqa_circuit": _mib_circuit_preset("mib_mcqa"),
     "mib_arithmetic_circuit": _mib_circuit_preset("mib_arithmetic"),

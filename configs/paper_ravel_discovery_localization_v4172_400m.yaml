@@ -1,0 +1,83 @@
+schema_version: 1
+status: preregistered_before_discovery_localization
+
+target:
+  target_id: v4172_400M
+  model_version: spatial-r1-v4.1.7.2
+  config: configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+  checkpoint_run: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201
+  checkpoint_step: 76293
+  checkpoint_identity: a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17
+  checkpoint_config_hash: 08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b
+  model_config_hash: 053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f
+
+discovery:
+  benchmark_id: ravel
+  phase: discovery
+  runtime_selected_row_count: 512
+  expected_paired_correct_independent_units: 142
+  independent_unit: pair_group_id
+  localization_pair_type: cause
+  variables: [Continent, Country, Language]
+  official_counterfactual_columns:
+    - attribute_counterfactual
+    - wikipedia_counterfactual
+  benchmark_build_id: f056bb4f133cde4fc0ae02f9
+  benchmark_manifest_hash: f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6
+  selection_uses_validation: false
+  selection_uses_test: false
+  validation_data_accessor_allowed: false
+  test_data_accessor_allowed: false
+  seed: 4172
+
+capture:
+  production_precision: true
+  target_position: official_first_entity_token
+  capture_threshold: 0.95
+  initial_widths:
+    qk: 512
+    v: 2048
+    rst: 4096
+  maximum_widths:
+    qk: 2048
+    v: 8192
+    rst: 8192
+
+ranking:
+  per_variable: true
+  score: absolute_discovery_mean_contribution_importance
+  denominator: qualified_rows_within_exact_variable_layer_route
+  site_identity: [layer, route, operator_id]
+  routes: [q, k, v, rst]
+  tie_breaker: [layer, route, operator_id]
+  rank_stability:
+    split_rule: seeded_balanced_pair_group_split_within_causal_variable_and_official_counterfactual_column
+    threshold_minimum: 0.80
+    every_variable_must_pass: true
+    pooled_stability_is_audit_only: true
+  topk_overlap:
+    prefix_counts: [32, 64, 128, 256, 512, 1024, 2048, 4096]
+    metric: overlap_fraction_of_each_prefix
+
+circuit_freeze:
+  per_variable: true
+  rule: smallest_audited_prefix_passing_both_discovery_gates
+  discovery_gates:
+    cumulative_absolute_importance_minimum: 0.70
+    split_topk_overlap_minimum: 0.95
+  no_passing_prefix_action: freeze_no_circuit_for_that_variable
+  unstable_rank_action: freeze_no_circuit_for_that_variable
+  route_presence_is_a_discovery_result: true
+  result_dependent_route_inclusion_forbidden: true
+  result_dependent_route_exclusion_forbidden: true
+  validation_may_change_circuit: false
+  test_may_change_circuit: false
+  operator_reselection_after_discovery: false
+
+storage:
+  preserve_aggregate_variable_rankings: true
+  preserve_selected_prefixes_and_identity_hashes: true
+  preserve_raw_per_example_behavior_vectors: false
+  preserve_raw_per_example_operator_vectors: false
+  preserve_raw_capture_rows: false
+  semantic_audit_after_run: true

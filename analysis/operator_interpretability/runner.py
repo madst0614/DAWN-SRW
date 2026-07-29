@@ -120,6 +120,12 @@ from analysis.operator_interpretability.protocol import (
     protocol_record,
     validate_model_version,
 )
+from analysis.operator_interpretability.ravel_localization import (
+    RAVEL_DISCOVERY_PAIRED_CORRECT_COUNT,
+    RAVEL_DISCOVERY_ROW_COUNT,
+    build_ravel_variable_localization,
+    load_ravel_discovery_spec,
+)
 from analysis.operator_interpretability.space import (
     address_confirmation,
     discover_functional_families,
@@ -284,6 +290,7 @@ class OperatorInterpretabilityRunner:
         self._requested_items: tuple[str, ...] = ()
         self._paired_trajectory_test_isolated = False
         self._frozen_circuit_phase_isolated = False
+        self._ravel_discovery_isolated = False
 
     def _print(self, message: str) -> None:
         if self.ctx.is_primary:
@@ -634,6 +641,19 @@ class OperatorInterpretabilityRunner:
                 "dedicated input-contract item so split access remains "
                 "isolated")
         self._frozen_circuit_phase_isolated = frozen_circuit_requested
+        ravel_discovery_item = "ravel.discovery_operator_localization"
+        ravel_discovery_requested = ravel_discovery_item in requested_set
+        ravel_discovery_only_items = {
+            "ravel.input_contract",
+            ravel_discovery_item,
+        }
+        if (ravel_discovery_requested
+                and not requested_set <= ravel_discovery_only_items):
+            raise ValueError(
+                "ravel.discovery_operator_localization must run only with "
+                "its input contract so validation and test access remain "
+                "forbidden")
+        self._ravel_discovery_isolated = ravel_discovery_requested
         trajectory_only_items = {
             "mib_ioi.input_contract",
             "mib_ioi.behavioral_eligibility",
@@ -697,6 +717,8 @@ class OperatorInterpretabilityRunner:
                 or self.results.get("frozen_circuit_test", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("frozen_circuit_validation", {}).get(
+                    "strongest_supported_claim")
+                or self.results.get("ravel_discovery_localization", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("native_operator_program", {}).get(
                     "strongest_supported_claim")),
@@ -2919,6 +2941,259 @@ class OperatorInterpretabilityRunner:
             "test_used": False,
             "artifact_warnings": artifact_warnings,
             "human_summary": human_summary,
+        }
+
+    def _run_ravel_discovery_localization(self) -> dict[str, Any]:
+        """Localize and freeze variable circuits without held-out access."""
+        if self._scope("ravel_discovery_localization") != ("ravel",):
+            raise ValueError(
+                "RAVEL discovery localization is registered only for ravel")
+        if not self._ravel_discovery_isolated:
+            raise RuntimeError(
+                "RAVEL discovery localization did not enter split-isolated "
+                "execution")
+
+        spec = load_ravel_discovery_spec()
+        spec.validate_runtime(
+            target_id=str(self.ctx.model_info.get("target_id") or ""),
+            model_version=self.model_version,
+            checkpoint_step=int(self.ctx.checkpoint_step),
+            checkpoint_identity=str(self.contract["checkpoint_identity"]),
+            checkpoint_config_hash=str(
+                self.ctx.model_info.get("checkpoint_config_hash") or ""),
+            model_config_hash=str(self.contract["model_config_hash"]),
+            benchmark_build_id=self.build.build_id,
+            benchmark_manifest_hash=self.build.manifest_hash,
+            seed=self.config.seed,
+            ravel_max_examples_per_phase=(
+                self.config.ravel_max_examples_per_phase),
+            capture_threshold=self.config.capture_threshold,
+            capture_widths=(
+                self.config.capture_topk_qk,
+                self.config.capture_topk_v,
+                self.config.capture_topk_rst,
+                self.config.capture_max_topk_qk,
+                self.config.capture_max_topk_v,
+                self.config.capture_max_topk_rst,
+            ),
+            rank_stability_minimum=self.config.rank_stability_min,
+        )
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL ravel_discovery "
+            "stage=behavioral_eligibility status=running")
+        phase_rows = self._load_phase_examples("ravel", "discovery")
+        if len(phase_rows) != RAVEL_DISCOVERY_ROW_COUNT:
+            raise ValueError(
+                "RAVEL discovery canonical row count drift: "
+                f"expected={RAVEL_DISCOVERY_ROW_COUNT} "
+                f"actual={len(phase_rows)}")
+        behavior = evaluate_behavior(
+            self.ctx, phase_rows,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        known_correct_mask = [
+            bool(value) for value in behavior["known_correct"]]
+        known_correct = [
+            example for example, keep in zip(
+                phase_rows, known_correct_mask)
+            if keep
+        ]
+        independent = self._independent_capture_examples(
+            "ravel", known_correct)
+        if len(independent) != RAVEL_DISCOVERY_PAIRED_CORRECT_COUNT:
+            raise ValueError(
+                "RAVEL discovery paired-correct independent-unit drift: "
+                f"expected={RAVEL_DISCOVERY_PAIRED_CORRECT_COUNT} "
+                f"actual={len(independent)}")
+        variable_unit_counts = {
+            variable: sum(
+                str(example.causal_variable) == variable
+                for example in independent)
+            for variable in benchmark_spec("ravel").causal_variables
+        }
+        source_unit_counts = {
+            variable: {
+                source_column: sum(
+                    str(example.causal_variable) == variable
+                    and str(example.metadata.get(
+                        "official_counterfactual_column")) == source_column
+                    for example in independent)
+                for source_column in benchmark_spec(
+                    "ravel").counterfactual_columns
+            }
+            for variable in benchmark_spec("ravel").causal_variables
+        }
+        behavior_vector_fields = (
+            "example_ids",
+            "base_positive_logp",
+            "base_negative_logp",
+            "base_margin",
+            "corrupted_margin",
+            "source_own_margin",
+            "source_behavior_scored",
+            "base_known_correct",
+            "source_known_correct",
+            "known_correct",
+        )
+        behavior_vector_payload = {
+            field: behavior[field] for field in behavior_vector_fields}
+        behavior_summary = {
+            "status": "ready",
+            "phase": "discovery",
+            "runtime_selected_row_count": len(phase_rows),
+            "known_correct_row_count": int(
+                behavior["known_correct_count"]),
+            "paired_correct_independent_unit_count": len(independent),
+            "paired_correct_independent_unit_count_by_variable": (
+                variable_unit_counts),
+            "paired_correct_independent_unit_count_by_variable_and_source": (
+                source_unit_counts),
+            "base_accuracy": float(behavior["accuracy"]),
+            "source_accuracy": behavior["source_accuracy"],
+            "pair_accuracy": float(behavior["pair_accuracy"]),
+            "mean_margin": float(behavior["mean_margin"]),
+            "mean_corrupted_margin": float(
+                behavior["mean_corrupted_margin"]),
+            "mean_source_own_margin": behavior["mean_source_own_margin"],
+            "runtime_selected_example_ids_hash": canonical_hash([
+                example.example_id for example in phase_rows]),
+            "known_correct_row_ids_hash": canonical_hash([
+                example.example_id for example in known_correct]),
+            "paired_correct_independent_unit_ids_hash": canonical_hash([
+                str(example.metadata["pair_group_id"])
+                for example in independent]),
+            "raw_behavior_vector_payload_hash": canonical_hash(
+                behavior_vector_payload),
+            "raw_behavior_vectors_persisted": False,
+        }
+        self._print(
+            "TRAIN_ANALYSIS_POOL ravel_discovery "
+            "stage=behavioral_eligibility status=ready "
+            f"paired_correct={len(independent)}")
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL ravel_discovery "
+            "stage=operator_capture status=running")
+        capture = capture_discovery_candidates(
+            self.ctx, independent,
+            seed=self.config.seed,
+            retain_rows=True,
+            **self._capture_kwargs("ravel"))
+        transient_rows = list(capture.get("rows") or ())
+        variable_results = build_ravel_variable_localization(
+            transient_rows,
+            spec=spec,
+            rank_stability_by_variable=dict(
+                capture.get("rank_stability_by_causal_variable") or {}),
+        )
+        pooled_ranked = [
+            dict(row) for row in capture.pop("ranked_sites", ())
+            if isinstance(row, Mapping)
+        ]
+        capture.pop("rows", None)
+        raw_rows_materialized = bool(capture.pop(
+            "raw_rows_materialized_for_runtime", False))
+        capture.update({
+            "discovery_independent_example_count": len(independent),
+            "runtime_phase_cap": self.config.max_examples_for("ravel"),
+            "pooled_ranked_site_count": len(pooled_ranked),
+            "pooled_ranked_sites_content_hash": canonical_hash(pooled_ranked),
+            "pooled_ranked_site_preview": pooled_ranked[:16],
+            "pooled_ranking_used_for_circuit_freeze": False,
+            "raw_capture_row_count": int(capture["total_row_count"]),
+            "raw_capture_rows_persisted": False,
+            "raw_capture_rows_used_transiently": raw_rows_materialized,
+            "raw_capture_retention": (
+                "aggregate_variable_rankings_selected_prefixes_and_hashes"),
+        })
+
+        variable_statuses = {
+            variable: str(variable_results[variable]["status"])
+            for variable in spec.variables
+        }
+        all_variables_ready = all(
+            status == "ready" for status in variable_statuses.values())
+        if all_variables_ready:
+            status = "ready"
+            decision = "all_variable_circuits_frozen"
+            strongest_claim = (
+                "ravel_discovery_variable_operator_circuits_frozen")
+        elif any(
+                value == "unstable_localization"
+                for value in variable_statuses.values()):
+            status = "unstable_localization"
+            decision = "no_validation_due_to_unstable_variable_localization"
+            strongest_claim = None
+        else:
+            status = "no_preregistered_prefix"
+            decision = "no_validation_due_to_discovery_freeze_rule_failure"
+            strongest_claim = None
+        for variable in spec.variables:
+            result = variable_results[variable]
+            circuit = dict(result.get("circuit") or {})
+            self._print(
+                "TRAIN_ANALYSIS_POOL ravel_discovery "
+                f"variable={variable} status={result['status']} "
+                f"rank_stability={result.get('rank_stability', {}).get('rank_stability')} "
+                f"selected_k={circuit.get('selected_k', 0)} "
+                f"route_counts={circuit.get('selected_route_counts')}")
+        self._print(
+            "TRAIN_ANALYSIS_POOL ravel_discovery "
+            f"stage=operator_capture status={status}")
+
+        del transient_rows
+        del pooled_ranked
+        gc.collect()
+        return {
+            "status": status,
+            "decision": decision,
+            "benchmark": "ravel",
+            "phase": "discovery",
+            "preregistered_specification": {
+                "path": spec.path,
+                "content_hash": spec.content_hash,
+                "status": spec.payload["status"],
+                "variables": list(spec.variables),
+                "rank_stability_minimum": (
+                    spec.rank_stability_minimum),
+                "audited_prefix_counts": list(spec.prefix_counts),
+                "cumulative_absolute_importance_minimum": (
+                    spec.cumulative_importance_minimum),
+                "split_topk_overlap_minimum": (
+                    spec.split_overlap_minimum),
+                "circuit_freeze_rule": (
+                    "smallest_audited_prefix_passing_both_discovery_gates"),
+                "result_dependent_route_changes_forbidden": True,
+            },
+            "behavioral_eligibility": behavior_summary,
+            "capture": capture,
+            "variable_localization": variable_results,
+            "variable_statuses": variable_statuses,
+            "all_preregistered_variables_ready": all_variables_ready,
+            "split_isolation": {
+                "ranking_phase": "discovery",
+                "selection_phase": "discovery",
+                "validation_evaluated": False,
+                "validation_evaluation_count": 0,
+                "validation_data_accessor_called": False,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+                "validation_used_for_selection": False,
+                "test_used_for_selection": False,
+                "validation_may_change_circuit": False,
+                "test_may_change_circuit": False,
+            },
+            "storage_audit": {
+                "aggregate_variable_rankings_persisted": True,
+                "selected_prefixes_and_identity_hashes_persisted": True,
+                "raw_per_example_behavior_vectors_persisted": False,
+                "raw_per_example_operator_vectors_persisted": False,
+                "raw_capture_rows_persisted": False,
+                "raw_parameters_persisted": False,
+                "dense_capture_persisted": False,
+            },
+            "strongest_supported_claim": strongest_claim,
         }
 
     def _reduce_ravel_capture(
