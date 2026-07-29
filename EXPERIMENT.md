@@ -7,7 +7,7 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 - Current goal: use `codex/v4167-poc` as the sole canonical integration, baseline-source, and final experiment-reporting branch for all POC work. Experimental branches may isolate candidate code and runs, but every material result and current decision must be synchronized back to this notebook on POC and pushed. Only accepted source changes are integrated into POC.
 - Paper-analysis track: `configs/paper_checkpoint_registry.yaml` is the descriptive source for the user-designated DAWN-SRW v4172 400M/1.3B and baseline-JAX 400M/1.3B run roots. The 400M DAWN and baseline are the matched 40B-token performance pair; DAWN 1.3B is available for 20B-token scale evaluation and selected mechanistic replication. The baseline-JAX 1.3B run is still training and is excluded from evaluation and comparison until the user declares it complete.
-- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. Promote IOI, ARC, and RAVEL to task-specific causal analysis; retain MCQA as a reserve/appendix task. Causal claims remain gated on localization, intervention, controls, restoration, and held-out confirmation. DAWN 1.3B work is sequential and selective, and no 1.3B baseline work is currently allowed.
+- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398`; a 4,096-site Q/K-dominant circuit specification is now frozen before any validation/test intervention. Promote IOI next to frozen-spec validation suppression, matched controls, and restoration; retain RAVEL and ARC as the following primary/secondary tasks. No causal IOI claim is supported until those interventions and held-out confirmation complete. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
 - v4175 40M POC state: a route-separated `spatial-r1-v4.1.7.5` reference is locally implemented directly on `codex/v4167-poc` from exact clean parent/origin commit `7de5fc391608d337d9835d0cb9759487a6affd8d`. One shared eight-space atlas owns `space_read_proj`/`space_write_proj`; Q, K, V, and RST own independent selector projections and space keys, independently choose top-2 atlas entries, retain separate tau maps and operator banks, and use metric-complete dense all-space execution. The exact 40M tree is 40,344,160 parameters, 544 (`0.00135%`) above the 40,343,616 Transformer reference. These changes and this notebook entry remain an uncommitted local dirty worktree and are not yet canonical published source.
 - v4175 evidence boundary: local Python/JAX/Flax `3.12.7/0.6.2/0.10.7` abstract-tree, route-factory, calibration, JIT forward/backward, compact-metric, reduced canonical train-step, and v4174 regression checks passed. TPU compile, HBM, step time, throughput, and training stability are `not measured`; execution optimization is intentionally deferred until after the 40M semantic reference runs.
 - Publication state: accepted QKV+RST outer analytic-pullback source is integrated by merge commit `62417b239d5b79c5dfa8684563532958ed212385` on `codex/v4167-poc`. User-approved QK/V/RST initializer target fractions `0.08/0.08/0.05` are integrated by merge commit `bb2a3ada9a0c281df9439043162dde8045d62bfd` and measured at clean POC commit `ae12416b40607ef8dd21fe79a64d86b4335e18b3`. Generation-`g5` registry and the rejected matched chunk4 report are centralized by POC commit `4e896c00b63f9b0523bb95ebe8357c37cc824740`. The chunk4 source remains only on `codex/v4174-g4-frac885-rst-chunk4` at `a3879f21dcd3b786bdc2cde270bcca2a382796a4`.
@@ -257,6 +257,69 @@ aggregate statistics, and content hashes. The clean analysis commit is
 `469c2d12caf1dabf578e16d0bd1ab9cc7bf70ea4`, and the protocol hash is
 `e55551954702df3ae628798f5a208681e1eed68dbbda0d967967af6865107adc`.
 
+### IOI discovery localization and frozen intervention specification
+
+The task-specific IOI localization used only the 119 paired-correct independent
+discovery examples. All `8,568/8,568` layer-route rows passed the `0.95`
+captured-mass threshold after the QK/V/RST widths expanded from
+`512/2048/4096` to `2048/8192/8192`. The ranking contains 456,697 unique
+layer-route-operator sites and has split-half Spearman rank stability
+`0.9139788`, above the fixed `0.80` gate. The exact ranking hash is
+`84f0ee8fa0a6aaa959a6140f0fa04b9b00b3b2c5c10e3dffba995eddd20f7d60`.
+
+| Discovery prefix k | Shared sites across halves | Overlap fraction | Jaccard | Cumulative absolute importance |
+|---:|---:|---:|---:|---:|
+| 32 | 32 | 1.0000 | 1.0000 | 0.0482 |
+| 64 | 63 | 0.9844 | 0.9692 | 0.0836 |
+| 128 | 125 | 0.9766 | 0.9542 | 0.1352 |
+| 256 | 252 | 0.9844 | 0.9692 | 0.2032 |
+| 512 | 498 | 0.9727 | 0.9468 | 0.2815 |
+| 1,024 | 989 | 0.9658 | 0.9339 | 0.3863 |
+| 2,048 | 1,984 | 0.9688 | 0.9394 | 0.5346 |
+| 4,096 | 3,993 | 0.9749 | 0.9509 | 0.7192 |
+
+The full ranking is strongly Q/K-dominant: K contributes `57.9672%` and Q
+`40.3133%` of aggregate absolute discovery importance, versus V `1.0019%` and
+RST `0.7176%`. The first K, Q, V, and RST sites appear at ranks `1`, `9`,
+`3,503`, and `6,506`, respectively. The highest-ranked sites repeat K operators
+`547`, `1738`, and `3381` across middle layers, led by layer-5 K operator 547
+with importance `33.56385`. The largest layer-route aggregate is layer-14 K
+(`5.4275%` of total importance), followed by layer-15 K (`4.7751%`) and
+layer-13 K (`4.5435%`). These are localization statistics, not yet causal
+effects.
+
+The discovery-only circuit-size rule is frozen as the smallest audited prefix
+with cumulative absolute importance at least `0.70` and discovery-half top-k
+overlap at least `0.95`. This selects `k=4,096`: Q `1,744`, K `2,350`, V `2`,
+and RST `0`, spanning all 18 layers. The zero RST count is retained as a
+discovery result rather than corrected after inspection. The selected ranked
+rows hash is
+`1439f6f3c3288818f6398f10a38620c9e1c348d7f064f8b1ac4fa59c05cfe0c1`,
+and the selected site-identity hash is
+`573cfff883069bee821542bf24cee7a618a43195e8c22f4573f2ef7e18f60200`.
+The machine-readable specification is
+`configs/paper_ioi_frozen_circuit_v4172_400m.yaml`.
+
+Validation and test may not change the 4,096 sites, layer/route counts,
+suppression or restoration definition, score, thresholds, or controls.
+Validation will compare intact execution with full-denominator circuit
+suppression, 100 replicates each of equal-count random, same-layer random,
+activation-matched, and route-frequency-matched controls, then exact
+same-example restoration. Held-out test remains unopened until the validation
+record is final. No validation/test intervention was run in this localization
+stage, so necessity, control separation, restoration, and held-out
+generalization remain `not measured`.
+
+The localization result root is
+`gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_items-29d4917e29bd_20260729T062234Z-439dd636`.
+Use `run_manifest.json` and `summary.json` for run identity/status,
+`summary.log` for the canonical human-readable record, and
+`items/mib_ioi/operator_localization.json` for the aggregate ranking. A
+post-run semantic audit found no raw per-example logit, margin, correctness,
+operator-ID, weight, or capture-row vector. The 101,232,291-byte localization
+JSON is retained because its one large list is the legitimate aggregate
+discovery ranking, not a raw per-example vector.
+
 ### Manuscript table and figure map
 
 | Output | Required content | Current evidence source |
@@ -266,7 +329,7 @@ aggregate statistics, and content hashes. The clean analysis commit is
 | Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
 | Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
 | Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M C4 and zero-shot complete; comparison cells pending |
-| Figure 3: circuit localization | Layer x operator causal contribution, trajectory, held-out overlap | Behavioral task-selection table complete in `#07`; IOI/ARC/RAVEL causal localization pending |
+| Figure 3: circuit localization | Layer x operator discovery contribution, split overlap, trajectory, held-out overlap | IOI aggregate site ranking and split overlap complete in `#09`; IOI causal effect/trajectory and ARC/RAVEL localization pending |
 | Figure 4: causal intervention | Intact, suppressed, matched control, restored | Pending scientific |
 | Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | Pending scientific |
 | Figure 6: scale replication | 400M versus 1.3B effect size and normalized layer trajectory | Pending selected 1.3B replication |
@@ -278,10 +341,11 @@ aggregate statistics, and content hashes. The clean analysis commit is
   10M-token C4 validation and full unlimited stock six-task results above are
   reproducible and paper-eligible; and IOI, MCQA, ARC, and RAVEL have enough
   paired-correct independent examples for mechanistic follow-up under the
-  preregistered threshold.
+  preregistered threshold; IOI has a stable discovery-only aggregate operator
+  ranking and a frozen 4,096-site intervention specification.
 - Not supported yet: matched dense performance retention, causal importance,
-  restoration, reuse, scale replication, pruning-quality tradeoffs, or
-  hardware speedup.
+  IOI trajectory confirmation, suppression/control separation, restoration,
+  reuse, scale replication, pruning-quality tradeoffs, or hardware speedup.
 - Do not infer a full validation loss from the Phase 0 fixed batch or from a
   training-log summary. Do not use `limit=1` task scores.
 - Do not call 400M-to-1.3B a scaling curve. Do not include baseline 1.3B until
@@ -1063,6 +1127,17 @@ aggregate statistics, and content hashes. The clean analysis commit is
 - Validation identity/result: `local validated` on `codex/v4167-poc` source commit `a7d3175fdb8ba9d5aad492848a9e09c9ed9f9257`; the only tracked worktree difference was this reporting-only `EXPERIMENT.md` edit. `C:\Users\USER\Desktop\DAWN-SRW\.venv\Scripts\python.exe` resolved Python with JAX `0.6.2`, Flax `0.10.7`, and NumPy `2.2.6`; module compilation passed, synthetic semantic compaction preserved scalar paper metrics while removing all ten known raw-vector fields and retaining a 64-hex content hash, effect-vector persistence was disabled, and three focused native-program/protocol/runner contract tests passed.
 - Lesson/decision/next: use aggregate statistics and hashes as durable paper evidence, and inspect completed artifacts by field meaning after each run; do not delete a normal structured JSON merely because it is large. Re-audit the next causal-analysis result root after completion and purge only confirmed raw per-example vector artifacts while preserving valid detailed scientific results.
 - Evidence: audited root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis`; source `analysis/operator_interpretability/runner.py`; manuscript storage policy and retained result boundary in the Paper Writing Ledger above.
+
+#### #09 — Localize the IOI discovery circuit and freeze its intervention specification
+
+- Hypothesis/change: IOI computation should produce a stable discovery-only layer-route-operator ranking from which one intervention specification can be fixed before any validation/test intervention. Source commit `e213488308e6ab75efa969e96cb7febcd2f688dd` retains the complete aggregate discovery ranking and exact content hash in the normal result JSON and adds split-half top-k overlap summaries; it does not retain raw per-example capture vectors.
+- Reproducibility identity: `TPU measured` from clean `codex/v4167-poc` commit `e213488308e6ab75efa969e96cb7febcd2f688dd`; existing TPU `spatial-se-400m`; target/model `v4172_400M` / `spatial-r1-v4.1.7.2`; config `configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml`; numeric checkpoint `checkpoints/000000076293`; checkpoint identity `a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17`; checkpoint-config hash `08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b`; model-config hash `053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f`; source worktree clean. Requested item was only `mib_ioi.operator_localization`; its input-contract and behavioral dependencies ran, but no validation/test intervention item ran.
+- Runtime/protocol: one TPU v4-64 pod, eight hosts, 32 devices, mesh `data=16, model=2`, `/usr/bin/python3` 3.10.6, JAX/jaxlib `0.6.2`, Flax `0.10.7`, Optax `0.2.8`, NumPy `2.2.6`, seed `4172`, maximum 128 rows per non-RAVEL phase, capture threshold `0.95`, and QK/V/RST width growth `512/2048/4096 -> 2048/8192/8192`. Immutable benchmark build `f056bb4f133cde4fc0ae02f9` had manifest hash `f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6`; protocol hash was `e0b7c4cb0245f1ed3a1e6be1a0c4ca4b837b6ff78d25224a8f588b8e77c1885c`.
+- Result: `ready`; all `8,568/8,568` discovery layer-route rows qualified, producing 456,697 aggregate ranked sites from 119 independent paired-correct IOI examples. Split-half rank stability was `0.913978765` versus the `0.80` gate. Top-k overlap fractions for `k=32/64/128/256/512/1024/2048/4096` were `1.0000/0.9844/0.9766/0.9844/0.9727/0.9658/0.9688/0.9749`. Aggregate absolute importance was K `57.9672%`, Q `40.3133%`, V `1.0019%`, and RST `0.7176%`; the first K/Q/V/RST sites appeared at ranks `1/9/3503/6506`.
+- Frozen specification: choose the smallest audited discovery prefix with cumulative absolute importance `>=0.70` and split top-k overlap `>=0.95`. This selects `k=4,096`, cumulative importance `0.719248713`, overlap `0.974853516`, and Jaccard `0.950940700`, with Q/K/V/RST counts `1,744/2,350/2/0` across all 18 layers. Selected-ranked-row hash `1439f6f3c3288818f6398f10a38620c9e1c348d7f064f8b1ac4fa59c05cfe0c1`; site-identity hash `573cfff883069bee821542bf24cee7a618a43195e8c22f4573f2ef7e18f60200`. Freeze `configs/paper_ioi_frozen_circuit_v4172_400m.yaml`; validation/test may not change the sites, k, score, suppression/restoration, gates, or matched controls.
+- Storage audit: the result root contains seven objects totaling 101,298,715 bytes (`96.61 MiB`). Semantic traversal found no raw per-example logit, margin, correctness, operator-ID, weight, or capture-row vector. The 101,232,291-byte localization JSON is retained because its 456,697-row list contains aggregate discovery site statistics required to resolve the frozen circuit; it is not deleted or truncated by size.
+- Lesson/decision/next: accept stable IOI discovery localization and the frozen 4,096-site specification, but make no causal claim from contribution ranking alone. Implement the frozen-spec loader plus equal-count, same-layer, activation-matched, and route-frequency-matched controls and exact restoration; run validation first, finalize its record, and only then open held-out test. Preserve a scientifically negative result if suppression, control separation, or restoration misses its frozen gate.
+- Evidence: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_items-29d4917e29bd_20260729T062234Z-439dd636`; exact run identity/status `run_manifest.json` and `summary.json`; canonical paper text `summary.log`; aggregate ranking `items/mib_ioi/operator_localization.json`; machine-readable frozen specification `configs/paper_ioi_frozen_circuit_v4172_400m.yaml`; remote runtime logs `~/train.log` on all eight workers.
 
 ## Backfill Boundary
 
