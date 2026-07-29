@@ -1,0 +1,157 @@
+schema_version: 1
+status: frozen_after_discovery_before_validation
+
+target:
+  target_id: v4172_400M
+  model_version: spatial-r1-v4.1.7.2
+  config: configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+  checkpoint_run: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201
+  checkpoint_step: 76293
+  checkpoint_identity: a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17
+  checkpoint_config_hash: 08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b
+  model_config_hash: 053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f
+
+discovery:
+  benchmark_id: mib_arc
+  phase: discovery
+  selection_uses_validation: false
+  selection_uses_test: false
+  runtime_selected_row_count: 128
+  independent_example_count: 50
+  independent_unit: example_id
+  split_rule: seeded_balanced_example_id_split
+  split_independent_unit_counts: [25, 25]
+  analysis_commit: 7d94dc303162b727192b9721b354fc88744ca2f0
+  analysis_worktree_dirty: false
+  benchmark_build_id: f056bb4f133cde4fc0ae02f9
+  benchmark_manifest_hash: f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6
+  preregistered_spec_hash: 70ff8bcab6b1ad0448c29c582f0fc204e834a4b7c9800e925591d32f82cc6b7b
+  protocol_hash: 16440596df4d4a4f07e604659214b7d78166aae5e350cdbb121ed66e8062a33a
+  result_root: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_arc_discovery_localization_20260729T140441Z-a987a54d
+  localization_item: items/mib_arc/discovery_operator_localization.json
+  localization_item_sha256: 32059614c227892a5231976aae3a529d42a949057150df1865dd1bc3773f5e1a
+  localization_item_bytes: 81425519
+  capture_threshold: 0.95
+  capture_final_widths:
+    qk: 1024
+    v: 4096
+    rst: 8192
+  qualified_row_count: 3600
+  total_row_count: 3600
+  rank_stability: 0.8938604492424003
+  rank_stability_minimum: 0.80
+  ranked_site_count: 341062
+  ranked_sites_content_hash: cddb10f0a2f0cbfe5a6d002d5b629a7a79b1120c7474350d2ed6cf8eea39e5e7
+  raw_capture_digest: 5f5d15e0094e1f6d9ab2d61a76e15bf1d7977fc4c05066e6b32a8e08130b9349
+  raw_per_example_vectors_persisted: false
+
+selection:
+  ranking_score: absolute_discovery_mean_contribution_importance
+  rule: smallest_audited_prefix_passing_both_discovery_gates
+  discovery_gates:
+    cumulative_absolute_importance_minimum: 0.70
+    split_topk_overlap_minimum: 0.95
+  selected_k: 4096
+  selected_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+  selected_route_counts:
+    q: 1770
+    k: 2326
+    v: 0
+    rst: 0
+  selected_layer_route_counts:
+    0: {q: 46, k: 51, v: 0, rst: 0}
+    1: {q: 63, k: 66, v: 0, rst: 0}
+    2: {q: 57, k: 63, v: 0, rst: 0}
+    3: {q: 62, k: 54, v: 0, rst: 0}
+    4: {q: 80, k: 114, v: 0, rst: 0}
+    5: {q: 124, k: 133, v: 0, rst: 0}
+    6: {q: 134, k: 134, v: 0, rst: 0}
+    7: {q: 127, k: 139, v: 0, rst: 0}
+    8: {q: 131, k: 134, v: 0, rst: 0}
+    9: {q: 140, k: 142, v: 0, rst: 0}
+    10: {q: 126, k: 140, v: 0, rst: 0}
+    11: {q: 146, k: 141, v: 0, rst: 0}
+    12: {q: 141, k: 124, v: 0, rst: 0}
+    13: {q: 149, k: 173, v: 0, rst: 0}
+    14: {q: 139, k: 270, v: 0, rst: 0}
+    15: {q: 67, k: 204, v: 0, rst: 0}
+    16: {q: 21, k: 146, v: 0, rst: 0}
+    17: {q: 17, k: 98, v: 0, rst: 0}
+  cumulative_absolute_importance_fraction: 0.70930148829107
+  discovery_split_shared_site_count: 3923
+  discovery_split_topk_overlap: 0.957763671875
+  discovery_split_topk_jaccard: 0.9189505739048958
+  top_importance: 33.84406482696533
+  boundary_importance: 1.267776618897915
+  selected_ranked_rows_hash: a5344782d588aeacc08fa8752d4a2471027bbb6deecd0aa0e5ad113254e48874
+  selected_site_identity_hash: 96bf2710cfdcb34894ff7154d8ccdd5d732f0fa4c52e4722e35ee2d9d2238fad
+  circuit_hash: ef8d58ecb44b05fc86b1cee81302eb58c69151713e02fa85e0af82547f43b414
+  site_resolution: first_selected_k_rows_of_exact_ranked_sites_content_hash
+  zero_selected_v_sites_is_a_discovery_result: true
+  zero_selected_rst_sites_is_a_discovery_result: true
+
+intervention:
+  selection_must_not_be_recomputed: true
+  validation_may_change_specification: false
+  test_may_change_specification: false
+  candidate_score: correct_minus_source_sum_log_probability
+  primary_effect: intact_margin_minus_suppressed_margin
+  suppression:
+    mode: circuit_wide_execution_numerator_suppression
+    admission_denominator: full_production_denominator
+  restoration:
+    mode: exact_selected_numerator_restore_after_suppression
+    admission_denominator: full_production_denominator
+    restored_values_source: same_example_intact_execution
+  controls:
+    replicate_count: 100
+    seed: 24172
+    match_fields: [layer, route]
+    match_exact_frozen_count_per_cell: true
+    sampling: uniform_without_replacement_within_layer_route_cell
+    sampling_population: frozen_site_complement
+    frozen_sites_excluded: true
+    duplicate_site_within_replicate_forbidden: true
+    control_site_set_hashes_must_be_unique: true
+
+evaluation:
+  validation_first: true
+  validation_runtime_selected_row_count: 128
+  validation_independent_example_count: 51
+  held_out_test_opened_only_after_validation_record_is_final: true
+  held_out_test_runtime_selected_row_count: 128
+  held_out_test_independent_example_count: 57
+  bootstrap_samples: 2000
+  permutation_samples: 2000
+  alpha: 0.05
+  validation_gates:
+    suppression_margin_drop_ci_low_above_zero: true
+    frozen_minus_matched_random_margin_drop_ci_low_above_zero: true
+    restoration_recovery_ci_low_minimum: 0.80
+  unrelated_output_damage:
+    role: selectivity_audit_only
+    threshold: null
+  report_even_when_gate_fails: true
+  report:
+    - intact_mean_margin
+    - intact_accuracy
+    - suppressed_mean_margin
+    - suppressed_accuracy
+    - mean_margin_drop
+    - margin_drop_bootstrap_ci
+    - prediction_flip_fraction
+    - source_direction_change
+    - matched_random_margin_drop_distribution
+    - frozen_minus_matched_random_paired_effect
+    - unrelated_output_damage
+    - restored_mean_margin
+    - restoration_recovery_fraction
+    - restoration_recovery_bootstrap_ci
+
+storage:
+  preserve_aggregate_statistics_and_hashes: true
+  preserve_frozen_site_identity_hash: true
+  preserve_raw_per_example_logits: false
+  preserve_raw_per_example_margins: false
+  preserve_raw_per_example_operator_vectors: false
+  semantic_audit_after_run: true
