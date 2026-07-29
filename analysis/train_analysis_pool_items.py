@@ -219,6 +219,20 @@ _register("mib_arc.discovery_operator_localization", _mechanistic_item(
     "mib_arc.input_contract",
     claim_role="auxiliary",
     test_used=False))
+_register("mib_arc.frozen_circuit_validation", _mechanistic_item(
+    "mib_arc", "arc_frozen_validation",
+    "ARC frozen-circuit confirmatory validation",
+    "Does the discovery-frozen 4,096-site ARC circuit causally support the "
+    "51 paired-correct validation examples beyond an exact layer-route "
+    "matched random control, and does same-example restoration recover it?",
+    "Load the hash-bound frozen ARC YAML and discovery artifact without "
+    "re-localization; evaluate only validation under intact execution, "
+    "frozen full-denominator suppression, 100 uniform-without-replacement "
+    "controls matching every layer-route cell count, and exact selected-"
+    "numerator restoration. Held-out test access is forbidden.",
+    "mib_arc.input_contract",
+    claim_role="auxiliary",
+    test_used=False))
 _register("ravel.operator_space_structure", _mechanistic_item(
     "ravel", "operator_space_structure", "RAVEL operator-space structure",
     "Do read/write maps form reproducible local functional families independent of address?",
@@ -294,6 +308,8 @@ TRAIN_ANALYSIS_POOL_PRESETS: dict[str, tuple[str, ...]] = {
         "ravel.discovery_operator_localization",),
     "arc_discovery_localization": (
         "mib_arc.discovery_operator_localization",),
+    "arc_frozen_validation": (
+        "mib_arc.frozen_circuit_validation",),
     "mib_ioi_circuit": _mib_circuit_preset("mib_ioi"),
     "mib_mcqa_circuit": _mib_circuit_preset("mib_mcqa"),
     "mib_arithmetic_circuit": _mib_circuit_preset("mib_arithmetic"),

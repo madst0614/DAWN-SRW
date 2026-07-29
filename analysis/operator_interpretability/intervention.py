@@ -654,6 +654,67 @@ def prepare_frozen_circuit_evaluation(
     )
 
 
+def prepare_arc_frozen_circuit_evaluation(
+        ctx: Any, examples: Sequence[BenchmarkExample], *,
+        pad_token_id: int) -> FrozenCircuitEvaluationBatch:
+    """Stage the fixed ARC validation rows for all confirmatory conditions."""
+    if not examples:
+        raise ValueError("frozen ARC circuit evaluation has no examples")
+    phase = str(examples[0].phase)
+    if any(
+            example.benchmark_id != "mib_arc"
+            or str(example.phase) != phase
+            or str(example.pair_type) != "symbol_counterfactual"
+            for example in examples):
+        raise ValueError(
+            "frozen ARC circuit evaluation requires one homogeneous "
+            "mib_arc symbol-counterfactual phase")
+    if phase not in {"validation", "test"}:
+        raise ValueError(
+            f"unsupported frozen ARC evaluation phase={phase}")
+
+    rows: list[tuple[tuple[int, ...], np.ndarray]] = []
+    for answer_field in ("positive_ids", "negative_ids"):
+        for example in examples:
+            prompt = tuple(example.input_ids_base)
+            answer = tuple(getattr(example, answer_field))
+            sequence = (*prompt, *answer)
+            labels = np.full((len(sequence),), -100, dtype=np.int32)
+            labels[len(prompt):] = np.asarray(answer, dtype=np.int32)
+            rows.append((sequence, labels))
+    for example in examples:
+        sequence = tuple(example.input_ids_base)
+        if len(sequence) < 2:
+            raise ValueError(
+                f"{example.example_id}: ARC unrelated-output audit is empty")
+        labels = np.asarray(sequence, dtype=np.int32).copy()
+        labels[0] = -100
+        rows.append((sequence, labels))
+
+    multiple = max(1, int(ctx.mesh.shape["data"]))
+    length = max(len(sequence) for sequence, _ in rows)
+    real_count = len(rows)
+    batch_size = ((real_count + multiple - 1) // multiple) * multiple
+    input_ids = np.full(
+        (batch_size, length), int(pad_token_id), dtype=np.int32)
+    labels = np.full((batch_size, length), -100, dtype=np.int32)
+    for index, (sequence, row_labels) in enumerate(rows):
+        input_ids[index, :len(sequence)] = np.asarray(
+            sequence, dtype=np.int32)
+        labels[index, :len(sequence)] = row_labels
+    for index in range(real_count, batch_size):
+        input_ids[index] = input_ids[0]
+        labels[index] = labels[0]
+    ids_device, labels_device = _device_batch(ctx, input_ids, labels)
+    return FrozenCircuitEvaluationBatch(
+        input_ids=ids_device,
+        labels=labels_device,
+        example_count=len(examples),
+        real_row_count=real_count,
+        phase=phase,
+    )
+
+
 def _frozen_circuit_score_executable(ctx: Any):
     cache = getattr(ctx, "_operator_interpretability_executables", None)
     if cache is None:

@@ -22,6 +22,14 @@ from analysis.operator_interpretability.arc_localization import (
     build_arc_localization,
     load_arc_discovery_spec,
 )
+from analysis.operator_interpretability.arc_frozen_circuit import (
+    FROZEN_ARC_CONTROL_ALGORITHM_VERSION,
+    FROZEN_ARC_CONTROL_NAME,
+    FROZEN_ARC_VALIDATION_PAIRED_CORRECT_COUNT,
+    FROZEN_ARC_VALIDATION_ROW_COUNT,
+    FrozenARCControlSampler,
+    load_frozen_arc_circuit,
+)
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
     resolve_benchmark_build,
@@ -81,6 +89,7 @@ from analysis.operator_interpretability.intervention import (
     evaluate_native_operator_program_phase_baselines,
     evaluate_native_operator_program_selection_candidate,
     evaluate_operator_interchange,
+    prepare_arc_frozen_circuit_evaluation,
     prepare_frozen_circuit_evaluation,
 )
 from analysis.operator_interpretability.program import (
@@ -297,6 +306,7 @@ class OperatorInterpretabilityRunner:
         self._paired_trajectory_test_isolated = False
         self._frozen_circuit_phase_isolated = False
         self._arc_discovery_isolated = False
+        self._arc_frozen_validation_isolated = False
         self._ravel_discovery_isolated = False
 
     def _print(self, message: str) -> None:
@@ -648,6 +658,22 @@ class OperatorInterpretabilityRunner:
                 "dedicated input-contract item so split access remains "
                 "isolated")
         self._frozen_circuit_phase_isolated = frozen_circuit_requested
+        arc_frozen_validation_item = (
+            "mib_arc.frozen_circuit_validation")
+        arc_frozen_validation_requested = (
+            arc_frozen_validation_item in requested_set)
+        arc_frozen_validation_only_items = {
+            "mib_arc.input_contract",
+            arc_frozen_validation_item,
+        }
+        if (arc_frozen_validation_requested
+                and not requested_set <= arc_frozen_validation_only_items):
+            raise ValueError(
+                "mib_arc.frozen_circuit_validation must run only with its "
+                "input contract so discovery and held-out test access remain "
+                "isolated")
+        self._arc_frozen_validation_isolated = (
+            arc_frozen_validation_requested)
         arc_discovery_item = "mib_arc.discovery_operator_localization"
         arc_discovery_requested = arc_discovery_item in requested_set
         arc_discovery_only_items = {
@@ -737,6 +763,8 @@ class OperatorInterpretabilityRunner:
                 or self.results.get("frozen_circuit_test", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("frozen_circuit_validation", {}).get(
+                    "strongest_supported_claim")
+                or self.results.get("arc_frozen_validation", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("arc_discovery_localization", {}).get(
                     "strongest_supported_claim")
@@ -1479,6 +1507,517 @@ class OperatorInterpretabilityRunner:
 
     def _run_frozen_circuit_test(self) -> dict[str, Any]:
         return self._run_frozen_circuit_phase("test")
+
+    def _run_arc_frozen_validation(self) -> dict[str, Any]:
+        """Run only the discovery-frozen ARC validation protocol."""
+        if self._scope("arc_frozen_validation") != ("mib_arc",):
+            raise ValueError(
+                "ARC frozen validation is registered only for mib_arc")
+        if not self._arc_frozen_validation_isolated:
+            raise RuntimeError(
+                "ARC frozen validation did not enter split-isolated execution")
+
+        frozen = load_frozen_arc_circuit(self.shape)
+        frozen.validate_runtime(
+            shape=self.shape,
+            target_id=str(self.ctx.model_info.get("target_id") or ""),
+            model_version=self.model_version,
+            checkpoint_step=int(self.ctx.checkpoint_step),
+            checkpoint_identity=str(self.contract["checkpoint_identity"]),
+            checkpoint_config_hash=str(
+                self.ctx.model_info.get("checkpoint_config_hash") or ""),
+            model_config_hash=str(self.contract["model_config_hash"]),
+            benchmark_build_id=self.build.build_id,
+            benchmark_manifest_hash=self.build.manifest_hash,
+        )
+        evaluation = frozen.evaluation
+        bootstrap_samples = int(evaluation["bootstrap_samples"])
+        permutation_samples = int(evaluation["permutation_samples"])
+        alpha = float(evaluation["alpha"])
+        if self.config.max_examples_for(
+                "mib_arc") != FROZEN_ARC_VALIDATION_ROW_COUNT:
+            raise ValueError(
+                "frozen ARC validation requires the exact "
+                f"{FROZEN_ARC_VALIDATION_ROW_COUNT}-row phase")
+        if (self.config.bootstrap_samples != bootstrap_samples
+                or self.config.permutation_samples != permutation_samples
+                or not np.isclose(
+                    self.config.alpha, alpha, rtol=0.0, atol=0.0)):
+            raise ValueError(
+                "runtime resampling settings differ from the frozen ARC spec")
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "stage=behavioral_eligibility status=running")
+        phase_rows = self._load_phase_examples("mib_arc", "validation")
+        if len(phase_rows) != FROZEN_ARC_VALIDATION_ROW_COUNT:
+            raise ValueError(
+                "frozen ARC canonical validation selection count drift: "
+                f"expected={FROZEN_ARC_VALIDATION_ROW_COUNT} "
+                f"actual={len(phase_rows)}")
+        behavior = evaluate_behavior(
+            self.ctx, phase_rows,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        known_correct = [
+            example for example, keep in zip(
+                phase_rows, behavior["known_correct"])
+            if keep
+        ]
+        if len(known_correct) != FROZEN_ARC_VALIDATION_PAIRED_CORRECT_COUNT:
+            raise ValueError(
+                "frozen ARC paired-correct validation count drift: "
+                f"expected={FROZEN_ARC_VALIDATION_PAIRED_CORRECT_COUNT} "
+                f"actual={len(known_correct)}")
+        eligible_example_ids_hash = canonical_hash([
+            example.example_id for example in known_correct
+        ])
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "stage=behavioral_eligibility status=ready "
+            f"paired_correct={len(known_correct)}")
+
+        batch = prepare_arc_frozen_circuit_evaluation(
+            self.ctx, known_correct,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "condition=intact status=running")
+        intact = evaluate_frozen_circuit_condition(
+            self.ctx, batch, shape=self.shape, condition="intact")
+        intact_positive = np.asarray(
+            intact["positive_log_probability"], dtype=np.float64)
+        intact_negative = np.asarray(
+            intact["negative_log_probability"], dtype=np.float64)
+        intact_margin = intact_positive - intact_negative
+        known_correct_mask = np.asarray(
+            behavior["known_correct"], dtype=np.bool_)
+        reference_positive = np.asarray(
+            behavior["base_positive_logp"],
+            dtype=np.float64)[known_correct_mask]
+        reference_negative = np.asarray(
+            behavior["base_negative_logp"],
+            dtype=np.float64)[known_correct_mask]
+        reference_margin = reference_positive - reference_negative
+        log_probability_errors = np.concatenate((
+            intact_positive - reference_positive,
+            intact_negative - reference_negative,
+        ))
+        margin_errors = intact_margin - reference_margin
+        prediction_agreement = (
+            (intact_margin > 0.0) == (reference_margin > 0.0))
+        intact_reference_prediction_agreement = bool(
+            np.all(prediction_agreement))
+        intact_summary = {
+            "mean_margin": float(np.mean(intact_margin)),
+            "mean_correct_log_probability": float(np.mean(intact_positive)),
+            "mean_source_log_probability": float(np.mean(intact_negative)),
+            "exact_accuracy": float(np.mean(intact_margin > 0.0)),
+            "mean_unrelated_log_probability": float(np.mean(
+                np.asarray(
+                    intact["unrelated_mean_log_probability"],
+                    dtype=np.float64))),
+            "unrelated_token_count_minimum": int(
+                intact["unrelated_token_count_minimum"]),
+            "unrelated_token_count_maximum": int(
+                intact["unrelated_token_count_maximum"]),
+            "unrelated_behavior_definition": (
+                "mean_next_token_log_probability_on_entire_base_prompt_"
+                "excluding_first_token"),
+            "production_diagnostics_reference": {
+                "mean_margin": float(np.mean(reference_margin)),
+                "exact_accuracy": float(np.mean(reference_margin > 0.0)),
+            },
+            "production_reference_numeric_audit": {
+                "prediction_sign_agreement_passed": (
+                    intact_reference_prediction_agreement),
+                "prediction_sign_agreement_fraction": float(
+                    np.mean(prediction_agreement)),
+                "max_absolute_log_probability_error": float(
+                    np.max(np.abs(log_probability_errors))),
+                "mean_absolute_log_probability_error": float(
+                    np.mean(np.abs(log_probability_errors))),
+                "max_absolute_margin_error": float(
+                    np.max(np.abs(margin_errors))),
+                "mean_absolute_margin_error": float(
+                    np.mean(np.abs(margin_errors))),
+                "formal_numeric_tolerance_in_frozen_spec": False,
+                "used_as_statistical_threshold": False,
+            },
+        }
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "condition=intact status=ready "
+            f"margin={intact_summary['mean_margin']:.8f} "
+            f"accuracy={intact_summary['exact_accuracy']:.8f} "
+            "reference_sign_agreement="
+            f"{float(np.mean(prediction_agreement)):.8f} "
+            "reference_max_abs_logp_error="
+            f"{float(np.max(np.abs(log_probability_errors))):.8f}")
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "condition=frozen_suppression status=running")
+        suppressed = evaluate_frozen_circuit_condition(
+            self.ctx, batch, shape=self.shape, condition="suppression",
+            circuit=frozen.circuit)
+        suppression_summary = summarize_condition(
+            intact, suppressed,
+            bootstrap_samples=bootstrap_samples,
+            alpha=alpha,
+            seed=self.config.seed + 40_000,
+        )
+        suppression_summary["unrelated_behavior_definition"] = (
+            "mean_next_token_log_probability_on_entire_base_prompt_"
+            "excluding_first_token")
+        frozen_effects = condition_effect_vectors(intact, suppressed)
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "condition=frozen_suppression status=ready "
+            f"margin_drop={suppression_summary['mean_margin_drop']:.8f} "
+            f"accuracy={suppression_summary['exact_accuracy']:.8f}")
+
+        sampler = FrozenARCControlSampler(frozen, self.shape)
+        replicate_count = int(frozen.controls["replicate_count"])
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            f"control={FROZEN_ARC_CONTROL_NAME} "
+            f"replicate=0/{replicate_count} status=running")
+        margin_drop_rows: list[np.ndarray] = []
+        mean_margin_drop: list[float] = []
+        exact_accuracy: list[float] = []
+        prediction_flip: list[float] = []
+        correct_logp_change: list[float] = []
+        source_direction_change: list[float] = []
+        unrelated_damage: list[float] = []
+        identity_hashes: list[str] = []
+        for replicate_index in range(replicate_count):
+            control_circuit, audit = sampler.generate(replicate_index)
+            control_scores = evaluate_frozen_circuit_condition(
+                self.ctx, batch, shape=self.shape,
+                condition="suppression", circuit=control_circuit)
+            effects = condition_effect_vectors(intact, control_scores)
+            margin_drop_rows.append(effects["margin_drop"])
+            mean_margin_drop.append(float(np.mean(
+                effects["margin_drop"])))
+            exact_accuracy.append(float(np.mean(
+                effects["margin"] > 0.0)))
+            prediction_flip.append(float(np.mean(
+                (effects["intact_margin"] > 0.0)
+                != (effects["margin"] > 0.0))))
+            correct_logp_change.append(float(np.mean(
+                effects["correct_log_probability_change"])))
+            source_direction_change.append(float(np.mean(
+                effects["source_minus_correct_margin_change"])))
+            unrelated_damage.append(float(np.mean(
+                effects["unrelated_log_probability_damage"])))
+            identity_hashes.append(str(audit["site_identity_hash"]))
+            if ((replicate_index + 1) % 10 == 0
+                    or replicate_index + 1 == replicate_count):
+                self._print(
+                    "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+                    f"control={FROZEN_ARC_CONTROL_NAME} "
+                    f"replicate={replicate_index + 1}/"
+                    f"{replicate_count} status=running")
+            del control_scores, control_circuit
+        if len(set(identity_hashes)) != replicate_count:
+            raise RuntimeError(
+                "frozen ARC control site-set hashes are not unique")
+        control_matrix = np.stack(margin_drop_rows, axis=0)
+        separation = compare_frozen_to_controls(
+            frozen_effects["margin_drop"],
+            control_matrix,
+            bootstrap_samples=bootstrap_samples,
+            permutation_samples=permutation_samples,
+            alpha=alpha,
+            seed=self.config.seed + 50_000,
+        )
+        control_output = {
+            "replicate_count": replicate_count,
+            "base_seed": int(frozen.controls["seed"]),
+            "match_fields": list(frozen.controls["match_fields"]),
+            "sampling": frozen.controls["sampling"],
+            "sampling_population": frozen.controls["sampling_population"],
+            "control_algorithm_version": (
+                FROZEN_ARC_CONTROL_ALGORITHM_VERSION),
+            "rng_derivation": (
+                "numpy_seed_sequence_base_seed_and_replicate"),
+            "site_count_per_replicate": frozen.selected_k,
+            "exact_frozen_count_matched_per_layer_route_cell": True,
+            "frozen_circuit_sites_excluded": True,
+            "duplicate_site_within_replicate_forbidden": True,
+            "all_site_identity_hashes_unique": True,
+            "site_identity_hashes": identity_hashes,
+            "mean_margin_drop_distribution": mean_margin_drop,
+            "exact_accuracy_distribution": exact_accuracy,
+            "prediction_flip_fraction_distribution": prediction_flip,
+            "mean_correct_log_probability_change_distribution": (
+                correct_logp_change),
+            "mean_source_direction_change_distribution": (
+                source_direction_change),
+            "mean_unrelated_log_probability_damage_distribution": (
+                unrelated_damage),
+            "frozen_minus_control": separation,
+        }
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            f"control={FROZEN_ARC_CONTROL_NAME} status=ready "
+            f"mean_drop={float(np.mean(mean_margin_drop)):.8f} "
+            "frozen_minus_control="
+            f"{separation['mean_frozen_minus_control']:.8f}")
+        del margin_drop_rows, control_matrix
+        gc.collect()
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "condition=exact_restoration status=running")
+        restored = evaluate_frozen_circuit_condition(
+            self.ctx, batch, shape=self.shape, condition="restoration",
+            circuit=frozen.circuit)
+        restoration_summary = summarize_condition(
+            intact, restored,
+            bootstrap_samples=bootstrap_samples,
+            alpha=alpha,
+            seed=self.config.seed + 60_000,
+        )
+        restoration_summary["unrelated_behavior_definition"] = (
+            "mean_next_token_log_probability_on_entire_base_prompt_"
+            "excluding_first_token")
+        restored_effects = condition_effect_vectors(intact, restored)
+        recovery = bootstrap_restoration_recovery(
+            intact_margin,
+            frozen_effects["margin"],
+            restored_effects["margin"],
+            samples=bootstrap_samples,
+            alpha=alpha,
+            seed=self.config.seed + 61_000,
+        )
+        restoration_summary.update({
+            "restoration_recovery_fraction": recovery[
+                "recovery_fraction"],
+            "restoration_recovery_bootstrap_ci": recovery,
+            "restoration_mode": (
+                "exact_selected_numerator_restore_after_suppression"),
+            "restored_values_source": "same_example_intact_execution",
+        })
+        self._print(
+            "TRAIN_ANALYSIS_POOL frozen_arc phase=validation "
+            "condition=exact_restoration status=ready "
+            "recovery="
+            f"{restoration_summary['restoration_recovery_fraction']}")
+
+        suppression_ci_low = suppression_summary[
+            "margin_drop_bootstrap_ci"]["ci_low"]
+        suppression_gate = (
+            suppression_ci_low is not None
+            and float(suppression_ci_low) > 0.0)
+        control_ci_low = separation["bootstrap_ci"]["ci_low"]
+        control_gate = (
+            control_ci_low is not None
+            and float(control_ci_low) > 0.0)
+        recovery_ci_low = recovery["ci_low"]
+        recovery_minimum = float(evaluation[
+            "validation_gates"][
+                "restoration_recovery_ci_low_minimum"])
+        restoration_gate = (
+            recovery_ci_low is not None
+            and float(recovery_ci_low) >= recovery_minimum)
+        if (suppression_gate and control_gate and restoration_gate
+                and intact_reference_prediction_agreement):
+            decision = "strong_success"
+            strongest_claim = (
+                "validation_level_auxiliary_causal_arc_rw_operator_circuit")
+        elif (suppression_gate and not control_gate
+                and intact_reference_prediction_agreement):
+            decision = (
+                "partial_success_general_operator_damage_not_excluded")
+            strongest_claim = (
+                "validation_level_arc_frozen_suppression_without_"
+                "matched_random_separation")
+        elif (not suppression_gate
+                and not control_gate
+                and not restoration_gate):
+            decision = "failure_not_a_validation_causal_arc_circuit"
+            strongest_claim = None
+        else:
+            decision = "mixed_inconclusive"
+            strongest_claim = None
+
+        correct_logp_damage = -float(
+            suppression_summary["mean_correct_log_probability_change"])
+        unrelated_logp_damage = float(
+            suppression_summary[
+                "mean_unrelated_log_probability_damage"])
+        unrelated_damage_ratio = (
+            abs(unrelated_logp_damage)
+            / max(abs(correct_logp_damage), 1.0e-12))
+        result = {
+            "status": "ready",
+            "benchmark": "mib_arc",
+            "phase": "validation",
+            "decision": decision,
+            "strongest_supported_claim": strongest_claim,
+            "record_status": "complete",
+            "validation_record_status": "complete",
+            "frozen_specification": {
+                "path": frozen.spec_path,
+                "content_hash": frozen.spec_content_hash,
+                "status": frozen.spec["status"],
+                "selected_k": frozen.selected_k,
+                "selected_route_counts": dict(
+                    frozen.spec["selection"]["selected_route_counts"]),
+                "selected_layer_route_counts": {
+                    str(layer): dict(counts)
+                    for layer, counts in (
+                        frozen.selected_layer_route_counts.items())
+                },
+                "selected_site_identity_hash": (
+                    frozen.selected_site_identity_hash),
+                "selected_ranked_rows_hash": frozen.spec[
+                    "selection"]["selected_ranked_rows_hash"],
+                "ranked_sites_content_hash": frozen.spec[
+                    "discovery"]["ranked_sites_content_hash"],
+                "frozen_selection_circuit_hash": frozen.spec[
+                    "selection"]["circuit_hash"],
+                "runtime_operator_circuit_hash": (
+                    frozen.circuit.circuit_hash),
+                "localization_artifact": frozen.localization_path,
+                "localization_protocol_hash": (
+                    frozen.localization_protocol_hash),
+                "selection_recomputed": False,
+                "operator_ids_changed": False,
+                "layers_or_routes_changed": False,
+            },
+            "validation_cohort": {
+                "runtime_selected_row_count": len(phase_rows),
+                "selection_rule": (
+                    "canonical_hash_example_id_then_example_id_first_128"),
+                "paired_correct_independent_count": len(known_correct),
+                "independent_unit": "example_id",
+                "paired_correct_example_ids_hash": (
+                    eligible_example_ids_hash),
+                "base_accuracy_all_rows": behavior["accuracy"],
+                "source_accuracy_all_rows": behavior["source_accuracy"],
+                "pair_accuracy_all_rows": behavior["pair_accuracy"],
+                "candidate_score": (
+                    "correct_minus_source_sum_log_probability"),
+            },
+            "primary_metrics": {
+                "intact_mean_margin": intact_summary["mean_margin"],
+                "intact_accuracy": intact_summary["exact_accuracy"],
+                "production_reference_mean_margin": intact_summary[
+                    "production_diagnostics_reference"]["mean_margin"],
+                "production_reference_accuracy": intact_summary[
+                    "production_diagnostics_reference"]["exact_accuracy"],
+                "suppressed_mean_margin": suppression_summary["mean_margin"],
+                "suppressed_accuracy": suppression_summary["exact_accuracy"],
+                "mean_margin_drop": suppression_summary[
+                    "mean_margin_drop"],
+                "margin_drop_bootstrap_ci": suppression_summary[
+                    "margin_drop_bootstrap_ci"],
+                "mean_correct_log_probability_change": suppression_summary[
+                    "mean_correct_log_probability_change"],
+                "prediction_flip_fraction": suppression_summary[
+                    "prediction_flip_fraction"],
+                "mean_source_minus_correct_margin_change": (
+                    suppression_summary[
+                        "mean_source_minus_correct_margin_change"]),
+                "mean_unrelated_log_probability_damage": (
+                    suppression_summary[
+                        "mean_unrelated_log_probability_damage"]),
+                "matched_random_margin_drop_distribution": (
+                    control_output["mean_margin_drop_distribution"]),
+                "frozen_minus_matched_random_paired_effect": (
+                    control_output["frozen_minus_control"]),
+                "restored_mean_margin": restoration_summary["mean_margin"],
+                "restored_accuracy": restoration_summary["exact_accuracy"],
+                "restoration_recovery_fraction": recovery[
+                    "recovery_fraction"],
+                "restoration_recovery_bootstrap_ci": recovery,
+            },
+            "conditions": {
+                "intact": intact_summary,
+                "frozen_circuit_suppression": suppression_summary,
+                FROZEN_ARC_CONTROL_NAME: control_output,
+                "frozen_circuit_exact_restoration": restoration_summary,
+            },
+            "validation_gates": {
+                "suppression_margin_drop_ci_low_above_zero": {
+                    "passed": suppression_gate,
+                    "observed_ci_low": suppression_ci_low,
+                    "threshold": 0.0,
+                },
+                "frozen_minus_matched_random_margin_drop_ci_low_above_zero": {
+                    "passed": control_gate,
+                    "observed_ci_low": control_ci_low,
+                    "threshold": 0.0,
+                },
+                "restoration_recovery_ci_low_minimum": {
+                    "passed": restoration_gate,
+                    "observed_ci_low": recovery_ci_low,
+                    "threshold": recovery_minimum,
+                },
+                "all_preregistered_gates_passed": bool(
+                    suppression_gate and control_gate and restoration_gate),
+                "execution_reference_prediction_sign_agreement": {
+                    "passed": intact_reference_prediction_agreement,
+                    "rule": (
+                        f"all_{FROZEN_ARC_VALIDATION_PAIRED_CORRECT_COUNT}_"
+                        "intervention_graph_intact_margin_signs_match_"
+                        "production_diagnostics"),
+                    "preregistered_statistical_gate": False,
+                },
+                "threshold_source": (
+                    "frozen_spec.evaluation.validation_gates"),
+            },
+            "unrelated_behavior_audit": {
+                "definition": (
+                    "mean_next_token_log_probability_on_entire_base_prompt_"
+                    "excluding_first_token"),
+                "mean_log_probability_damage": unrelated_logp_damage,
+                "correct_log_probability_damage": correct_logp_damage,
+                "absolute_damage_ratio": unrelated_damage_ratio,
+                "formal_gate_defined_in_frozen_spec": False,
+                "used_for_preregistered_gate": False,
+            },
+            "split_isolation": {
+                "selection_phase": "discovery",
+                "evaluation_phase": "validation",
+                "validation_used_to_change_specification": False,
+                "configuration_changed_after_discovery": False,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+                "held_out_test_opened": False,
+                "held_out_test_allowed_after_this_record_is_final": True,
+            },
+            "storage_audit": {
+                "status": "passed",
+                "aggregate_statistics_and_hashes_preserved": True,
+                "raw_per_example_logits_persisted": False,
+                "raw_per_example_margins_persisted": False,
+                "raw_per_example_operator_vectors_persisted": False,
+                "control_site_ids_persisted": False,
+                "control_site_identity_hashes_persisted": True,
+            },
+            "statistical_protocol": {
+                "bootstrap_samples": bootstrap_samples,
+                "permutation_samples": permutation_samples,
+                "alpha": alpha,
+                "runtime_seed": self.config.seed,
+                "control_seed": int(frozen.controls["seed"]),
+            },
+            "test_evaluated": False,
+            "test_evaluation_count": 0,
+            "test_data_accessor_called": False,
+            "test_used": False,
+        }
+        return {
+            "status": "ready",
+            "benchmarks": {"mib_arc": result},
+            "strongest_supported_claim": strongest_claim,
+            "test_evaluated": False,
+            "test_data_accessor_called": False,
+        }
 
     def _capture_kwargs(self, benchmark_id: str) -> dict[str, Any]:
         return {

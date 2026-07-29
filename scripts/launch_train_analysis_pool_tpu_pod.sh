@@ -38,7 +38,7 @@ usage() {
         "  --runtime ID               Physical runtime profile (default: $RUNTIME)" \
         "  --output PATH              Optional parent for run_analysis_* folders; checkpoint side_analysis is default" \
         "  --benchmark-root PATH      Immutable prepared benchmark root" \
-        "  --preset NAME              Item bundle: ioi_frozen_validation, ioi_frozen_test, ioi_native_program, ioi_paired_operator_trajectory, ravel_discovery_localization, arc_discovery_localization, zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
+        "  --preset NAME              Item bundle: ioi_frozen_validation, ioi_frozen_test, ioi_native_program, ioi_paired_operator_trajectory, ravel_discovery_localization, arc_discovery_localization, arc_frozen_validation, zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
         "  --items IDS                Concrete comma-separated item ids; overrides preset" \
         "  --max-examples-per-phase N Non-RAVEL per-phase cap (default: $MAX_EXAMPLES)" \
         "  --ravel-max-examples-per-phase N RAVEL per-phase cap (default: $RAVEL_MAX_EXAMPLES)" \
@@ -109,7 +109,7 @@ if ! [[ "$RAVEL_MAX_EXAMPLES" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 case "$PRESET" in
-    contract|zero_shot|mechanistic_screen|ioi_frozen_validation|ioi_frozen_test|ioi_native_program|ioi_paired_operator_trajectory|ravel_discovery_localization|arc_discovery_localization|mib_ioi_circuit|mib_mcqa_circuit|mib_arithmetic_circuit|mib_arc_circuit|circuit|ravel_causal|causal|scientific|all) ;;
+    contract|zero_shot|mechanistic_screen|ioi_frozen_validation|ioi_frozen_test|ioi_native_program|ioi_paired_operator_trajectory|ravel_discovery_localization|arc_discovery_localization|arc_frozen_validation|mib_ioi_circuit|mib_mcqa_circuit|mib_arithmetic_circuit|mib_arc_circuit|circuit|ravel_causal|causal|scientific|all) ;;
     *) echo "ERROR: unsupported canonical preset $PRESET" >&2; exit 1 ;;
 esac
 case "$RUNTIME" in
