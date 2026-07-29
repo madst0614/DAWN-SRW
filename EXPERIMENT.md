@@ -7,7 +7,7 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 - Current goal: use `codex/v4167-poc` as the sole canonical integration, baseline-source, and final experiment-reporting branch for all POC work. Experimental branches may isolate candidate code and runs, but every material result and current decision must be synchronized back to this notebook on POC and pushed. Only accepted source changes are integrated into POC.
 - Paper-analysis track: `configs/paper_checkpoint_registry.yaml` is the descriptive source for the user-designated DAWN-SRW v4172 400M/1.3B and baseline-JAX 400M/1.3B run roots. The 400M DAWN and baseline are the matched 40B-token performance pair; DAWN 1.3B is available for 20B-token scale evaluation and selected mechanistic replication. The baseline-JAX 1.3B run is still training and is excluded from evaluation and comparison until the user declares it complete.
-- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`. Run the matched C4 validation next, then the 400M `mechanistic_screen`. Full `scientific` analysis remains gated on the screen; 1.3B DAWN work is sequential and selective, and no 1.3B baseline work is currently allowed.
+- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. Run the 400M `mechanistic_screen` next. Full `scientific` analysis remains gated on the screen; 1.3B DAWN work is sequential and selective, and no 1.3B baseline work is currently allowed.
 - v4175 40M POC state: a route-separated `spatial-r1-v4.1.7.5` reference is locally implemented directly on `codex/v4167-poc` from exact clean parent/origin commit `7de5fc391608d337d9835d0cb9759487a6affd8d`. One shared eight-space atlas owns `space_read_proj`/`space_write_proj`; Q, K, V, and RST own independent selector projections and space keys, independently choose top-2 atlas entries, retain separate tau maps and operator banks, and use metric-complete dense all-space execution. The exact 40M tree is 40,344,160 parameters, 544 (`0.00135%`) above the 40,343,616 Transformer reference. These changes and this notebook entry remain an uncommitted local dirty worktree and are not yet canonical published source.
 - v4175 evidence boundary: local Python/JAX/Flax `3.12.7/0.6.2/0.10.7` abstract-tree, route-factory, calibration, JIT forward/backward, compact-metric, reduced canonical train-step, and v4174 regression checks passed. TPU compile, HBM, step time, throughput, and training stability are `not measured`; execution optimization is intentionally deferred until after the 40M semantic reference runs.
 - Publication state: accepted QKV+RST outer analytic-pullback source is integrated by merge commit `62417b239d5b79c5dfa8684563532958ed212385` on `codex/v4167-poc`. User-approved QK/V/RST initializer target fractions `0.08/0.08/0.05` are integrated by merge commit `bb2a3ada9a0c281df9439043162dde8045d62bfd` and measured at clean POC commit `ae12416b40607ef8dd21fe79a64d86b4335e18b3`. Generation-`g5` registry and the rejected matched chunk4 report are centralized by POC commit `4e896c00b63f9b0523bb95ebe8357c37cc824740`. The chunk4 source remains only on `codex/v4174-g4-frac885-rst-chunk4` at `a3879f21dcd3b786bdc2cde270bcca2a382796a4`.
@@ -46,7 +46,7 @@ means that no result may be inferred or filled from a training log.
 
 | Claim | Required evidence | Current status | Manuscript wording now allowed |
 |---|---|---|---|
-| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | DAWN 400M zero-shot measured; full C4 and dense 400M pending | Report DAWN absolute zero-shot only; do not yet claim parity with the dense baseline |
+| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | DAWN 400M C4 and zero-shot measured; dense 400M pending | Report DAWN absolute C4 and zero-shot results; do not yet claim parity with the dense baseline |
 | B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | Pending `mechanistic_screen` and gated `scientific` run | State as a hypothesis/method objective, not a result |
 | C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | Pending | Do not claim reuse or task-level specialization |
 | D. Scale replication | 1.3B performance and selected causal effect with the same control design | DAWN 1.3B checkpoint available; evaluation pending | Describe the planned replication only |
@@ -55,7 +55,7 @@ means that no result may be inferred or filled from a training log.
 
 | Model | Parameters | Training tokens | Checkpoint state | Paper role |
 |---|---:|---:|---|---|
-| DAWN-SRW v4172 400M | `393,800,708` measured | `39,999,504,384` in the evaluation manifest | Step `76,293` resolved, restored, parity-validated, zero-shot measured | Discovery model, full mechanistic analysis, primary causal result |
+| DAWN-SRW v4172 400M | `393,800,708` measured | `39,999,504,384` in the evaluation manifest | Step `76,293` resolved, restored, parity-validated, C4 and zero-shot measured | Discovery model, full mechanistic analysis, primary causal result |
 | Dense Transformer 400M | Config estimate `~393.9M`; exact restore count pending | `40B` configured | User-designated run available; exact numeric step/evaluation pending | Matched 400M performance control |
 | DAWN-SRW v4172 1.3B | `1,272,038,404` configured; restore verification pending | `20B` configured | User-designated run available; exact numeric step/evaluation pending | Larger-scale performance and selected causal replication |
 | Dense Transformer 1.3B | Pending completed training | `20B` configured | Training in progress; excluded by user decision | No current paper result |
@@ -119,6 +119,26 @@ required before any DAWN-versus-dense performance statement.
   performance table. The eligible v4172 400M run has `limit=null`,
   `smoke_test_only=false`, all six tasks complete, and `comparable=true`.
 
+### Table-ready v4172 400M C4 validation
+
+| Model | Validation protocol | Valid target tokens | Cross-entropy | Perplexity | Token accuracy |
+|---|---|---:|---:|---:|---:|
+| DAWN-SRW v4172 400M | packed C4 validation, 10M-token cap | `9,974,720` | `2.940212858` | `18.919873132` | `0.424911877` (`42.4912%`) |
+
+The locked `packed_c4_validation_v1` run evaluated all 610 complete global
+batches admitted by the 10M-token cap: 19,520 sequences at length 512 and
+global batch 32. The capped dataset view contained 19,531 sequences; the final
+11 could not form a complete global batch and were excluded before scoring.
+The result is `comparable=true` and uses the same fixed protocol required for
+the dense 400M and DAWN 1.3B rows.
+
+The paper-eligible C4 result root is
+`gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T044410Z-37fa6082`.
+Use `validation_summary.json` for table cells, `run_manifest.json` for the
+source, software, data, mesh, checkpoint, and hash contract, and `summary.log`
+for the canonical text summary. This run used clean evaluation commit
+`37fa60822af9ae13a8cd2fddb361b563cbdc3304`.
+
 ### Table-ready v4172 400M performance
 
 | Benchmark | Split (`n`) | Metric | Score | Standard error |
@@ -139,6 +159,18 @@ Use `backends/stock_zero_shot/results_summary.json` for table cells,
 fingerprint, protocol, and source identity, and `items/zero_shot/*.json` for
 per-task evidence. This run used clean evaluation commit
 `623eaee8fc30471db809cb7093d3ed28594bff35`.
+
+### Manuscript-ready performance result
+
+At the fixed step-76,293 checkpoint, the 393.8M-parameter DAWN-SRW model
+obtained C4 validation cross-entropy 2.9402, perplexity 18.9199, and next-token
+accuracy 42.49% over 9.97M valid target tokens. On the six stock zero-shot
+tasks, it obtained mean accuracy 46.29%, with its strongest absolute result on
+PIQA (71.22%) and lower results on ARC-Challenge (25.68%) and LAMBADA
+(35.20%). These measurements establish that the checkpoint is a functioning
+language model suitable for causal analysis. They do not yet establish
+performance retention relative to a dense Transformer, because the matched
+400M dense-control cells remain unmeasured.
 
 ### Mechanistic study design locked before screening
 
@@ -181,11 +213,11 @@ computational organization are the replication target.
 
 | Output | Required content | Current evidence source |
 |---|---|---|
-| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; `2026-07-29/#03` and `#05`; baseline rows pending |
-| Table 2: C4 validation | Loss, perplexity, token accuracy for DAWN/dense 400M and DAWN 1.3B | Pending full validation |
+| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; `2026-07-29/#03`, `#05`, and `#06`; baseline rows pending |
+| Table 2: C4 validation | Loss, perplexity, token accuracy for DAWN/dense 400M and DAWN 1.3B | DAWN 400M row complete in `#06`; comparison rows pending |
 | Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
 | Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
-| Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M zero-shot complete; other cells pending |
+| Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M C4 and zero-shot complete; comparison cells pending |
 | Figure 3: circuit localization | Layer x operator causal contribution, trajectory, held-out overlap | Pending screen/scientific |
 | Figure 4: causal intervention | Intact, suppressed, matched control, restored | Pending scientific |
 | Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | Pending scientific |
@@ -194,8 +226,9 @@ computational organization are the replication target.
 ### Interpretation and exclusion rules
 
 - Supported now: the exact v4172 400M checkpoint restores reproducibly; the
-  production and analysis forwards agree within `3.31e-7` CE; the full
-  unlimited stock six-task result above is reproducible and paper-eligible.
+  production and analysis forwards agree within `3.31e-7` CE; the locked
+  10M-token C4 validation and full unlimited stock six-task results above are
+  reproducible and paper-eligible.
 - Not supported yet: matched dense performance retention, causal importance,
   restoration, reuse, scale replication, pruning-quality tradeoffs, or
   hardware speedup.
@@ -947,6 +980,14 @@ computational organization are the replication target.
 - Runtime/protocol: one TPU v4-64 pod, eight hosts, 32 devices, mesh `data=16, model=2`, global evaluation batch 32, maximum sequence length 512, length buckets `64/128/256/512`, and float32 evaluation. Remote software was `/usr/bin/python3` 3.10.6, JAX/jaxlib 0.6.2, Flax 0.10.7, Orbax 0.11.24, lm-eval 0.4.2, datasets 2.19.2, Transformers 4.40.2, tokenizers 0.19.1, and PEFT 0.10.0. Evaluation splits/rows were LAMBADA test 5,153; HellaSwag validation 10,042; PIQA validation 1,838; ARC-Easy test 2,376; ARC-Challenge test 1,172; and WinoGrande validation 1,267. Exact dataset fingerprints and task-config hashes are preserved in the run manifest.
 - Integrity/result boundary: all six item statuses are `ready`; no request was left-truncated or exceeded the continuation limit. The run repeated the Phase 0 C4 forward check on 16,352 target tokens: production CE `2.8010849952697754`, adapter CE `2.8010853258561417`, absolute difference `3.3058636628169324e-7` versus tolerance `5e-5`. This is the first v4172 400M zero-shot run eligible for paper tables; the two preceding `limit=1` runs remain parity-only.
 - Evidence/decision: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_zero_shot_20260729T041547Z-6232963d`; aggregate metrics `backends/stock_zero_shot/results_summary.json`; exact environment/protocol/dataset manifest `backends/stock_zero_shot/run_manifest.json`; task artifacts `items/zero_shot/{lambada_openai,hellaswag,piqa,arc_easy,arc_challenge,winogrande}.json`; canonical text summary `summary.log`. Accept these six scores as the v4172 400M stock zero-shot paper result and proceed to matched C4 validation.
+
+#### #06 — Measure v4172 400M packed C4 validation performance
+
+- Result: `TPU measured`; the complete locked `packed_c4_validation_v1` protocol finished with `comparable=true`. Across 610/610 global batches and 9,974,720 valid target tokens, cross-entropy was `2.94021285810529`, perplexity was `18.919873132016434`, and next-token accuracy was `0.4249118772256264` (`42.49118772256264%`).
+- Reproducibility identity: clean `codex/v4167-poc` commit `37fa60822af9ae13a8cd2fddb361b563cbdc3304`; target/model `v4172_400M` / `spatial-r1-v4.1.7.2`; config `configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml`; concrete checkpoint `checkpoints/000000076293`; 393,800,708 parameters; 39,999,504,384 pretraining tokens; checkpoint-config hash `08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b`; parameter identity hash `37039db095829caae9b2812d77947cedaf084f39d2f5ac36c0bf0138386cb8ca`; tracked worktree clean.
+- Runtime/protocol: one TPU v4-64 pod, eight hosts, 32 devices, mesh `data=16, model=2`, global evaluation batch 32, sequence length 512, float32 evaluation, token reduction chunk 32,768, and no optimizer or checkpoint write. The `production_diagnostics` forward was used to report both loss and token accuracy; Phase 0 had already established its loss parity with the production-minimal forward. Remote software was `/usr/bin/python3` 3.10.6, JAX/jaxlib 0.6.2, Flax 0.10.7, Orbax 0.11.24, NumPy 2.2.6, fsspec 2024.3.1, and gcsfs 2024.3.1.
+- Validation data: `gs://dawn-tpu-data-c4/c4_val.bin` with metadata `gs://dawn-tpu-data-c4/c4_val_meta.json`, tokenizer `bert-base-uncased`, vocabulary 30,522, and metadata hash `4c2fc359ddd7542052442e5deab2eecd37f5cdf7f3dca19a0943ea47eaf4aaf7`. The 10M-token capped view contained 19,531 packed sequences; 19,520 complete-batch sequences were evaluated and 11 incomplete-batch sequences were excluded. The underlying validation artifact contains 50,000,384 tokens and records 2,210 discarded tail tokens during packing.
+- Evidence/decision: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T044410Z-37fa6082`; table cells `validation_summary.json`; exact source/software/data/protocol manifest `run_manifest.json`; canonical text summary `summary.log`; result hash `e32a86cec7f1901b4688775d77aacf92e9649344e7cd170a0f45c8c5b9cef893`. Accept this as the v4172 400M C4 paper row and proceed to the 400M `mechanistic_screen`; matched dense performance claims remain gated on the dense 400M run.
 
 ## Backfill Boundary
 
