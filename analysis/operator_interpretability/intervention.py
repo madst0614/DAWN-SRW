@@ -471,7 +471,7 @@ def evaluate_circuit_necessity(
 
 @dataclass(frozen=True)
 class FrozenCircuitEvaluationBatch:
-    """One validation-only device batch shared by every frozen condition."""
+    """One split-isolated device batch shared by every frozen condition."""
 
     input_ids: jax.Array
     labels: jax.Array
@@ -588,12 +588,17 @@ def _frozen_circuit_evaluation_arrays(
 ) -> tuple[np.ndarray, np.ndarray, int]:
     if not examples:
         raise ValueError("frozen circuit evaluation has no examples")
+    phase = str(examples[0].phase)
     if any(
             example.benchmark_id != "mib_ioi"
-            or example.phase != "validation"
+            or str(example.phase) != phase
             for example in examples):
         raise ValueError(
-            "frozen IOI circuit evaluation accepts validation examples only")
+            "frozen IOI circuit evaluation requires one homogeneous "
+            "mib_ioi phase")
+    if phase not in {"validation", "test"}:
+        raise ValueError(
+            f"unsupported frozen IOI evaluation phase={phase}")
     rows: list[tuple[tuple[int, ...], np.ndarray]] = []
     for answer_field in ("positive_ids", "negative_ids"):
         for example in examples:
@@ -634,7 +639,7 @@ def prepare_frozen_circuit_evaluation(
         ctx: Any, examples: Sequence[BenchmarkExample], *,
         tokenizer: Any,
         pad_token_id: int) -> FrozenCircuitEvaluationBatch:
-    """Stage the exact same validation rows once for all seven conditions."""
+    """Stage the exact same phase rows once for all seven conditions."""
     multiple = max(1, int(ctx.mesh.shape["data"]))
     input_ids, labels, real_count = _frozen_circuit_evaluation_arrays(
         examples, tokenizer=tokenizer,
@@ -688,8 +693,9 @@ def evaluate_frozen_circuit_condition(
         shape: OperatorSpaceShape, condition: str,
         circuit: OperatorCircuit | None = None) -> dict[str, Any]:
     """Score intact, suppression/control, or exact restoration in one graph."""
-    if batch.phase != "validation":
-        raise ValueError("frozen circuit condition must remain validation-only")
+    if batch.phase not in {"validation", "test"}:
+        raise ValueError(
+            f"unsupported frozen circuit condition phase={batch.phase}")
     if condition == "intact":
         keep_qk = np.ones(
             (shape.n_layers, 2, shape.n_qk), dtype=np.bool_)
