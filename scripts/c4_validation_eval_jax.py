@@ -226,7 +226,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         mesh,
         for_eval=True,
         analysis=False,
-        kernel_profile="production",
+        kernel_profile="production_diagnostics",
     )
 
     configured_max_tokens = _require_positive(
@@ -303,6 +303,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max_batches=evaluated_batches,
         token_chunk_size=token_chunk_size,
     )
+    if not 0.0 < token_accuracy <= 1.0:
+        raise RuntimeError(
+            "validation token accuracy was not computed by the selected "
+            f"evaluation kernel: {token_accuracy}"
+        )
     valid_target_tokens = (
         evaluated_batches * batch_size * (max_length - 1)
     )
@@ -337,6 +342,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "protocol_name": PROTOCOL_NAME,
         "protocol_version": PROTOCOL_VERSION,
         "evaluation_mode": "c4_validation_no_update",
+        "kernel_profile": "production_diagnostics",
         "dawn_git_commit": git_info["commit"],
         "dawn_git_branch": git_info["branch"],
         "working_tree_clean": git_info["working_tree_clean"],
