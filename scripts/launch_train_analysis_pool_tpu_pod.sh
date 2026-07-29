@@ -18,6 +18,12 @@ ITEMS=""
 RUNTIME="v4-64"
 MAX_EXAMPLES="128"
 RAVEL_MAX_EXAMPLES="512"
+CAPTURE_TOPK_QK="512"
+CAPTURE_TOPK_V="2048"
+CAPTURE_TOPK_RST="4096"
+CAPTURE_MAX_TOPK_QK="2048"
+CAPTURE_MAX_TOPK_V="8192"
+CAPTURE_MAX_TOPK_RST="8192"
 MESH_DATA=""
 MESH_MODEL=""
 readonly SESSION="train"
@@ -38,10 +44,16 @@ usage() {
         "  --runtime ID               Physical runtime profile (default: $RUNTIME)" \
         "  --output PATH              Optional parent for run_analysis_* folders; checkpoint side_analysis is default" \
         "  --benchmark-root PATH      Immutable prepared benchmark root" \
-        "  --preset NAME              Item bundle: ioi_frozen_validation, ioi_frozen_test, ioi_native_program, ioi_paired_operator_trajectory, ravel_discovery_localization, arc_discovery_localization, arc_frozen_validation, zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
+        "  --preset NAME              Item bundle: ioi_frozen_validation, ioi_frozen_test, ioi_native_program, ioi_paired_operator_trajectory, ioi_scale_discovery_localization, ravel_discovery_localization, arc_discovery_localization, arc_frozen_validation, zero_shot, mechanistic_screen, circuit, causal, scientific, all" \
         "  --items IDS                Concrete comma-separated item ids; overrides preset" \
         "  --max-examples-per-phase N Non-RAVEL per-phase cap (default: $MAX_EXAMPLES)" \
         "  --ravel-max-examples-per-phase N RAVEL per-phase cap (default: $RAVEL_MAX_EXAMPLES)" \
+        "  --capture-topk-qk N        Initial Q/K capture width (default: $CAPTURE_TOPK_QK)" \
+        "  --capture-topk-v N         Initial V capture width (default: $CAPTURE_TOPK_V)" \
+        "  --capture-topk-rst N       Initial RST capture width (default: $CAPTURE_TOPK_RST)" \
+        "  --capture-max-topk-qk N    Maximum Q/K capture width (default: $CAPTURE_MAX_TOPK_QK)" \
+        "  --capture-max-topk-v N     Maximum V capture width (default: $CAPTURE_MAX_TOPK_V)" \
+        "  --capture-max-topk-rst N   Maximum RST capture width (default: $CAPTURE_MAX_TOPK_RST)" \
         "  --mesh-data N              Ad-hoc assertion; target/runtime value cannot be overridden" \
         "  --mesh-model N             Ad-hoc assertion; registered target owns this value" \
         "  --branch NAME              Git branch (default: $BRANCH)" \
@@ -78,6 +90,12 @@ while [[ $# -gt 0 ]]; do
         --items) ITEMS="$2"; shift 2 ;;
         --max-examples-per-phase) MAX_EXAMPLES="$2"; shift 2 ;;
         --ravel-max-examples-per-phase) RAVEL_MAX_EXAMPLES="$2"; shift 2 ;;
+        --capture-topk-qk) CAPTURE_TOPK_QK="$2"; shift 2 ;;
+        --capture-topk-v) CAPTURE_TOPK_V="$2"; shift 2 ;;
+        --capture-topk-rst) CAPTURE_TOPK_RST="$2"; shift 2 ;;
+        --capture-max-topk-qk) CAPTURE_MAX_TOPK_QK="$2"; shift 2 ;;
+        --capture-max-topk-v) CAPTURE_MAX_TOPK_V="$2"; shift 2 ;;
+        --capture-max-topk-rst) CAPTURE_MAX_TOPK_RST="$2"; shift 2 ;;
         --mesh-data) MESH_DATA="$2"; shift 2 ;;
         --mesh-model) MESH_MODEL="$2"; shift 2 ;;
         --no-install) INSTALL_DEPS=0; shift ;;
@@ -108,8 +126,16 @@ if ! [[ "$RAVEL_MAX_EXAMPLES" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: --ravel-max-examples-per-phase must be a positive integer" >&2
     exit 1
 fi
+for CAPTURE_WIDTH in \
+        "$CAPTURE_TOPK_QK" "$CAPTURE_TOPK_V" "$CAPTURE_TOPK_RST" \
+        "$CAPTURE_MAX_TOPK_QK" "$CAPTURE_MAX_TOPK_V" "$CAPTURE_MAX_TOPK_RST"; do
+    if ! [[ "$CAPTURE_WIDTH" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: capture widths must be positive integers" >&2
+        exit 1
+    fi
+done
 case "$PRESET" in
-    contract|zero_shot|mechanistic_screen|ioi_frozen_validation|ioi_frozen_test|ioi_native_program|ioi_paired_operator_trajectory|ravel_discovery_localization|arc_discovery_localization|arc_frozen_validation|mib_ioi_circuit|mib_mcqa_circuit|mib_arithmetic_circuit|mib_arc_circuit|circuit|ravel_causal|causal|scientific|all) ;;
+    contract|zero_shot|mechanistic_screen|ioi_frozen_validation|ioi_frozen_test|ioi_native_program|ioi_paired_operator_trajectory|ioi_scale_discovery_localization|ravel_discovery_localization|arc_discovery_localization|arc_frozen_validation|mib_ioi_circuit|mib_mcqa_circuit|mib_arithmetic_circuit|mib_arc_circuit|circuit|ravel_causal|causal|scientific|all) ;;
     *) echo "ERROR: unsupported canonical preset $PRESET" >&2; exit 1 ;;
 esac
 case "$RUNTIME" in
@@ -218,6 +244,12 @@ CMD=(
     --preset "\$PRESET"
     --max-examples-per-phase "$MAX_EXAMPLES"
     --ravel-max-examples-per-phase "$RAVEL_MAX_EXAMPLES"
+    --capture-topk-qk "$CAPTURE_TOPK_QK"
+    --capture-topk-v "$CAPTURE_TOPK_V"
+    --capture-topk-rst "$CAPTURE_TOPK_RST"
+    --capture-max-topk-qk "$CAPTURE_MAX_TOPK_QK"
+    --capture-max-topk-v "$CAPTURE_MAX_TOPK_V"
+    --capture-max-topk-rst "$CAPTURE_MAX_TOPK_RST"
     --init-distributed
 )
 if [[ -n "\$TARGET" ]]; then

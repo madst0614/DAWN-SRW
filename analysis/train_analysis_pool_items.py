@@ -142,6 +142,20 @@ _register("mib_ioi.native_operator_program", _mechanistic_item(
     "mib_ioi.behavioral_eligibility",
     claim_role="checkpoint_specific"))
 
+_register("mib_ioi.scale_discovery_operator_localization", _mechanistic_item(
+    "mib_ioi", "ioi_scale_discovery_localization",
+    "IOI 1.3B discovery-only operator-circuit localization",
+    "Which newly discovered 1.3B layer-route-operator sites carry the IOI "
+    "S2 counterfactual without transferring literal 400M operator IDs?",
+    "Open discovery only; use every paired-correct discovery example, require "
+    "split-rank stability of at least 0.80, and freeze the smallest fixed "
+    "audited prefix whose cumulative absolute importance is at least 0.70 "
+    "and split top-k overlap is at least 0.95. Validation and test access are "
+    "forbidden.",
+    "mib_ioi.input_contract",
+    claim_role="checkpoint_specific",
+    test_used=False))
+
 _register("mib_ioi.frozen_circuit_validation", _mechanistic_item(
     "mib_ioi", "frozen_circuit_validation",
     "IOI frozen-circuit confirmatory validation",
@@ -304,6 +318,8 @@ TRAIN_ANALYSIS_POOL_PRESETS: dict[str, tuple[str, ...]] = {
     "ioi_native_program": ("mib_ioi.native_operator_program",),
     "ioi_paired_operator_trajectory": (
         "mib_ioi.paired_operator_trajectory",),
+    "ioi_scale_discovery_localization": (
+        "mib_ioi.scale_discovery_operator_localization",),
     "ravel_discovery_localization": (
         "ravel.discovery_operator_localization",),
     "arc_discovery_localization": (

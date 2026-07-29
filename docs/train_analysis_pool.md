@@ -140,6 +140,7 @@ scientific_claims.primary
 | `contract` | primary input contract만 확인 |
 | `zero_shot` | stock zero-shot 6개 |
 | `mechanistic_screen` | primary 행동 적격성만 확인 |
+| `ioi_scale_discovery_localization` | 1.3B IOI discovery-only 별도 localization |
 | `mib_ioi_circuit` | IOI circuit 분석 |
 | `mib_mcqa_circuit` | MCQA circuit 분석 |
 | `mib_arithmetic_circuit` | arithmetic circuit 분석 |

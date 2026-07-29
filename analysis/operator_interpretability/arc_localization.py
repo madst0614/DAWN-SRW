@@ -415,8 +415,9 @@ def build_arc_localization(
         ranked_sites: Sequence[Mapping[str, Any]], *,
         capture: Mapping[str, Any],
         spec: ArcDiscoverySpec,
+        benchmark_id: str = "mib_arc",
 ) -> dict[str, Any]:
-    """Apply the preregistered ARC discovery gates to one aggregate ranking."""
+    """Apply preregistered discovery gates to one aggregate MIB ranking."""
     ranked = []
     seen: set[tuple[int, str, int]] = set()
     previous_sort_key: tuple[float, tuple[int, str, int]] | None = None
@@ -462,12 +463,22 @@ def build_arc_localization(
         int(value)
         for value in capture.get(
             "rank_stability_split_independent_group_counts", ()))
-    _expect(
-        split_counts,
-        tuple(spec.payload["ranking"]["rank_stability"][
-            "expected_split_independent_unit_counts"]),
-        "capture.rank_stability_split_independent_group_counts",
-    )
+    stability_spec = spec.payload["ranking"]["rank_stability"]
+    expected_split_counts = stability_spec.get(
+        "expected_split_independent_unit_counts")
+    if expected_split_counts is not None:
+        _expect(
+            split_counts,
+            tuple(int(value) for value in expected_split_counts),
+            "capture.rank_stability_split_independent_group_counts",
+        )
+    else:
+        minimum_per_split = int(
+            stability_spec["minimum_independent_units_per_split"])
+        if len(split_counts) != 2 or min(split_counts) < minimum_per_split:
+            raise ValueError(
+                "discovery rank-stability split is smaller than the "
+                "preregistered minimum")
     stability_value = capture.get("rank_stability")
     stability_passed = bool(
         capture.get("status") == "ready"
@@ -597,7 +608,7 @@ def build_arc_localization(
             "selected_ranked_rows_hash": canonical_hash(selected_rows),
             "selected_site_identity_hash": canonical_hash(identities),
             "circuit_hash": canonical_hash({
-                "benchmark_id": "mib_arc",
+                "benchmark_id": benchmark_id,
                 "sites": identities,
             }),
             "sites": identities,
@@ -605,7 +616,7 @@ def build_arc_localization(
 
     return {
         "status": status,
-        "benchmark": "mib_arc",
+        "benchmark": benchmark_id,
         "ranking_phase": "discovery",
         "ranking_score": "absolute_discovery_mean_contribution_importance",
         "ranked_site_count": len(ranked),

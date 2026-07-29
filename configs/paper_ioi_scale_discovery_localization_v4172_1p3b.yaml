@@ -1,0 +1,155 @@
+schema_version: 1
+status: preregistered_before_discovery_localization
+
+target:
+  target_id: v4172_1B
+  model_version: spatial-r1-v4.1.7.2
+  config: configs/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+  checkpoint_run: gs://dawn-tpu-data-c4/checkpoints/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260717_173556_3201
+  checkpoint_step: 87193
+  checkpoint_identity: 2e38b41fc298d60254ca9cb12ad0a06032b12f5e7a8c26f7e83f62afd74bf5f9
+  checkpoint_config_hash: 1e877263c7113fc9fc6a7a5f6d24b3b96b9f389bcb85cd8e3068c84f104a5222
+  model_config_hash: 8097a118097cf174e0da66839112e1ac767004699d8ad1c654321f61ec8adb61
+
+discovery:
+  benchmark_id: mib_ioi
+  phase: discovery
+  runtime_selected_row_count: 128
+  independent_unit: example_id
+  paired_correct_rule: all_base_and_source_correct_discovery_rows
+  minimum_paired_correct_independent_units: 32
+  localization_pair_type: s2_io_flip_counterfactual
+  benchmark_build_id: f056bb4f133cde4fc0ae02f9
+  benchmark_manifest_hash: f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6
+  selection_uses_validation: false
+  selection_uses_test: false
+  validation_data_accessor_allowed: false
+  test_data_accessor_allowed: false
+  seed: 4172
+
+capture:
+  production_precision: true
+  target_position: official_last_prompt_token
+  capture_threshold: 0.95
+  width_scaling_rule: nearest_power_of_two_preserving_400m_pool_fraction
+  reference_400m_pool_sizes:
+    qk: 4600
+    v: 14500
+    rst: 29300
+  target_1p3b_pool_sizes:
+    qk: 8534
+    v: 26904
+    rst: 54352
+  initial_widths:
+    qk: 1024
+    v: 4096
+    rst: 8192
+  maximum_widths:
+    qk: 4096
+    v: 16384
+    rst: 16384
+
+ranking:
+  score: absolute_discovery_mean_contribution_importance
+  denominator: qualified_rows_within_exact_layer_route
+  site_identity: [layer, route, operator_id]
+  routes: [q, k, v, rst]
+  tie_breaker: [layer, route, operator_id]
+  rank_stability:
+    split_rule: seeded_hash_of_benchmark_and_example_id
+    minimum_independent_units_per_split: 16
+    threshold_minimum: 0.80
+  topk_overlap:
+    prefix_counts: [32, 64, 128, 256, 512, 1024, 2048, 4096]
+    metric: overlap_fraction_of_each_prefix
+
+circuit_freeze:
+  rule: smallest_audited_prefix_passing_both_discovery_gates
+  discovery_gates:
+    cumulative_absolute_importance_minimum: 0.70
+    split_topk_overlap_minimum: 0.95
+  no_passing_prefix_action: freeze_no_circuit
+  unstable_rank_action: freeze_no_circuit
+  insufficient_behavior_action: freeze_no_circuit
+  route_presence_is_a_discovery_result: true
+  result_dependent_route_inclusion_forbidden: true
+  result_dependent_route_exclusion_forbidden: true
+  validation_may_change_circuit: false
+  test_may_change_circuit: false
+  operator_reselection_after_discovery: false
+  literal_400m_operator_id_transfer_forbidden: true
+
+confirmatory_protocol_if_frozen:
+  validation:
+    runtime_selected_row_count: 128
+    paired_correct_rule: all_base_and_source_correct_validation_rows
+    minimum_paired_correct_independent_units: 32
+    conditions:
+      - intact
+      - frozen_circuit_suppression
+      - equal_count_random_x100
+      - same_layer_random_x100
+      - activation_matched_x100
+      - route_frequency_matched_x100
+      - exact_restoration
+  suppression:
+    mode: circuit_wide_execution_numerator_suppression
+    admission_denominator: full_production_denominator
+  controls:
+    replicate_count_per_control: 100
+    circuit_sites_excluded_from_sampling: true
+    equal_count_random:
+      sampling: uniform_without_replacement
+      seed: 14172
+    same_layer_random:
+      match_selected_count_per_layer: true
+      sampling: uniform_without_replacement_within_layer
+      seed: 14173
+    activation_matched:
+      match_fields:
+        - layer
+        - route
+        - discovery_mean_pre_scale_operator_output_norm_quantile
+      sampling: nearest_bin_without_replacement
+      seed: 14174
+    route_frequency_matched:
+      match_selected_count_per_route: true
+      sampling: uniform_without_replacement_within_route
+      seed: 14175
+  restoration:
+    mode: exact_selected_numerator_restore_after_suppression
+    admission_denominator: full_production_denominator
+    restored_values_source: same_example_intact_execution
+  score:
+    candidate_score: positive_minus_negative_sum_log_probability
+    primary_effect: intact_margin_minus_suppressed_margin
+  statistics:
+    bootstrap_samples: 2000
+    permutation_samples: 2000
+    alpha: 0.05
+  validation_gates:
+    suppression_margin_drop_ci_low_above_zero: true
+    discovered_drop_exceeds_each_control: true
+    restoration_recovery_ci_low_minimum: 0.80
+  unrelated_output_damage:
+    role: selectivity_audit_only
+    threshold: null
+  held_out_test:
+    runtime_selected_row_count: 128
+    paired_correct_rule: all_base_and_source_correct_test_rows
+    minimum_paired_correct_independent_units: 32
+    opened_only_after_validation_record_is_final: true
+    validation_may_change_specification: false
+    same_frozen_sites: true
+    same_suppression: true
+    same_control_rules: true
+    same_restoration: true
+    same_thresholds: true
+
+storage:
+  preserve_aggregate_ranking: true
+  preserve_selected_prefix_and_identity_hashes: true
+  preserve_raw_per_example_behavior_vectors: false
+  preserve_raw_per_example_operator_vectors: false
+  preserve_raw_capture_rows: false
+  semantic_audit_after_run: true
