@@ -25,6 +25,9 @@ from analysis.operator_interpretability.units import OperatorSite, RankedSite
 
 
 ROUTES = ("q", "k", "v", "rst")
+DISCOVERY_OVERLAP_PREFIX_COUNTS = (
+    32, 64, 128, 256, 512, 1024, 2048, 4096,
+)
 
 
 def _digest_block(digest: Any, payload: bytes) -> None:
@@ -191,6 +194,66 @@ def _split_rank_stability(
     if stability is not None and not np.isfinite(stability):
         stability = None
     return stability, len(common_sites)
+
+
+def _split_topk_overlap(
+        split_aggregate: tuple[
+            Mapping[OperatorSite, Sequence[float]],
+            Mapping[OperatorSite, Sequence[float]]],
+        split_denominator: tuple[
+            Mapping[tuple[str, int], int],
+            Mapping[tuple[str, int], int]],
+) -> list[dict[str, Any]]:
+    rankings = []
+    for split in (0, 1):
+        scored = [
+            (
+                abs(float(np.sum(values))) / max(
+                    int(split_denominator[split].get(
+                        (site.route, site.layer), 0)),
+                    1),
+                site,
+            )
+            for site, values in split_aggregate[split].items()
+        ]
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        rankings.append([site for _, site in scored])
+    if not rankings[0] or not rankings[1]:
+        return []
+    rows = []
+    for requested_count in DISCOVERY_OVERLAP_PREFIX_COUNTS:
+        count = min(
+            int(requested_count), len(rankings[0]), len(rankings[1]))
+        if count <= 0:
+            continue
+        split_sets = (
+            set(rankings[0][:count]),
+            set(rankings[1][:count]),
+        )
+        shared = split_sets[0] & split_sets[1]
+        union = split_sets[0] | split_sets[1]
+        rows.append({
+            "requested_prefix_count": int(requested_count),
+            "evaluated_prefix_count": int(count),
+            "shared_site_count": len(shared),
+            "overlap_fraction_of_each_prefix": len(shared) / count,
+            "jaccard": len(shared) / len(union),
+            "shared_site_count_by_route": {
+                route: sum(site.route == route for site in shared)
+                for route in ROUTES
+            },
+            "split_0_site_count_by_route": {
+                route: sum(
+                    site.route == route for site in split_sets[0])
+                for route in ROUTES
+            },
+            "split_1_site_count_by_route": {
+                route: sum(
+                    site.route == route for site in split_sets[1])
+                for route in ROUTES
+            },
+        })
+    return rows
 
 
 def _capture_operator_paths(
@@ -414,6 +477,8 @@ def _capture_operator_paths(
     ranked.sort(key=lambda row: (-row.importance, row.site))
     pooled_rank_stability, pooled_common_site_count = _split_rank_stability(
         split_aggregate, split_denominator)
+    discovery_split_topk_overlap = _split_topk_overlap(
+        split_aggregate, split_denominator)
     rank_stability = pooled_rank_stability
     rank_stability_common_site_count = pooled_common_site_count
     rank_stability_by_causal_variable: dict[str, dict[str, Any]] = {}
@@ -484,6 +549,10 @@ def _capture_operator_paths(
         "rank_stability_split_example_counts": [
             split_assignment.count(0), split_assignment.count(1)],
         "rank_stability_split_independent_group_counts": split_group_counts,
+        "discovery_split_topk_overlap": discovery_split_topk_overlap,
+        "discovery_split_topk_overlap_selection_metric": (
+            "absolute_split_mean_contribution_importance"),
+        "discovery_split_topk_overlap_test_used": False,
         "capture_threshold": float(capture_threshold),
         "capture_mass_definition": (
             "sum_pre_cancellation_production_precision_operator_vector_norms"),

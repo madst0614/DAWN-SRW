@@ -411,14 +411,20 @@ class OperatorInterpretabilityRunner:
             result = self._compact_behavioral_eligibility(result)
         elif kind == "operator_localization" and isinstance(
                 result.get("ranked_sites"), Sequence):
-            ranked_sites = list(result.pop("ranked_sites", ()))
-            profiles = dict(result.pop(
-                "causal_variable_control_profiles", {}) or {})
+            ranked_sites = [
+                dict(row) for row in result.get("ranked_sites", ())
+                if isinstance(row, Mapping)
+            ]
+            profiles = dict(
+                result.get("causal_variable_control_profiles", {}) or {})
             result.update({
                 "ranked_site_count": len(ranked_sites),
                 "ranked_site_preview": [
-                    dict(row) for row in ranked_sites[:5]],
-                "ranked_sites_persisted_in_item_json": False,
+                    dict(row) for row in ranked_sites[:16]],
+                "ranked_sites_content_hash": canonical_hash(ranked_sites),
+                "ranked_sites_persisted_in_item_json": True,
+                "ranked_sites_are_aggregate_discovery_statistics": True,
+                "ranked_sites_are_per_example_vectors": False,
                 "causal_variable_profile_summary": {
                     str(variable): {
                         "layer": int(profile["layer"]),
@@ -430,7 +436,9 @@ class OperatorInterpretabilityRunner:
                     }
                     for variable, profile in profiles.items()
                 },
-                "causal_variable_profiles_persisted_in_item_json": False,
+                "causal_variable_profiles_persisted_in_item_json": bool(
+                    profiles),
+                "causal_variable_profiles_are_aggregate_statistics": True,
                 "raw_parameters_persisted": False,
                 "dense_capture_persisted": False,
             })
