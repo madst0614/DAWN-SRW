@@ -1606,6 +1606,12 @@ closed and must not be opened under this frozen protocol.
 - Validation and claim boundary: repository-local Python/JAX/Flax were `3.12.7/0.6.2/0.10.7`. Target/runtime selection passed for 32-device v4-64 and mesh `16x2`; explicit Git Bash launcher syntax and the exact zero-shot dry run passed; `git diff --check` passed. No debug script or test file was created or run. The 1.3B row was trained for approximately 20B tokens while both 400M rows were trained for approximately 40B, and no completed matched dense 1.3B result is in scope, so these measurements will be a larger-scale DAWN result rather than a matched scaling-curve or dense-comparison claim.
 - Decision/next: publish this pre-effect record on POC, deploy one exact clean pushed descendant on the existing user-authorized `spatial-se-400m`, and run C4 first. Record the restored parameter identity and complete C4 artifact before opening zero-shot. Do not evaluate baseline-JAX 1.3B and do not begin selected 1.3B IOI replication until the performance row is closed.
 
+#### #09 — Correct two descriptive target labels before 1.3B restore
+
+- Status/boundary: `pre-effect documentation correction; no TPU execution or metric`. Experiment #08 correctly froze target `v4172_1B`, its concrete step `87193`, checkpoint/config hashes, mesh, and both evaluation protocols, but its implementation-identity sentence abbreviated two registry strings incorrectly.
+- Correction: the exact target scale is `1p3b`, not `1b`, and its exact config path is `configs/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml`. These are the values already committed in `configs/train_analysis_pool.yaml` at `18ae13a9c4d60b4a6de21bda0a8a617b8d239fa4` and already used by the metadata/config equality audit. No checkpoint, model field, protocol, threshold, data, task, launcher argument, or source implementation changed.
+- Decision/next: retain #08 as immutable history with this explicit correction, publish the correction on canonical POC, and use only the exact registry values above for the first clean restore and C4 run.
+
 ## Backfill Boundary
 
 - The initial notebook covered evidence-backed work from 2026-07-21 through the step-1500 resume attempt.
