@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 from collections import defaultdict
 from typing import Any, Mapping, Sequence
 
@@ -15,11 +16,9 @@ from analysis.dawn_analysis_common import (
     git_info,
     materialize_global_array,
 )
-from analysis.dawn_analysis_storage import write_npz_atomic
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
     resolve_benchmark_build,
-    sha256_path,
     write_protocol_bound_artifact,
 )
 from analysis.operator_interpretability.benchmark_registry import (
@@ -68,7 +67,6 @@ from analysis.operator_interpretability.program import (
     native_program_diagnostic_checks,
     reindex_program_schedule,
     select_validation_program,
-    write_program_schedule_artifact,
 )
 from analysis.operator_interpretability.paired_trajectory import (
     build_divergence_atlas,
@@ -409,7 +407,9 @@ class OperatorInterpretabilityRunner:
             payload: Mapping[str, Any]) -> dict[str, Any]:
         output = dict(payload)
         result = dict(payload.get("result") or {})
-        if kind == "operator_localization" and isinstance(
+        if kind == "behavioral_eligibility":
+            result = self._compact_behavioral_eligibility(result)
+        elif kind == "operator_localization" and isinstance(
                 result.get("ranked_sites"), Sequence):
             ranked_sites = list(result.pop("ranked_sites", ()))
             profiles = dict(result.pop(
@@ -457,6 +457,95 @@ class OperatorInterpretabilityRunner:
         elif kind == "scientific_claims":
             result = self._compact_scientific_claims(item_id, result)
         output["result"] = result
+        return output
+
+    _BEHAVIOR_RAW_VECTOR_FIELDS = (
+        "example_ids",
+        "base_positive_logp",
+        "base_negative_logp",
+        "base_margin",
+        "corrupted_margin",
+        "source_own_margin",
+        "source_behavior_scored",
+        "base_known_correct",
+        "source_known_correct",
+        "known_correct",
+    )
+
+    @staticmethod
+    def _raw_vector_summary(values: Sequence[Any]) -> dict[str, Any]:
+        sequence = list(values)
+        non_null = [value for value in sequence if value is not None]
+        output: dict[str, Any] = {
+            "count": len(sequence),
+            "null_count": len(sequence) - len(non_null),
+        }
+        if all(isinstance(value, (bool, np.bool_)) for value in non_null):
+            true_count = sum(bool(value) for value in non_null)
+            output.update({
+                "value_type": "boolean",
+                "true_count": int(true_count),
+                "false_count": int(len(non_null) - true_count),
+            })
+        elif all(
+                isinstance(value, (int, float, np.integer, np.floating))
+                and not isinstance(value, (bool, np.bool_))
+                for value in non_null):
+            numeric = np.asarray(non_null, dtype=np.float64)
+            finite = numeric[np.isfinite(numeric)]
+            output.update({
+                "value_type": "numeric",
+                "finite_count": int(finite.size),
+                "non_finite_count": int(numeric.size - finite.size),
+                "minimum": float(np.min(finite)) if finite.size else None,
+                "maximum": float(np.max(finite)) if finite.size else None,
+                "mean": float(np.mean(finite)) if finite.size else None,
+            })
+        elif all(isinstance(value, str) for value in non_null):
+            output.update({
+                "value_type": "string",
+                "unique_count": len(set(non_null)),
+            })
+        else:
+            output["value_type"] = "mixed"
+        return output
+
+    @classmethod
+    def _compact_behavioral_eligibility(
+            cls, result: Mapping[str, Any]) -> dict[str, Any]:
+        output = dict(result)
+        phases = output.get("phases")
+        if not isinstance(phases, Mapping):
+            return output
+        compact_phases = {}
+        for phase, phase_result in phases.items():
+            if not isinstance(phase_result, Mapping):
+                compact_phases[str(phase)] = phase_result
+                continue
+            compact = dict(phase_result)
+            raw_vectors = {}
+            for field in cls._BEHAVIOR_RAW_VECTOR_FIELDS:
+                value = compact.pop(field, None)
+                if isinstance(value, Sequence) and not isinstance(
+                        value, (str, bytes)):
+                    raw_vectors[field] = list(value)
+            if raw_vectors:
+                compact.update({
+                    "raw_vector_fields": sorted(raw_vectors),
+                    "raw_vector_field_count": len(raw_vectors),
+                    "raw_vector_row_count": max(
+                        len(values) for values in raw_vectors.values()),
+                    "raw_vector_payload_hash": canonical_hash(raw_vectors),
+                    "raw_vector_summaries": {
+                        field: cls._raw_vector_summary(values)
+                        for field, values in sorted(raw_vectors.items())
+                    },
+                    "raw_vectors_persisted": False,
+                    "raw_vector_storage_policy": (
+                        "aggregate_statistics_and_content_hash_only"),
+                })
+            compact_phases[str(phase)] = compact
+        output["phases"] = compact_phases
         return output
 
     def _ensure_kind(
@@ -769,28 +858,36 @@ class OperatorInterpretabilityRunner:
             output.get("derived_ranked_site_count", len(ranked_sites)))
         output["derived_ranked_sites_persisted_in_item_json"] = False
         output["raw_capture_retention"] = (
-            "program_schedule_binary_artifact_and_capture_digest")
+            "aggregate_statistics_and_capture_digest_only")
         return output
-
-    @staticmethod
-    def _program_mass_label(program_mass: float) -> str:
-        return f"{float(program_mass):.2f}".replace(".", "p")
 
     def _write_program_artifacts(
             self, *, phase: str, program_mass: float,
             schedules: Mapping[str, Any]) -> dict[str, Any]:
         records = {}
-        mass_label = self._program_mass_label(program_mass)
         for name, schedule in schedules.items():
-            record = write_program_schedule_artifact(
-                self.store,
-                f"programs/{phase}/mass_{mass_label}/{name}.npz",
-                schedule,
-                shape=self.shape,
-                protocol=self.protocol,
-            )
-            if record is not None:
-                records[str(name)] = record
+            schedule.validate(self.shape)
+            if not np.isclose(
+                    float(schedule.program_mass), float(program_mass),
+                    rtol=0.0, atol=1.0e-12):
+                raise ValueError(
+                    "operator program schedule mass does not match the "
+                    "artifact record")
+            if self.ctx.is_primary:
+                records[str(name)] = {
+                    "program_algorithm_version": PROGRAM_ALGORITHM_VERSION,
+                    "schedule_hash": schedule.schedule_hash,
+                    "program_mass": float(schedule.program_mass),
+                    "prompt_side": str(schedule.prompt_side),
+                    "example_count": int(schedule.batch_size),
+                    "widths": dict(schedule.widths),
+                    "phase": str(phase),
+                    "artifact_persisted": False,
+                    "raw_ids_embedded_in_item_json": False,
+                    "raw_ids_persisted": False,
+                    "storage_policy": (
+                        "aggregate_metadata_and_schedule_hash_only"),
+                }
         return records
 
     def _write_program_effect_artifact(
@@ -798,26 +895,44 @@ class OperatorInterpretabilityRunner:
             vectors: Mapping[str, Any]) -> dict[str, Any] | None:
         if not self.ctx.is_primary:
             return None
-        mass_label = self._program_mass_label(program_mass)
-        path = self.store.path(
-            "programs", phase, f"mass_{mass_label}", "effects.npz")
-        arrays = {
-            "protocol_hash": np.asarray(canonical_hash(self.protocol)),
-            "program_algorithm_version": np.asarray(
-                PROGRAM_ALGORITHM_VERSION),
-            "program_mass": np.asarray(program_mass, dtype=np.float64),
-            **{str(key): np.asarray(value)
-               for key, value in vectors.items()},
-        }
-        write_npz_atomic(path, **arrays)
+        digest = hashlib.sha256()
+        digest.update(canonical_hash(self.protocol).encode("ascii"))
+        digest.update(PROGRAM_ALGORITHM_VERSION.encode("ascii"))
+        digest.update(str(phase).encode("utf-8"))
+        digest.update(np.asarray([program_mass], dtype="<f8").tobytes())
+        vector_metadata = {}
+        for source_key in sorted(vectors, key=lambda value: str(value)):
+            key = str(source_key)
+            array = np.asarray(vectors[source_key])
+            encoded_key = key.encode("utf-8")
+            digest.update(len(encoded_key).to_bytes(4, "little"))
+            digest.update(encoded_key)
+            digest.update(array.dtype.str.encode("ascii"))
+            digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+            if array.dtype.hasobject or array.dtype.kind in {"U", "S"}:
+                digest.update(canonical_hash(array.tolist()).encode("ascii"))
+            else:
+                digest.update(np.ascontiguousarray(array).tobytes())
+            finite_count = None
+            if np.issubdtype(array.dtype, np.number):
+                finite_count = int(np.isfinite(array).sum())
+            vector_metadata[key] = {
+                "shape": [int(value) for value in array.shape],
+                "dtype": str(array.dtype),
+                "element_count": int(array.size),
+                "finite_count": finite_count,
+            }
         return {
-            "path": path,
-            "sha256": sha256_path(path),
+            "vector_digest": digest.hexdigest(),
             "program_mass": float(program_mass),
             "phase": str(phase),
             "vector_names": sorted(str(key) for key in vectors),
-            "per_example_primary_effects_persisted": True,
+            "vector_metadata": vector_metadata,
+            "artifact_persisted": False,
+            "per_example_primary_effects_persisted": False,
             "primary_effects_embedded_in_item_json": False,
+            "storage_policy": (
+                "aggregate_metadata_and_in_memory_content_digest_only"),
         }
 
     def _capture_program_phase(
