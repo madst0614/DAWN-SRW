@@ -329,7 +329,8 @@ def create_or_reuse_sharded_fns(
         trajectory_widths: Optional[Mapping[str, int]] = None):
     kernel_profile = str(kernel_profile).strip().lower()
     if kernel_profile not in {
-            "production", "retention", "suppression", "trajectory"}:
+            "production", "production_diagnostics", "retention",
+            "suppression", "trajectory"}:
         raise ValueError(f"unknown minimal kernel profile: {kernel_profile!r}")
     if analysis and kernel_profile != "production":
         raise ValueError(
@@ -444,6 +445,10 @@ def create_or_reuse_sharded_fns(
     make_paired = getattr(mod, "make_sharded_srw_paired", None)
     make_single_min = getattr(mod, "make_sharded_srw_minimal", None)
     make_paired_min = getattr(mod, "make_sharded_srw_paired_minimal", None)
+    make_single_diagnostics_min = getattr(
+        mod, "make_sharded_srw_diagnostics_minimal", None)
+    make_paired_diagnostics_min = getattr(
+        mod, "make_sharded_srw_paired_diagnostics_minimal", None)
     make_single_retention_min = getattr(
         mod, "make_sharded_srw_retention_minimal", None)
     make_paired_retention_min = getattr(
@@ -487,11 +492,13 @@ def create_or_reuse_sharded_fns(
     if not analysis and kernel_profile != "trajectory":
         single_factories = {
             "production": make_single_min,
+            "production_diagnostics": make_single_diagnostics_min,
             "retention": make_single_retention_min,
             "suppression": make_single_suppression_min,
         }
         paired_factories = {
             "production": make_paired_min,
+            "production_diagnostics": make_paired_diagnostics_min,
             "retention": make_paired_retention_min,
             "suppression": make_paired_suppression_min,
         }
