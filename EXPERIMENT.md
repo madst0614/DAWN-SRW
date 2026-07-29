@@ -19,6 +19,198 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Current blocker: no local implementation blocker. A v4175 TPU run requires the user to name the exact existing TPU resource in the current task; none has been named, so no gcloud, SSH, launcher, watcher, or remote process command was run.
 - Next experiment: review and publish the exact v4175 source/config/notebook state, then run the fresh 40M config on an explicitly named existing TPU. First establish compile, HBM, finite step-1/short-window behavior, and route-specific selection evidence; optimize the dense route kernels only after that semantic reference is measured.
 
+## Paper Writing Ledger
+
+This section is the manuscript-facing source of truth. A paper writer should use
+it for framing, methods, table cells, figure inputs, evidence boundaries, and
+remaining-work decisions; the dated experiment log below is the audit trail.
+`Measured` means a result is eligible for a paper table, `validated` means a
+supporting contract passed but is not itself a headline result, and `pending`
+means that no result may be inferred or filled from a training log.
+
+### Paper thesis and contribution structure
+
+- Working one-sentence thesis: DAWN-SRW realizes language-model state
+  transitions through input-conditioned read/write operators, enabling
+  operator-level computation to be localized, intervened on, restored, and
+  tested for reuse.
+- Evidence order: `(A) language-model performance retention -> (B) causal RW
+  operator units -> (C) cross-example circuit reuse -> (D) selected 1.3B
+  replication`.
+- The novelty claim is the causal and reusable operator unit, not absolute
+  benchmark leadership. Performance establishes that the analyzed checkpoint
+  is a functioning language model.
+- The 400M and 1.3B checkpoints are not a scaling curve: they differ in both
+  parameter count and training tokens (`40B` versus `20B`). The 1.3B result is
+  a replication at a larger scale.
+
+| Claim | Required evidence | Current status | Manuscript wording now allowed |
+|---|---|---|---|
+| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | DAWN 400M zero-shot measured; full C4 and dense 400M pending | Report DAWN absolute zero-shot only; do not yet claim parity with the dense baseline |
+| B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | Pending `mechanistic_screen` and gated `scientific` run | State as a hypothesis/method objective, not a result |
+| C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | Pending | Do not claim reuse or task-level specialization |
+| D. Scale replication | 1.3B performance and selected causal effect with the same control design | DAWN 1.3B checkpoint available; evaluation pending | Describe the planned replication only |
+
+### Study matrix and comparison roles
+
+| Model | Parameters | Training tokens | Checkpoint state | Paper role |
+|---|---:|---:|---|---|
+| DAWN-SRW v4172 400M | `393,800,708` measured | `39,999,504,384` in the evaluation manifest | Step `76,293` resolved, restored, parity-validated, zero-shot measured | Discovery model, full mechanistic analysis, primary causal result |
+| Dense Transformer 400M | Config estimate `~393.9M`; exact restore count pending | `40B` configured | User-designated run available; exact numeric step/evaluation pending | Matched 400M performance control |
+| DAWN-SRW v4172 1.3B | `1,272,038,404` configured; restore verification pending | `20B` configured | User-designated run available; exact numeric step/evaluation pending | Larger-scale performance and selected causal replication |
+| Dense Transformer 1.3B | Pending completed training | `20B` configured | Training in progress; excluded by user decision | No current paper result |
+
+The machine-readable run roots and availability states are in
+`configs/paper_checkpoint_registry.yaml`. Every paper result must additionally
+resolve one numeric checkpoint step and preserve its exact evaluation commit.
+
+### DAWN-SRW v4172 400M method specification
+
+| Component | Exact paper model setting |
+|---|---|
+| Identity | `spatial-r1-v4.1.7.2`; generalized coordinate-wise bilinear RW operator keys |
+| Backbone dimensions | Vocabulary `30,522`; width `2,304`; 18 blocks; 36 attention heads; head width 64; maximum sequence length 512 |
+| Operator coordinates | Route width `d_route=256`; direct state-to-operation query projection |
+| Shared operator pools | Q/K pool `4,600`; V pool `14,500`; post-attention RST pool `29,300`; total stored pool rows `48,400` |
+| Operator representation | Each pool row owns model-width read and write vectors. Normalized read/write directions are projected through shared read/write probes; their coordinate-wise product forms the live generalized-bilinear route key |
+| Selection/composition | DirectTau boundary; `linear_angular` composition; denominator powers QK/V/RST `0.5/1.0/1.2` |
+| Block computation | Q, K, and V operator compositions form causal self-attention; a separately routed RST composition updates the post-attention residual before the next block |
+| Regularization/runtime | Model and router dropout `0`; gradient checkpointing enabled; QK/V/RST pool chunks `1/1/4` |
+| Parameters | `393,800,708` at the restored checkpoint |
+
+Training used C4 with seed 1, global batch 1,024, sequence length 512, one
+gradient-accumulation step, TPU mesh `data=16, model=2`, learning rate `3e-4`,
+8% warmup, weight decay `0.1`, tau learning-rate multiplier `0.001`, and
+quantile initialization targets QK/V/RST `0.05/0.03/0.01`. The optimizer is the
+repository canonical Adam-style transform with `b2=0.95`, decoupled
+base/pool weight decay, warmup plus cosine schedule, and optional global
+gradient clipping. The paper checkpoint is the concrete Orbax directory
+`checkpoints/000000076293` under the registered v4172 400M run.
+
+The tokenizer is `bert-base-uncased`, logical/effective vocabulary 30,522,
+lower-casing enabled, pad ID 0, CLS ID 101, SEP ID 102, no BOS/EOS token, and
+no automatic special-token insertion during zero-shot scoring. The zero-shot
+manifest records tokenizer vocabulary hash
+`68564f66edb91d6593d0a740d21bfa1fdfcf2db08573f06e17616315c797f572`.
+
+### Matched 400M dense-control contract
+
+The configured dense control uses the same C4 40B data, seed 1, global batch
+1,024, sequence length 512, 18 layers, dropout 0, mesh `16x2`, learning rate
+`3e-4`, 8% warmup, and weight decay `0.1`. Its architecture is width 1,280,
+FFN width 5,120, and 20 attention heads. The config estimates approximately
+393.9M parameters. Exact parameter count, numeric checkpoint step, full C4
+validation, tokenizer parity, and the identical zero-shot protocol remain
+required before any DAWN-versus-dense performance statement.
+
+### Evaluation protocol locked for paper tables
+
+- C4 validation must report cross-entropy, perplexity, token accuracy, valid
+  target-token count, split/data hash, batch, sequence length, dtype, and exact
+  checkpoint. The 16,352-token Phase 0 batch is a forward-parity contract, not
+  the final C4 validation row.
+- Zero-shot uses stock `lm-eval==0.4.2`, zero few-shot examples, protocol
+  `mamba_table3_zero_shot_v1`, no optimizer or checkpoint write, global batch
+  32, maximum length 512, and length buckets 64/128/256/512.
+- Table metrics are normalized accuracy for HellaSwag, PIQA, ARC-Easy, and
+  ARC-Challenge; raw accuracy for LAMBADA and WinoGrande; LAMBADA perplexity is
+  reported separately. Every accuracy includes its standard error.
+- `limit=1` executions are parity-only and must never populate a paper
+  performance table. The eligible v4172 400M run has `limit=null`,
+  `smoke_test_only=false`, all six tasks complete, and `comparable=true`.
+
+### Table-ready v4172 400M performance
+
+| Benchmark | Split (`n`) | Metric | Score | Standard error |
+|---|---:|---|---:|---:|
+| LAMBADA OpenAI | test (`5,153`) | accuracy | `0.352027945` | `0.006653938` |
+| LAMBADA OpenAI | test (`5,153`) | perplexity | `24.077383687` | `0.800538623` |
+| HellaSwag | validation (`10,042`) | normalized accuracy | `0.458374826` | `0.004972460` |
+| PIQA | validation (`1,838`) | normalized accuracy | `0.712187160` | `0.010563250` |
+| ARC-Easy | test (`2,376`) | normalized accuracy | `0.484006734` | `0.010254534` |
+| ARC-Challenge | test (`1,172`) | normalized accuracy | `0.256825939` | `0.012766924` |
+| WinoGrande | validation (`1,267`) | accuracy | `0.513812155` | `0.014047123` |
+| Six-task aggregate | six primary accuracy metrics | arithmetic mean | `0.462872460` | not aggregated |
+
+The paper-eligible zero-shot result root is
+`gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_zero_shot_20260729T041547Z-6232963d`.
+Use `backends/stock_zero_shot/results_summary.json` for table cells,
+`backends/stock_zero_shot/run_manifest.json` for software, tokenizer, split,
+fingerprint, protocol, and source identity, and `items/zero_shot/*.json` for
+per-task evidence. This run used clean evaluation commit
+`623eaee8fc30471db809cb7093d3ed28594bff35`.
+
+### Mechanistic study design locked before screening
+
+The 400M screen candidates are IOI, MCQA, arithmetic, ARC reasoning, and
+RAVEL. Each task is split before circuit search:
+
+- Discovery split: select layers, pools, operators, circuit size, and
+  intervention specification.
+- Confirmatory split: apply the frozen discovery specification once; it cannot
+  be reused to select operators or thresholds.
+- Screening measurements: number of correct examples, operator/circuit
+  concentration, cross-example consistency, layer localization, intervention
+  effect, and separation from matched controls.
+- Promotion rule: retain only tasks with enough correct examples, a localized
+  and repeatable effect, the same effect direction on held-out examples, and
+  clear separation from random matched controls. Promote two or three tasks;
+  do not force every task into the main analysis.
+
+For each promoted task, the full causal sequence is:
+
+1. Localize layer, Q/K/V/RST pool, operator, and multilayer trajectory.
+2. Suppress the frozen circuit and measure correct-answer logit, logit
+   difference, loss, exact accuracy, prediction flips, and unrelated outputs.
+3. Compare with equal-count random, same-layer random, activation-magnitude
+   matched, route-frequency matched, and other-task circuit controls.
+4. Restore the suppressed circuit and test recovery toward intact behavior.
+5. Transfer a source circuit to same-template held-out inputs, different
+   wording with the same computation, and a different-computation negative
+   control.
+6. Treat mediation as supporting analysis only; suppression, matched controls,
+   restoration, and held-out transfer carry the main causal claim.
+
+The full `scientific` preset remains gated until screen eligibility and
+discovery/confirmatory separation are reviewed. For 1.3B, repeat only one or
+two strongest 400M tasks and interventions with the same controls. Identical
+operator indices across scales are not required; the effect direction and
+computational organization are the replication target.
+
+### Manuscript table and figure map
+
+| Output | Required content | Current evidence source |
+|---|---|---|
+| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; `2026-07-29/#03` and `#05`; baseline rows pending |
+| Table 2: C4 validation | Loss, perplexity, token accuracy for DAWN/dense 400M and DAWN 1.3B | Pending full validation |
+| Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
+| Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
+| Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M zero-shot complete; other cells pending |
+| Figure 3: circuit localization | Layer x operator causal contribution, trajectory, held-out overlap | Pending screen/scientific |
+| Figure 4: causal intervention | Intact, suppressed, matched control, restored | Pending scientific |
+| Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | Pending scientific |
+| Figure 6: scale replication | 400M versus 1.3B effect size and normalized layer trajectory | Pending selected 1.3B replication |
+
+### Interpretation and exclusion rules
+
+- Supported now: the exact v4172 400M checkpoint restores reproducibly; the
+  production and analysis forwards agree within `3.31e-7` CE; the full
+  unlimited stock six-task result above is reproducible and paper-eligible.
+- Not supported yet: matched dense performance retention, causal importance,
+  restoration, reuse, scale replication, pruning-quality tradeoffs, or
+  hardware speedup.
+- Do not infer a full validation loss from the Phase 0 fixed batch or from a
+  training-log summary. Do not use `limit=1` task scores.
+- Do not call 400M-to-1.3B a scaling curve. Do not include baseline 1.3B until
+  the user declares training complete and a numeric checkpoint is resolved.
+- Structural sparsity may be reported from measured operator usage. Hardware
+  efficiency requires matched device, mesh, batch, length, dtype,
+  compilation, logging, and checkpointing conditions; without that protocol,
+  restrict language to estimated executed operator work.
+- A strong causal statement requires repeat activation, selective suppression,
+  matched-control separation, restoration, held-out transfer, and scale
+  replication. Any missing link must remain explicit in the paper.
+
 ## Fixed Context
 
 - `codex/v4167-poc` is the canonical integration branch, canonical baseline-source branch, and central final-reporting branch for every POC. Work and measurements may occur on candidate branches, but every material result and current-state decision must be synchronized to this notebook on POC and pushed.
