@@ -27,6 +27,12 @@ remaining-work decisions; the dated experiment log below is the audit trail.
 `Measured` means a result is eligible for a paper table, `validated` means a
 supporting contract passed but is not itself a headline result, and `pending`
 means that no result may be inferred or filled from a training log.
+Scientifically negative or null outcomes from a completed valid protocol are
+results and must be reported: this includes a preregistered threshold miss, no
+localized effect, no control separation, a non-significant effect, or a
+rejected hypothesis. Authentication, launcher, dependency, or code failures
+that produce no interpretable scientific measurement are operational incidents,
+not paper results; rerun them correctly and report the valid completed outcome.
 
 ### Paper thesis and contribution structure
 
@@ -270,6 +276,11 @@ for exact row-level audit data. The clean analysis commit is
   training-log summary. Do not use `limit=1` task scores.
 - Do not call 400M-to-1.3B a scaling curve. Do not include baseline 1.3B until
   the user declares training complete and a numeric checkpoint is resolved.
+- Preserve completed null and negative results in the manuscript ledger and
+  result tables. Do not silently drop a task because its valid result misses a
+  threshold; identify the failed gate and restrict the corresponding claim.
+- Do not promote setup, authentication, launcher, dependency, or implementation
+  failures into scientific evidence when no valid protocol result was produced.
 - Structural sparsity may be reported from measured operator usage. Hardware
   efficiency requires matched device, mesh, batch, length, dtype,
   compilation, logging, and checkpointing conditions; without that protocol,
