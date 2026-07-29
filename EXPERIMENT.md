@@ -7,7 +7,7 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 - Current goal: use `codex/v4167-poc` as the sole canonical integration, baseline-source, and final experiment-reporting branch for all POC work. Experimental branches may isolate candidate code and runs, but every material result and current decision must be synchronized back to this notebook on POC and pushed. Only accepted source changes are integrated into POC.
 - Paper-analysis track: `configs/paper_checkpoint_registry.yaml` is the descriptive source for the user-designated DAWN-SRW v4172 400M/1.3B and baseline-JAX 400M/1.3B run roots. The 400M DAWN and baseline are the matched 40B-token performance pair; DAWN 1.3B is available for 20B-token scale evaluation and selected mechanistic replication. The baseline-JAX 1.3B run is still training and is excluded from evaluation and comparison until the user declares it complete.
-- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. Run the 400M `mechanistic_screen` next. Full `scientific` analysis remains gated on the screen; 1.3B DAWN work is sequential and selective, and no 1.3B baseline work is currently allowed.
+- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. Promote IOI, ARC, and RAVEL to task-specific causal analysis; retain MCQA as a reserve/appendix task. Causal claims remain gated on localization, intervention, controls, restoration, and held-out confirmation. DAWN 1.3B work is sequential and selective, and no 1.3B baseline work is currently allowed.
 - v4175 40M POC state: a route-separated `spatial-r1-v4.1.7.5` reference is locally implemented directly on `codex/v4167-poc` from exact clean parent/origin commit `7de5fc391608d337d9835d0cb9759487a6affd8d`. One shared eight-space atlas owns `space_read_proj`/`space_write_proj`; Q, K, V, and RST own independent selector projections and space keys, independently choose top-2 atlas entries, retain separate tau maps and operator banks, and use metric-complete dense all-space execution. The exact 40M tree is 40,344,160 parameters, 544 (`0.00135%`) above the 40,343,616 Transformer reference. These changes and this notebook entry remain an uncommitted local dirty worktree and are not yet canonical published source.
 - v4175 evidence boundary: local Python/JAX/Flax `3.12.7/0.6.2/0.10.7` abstract-tree, route-factory, calibration, JIT forward/backward, compact-metric, reduced canonical train-step, and v4174 regression checks passed. TPU compile, HBM, step time, throughput, and training stability are `not measured`; execution optimization is intentionally deferred until after the 40M semantic reference runs.
 - Publication state: accepted QKV+RST outer analytic-pullback source is integrated by merge commit `62417b239d5b79c5dfa8684563532958ed212385` on `codex/v4167-poc`. User-approved QK/V/RST initializer target fractions `0.08/0.08/0.05` are integrated by merge commit `bb2a3ada9a0c281df9439043162dde8045d62bfd` and measured at clean POC commit `ae12416b40607ef8dd21fe79a64d86b4335e18b3`. Generation-`g5` registry and the rejected matched chunk4 report are centralized by POC commit `4e896c00b63f9b0523bb95ebe8357c37cc824740`. The chunk4 source remains only on `codex/v4174-g4-frac885-rst-chunk4` at `a3879f21dcd3b786bdc2cde270bcca2a382796a4`.
@@ -47,8 +47,8 @@ means that no result may be inferred or filled from a training log.
 | Claim | Required evidence | Current status | Manuscript wording now allowed |
 |---|---|---|---|
 | A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | DAWN 400M C4 and zero-shot measured; dense 400M pending | Report DAWN absolute C4 and zero-shot results; do not yet claim parity with the dense baseline |
-| B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | Pending `mechanistic_screen` and gated `scientific` run | State as a hypothesis/method objective, not a result |
-| C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | Pending | Do not claim reuse or task-level specialization |
+| B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | Behavioral eligibility measured for IOI, MCQA, ARC, and RAVEL; causal analysis pending | Report which tasks are eligible for analysis; do not yet claim causal importance |
+| C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | IOI, ARC, and RAVEL promoted to confirmatory causal analysis; transfer evidence pending | Describe the frozen follow-up design, not circuit reuse as a result |
 | D. Scale replication | 1.3B performance and selected causal effect with the same control design | DAWN 1.3B checkpoint available; evaluation pending | Describe the planned replication only |
 
 ### Study matrix and comparison roles
@@ -172,22 +172,46 @@ language model suitable for causal analysis. They do not yet establish
 performance retention relative to a dense Transformer, because the matched
 400M dense-control cells remain unmeasured.
 
-### Mechanistic study design locked before screening
+### Mechanistic screening result and locked causal design
 
-The 400M screen candidates are IOI, MCQA, arithmetic, ARC reasoning, and
-RAVEL. Each task is split before circuit search:
+The preregistered first-stage screen tested behavioral eligibility for IOI,
+MCQA, arithmetic, ARC reasoning, and RAVEL before any circuit search. A row is
+mechanistically eligible only when the frozen checkpoint answers both the base
+example and its labeled source behavior correctly where the source label is
+defined. Every discovery, validation, and test phase must contain at least 32
+independent eligible units. MIB candidate scores use summed log probability;
+RAVEL uses mean log probability per token. The screen performs no optimizer or
+parameter update and, by itself, supports no localization or causal claim.
+
+| Task | Rows D/V/T | Base accuracy D/V/T | Source accuracy D/V/T | Pair accuracy D/V/T | Independent eligible units D/V/T | All-phase gate | Follow-up decision |
+|---|---:|---:|---:|---:|---:|---|---|
+| IOI | `128/128/128` | `0.984/0.977/0.992` | `0.945/0.984/0.898` | `0.930/0.961/0.891` | `119/123/114` | Pass | Primary MIB causal task |
+| MCQA | `110/50/50` | `1.000/1.000/1.000` | `0.727/0.680/0.640` | `0.727/0.680/0.640` | `80/34/32` | Pass | Reserve/appendix; test split is exactly at the threshold |
+| Arithmetic | `128/128/128` | `0.438/0.445/0.500` | `0.516/0.555/0.461` | `0.094/0.086/0.063` | `12/11/8` | Fail | Exclude from causal claims at this checkpoint |
+| ARC | `128/128/128` | `0.977/0.969/0.992` | `0.414/0.430/0.453` | `0.391/0.398/0.445` | `50/51/57` | Pass | Secondary MIB causal task |
+| RAVEL | `512/512/512` | `0.678/0.699/0.676` | `0.699/0.633/0.660` | `0.578/0.574/0.568` | `142/154/146` | Pass | Primary variable-localization and transfer task |
+
+`D/V/T` denotes discovery/validation/test. For RAVEL, paired-correct row counts
+were `296/294/291`; the independent-unit counts in the table collapse repeated
+rows from the same official causal unit. The task selection is fixed before
+localization: IOI supplies the strongest MIB paired behavior, ARC adds a
+distinct reasoning task with a comfortable all-phase sample buffer, and RAVEL
+supplies the largest independent causal-variable sample. MCQA remains valid
+but is not used to select the main result because validation/test contain only
+`34/32` units. Arithmetic is not analyzed causally because it never meets the
+minimum sample gate.
+
+The second-stage split contract is:
 
 - Discovery split: select layers, pools, operators, circuit size, and
   intervention specification.
-- Confirmatory split: apply the frozen discovery specification once; it cannot
-  be reused to select operators or thresholds.
-- Screening measurements: number of correct examples, operator/circuit
-  concentration, cross-example consistency, layer localization, intervention
-  effect, and separation from matched controls.
-- Promotion rule: retain only tasks with enough correct examples, a localized
-  and repeatable effect, the same effect direction on held-out examples, and
-  clear separation from random matched controls. Promote two or three tasks;
-  do not force every task into the main analysis.
+- Confirmatory validation split: freeze and apply the discovery specification;
+  it cannot be reused to select operators or thresholds.
+- Held-out test: evaluate only the already-frozen specification and report it
+  separately from discovery and validation.
+- Promotion beyond behavioral eligibility requires a localized and repeatable
+  effect, the same effect direction on held-out examples, and clear separation
+  from random and matched controls.
 
 For each promoted task, the full causal sequence is:
 
@@ -203,11 +227,19 @@ For each promoted task, the full causal sequence is:
 6. Treat mediation as supporting analysis only; suppression, matched controls,
    restoration, and held-out transfer carry the main causal claim.
 
-The full `scientific` preset remains gated until screen eligibility and
-discovery/confirmatory separation are reviewed. For 1.3B, repeat only one or
-two strongest 400M tasks and interventions with the same controls. Identical
-operator indices across scales are not required; the effect direction and
-computational organization are the replication target.
+Run the task-specific IOI, ARC, and RAVEL analyses before the fail-closed full
+`scientific` claim aggregation. For 1.3B, repeat only one or two strongest
+400M tasks and interventions with the same controls. Identical operator
+indices across scales are not required; the effect direction and computational
+organization are the replication target.
+
+The paper-eligible screening result root is
+`gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_mechanistic_screen_20260729T051149Z-7d3be0d9`.
+Use `summary.json` and `summary.log` for the run-level decision, and
+`items/{mib_ioi,mib_mcqa,mib_arithmetic,mib_arc,ravel}/behavioral_eligibility.json`
+for exact row-level audit data. The clean analysis commit is
+`469c2d12caf1dabf578e16d0bd1ab9cc7bf70ea4`, and the protocol hash is
+`e55551954702df3ae628798f5a208681e1eed68dbbda0d967967af6865107adc`.
 
 ### Manuscript table and figure map
 
@@ -218,7 +250,7 @@ computational organization are the replication target.
 | Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
 | Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
 | Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M C4 and zero-shot complete; comparison cells pending |
-| Figure 3: circuit localization | Layer x operator causal contribution, trajectory, held-out overlap | Pending screen/scientific |
+| Figure 3: circuit localization | Layer x operator causal contribution, trajectory, held-out overlap | Behavioral task-selection table complete in `#07`; IOI/ARC/RAVEL causal localization pending |
 | Figure 4: causal intervention | Intact, suppressed, matched control, restored | Pending scientific |
 | Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | Pending scientific |
 | Figure 6: scale replication | 400M versus 1.3B effect size and normalized layer trajectory | Pending selected 1.3B replication |
@@ -228,7 +260,9 @@ computational organization are the replication target.
 - Supported now: the exact v4172 400M checkpoint restores reproducibly; the
   production and analysis forwards agree within `3.31e-7` CE; the locked
   10M-token C4 validation and full unlimited stock six-task results above are
-  reproducible and paper-eligible.
+  reproducible and paper-eligible; and IOI, MCQA, ARC, and RAVEL have enough
+  paired-correct independent examples for mechanistic follow-up under the
+  preregistered threshold.
 - Not supported yet: matched dense performance retention, causal importance,
   restoration, reuse, scale replication, pruning-quality tradeoffs, or
   hardware speedup.
@@ -988,6 +1022,14 @@ computational organization are the replication target.
 - Runtime/protocol: one TPU v4-64 pod, eight hosts, 32 devices, mesh `data=16, model=2`, global evaluation batch 32, sequence length 512, float32 evaluation, token reduction chunk 32,768, and no optimizer or checkpoint write. The `production_diagnostics` forward was used to report both loss and token accuracy; Phase 0 had already established its loss parity with the production-minimal forward. Remote software was `/usr/bin/python3` 3.10.6, JAX/jaxlib 0.6.2, Flax 0.10.7, Orbax 0.11.24, NumPy 2.2.6, fsspec 2024.3.1, and gcsfs 2024.3.1.
 - Validation data: `gs://dawn-tpu-data-c4/c4_val.bin` with metadata `gs://dawn-tpu-data-c4/c4_val_meta.json`, tokenizer `bert-base-uncased`, vocabulary 30,522, and metadata hash `4c2fc359ddd7542052442e5deab2eecd37f5cdf7f3dca19a0943ea47eaf4aaf7`. The 10M-token capped view contained 19,531 packed sequences; 19,520 complete-batch sequences were evaluated and 11 incomplete-batch sequences were excluded. The underlying validation artifact contains 50,000,384 tokens and records 2,210 discarded tail tokens during packing.
 - Evidence/decision: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T044410Z-37fa6082`; table cells `validation_summary.json`; exact source/software/data/protocol manifest `run_manifest.json`; canonical text summary `summary.log`; result hash `e32a86cec7f1901b4688775d77aacf92e9649344e7cd170a0f45c8c5b9cef893`. Accept this as the v4172 400M C4 paper row and proceed to the 400M `mechanistic_screen`; matched dense performance claims remain gated on the dense 400M run.
+
+#### #07 — Screen v4172 400M tasks for mechanistic eligibility
+
+- Result: `TPU measured`; the complete preregistered `mechanistic_screen` finished with all five immutable input contracts and all five behavioral-eligibility items `ready`, no interpretation blocker, and zero artifact warnings. IOI, MCQA, ARC, and RAVEL passed the `minimum_known_correct=32` gate independently in discovery, validation, and test. Arithmetic returned only `12/11/8` independent paired-correct units and is excluded from causal analysis at this checkpoint.
+- Table values: IOI independent eligible units were `119/123/114`, with base/source/pair accuracy `0.984/0.945/0.930`, `0.977/0.984/0.961`, and `0.992/0.898/0.891` over discovery/validation/test. MCQA units were `80/34/32`, ARC units were `50/51/57`, and RAVEL independent units were `142/154/146`; RAVEL paired-correct row counts before independent-unit collapsing were `296/294/291`. The full manuscript-facing table, including every phase accuracy, is in the Paper Writing Ledger.
+- Reproducibility identity: clean `codex/v4167-poc` commit `469c2d12caf1dabf578e16d0bd1ab9cc7bf70ea4`; target/model `v4172_400M` / `spatial-r1-v4.1.7.2`; config `configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml`; concrete checkpoint `checkpoints/000000076293`; 393,800,708 parameters; checkpoint-config hash `08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b`; checkpoint identity `a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17`; parameter-schema hash `d5cbfc00422932c3921211ee4f00b001eb872b4f5382b13b4249311a478c41af`; model-config hash `053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f`; tracked worktree clean.
+- Runtime/protocol: one TPU v4-64 pod, eight hosts, 32 devices, mesh `data=16, model=2`, seed 4172, non-RAVEL phase cap 128, RAVEL phase cap 512, and no optimizer or parameter write. Remote software was `/usr/bin/python3` 3.10.6, JAX/jaxlib 0.6.2, Flax 0.10.7, Optax 0.2.8, and NumPy 2.2.6. The immutable benchmark build was `f056bb4f133cde4fc0ae02f9`, manifest hash `f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6`, tokenizer revision `86b5e0934494bd15c9632b12f734a8a67f723594`, tokenizer vocab hash `de054a2243ead40e8e1bcc06edf510f87bdff3f2d57fd0788f2715a7b2e0bd38`, and protocol hash `e55551954702df3ae628798f5a208681e1eed68dbbda0d967967af6865107adc`.
+- Evidence/decision: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_mechanistic_screen_20260729T051149Z-7d3be0d9`; run identity/status `run_manifest.json`; paper summary `summary.json` and `summary.log`; exact task results `items/{mib_ioi,mib_mcqa,mib_arithmetic,mib_arc,ravel}/behavioral_eligibility.json`. Promote IOI, ARC, and RAVEL to task-specific causal analysis, retain MCQA as reserve/appendix evidence, and make no localization or causal claim from this screen alone.
 
 ## Backfill Boundary
 
