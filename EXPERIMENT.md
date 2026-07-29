@@ -7,7 +7,7 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 - Current goal: use `codex/v4167-poc` as the sole canonical integration, baseline-source, and final experiment-reporting branch for all POC work. Experimental branches may isolate candidate code and runs, but every material result and current decision must be synchronized back to this notebook on POC and pushed. Only accepted source changes are integrated into POC.
 - Paper-analysis track: `configs/paper_checkpoint_registry.yaml` is the descriptive source for the user-designated DAWN-SRW v4172 400M/1.3B and baseline-JAX 400M/1.3B run roots. The 400M DAWN and baseline are the matched 40B-token performance pair; DAWN 1.3B is available for 20B-token scale evaluation and selected mechanistic replication. The baseline-JAX 1.3B run is still training and is excluded from evaluation and comparison until the user declares it complete.
-- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398` and froze a 4,096-site Q/K-dominant circuit. The exact frozen-spec validation in `2026-07-29/#17` and fully held-out test in `2026-07-29/#20` are both strong successes: suppression, separation from all four 100-replicate matched controls, and exact restoration passed every preregistered gate over 123 validation and 114 test paired-correct units. The first test launch in `2026-07-29/#19` remains recorded as a pre-condition operational incident with no effect estimate. The discovery-frozen Q/K-centered RW operator circuit is now an independently validated and held-out-confirmed paper-central causal result. RAVEL localization and variable transfer are next, followed by ARC. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
+- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398` and froze a 4,096-site Q/K-dominant circuit. The exact frozen-spec validation in `2026-07-29/#17` and fully held-out test in `2026-07-29/#20` are both strong successes: suppression, separation from all four 100-replicate matched controls, and exact restoration passed every preregistered gate over 123 validation and 114 test paired-correct units. The first test launch in `2026-07-29/#19` remains recorded as a pre-condition operational incident with no effect estimate. The discovery-frozen Q/K-centered RW operator circuit is now an independently validated and held-out-confirmed paper-central causal result. The preregistered RAVEL discovery localization in `2026-07-29/#22` is a fail-closed negative result: Continent/Country/Language rank stability was `0.62876/0.67624/0.66062`, no audited prefix passed both discovery gates, and no variable circuit was frozen. RAVEL validation, transfer, and test were not opened. ARC auxiliary causal replication is next. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
 - v4175 40M POC state: accepted `spatial-r1-v4.1.7.5` shared-atlas source is integrated on `codex/v4167-poc` at exact commit `4da8bd8891fb1413ffb8570241ab817a9791a8e5`, with no compatibility version or migration path. One shared eight-space atlas owns `operation_space_keys [M,R]`, `space_read_proj`, and `space_write_proj`; Q, K, V, and RST retain independent query projections, independently choose top-2 atlas entries, and retain separate tau maps and operator banks. Current config commit `4fe89796c6960c7a8e6fb8715a24daf7d4720041` uses QK/V/RST denominator powers `0.5/0.8/1.0`, initial active targets approximately `67/67/207/600`, and scratch root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_shared_keys_40M_c4_5B_den_modify`. The exact tree is 40,341,088 parameters, 2,528 (`0.00627%`) below the 40,343,616 Transformer reference.
 - v4175 evidence boundary: repository-local Python/JAX/Flax `3.12.7/0.6.2/0.10.7` compilation, abstract-tree/symbolic-count, shared-key and independent-route selection, legacy-checkpoint rejection, reduced JIT forward/backward, complete selector metrics, and focused v4174 regression checks passed. User-provided TPU v4-4 observations through step 100 show that `0.5/0.8/1.0` avoids the all-`0.5` RST gain spike and improves early loss, but route-space concentration and attention/residual growth remain under observation. The exact TPU resource, deployed commit, generated run folder, checkpoint step, compile/HBM, step time, and throughput were not provided or independently measured in this reporting turn; no TPU command was run.
 - Publication state: accepted QKV+RST outer analytic-pullback source is integrated by merge commit `62417b239d5b79c5dfa8684563532958ed212385` on `codex/v4167-poc`. User-approved QK/V/RST initializer target fractions `0.08/0.08/0.05` are integrated by merge commit `bb2a3ada9a0c281df9439043162dde8045d62bfd` and measured at clean POC commit `ae12416b40607ef8dd21fe79a64d86b4335e18b3`. Generation-`g5` registry and the rejected matched chunk4 report are centralized by POC commit `4e896c00b63f9b0523bb95ebe8357c37cc824740`. The chunk4 source remains only on `codex/v4174-g4-frac885-rst-chunk4` at `a3879f21dcd3b786bdc2cde270bcca2a382796a4`.
@@ -16,8 +16,8 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Current conclusion: use generation `g5` with RST chunk8 for production. The matched chunk4 candidate produced `0.634587` s combined F+B (`0.9222%` slower than the matched chunk8 control) and failed the mandatory `0.565677` s gate. Its full-step mean was `8.923707` s/it, only `0.2242%` faster than chunk8 and below the required `2%`; p90 was `0.2863%` worse. The noise-level mean does not override the failed gates, so chunk4 is rejected.
 - Baseline state: `docs/v4174_dense_rw_baselines.yaml` generation `g5` is active for QK/V/RST fractions `0.08/0.08/0.05` and chunks `1/1/2/8`. Generation `g4` is superseded historical evidence under the prior initializer fingerprint; generations `g1` through `g3` remain historical.
 - Last verified v4174 production state (2026-07-27): fresh generation-`g5` production was running on the then-explicitly-authorized existing TPU `spatial-se-400m` from exact POC commit `4e896c00`. The GCS run folder is `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_20B_v4_64/run_vspatial-r1-v4.1.7.4_20260727_002935_3201`; all eight workers then retained one `scripts/train_jax.py --from-scratch` process in `tmux train`. Step 20 was finite at loss `9.3893`, and its latest 10-step timing window was `8.530` s/it (`61,343.2` tokens/s). No live status refresh was authorized or performed for this v4175 task.
-- Current blocker: no IOI blocker. The final held-out artifact used clean analysis commit `75b0e0157bce670d1ca6f7801a8393014ce09ffb`, checkpoint step `76293`, mesh `16x2`, frozen-spec hash `6ec2661823bb52aa3bc336fb69fed1eef317f9cced02f836eaaade8c116a418c`, and result root ending `20260729T123731Z-3cb89374`; all preregistered test gates passed. The completed validation lineage remains unchanged at analysis commit `209147bbbdaae00ebdf64655b917a91f77d50b26`, canonical record commit `3b2f04aae3afe49fd1040c99e667acf50daadefc`, and result root ending `20260729T120132Z-ac1fc0cb`.
-- Next experiment: run only the preregistered RAVEL discovery operator localization at clean implementation commit `ac37902f67ca2148250f9ff1b1f4974cb45a870e` on the v4172 400M checkpoint. The discovery accessor is limited to 512 canonical rows and exactly 142 paired-correct independent units; validation and test access are forbidden. Preserve the completed IOI frozen specification and validation/test artifacts without any retuning. RAVEL validation and transfer may begin only if every variable passes the frozen discovery rule.
+- Current blocker: no IOI blocker. The final held-out artifact used clean analysis commit `75b0e0157bce670d1ca6f7801a8393014ce09ffb`, checkpoint step `76293`, mesh `16x2`, frozen-spec hash `6ec2661823bb52aa3bc336fb69fed1eef317f9cced02f836eaaade8c116a418c`, and result root ending `20260729T123731Z-3cb89374`; all preregistered test gates passed. RAVEL is blocked from confirmatory work by its discovery specification rather than by infrastructure: every variable missed the `0.80` stability gate and no audited prefix jointly reached cumulative importance `0.70` and split overlap `0.95`. No RAVEL circuit exists to suppress, restore, or transfer under this frozen protocol.
+- Next experiment: proceed to ARC auxiliary causal replication on the v4172 400M checkpoint. Implement and preregister only discovery localization, frozen suppression, a matched random control, exact restoration, and held-out direction reproduction before opening ARC validation/test. Preserve both the successful IOI record and the negative RAVEL discovery record unchanged. The matched dense 400M performance track follows ARC on the single available TPU.
 
 ## Paper Writing Ledger
 
@@ -61,7 +61,7 @@ contain raw per-example vectors.
 |---|---|---|---|
 | A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | DAWN 400M C4 and zero-shot measured; dense 400M pending | Report DAWN absolute C4 and zero-shot results; do not yet claim parity with the dense baseline |
 | B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | IOI discovery localization, independent validation, and fully held-out test all passed; every suppression/control/restoration gate passed | Claim that the discovery-frozen Q/K-centered RW operator circuit is causally necessary for IOI computation and recoverable on independent validation and held-out test |
-| C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | The same frozen IOI circuit generalized to independent validation and held-out inputs; RAVEL variable transfer remains pending | Claim held-out reuse of the frozen IOI circuit across inputs; do not yet claim cross-variable transfer |
+| C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | The same frozen IOI circuit generalized to independent validation and held-out inputs; preregistered RAVEL discovery was unstable and froze no variable circuit, so transfer was not eligible | Claim held-out reuse of the frozen IOI circuit across inputs; do not claim variable-level transfer |
 | D. Scale replication | 1.3B performance and selected causal effect with the same control design | DAWN 1.3B checkpoint available; evaluation pending | Describe the planned replication only |
 
 ### Study matrix and comparison roles
@@ -375,8 +375,61 @@ The aggregate result explicitly records `test_data_accessor_called=false`; a
 semantic traversal found no 123-element persisted array, and the largest array
 was a legitimate 100-replicate control distribution. This supports the
 validation-level statement that a Q/K-centered RW operator circuit causally
-supports IOI computation. Held-out confirmation remains pending and no
-paper-central claim is made yet.
+supports IOI computation. The unchanged frozen circuit subsequently passed the
+fully held-out test in `2026-07-29/#20`; IOI is therefore the paper-central
+causal result and is closed to retuning.
+
+### RAVEL discovery localization: frozen negative result
+
+The RAVEL-only run opened the canonical 512-row discovery selector and
+reproduced exactly 142 paired-correct independent `pair_group_id` units:
+Continent 40, Country 50, and Language 52. Validation and test accessors were
+not called. All 10,224 variable-layer-route capture rows qualified after one
+width expansion from QK/V/RST `512/2048/4096` to `1024/4096/8192`.
+
+| Variable | Independent units | Ranked sites | Split-rank stability | Stability gate | Frozen k |
+|---|---:|---:|---:|---|---:|
+| Continent | 40 | 480,066 | 0.628762 | Fail | 0 |
+| Country | 50 | 494,478 | 0.676243 | Fail | 0 |
+| Language | 52 | 504,210 | 0.660622 | Fail | 0 |
+
+The fixed audited prefixes were `32/64/128/256/512/1024/2048/4096`.
+For Continent, cumulative-importance/overlap pairs were
+`0.0475/0.9063`, `0.0851/0.9844`, `0.1404/0.9609`, `0.2108/0.9375`,
+`0.2943/0.9160`, `0.4027/0.9111`, `0.5446/0.9014`, and
+`0.7157/0.9065`. Country produced `0.0485/0.9375`, `0.0868/0.9844`,
+`0.1429/0.9609`, `0.2127/0.9336`, `0.2959/0.9434`, `0.4028/0.8945`,
+`0.5432/0.9014`, and `0.7134/0.9048`. Language produced
+`0.0472/0.8750`, `0.0844/0.9844`, `0.1395/0.9453`, `0.2080/0.9336`,
+`0.2903/0.9219`, `0.3993/0.9092`, `0.5425/0.9155`, and
+`0.7145/0.9141`. Thus no prefix jointly passed cumulative importance
+`>=0.70` and split overlap `>=0.95`, independently of the failed `0.80`
+rank-stability gate.
+
+The descriptive rankings were consistently Q/K-heavy but are not frozen
+circuits. Q/K importance fractions were `39.7041%/58.1049%` for Continent,
+`39.2370%/58.4925%` for Country, and `39.3885%/58.4359%` for Language;
+V and RST together contributed only `2.19%`, `2.27%`, and `2.18%`.
+Layer 14 was largest for all three variables (`9.06%/8.94%/8.98%`), followed
+by layers 13 and 15. Every ranking was led by layer-5 Q operator 3969, with
+layer-5 K operators 547 and 3381 next in variable-dependent order. The first
+V site appeared only at ranks `4,622/4,681/4,943`, and the first RST site at
+`6,042/6,417/6,164`. These repeated top sites are descriptive evidence only;
+the preregistered full-ranking and prefix gates prohibit freezing or transfer.
+
+The result used clean analysis commit
+`e6de10d1a7d27aea2fda4f12505264edf27716e6`, spec hash
+`812ea210137a7fc4b2d5956f59975a5c8efbb8881569110455add15a67aa10df`,
+protocol hash
+`b191fc1cd00ad3ebb95a9ec3b5b853c67f138e49fc937a2df519b150bb7f2ba3`,
+and result root
+`gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_ravel_discovery_localization_20260729T131153Z-1b93b28d`.
+The 378,997,602-byte item JSON has SHA-256
+`1cd76e32fb3be15f427c64a21f6de7ac90ca005008f6d89f604f75ded9330bf4`
+and retains aggregate rankings, not raw per-example vectors. This negative
+result blocks RAVEL validation, restoration, transfer, and held-out test under
+the frozen protocol; it must not be repaired by changing routes, variables,
+prefixes, thresholds, or the discovery cohort.
 
 ### Manuscript table and figure map
 
@@ -387,9 +440,9 @@ paper-central claim is made yet.
 | Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
 | Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
 | Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M C4 and zero-shot complete; comparison cells pending |
-| Figure 3: circuit localization | Layer x operator discovery contribution, split overlap, trajectory, held-out overlap | IOI aggregate site ranking and split overlap complete in `#09`; IOI validation causal effect complete in `#17`; trajectory, held-out overlap, and ARC/RAVEL localization pending |
-| Figure 4: causal intervention | Intact, suppressed, matched control, restored | IOI validation panel complete in `#17`; held-out test panel pending |
-| Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | Pending scientific |
+| Figure 3: circuit localization | Layer x operator discovery contribution, split overlap, trajectory, held-out overlap | IOI localization/validation/test complete in `#09/#17/#20`; RAVEL discovery negative in `#22`; ARC pending |
+| Figure 4: causal intervention | Intact, suppressed, matched control, restored | IOI validation and held-out test panels complete in `#17/#20` |
+| Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | RAVEL transfer not eligible because `#22` froze no variable circuit; no transfer claim |
 | Figure 6: scale replication | 400M versus 1.3B effect size and normalized layer trajectory | Pending selected 1.3B replication |
 
 ### Interpretation and exclusion rules
@@ -400,12 +453,13 @@ paper-central claim is made yet.
   reproducible and paper-eligible; and IOI, MCQA, ARC, and RAVEL have enough
   paired-correct independent examples for mechanistic follow-up under the
   preregistered threshold. IOI has a stable discovery aggregate operator
-  ranking, a frozen 4,096-site intervention specification, and validation-level
-  causal evidence from suppression, all four matched controls, and exact
-  restoration.
-- Not supported yet: matched dense performance retention, held-out-confirmed
-  causal importance, IOI trajectory confirmation, held-out or cross-variable
-  reuse, scale replication, pruning-quality tradeoffs, or hardware speedup.
+  ranking, a frozen 4,096-site intervention specification, and independently
+  confirmed validation/test causal evidence from suppression, all four matched
+  controls, and exact restoration. RAVEL has a valid negative discovery result
+  and no frozen variable circuit.
+- Not supported yet: matched dense performance retention, variable-level
+  transfer, IOI trajectory confirmation, scale replication, pruning-quality
+  tradeoffs, or hardware speedup.
 - Do not infer a full validation loss from the Phase 0 fixed batch or from a
   training-log summary. Do not use `limit=1` task scores.
 - Do not call 400M-to-1.3B a scaling curve. Do not include baseline 1.3B until
@@ -1306,6 +1360,18 @@ paper-central claim is made yet.
 - Implementation/storage: the dedicated item is `ravel.discovery_operator_localization`; its complete dependency closure is exactly `ravel.input_contract` plus that item. It evaluates behavior only on discovery, reduces paired-correct rows to independent cause groups, captures layer/route/operator contributions, computes per-variable rankings, stability, overlap, cumulative importance, and frozen selected-site identities, and persists aggregate rankings and hashes. Raw per-example behavior vectors, raw operator vectors, and raw capture rows are transient and are not durable paper artifacts.
 - Local evidence: repository-local Python/JAX/Flax were `3.12.7/0.6.2/0.10.7`. Module compilation, launcher `bash -n`, `git diff --check`, specification hash/semantic validation, item dependency closure, IOI frozen-file diff audit, and the exact `spatial-se-400m` launcher dry-run passed. No test or debug file was created or run. TPU localization values, rank stability, overlaps, circuit sizes, and route/layer/operator composition are `not measured` in this entry.
 - Execution/decision: with one authorized TPU, run the tracks sequentially rather than contending for the device. Publish this pre-effect record before launch, then deploy the exact clean POC descendant on the existing user-authorized `spatial-se-400m` v4-64 with mesh `16x2`, tmux `train`, and `~/train.log`. Run only preset `ravel_discovery_localization`; preserve the outcome without changing thresholds, prefix counts, variables, route policy, or cohort. Do not open RAVEL validation or test in this attempt.
+
+#### #22 — Fail closed on preregistered RAVEL discovery localization
+
+- Status/decision: `TPU measured; unstable_localization; frozen negative result`. The valid discovery-only run completed, but Continent, Country, and Language each missed the preregistered `0.80` split-rank-stability gate and no audited prefix passed both the `0.70` cumulative-importance and `0.95` split-overlap gates. The result decision is `no_validation_due_to_unstable_variable_localization`; every variable circuit is `not_frozen` with `selected_k=0`. Do not open RAVEL validation, restoration, transfer, or held-out test, and do not change variables, routes, prefix counts, thresholds, seed, or cohort to rescue the result.
+- Exact identity: canonical branch `codex/v4167-poc`, RAVEL implementation commit `ac37902f67ca2148250f9ff1b1f4974cb45a870e`, exact clean deployed/analysis commit `e6de10d1a7d27aea2fda4f12505264edf27716e6`, existing user-authorized TPU `spatial-se-400m`, TPU v4-64 with 32 devices/eight hosts, mesh `data=16, model=2`, target/config `v4172_400M` / `configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml`, checkpoint step `76293`, 393,800,708 parameters, checkpoint identity `a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17`, checkpoint-config hash `08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b`, and model-config hash `053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f`. Remote Python/JAX/Flax/Optax/NumPy were `3.10.6/0.6.2/0.10.7/0.2.8/2.2.6`.
+- Frozen discovery contract: spec path/hash `configs/paper_ravel_discovery_localization_v4172_400m.yaml` / `812ea210137a7fc4b2d5956f59975a5c8efbb8881569110455add15a67aa10df`; immutable benchmark build/manifest hash `f056bb4f133cde4fc0ae02f9` / `f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6`; seed `4172`; discovery row cap `512`; capture threshold `0.95`; initial QK/V/RST widths `512/2048/4096`; maximum widths `2048/8192/8192`; stability threshold `0.80`; audited prefixes `32/64/128/256/512/1024/2048/4096`; cumulative-importance/overlap thresholds `0.70/0.95`. Protocol hash was `b191fc1cd00ad3ebb95a9ec3b5b853c67f138e49fc937a2df519b150bb7f2ba3`.
+- Cohort/capture: the canonical 512 discovery rows contained 296 paired-correct rows and exactly 142 independent cause `pair_group_id` units with ID hash `5d2110221d60fd1490bd466246a5403a4f1857e484726fd84a5ebc6f8c15619a`. Variable counts were Continent/Country/Language `40/50/52`; balanced split counts were `20/20`, `25/25`, and `26/26`, with every official counterfactual-source stratum represented. One width retry produced final widths `1024/4096/8192`; all `10,224/10,224` layer-route rows qualified. The pooled ranking contained 573,764 sites but was audit-only; its stability was `0.747600` and it was not used for any gate. The raw transient capture covered 36,642,816 operator values with digest `366425f4db57e2abaf12d4961fd580733da86a06d6eb441892495813d59960dc`.
+- Variable results: Continent/Country/Language ranked-site counts were `480,066/494,478/504,210`, content hashes `825cbff4b3d26ccb663f586ab608e92b683d5a67ce641de1474e6ea951d324c9` / `3994535f6c9a13dade7b5cc65be341941222fa3c3afea02b40671cb7595a56f8` / `909d7a978d36353afebf75b3848b298375b946f372ca515669a786b0b2253483`, and split-rank stabilities `0.628761671/0.676242965/0.660621730`. At `k=4096`, cumulative importance was `0.715740818/0.713365049/0.714547273`, but overlap was only `0.906494141/0.904785156/0.914062500`. At smaller prefixes, overlap could be high—for example all three had `0.984375` at `k=64`—but cumulative importance was only `0.085116/0.086797/0.084375`. Every prefix audit therefore returned `passed=false` before any confirmatory access.
+- Descriptive composition: Q/K fractions were Continent `39.7041%/58.1049%`, Country `39.2370%/58.4925%`, and Language `39.3885%/58.4359%`; V/RST together were only `2.19%/2.27%/2.18%`. Layer 14 carried the most importance for every variable (`9.06%/8.94%/8.98%`), followed by layers 13 and 15. Every ranking's first site was layer-5 Q operator 3969, followed by layer-5 K operators 547 and 3381 in variable-dependent order. First V ranks were `4,622/4,681/4,943`; first RST ranks were `6,042/6,417/6,164`. This repeated Q/K-heavy top core is descriptive only and cannot override the frozen stability and prefix failures.
+- Split/storage audit: only `ravel.input_contract` and `ravel.discovery_operator_localization` executed. The artifact records discovery as both ranking and selection phase; validation/test accessor called `false`, evaluation count `0`, and used for selection `false`. Aggregate variable rankings and hashes were persisted; raw per-example behavior vectors, operator vectors, capture rows, parameters, and dense capture were not. Exact-key scanning found zero durable `rows`, `example_ids`, per-example log-probability/margin, `operator_ids`, or `weights` fields.
+- Evidence: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_ravel_discovery_localization_20260729T131153Z-1b93b28d`; item JSON size/SHA-256 `378,997,602` bytes / `1cd76e32fb3be15f427c64a21f6de7ac90ca005008f6d89f604f75ded9330bf4`; six-object root total `379,040,168` bytes. The size warning is advisory and writing completed; the large lists are aggregate rankings. All eight workers reported exact SHA `e6de10d1a7d27aea2fda4f12505264edf27716e6`, branch `codex/v4167-poc`, tracked-clean state, and zero error-pattern matches over their completed logs.
+- Lesson/next: preserve this as the paper's preregistered RAVEL negative result rather than weakening its gates. RAVEL contributes no variable-transfer claim at this checkpoint. Proceed sequentially to ARC auxiliary discovery localization and frozen suppression/control/restoration, then the matched dense 400M performance track; leave the completed IOI result untouched.
 
 ## Backfill Boundary
 
