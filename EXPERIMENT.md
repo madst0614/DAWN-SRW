@@ -33,6 +33,13 @@ localized effect, no control separation, a non-significant effect, or a
 rejected hypothesis. Authentication, launcher, dependency, or code failures
 that produce no interpretable scientific measurement are operational incidents,
 not paper results; rerun them correctly and report the valid completed outcome.
+Paper storage is aggregate-first: per-example IDs, logits, margins, correctness
+masks, raw capture rows, operator schedules, and effect vectors are not durable
+paper artifacts. Retain aggregate statistics, content hashes, immutable
+benchmark/protocol identity, exact code/config/checkpoint identity, and compact
+run summaries. Do not classify or remove JSON by file size alone; write normal
+structured results, then audit their field semantics and purge only files that
+contain raw per-example vectors.
 
 ### Paper thesis and contribution structure
 
@@ -242,8 +249,11 @@ organization are the replication target.
 The paper-eligible screening result root is
 `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_mechanistic_screen_20260729T051149Z-7d3be0d9`.
 Use `summary.json` and `summary.log` for the run-level decision, and
-`items/{mib_ioi,mib_mcqa,mib_arithmetic,mib_arc,ravel}/behavioral_eligibility.json`
-for exact row-level audit data. The clean analysis commit is
+the aggregate task table below for the benchmark-level decision. The former
+per-example behavioral JSON vectors were deliberately purged under the
+aggregate-only paper-storage policy; reproducibility remains bound by the
+immutable benchmark manifest, protocol hash, exact code/checkpoint identity,
+aggregate statistics, and content hashes. The clean analysis commit is
 `469c2d12caf1dabf578e16d0bd1ab9cc7bf70ea4`, and the protocol hash is
 `e55551954702df3ae628798f5a208681e1eed68dbbda0d967967af6865107adc`.
 
@@ -281,6 +291,10 @@ for exact row-level audit data. The clean analysis commit is
   threshold; identify the failed gate and restrict the corresponding claim.
 - Do not promote setup, authentication, launcher, dependency, or implementation
   failures into scientific evidence when no valid protocol result was produced.
+- Do not retain raw per-example vectors as paper artifacts. Keep aggregate
+  statistics and deterministic content hashes, and audit completed result files
+  by field semantics rather than treating a large JSON file as invalid merely
+  because of its size.
 - Structural sparsity may be reported from measured operator usage. Hardware
   efficiency requires matched device, mesh, batch, length, dtype,
   compilation, logging, and checkpointing conditions; without that protocol,
@@ -1040,7 +1054,15 @@ for exact row-level audit data. The clean analysis commit is
 - Table values: IOI independent eligible units were `119/123/114`, with base/source/pair accuracy `0.984/0.945/0.930`, `0.977/0.984/0.961`, and `0.992/0.898/0.891` over discovery/validation/test. MCQA units were `80/34/32`, ARC units were `50/51/57`, and RAVEL independent units were `142/154/146`; RAVEL paired-correct row counts before independent-unit collapsing were `296/294/291`. The full manuscript-facing table, including every phase accuracy, is in the Paper Writing Ledger.
 - Reproducibility identity: clean `codex/v4167-poc` commit `469c2d12caf1dabf578e16d0bd1ab9cc7bf70ea4`; target/model `v4172_400M` / `spatial-r1-v4.1.7.2`; config `configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml`; concrete checkpoint `checkpoints/000000076293`; 393,800,708 parameters; checkpoint-config hash `08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b`; checkpoint identity `a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17`; parameter-schema hash `d5cbfc00422932c3921211ee4f00b001eb872b4f5382b13b4249311a478c41af`; model-config hash `053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f`; tracked worktree clean.
 - Runtime/protocol: one TPU v4-64 pod, eight hosts, 32 devices, mesh `data=16, model=2`, seed 4172, non-RAVEL phase cap 128, RAVEL phase cap 512, and no optimizer or parameter write. Remote software was `/usr/bin/python3` 3.10.6, JAX/jaxlib 0.6.2, Flax 0.10.7, Optax 0.2.8, and NumPy 2.2.6. The immutable benchmark build was `f056bb4f133cde4fc0ae02f9`, manifest hash `f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6`, tokenizer revision `86b5e0934494bd15c9632b12f734a8a67f723594`, tokenizer vocab hash `de054a2243ead40e8e1bcc06edf510f87bdff3f2d57fd0788f2715a7b2e0bd38`, and protocol hash `e55551954702df3ae628798f5a208681e1eed68dbbda0d967967af6865107adc`.
-- Evidence/decision: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_mechanistic_screen_20260729T051149Z-7d3be0d9`; run identity/status `run_manifest.json`; paper summary `summary.json` and `summary.log`; exact task results `items/{mib_ioi,mib_mcqa,mib_arithmetic,mib_arc,ravel}/behavioral_eligibility.json`. Promote IOI, ARC, and RAVEL to task-specific causal analysis, retain MCQA as reserve/appendix evidence, and make no localization or causal claim from this screen alone.
+- Evidence/decision: result root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_mechanistic_screen_20260729T051149Z-7d3be0d9`; run identity/status `run_manifest.json`; paper summary `summary.json` and `summary.log`; aggregate benchmark values are transcribed in the Paper Writing Ledger. The former per-example behavioral JSON vectors were deliberately purged under the aggregate-only paper-storage policy; benchmark/protocol/code/checkpoint identity and the manuscript-facing aggregate result remain retained. Promote IOI, ARC, and RAVEL to task-specific causal analysis, retain MCQA as reserve/appendix evidence, and make no localization or causal claim from this screen alone.
+
+#### #08 — Purge raw-vector artifacts and make paper storage aggregate-only
+
+- Hypothesis/change: raw per-example behavioral vectors and native-program schedule/effect arrays are not required for manuscript claims once exact run identity, immutable inputs, aggregate metrics, and deterministic content hashes are retained. Source commit `a7d3175fdb8ba9d5aad492848a9e09c9ed9f9257` removes the known behavioral vectors from persisted item JSON while retaining scalar results, per-field aggregate summaries, and one exact payload hash; native-program schedules and effect vectors are now hashed in memory and represented by aggregate metadata without writing per-example NPZ artifacts. JSON remains governed by field semantics rather than a file-size deletion rule; no new hard size cutoff was added.
+- Storage result: `storage audited`; under the v4172 400M `side_analysis` root, seven `behavioral_eligibility.json` files containing raw per-example vectors and twenty old native-program schedule NPZ files were permanently removed. The audited footprint changed from 110 objects / 197,447,261 bytes to 83 objects / 765,425 bytes, reclaiming 196,681,836 bytes (`187.57 MiB`). Compact run manifests, summaries, manuscript metrics, protocol/checkpoint identity, aggregate native-program JSON, and logs were retained.
+- Validation identity/result: `local validated` on `codex/v4167-poc` source commit `a7d3175fdb8ba9d5aad492848a9e09c9ed9f9257`; the only tracked worktree difference was this reporting-only `EXPERIMENT.md` edit. `C:\Users\USER\Desktop\DAWN-SRW\.venv\Scripts\python.exe` resolved Python with JAX `0.6.2`, Flax `0.10.7`, and NumPy `2.2.6`; module compilation passed, synthetic semantic compaction preserved scalar paper metrics while removing all ten known raw-vector fields and retaining a 64-hex content hash, effect-vector persistence was disabled, and three focused native-program/protocol/runner contract tests passed.
+- Lesson/decision/next: use aggregate statistics and hashes as durable paper evidence, and inspect completed artifacts by field meaning after each run; do not delete a normal structured JSON merely because it is large. Re-audit the next causal-analysis result root after completion and purge only confirmed raw per-example vector artifacts while preserving valid detailed scientific results.
+- Evidence: audited root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis`; source `analysis/operator_interpretability/runner.py`; manuscript storage policy and retained result boundary in the Paper Writing Ledger above.
 
 ## Backfill Boundary
 
