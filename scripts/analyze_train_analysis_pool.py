@@ -451,7 +451,8 @@ def _run_zero_shot_backend(
 
 
 def _resolve_source(
-        args: argparse.Namespace) -> tuple[
+        args: argparse.Namespace, *,
+        require_operator_interpretability_model: bool) -> tuple[
             ExecutionSelection, str, int, dict, dict, dict, str]:
     requested_checkpoint = args.checkpoint
     requested_config = args.config
@@ -489,7 +490,9 @@ def _resolve_source(
         checkpoint_config, selection,
         visible_device_count=int(jax.device_count()),
         visible_process_count=int(jax.process_count()))
-    validate_model_version(str(config.get("model", {}).get("model_version")))
+    if require_operator_interpretability_model:
+        validate_model_version(
+            str(config.get("model", {}).get("model_version")))
     return (
         selection, checkpoint_dir, int(checkpoint_step),
         checkpoint_metadata, config, checkpoint_mesh,
@@ -616,7 +619,9 @@ def main() -> int:
                 flush=True,
             )
     (selection, checkpoint_dir, checkpoint_step, checkpoint_metadata,
-     config, checkpoint_mesh, checkpoint_config_hash) = _resolve_source(args)
+     config, checkpoint_mesh, checkpoint_config_hash) = _resolve_source(
+         args,
+         require_operator_interpretability_model=bool(mechanistic_items))
     run_id = _new_analysis_run_id()
     run_label = _run_label(args, items)
     output = _independent_run_output(

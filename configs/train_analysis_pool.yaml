@@ -29,6 +29,14 @@ targets:
     mesh_model: 2
     compatible_runtimes: [v4-32, v4-64, v4-128]
 
+  baseline_jax_400m:
+    model_version: baseline-JAX
+    scale: 400m
+    checkpoint: gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/checkpoints/000000076293
+    config: configs/train_config_baseline_tpu_400M_c4_40B_v4_64_tp2.yaml
+    mesh_model: 2
+    compatible_runtimes: [v4-32, v4-64, v4-128]
+
 # Runtime profiles identify physical global topology. TPU v4 accelerator names
 # count TensorCores, while JAX exposes half as many devices/chips.
 runtimes:
