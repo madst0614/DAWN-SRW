@@ -17,6 +17,17 @@ TRACE_POOLS = ("q", "k", "v", "rst")
 TRACE_FIELDS = ("top_idx", "top_val", "captured_mass")
 
 
+def _transition_output(result, *, name: str, expected_ndim: int):
+    """Normalize production-only and diagnostic kernel return contracts."""
+    output = result[0] if isinstance(result, tuple) else result
+    if not hasattr(output, "ndim") or int(output.ndim) != int(expected_ndim):
+        shape = getattr(output, "shape", None)
+        raise ValueError(
+            f"{name} returned transition shape={shape}; "
+            f"expected rank {expected_ndim}")
+    return output
+
+
 def _operator_contribution_topk(
         state, operator_query, operator_keys, raw_tau,
         read_vectors, write_vectors, *, model_module, topk: int,
@@ -213,30 +224,44 @@ def topk_trace_forward(
         paired_queries = jnp.stack((query_q, query_k), axis=2)
         paired_tau = jnp.stack(
             (tau_all[:, :, 0:1], tau_all[:, :, 1:2]), axis=2)
-        qk_transitions = production_srw_fns["attn_qk_paired_minimal"](
-            normed, paired_queries, pool["attn_qk_op_key"], paired_tau,
-            pool["attn_qk_read"], pool["attn_qk_write"],
-            execution_qk["soft_gate_temperature"],
-            model_cfg.get(
-                "soft_gate_t_final", execution_qk["soft_gate_temperature"]),
-            execution_qk["soft_gate_boundary_power"],
-            model_cfg.get(
-                "soft_gate_boundary_power_final",
-                execution_qk["soft_gate_boundary_power"]),
-            execution_qk.get("execution_prune_eps", 0.0),
-        )[0]
-        v_transition = production_srw_fns["attn_v_single_minimal"](
-            normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
-            pool["attn_v_read"], pool["attn_v_write"],
-            execution_v["soft_gate_temperature"],
-            model_cfg.get(
-                "soft_gate_t_final", execution_v["soft_gate_temperature"]),
-            execution_v["soft_gate_boundary_power"],
-            model_cfg.get(
-                "soft_gate_boundary_power_final",
-                execution_v["soft_gate_boundary_power"]),
-            execution_v.get("execution_prune_eps", 0.0),
-        )[0]
+        qk_transitions = _transition_output(
+            production_srw_fns["attn_qk_paired_minimal"](
+                normed, paired_queries, pool["attn_qk_op_key"], paired_tau,
+                pool["attn_qk_read"], pool["attn_qk_write"],
+                execution_qk["soft_gate_temperature"],
+                model_cfg.get(
+                    "soft_gate_t_final",
+                    execution_qk["soft_gate_temperature"]),
+                execution_qk["soft_gate_boundary_power"],
+                model_cfg.get(
+                    "soft_gate_boundary_power_final",
+                    execution_qk["soft_gate_boundary_power"]),
+                execution_qk.get("execution_prune_eps", 0.0),
+            ),
+            name="attn_qk_paired_minimal",
+            expected_ndim=4,
+        )
+        if int(qk_transitions.shape[2]) != 2:
+            raise ValueError(
+                "attn_qk_paired_minimal must return exactly two routes; "
+                f"got shape={qk_transitions.shape}")
+        v_transition = _transition_output(
+            production_srw_fns["attn_v_single_minimal"](
+                normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
+                pool["attn_v_read"], pool["attn_v_write"],
+                execution_v["soft_gate_temperature"],
+                model_cfg.get(
+                    "soft_gate_t_final",
+                    execution_v["soft_gate_temperature"]),
+                execution_v["soft_gate_boundary_power"],
+                model_cfg.get(
+                    "soft_gate_boundary_power_final",
+                    execution_v["soft_gate_boundary_power"]),
+                execution_v.get("execution_prune_eps", 0.0),
+            ),
+            name="attn_v_single_minimal",
+            expected_ndim=3,
+        )
         attention_q = qk_transitions[:, :, 0, :] * qk_scale
         attention_k = qk_transitions[:, :, 1, :] * qk_scale
         attention_v = v_transition * v_scale
@@ -284,18 +309,23 @@ def topk_trace_forward(
             execution_kwargs=execution_rst,
             admission_den_power=powers["rst"],
             target_positions=target_positions)
-        rst_transition = production_srw_fns["rst_single_minimal"](
-            normed, query_rst, pool["rst_op_key"], tau_rst,
-            pool["rst_read"], pool["rst_write"],
-            execution_rst["soft_gate_temperature"],
-            model_cfg.get(
-                "soft_gate_t_final", execution_rst["soft_gate_temperature"]),
-            execution_rst["soft_gate_boundary_power"],
-            model_cfg.get(
-                "soft_gate_boundary_power_final",
-                execution_rst["soft_gate_boundary_power"]),
-            execution_rst.get("execution_prune_eps", 0.0),
-        )[0] * rst_scale
+        rst_transition = _transition_output(
+            production_srw_fns["rst_single_minimal"](
+                normed, query_rst, pool["rst_op_key"], tau_rst,
+                pool["rst_read"], pool["rst_write"],
+                execution_rst["soft_gate_temperature"],
+                model_cfg.get(
+                    "soft_gate_t_final",
+                    execution_rst["soft_gate_temperature"]),
+                execution_rst["soft_gate_boundary_power"],
+                model_cfg.get(
+                    "soft_gate_boundary_power_final",
+                    execution_rst["soft_gate_boundary_power"]),
+                execution_rst.get("execution_prune_eps", 0.0),
+            ),
+            name="rst_single_minimal",
+            expected_ndim=3,
+        ) * rst_scale
         rst_stats["top_val"] = rst_stats["top_val"] * jnp.abs(rst_scale)
         residual_state = residual_state + rst_transition
 
