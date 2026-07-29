@@ -1,13 +1,15 @@
-# DAWN-SRW v4.1.7.5 40M shared-atlas route-selector POC.
+# DAWN-SRW v4.1.7.5 40M shared-key operation-space atlas POC.
 #
 # Parameter comparison:
 #   Transformer baseline D=432: 40,343,616
-#   This v4175 configuration:   40,344,160
-#   Difference:                       +544 (+0.00135%)
+#   This v4175 configuration:   40,341,088
+#   Difference:                     -2,528 (-0.00627%)
 #
 # Semantic contract:
 #   - M operation spaces own one shared atlas of read/write coordinates.
-#   - Q, K, V, and RST independently select spaces from that atlas.
+#   - One [M,R] key table addresses the shared atlas.
+#   - Q, K, V, and RST use independent queries to select spaces.
+#   - Every route uses sqrt-mass RW composition (den_power=0.5).
 #   - The first implementation evaluates all spaces densely; execution
 #     optimization is intentionally deferred.
 #
@@ -39,7 +41,7 @@ model:
   dropout: 0.0
   gradient_checkpointing: true
 
-  # One shared coordinate atlas, independently selected by Q/K/V/RST.
+  # One shared coordinate/address atlas, independently queried by Q/K/V/RST.
   n_operation_spaces: 8
   operation_space_top_k: 2
 
@@ -82,10 +84,10 @@ model:
 
   srw_composition_mode: linear_angular
 
-  admission_den_power: 1.0
+  admission_den_power: 0.5
   admission_den_power_qk: 0.5
-  admission_den_power_v: 1.0
-  admission_den_power_rst: 1.2
+  admission_den_power_v: 0.5
+  admission_den_power_rst: 0.5
 
 training:
   # TPU v4-4.
@@ -121,4 +123,4 @@ training:
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_shared_keys_40M_c4_5B_den0p5

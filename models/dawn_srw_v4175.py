@@ -1,18 +1,19 @@
 """DAWN-SRW v4.1.7.5: explicit operation-space interfaces.
 
 A token-level global representation produces independent Q, K, V, and RST
-space queries.  Each route matches its own learned route keys and selects from
-one shared atlas of operation spaces.  A space-owned read projection maps the
-global representation into that space's private coordinates; the corresponding
+space queries.  Every route matches its query against the same learned
+operation-space keys and independently selects from one shared atlas of
+operation spaces.  A space-owned read projection maps the global
+representation into that space's private coordinates; the corresponding
 space-owned write projection returns local outputs to the global
 representation.  Q, K, V, and RST apply independent RW operator banks in those
 shared space coordinates.
 
 Q/K/V independently select attention spaces from the same pre-attention state.
 RST recomputes its own selection after the attention residual.  Every route
-owns a distinct selector and tau map for every operation space, so selector
-identity and operator control are route-specific while the meaning of a space's
-coordinate system remains intrinsic to that space.
+owns a distinct query projection and tau map for every operation space, so
+selection remains route-specific while a space's address and coordinate system
+remain intrinsic to that shared space.
 Selected-space weights are L1-normalized across the hard top-k support; if
 their total ReLU-squared mass is at or below ``SPACE_GATE_L1_EPS``, the
 highest-ranked space receives a deterministic one-hot fallback.  Absolute
@@ -197,7 +198,7 @@ def symbolic_parameter_count(model_cfg: Mapping[str, Any]) -> dict[str, int]:
     operation_space_interface = 2 * n_spaces * d_model * d_route
     space_addressing = (
         len(ROUTES) * d_model * d_route
-        + len(ROUTES) * n_spaces * d_route)
+        + n_spaces * d_route)
     space_operator_control = 4 * n_spaces * (d_route + 1)
     operator_bank = 2 * d_route * pool_total
     counts = {
@@ -244,10 +245,10 @@ def _independent_space_projection_init(
     return projections.astype(dtype)
 
 
-def _unit_space_route_key_init(
+def _unit_operation_space_key_init(
         key: jax.Array, shape: tuple[int, ...],
         dtype=jnp.float32) -> jax.Array:
-    """Initialize independent learned unit keys without an ``M <= R`` limit."""
+    """Initialize shared learned unit keys without an ``M <= R`` limit."""
     values = jax.random.normal(key, shape, dtype=jnp.float32)
     return _shared_forward_unit_direction(values).astype(dtype)
 
@@ -296,7 +297,7 @@ class OperationSpaceOperatorBank(nn.Module):
 
 
 class OperationSpaceSelector(nn.Module):
-    """Own independent Q/K/V/RST selectors for one shared space atlas."""
+    """Own route queries and shared address keys for one operation-space atlas."""
     d_model: int
     d_route: int
     n_operation_spaces: int
@@ -308,22 +309,22 @@ class OperationSpaceSelector(nn.Module):
         self.route_query_proj = self.param(
             "route_query_proj", _independent_space_projection_init,
             (len(ROUTES), d_model, d_route))
-        self.route_space_keys = self.param(
-            "route_space_keys", _unit_space_route_key_init,
-            (len(ROUTES), n_spaces, d_route))
+        self.operation_space_keys = self.param(
+            "operation_space_keys", _unit_operation_space_key_init,
+            (n_spaces, d_route))
 
 
 def _route_selector_parameters(
         space_selector_params: Mapping[str, jax.Array],
         route: str) -> tuple[jax.Array, jax.Array]:
-    """Return one route's query projection and keys from the shared atlas."""
+    """Return one route's query projection and the atlas' shared address keys."""
     try:
         route_index = ROUTE_INDEX[str(route)]
     except KeyError as exc:
         raise ValueError(f"unsupported operation-space route {route!r}") from exc
     return (
         space_selector_params["route_query_proj"][route_index],
-        space_selector_params["route_space_keys"][route_index],
+        space_selector_params["operation_space_keys"],
     )
 
 
@@ -470,14 +471,14 @@ def _read_operation_space_states(
 def _select_operation_spaces(
         global_state: jax.Array,
         space_query_kernel: jax.Array,
-        space_route_keys: jax.Array,
+        operation_space_keys: jax.Array,
         operation_space_top_k: int) -> dict[str, jax.Array]:
     """Direct cosine routing with hard top-k ReLU-squared non-softmax gates."""
     space_query = control_dot_f32(
         global_state, space_query_kernel,
         dimension_numbers=(((1,), (0,)), ((), ())))
     normalized_query = forward_unit_direction(space_query)
-    normalized_keys = forward_unit_direction(space_route_keys)
+    normalized_keys = forward_unit_direction(operation_space_keys)
     space_scores = control_dot_f32(
         normalized_query, normalized_keys,
         dimension_numbers=(((1,), (1,)), ((), ())))
@@ -517,7 +518,7 @@ def _apply_operation_space_tau_map(
 def _select_and_read_operation_spaces(
         global_state: jax.Array,
         space_query_kernel: jax.Array,
-        space_route_keys: jax.Array,
+        operation_space_keys: jax.Array,
         space_read_proj: jax.Array,
         operation_space_top_k: int
 ) -> tuple[dict[str, jax.Array], jax.Array]:
@@ -525,7 +526,7 @@ def _select_and_read_operation_spaces(
     space_routing = _select_operation_spaces(
         global_state,
         space_query_kernel,
-        space_route_keys,
+        operation_space_keys,
         operation_space_top_k)
     space_states = _read_operation_space_states(
         global_state, space_read_proj)
@@ -974,25 +975,18 @@ def _operation_space_geometry_diagnostics(
 
 def _operator_bank_geometry_diagnostics(
         operator_bank_params: Mapping[str, jax.Array],
-        space_route_keys: jax.Array,
+        operation_space_keys: jax.Array,
         space_query: jax.Array) -> dict[str, jax.Array]:
     """Address-key geometry and direct-read geometry for all RW banks."""
-    normalized_route_keys = forward_unit_direction(space_route_keys)
-    if normalized_route_keys.ndim == 3:
-        pairwise = jnp.einsum(
-            "amr,anr->amn", normalized_route_keys, normalized_route_keys)
-        pairwise_values = jax.vmap(_off_diagonal_entries)(pairwise)
-        query_norm = jnp.linalg.norm(
-            space_query.astype(jnp.float32), axis=-1).mean(axis=-1)
-    else:
-        pairwise = normalized_route_keys @ normalized_route_keys.T
-        pairwise_values = _off_diagonal_entries(pairwise)
-        query_norm = jnp.linalg.norm(
-            space_query.astype(jnp.float32), axis=-1).mean()
+    normalized_keys = forward_unit_direction(operation_space_keys)
+    pairwise = normalized_keys @ normalized_keys.T
+    pairwise_values = _off_diagonal_entries(pairwise)
+    query_norm = jnp.linalg.norm(
+        space_query.astype(jnp.float32), axis=-1).mean(axis=-1)
     out = {
-        "space_route_key_pairwise_cosine": pairwise_values,
-        "space_route_key_norm": jnp.linalg.norm(
-            space_route_keys.astype(jnp.float32), axis=-1),
+        "operation_space_key_pairwise_cosine": pairwise_values,
+        "operation_space_key_norm": jnp.linalg.norm(
+            operation_space_keys.astype(jnp.float32), axis=-1),
         "space_query_norm": query_norm,
     }
     for pool in POOLS:
@@ -1177,7 +1171,7 @@ class DAWN_SRW_V4175(nn.Module):
             _ = getattr(self.operator_controller, f"{route}_tau_kernel")
             _ = getattr(self.operator_controller, f"{route}_tau_bias")
         _ = local
-        _ = self.space_selector.route_space_keys
+        _ = self.space_selector.operation_space_keys
         _ = self.space_interface.space_write_proj
         for layer in self.layers:
             _ = layer.norm1(state)
@@ -1412,7 +1406,7 @@ class DAWN_SRW_V4175(nn.Module):
                         attn_global_state_flat,
                         space_selector_params[
                             "space_query_proj"]["kernel"],
-                        space_selector_params["space_route_keys"],
+                        space_selector_params["operation_space_keys"],
                         space_interface_params["space_read_proj"],
                         space_interface_params["space_write_proj"],
                         operator_controller_params["q_tau_kernel"],
@@ -1454,13 +1448,13 @@ class DAWN_SRW_V4175(nn.Module):
                     for route in ("q", "k", "v")}
                 global_interfaces = {}
                 for route in ("q", "k", "v"):
-                    route_query_proj, route_space_keys = (
+                    route_query_proj, operation_space_keys = (
                         _route_selector_parameters(
                             space_selector_params, route))
                     route_routing = _select_operation_spaces(
                         attn_global_state_flat,
                         route_query_proj,
-                        route_space_keys,
+                        operation_space_keys,
                         top_k)
                     attention_space_routing[route] = route_routing
                     route_result = execute(
@@ -1528,7 +1522,7 @@ class DAWN_SRW_V4175(nn.Module):
                     rst_global_state_flat,
                     space_selector_params[
                         "space_query_proj"]["kernel"],
-                    space_selector_params["space_route_keys"],
+                    space_selector_params["operation_space_keys"],
                     space_interface_params["space_read_proj"],
                     space_interface_params["space_write_proj"],
                     operator_controller_params["rst_tau_kernel"],
@@ -1542,13 +1536,14 @@ class DAWN_SRW_V4175(nn.Module):
                     rst_global_state.shape)
                 regular_metrics.update(rst_metrics)
             else:
-                rst_query_proj, rst_space_keys = _route_selector_parameters(
-                    space_selector_params, "rst")
+                (rst_query_proj,
+                 operation_space_keys) = _route_selector_parameters(
+                     space_selector_params, "rst")
                 (rst_space_routing,
                  rst_space_states) = _select_and_read_operation_spaces(
                     rst_global_state_flat,
                     rst_query_proj,
-                    rst_space_keys,
+                    operation_space_keys,
                     space_interface_params["space_read_proj"],
                     top_k)
                 rst_tau = _apply_operation_space_tau_map(
@@ -1785,7 +1780,7 @@ class DAWN_SRW_V4175(nn.Module):
                 last_global_state_for_space_diagnostics))
             result.update(_operator_bank_geometry_diagnostics(
                 operator_bank,
-                space_selector["route_space_keys"],
+                space_selector["operation_space_keys"],
                 last_space_query))
         return result
 
@@ -1795,8 +1790,8 @@ class DAWN_SRW_V4175(nn.Module):
             f"DAWN-SRW v4.1.7.5 ({MODEL_VERSION})",
             "global representation state: token-level persistent d_model "
             "state between layers",
-            "space addressing: independent Q/K/V/RST queries and route keys "
-            "select from one shared operation-space atlas",
+            "space addressing: independent Q/K/V/RST queries select against "
+            "shared operation-space keys in one atlas",
             f"canonical geometry: D={self.d_model}, M={n_spaces}, "
             f"R={self.d_route}; space-specific D->R read coordinates, "
             f"top_k={self.operation_space_top_k}",
@@ -1884,12 +1879,12 @@ def _sampled_layer_states(
     route_scales = {"q": qk_scale, "k": qk_scale, "v": v_scale}
     global_interfaces = {}
     for route in ("q", "k", "v"):
-        route_query_proj, route_space_keys = _route_selector_parameters(
+        route_query_proj, operation_space_keys = _route_selector_parameters(
             space_selector, route)
         route_routing = _select_operation_spaces(
             attn_global_state_flat,
             route_query_proj,
-            route_space_keys,
+            operation_space_keys,
             operation_space_top_k)
         route_temperature = (
             soft_gate_T_qk
@@ -2041,12 +2036,12 @@ def initialization_diagnostics_from_params(
     space_interface = params["space_interface"]
     route_routings = {}
     for route in ROUTES:
-        route_query_proj, route_space_keys = _route_selector_parameters(
+        route_query_proj, operation_space_keys = _route_selector_parameters(
             space_selector, route)
         route_routings[route] = _select_operation_spaces(
             attn_global_state,
             route_query_proj,
-            route_space_keys,
+            operation_space_keys,
             operation_space_top_k)
     diagnostics = _operation_space_geometry_diagnostics(
         space_interface["space_read_proj"],
@@ -2054,7 +2049,7 @@ def initialization_diagnostics_from_params(
         attn_global_state)
     diagnostics.update(_operator_bank_geometry_diagnostics(
         params["operator_bank"],
-        space_selector["route_space_keys"],
+        space_selector["operation_space_keys"],
         jnp.stack(tuple(
             route_routings[route]["space_query"] for route in ROUTES),
             axis=0)))
@@ -4117,7 +4112,7 @@ def _make_sharded_attention_space_dense(
 
     def attention_core(
             global_state,
-            space_query_kernel, space_route_keys,
+            space_query_kernel, operation_space_keys,
             space_read_proj, space_write_proj,
             q_tau_kernel, q_tau_bias,
             k_tau_kernel, k_tau_bias,
@@ -4127,7 +4122,7 @@ def _make_sharded_attention_space_dense(
             boundary_power, execution_prune_eps,
             qk_scale, v_scale, collect_metrics):
         routing = _select_operation_spaces(
-            global_state, space_query_kernel, space_route_keys, top_k)
+            global_state, space_query_kernel, operation_space_keys, top_k)
         if throughput_bf16:
             space_states = jnp.swapaxes(
                 throughput_dot_bf16_f32(
@@ -5310,7 +5305,7 @@ def _make_sharded_attention_space_bundle_dense(
 
     def attention_core(
             global_state,
-            space_query_kernel, space_route_keys,
+            space_query_kernel, operation_space_keys,
             space_read_proj, space_write_proj,
             q_tau_kernel, q_tau_bias,
             k_tau_kernel, k_tau_bias,
@@ -5320,7 +5315,7 @@ def _make_sharded_attention_space_bundle_dense(
             boundary_power, execution_prune_eps,
             qk_scale, v_scale, collect_metrics):
         routing = _select_operation_spaces(
-            global_state, space_query_kernel, space_route_keys, top_k)
+            global_state, space_query_kernel, operation_space_keys, top_k)
         packing, packing_metrics = _pack_top2_bundle_entries_sharded(
             routing,
             bundle_size=bundle_size,
@@ -5595,14 +5590,14 @@ def _make_sharded_rst_space_dense(
 
     def rst_core(
             global_state,
-            space_query_kernel, space_route_keys,
+            space_query_kernel, operation_space_keys,
             space_read_proj, space_write_proj,
             tau_kernel, tau_bias,
             read_vectors, write_vectors,
             temperature, boundary_power, execution_prune_eps,
             route_scale, collect_metrics):
         routing = _select_operation_spaces(
-            global_state, space_query_kernel, space_route_keys, top_k)
+            global_state, space_query_kernel, operation_space_keys, top_k)
         if throughput_bf16:
             space_states = jnp.swapaxes(
                 throughput_dot_bf16_f32(
@@ -6492,14 +6487,14 @@ def _make_sharded_rst_space_bundle_dense(
 
     def rst_core(
             global_state,
-            space_query_kernel, space_route_keys,
+            space_query_kernel, operation_space_keys,
             space_read_proj, space_write_proj,
             tau_kernel, tau_bias,
             read_vectors, write_vectors,
             temperature, boundary_power, execution_prune_eps,
             route_scale, collect_metrics):
         routing = _select_operation_spaces(
-            global_state, space_query_kernel, space_route_keys, top_k)
+            global_state, space_query_kernel, operation_space_keys, top_k)
         packing, packing_metrics = _pack_top2_bundle_entries_sharded(
             routing,
             bundle_size=bundle_size,

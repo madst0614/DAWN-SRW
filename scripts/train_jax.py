@@ -10948,7 +10948,7 @@ def _print_param_sharding_summary(param_shardings, model_version):
                     'space_selector/space_query_proj/kernel',
                     'space_selector/space_route_keys',
                     'space_selector/route_query_proj',
-                    'space_selector/route_space_keys',
+                    'space_selector/operation_space_keys',
                     'space_interface/space_read_proj',
                     'space_interface/space_write_proj',
                     'operator_controller/q_tau_kernel',
@@ -12290,11 +12290,51 @@ def _validate_v4173_native_local_write_checkpoint_schema(
             + "; ".join(incompatibilities))
 
 
+def _validate_v4175_shared_operation_space_checkpoint_schema(
+        restored_params, target_params):
+    """Require the native shared ``operation_space_keys [M,R]`` schema."""
+    restored_selector = restored_params.get('space_selector', {})
+    target_selector = target_params.get('space_selector', {})
+    incompatibilities = []
+    if 'route_space_keys' in restored_selector:
+        incompatibilities.append(
+            "legacy space_selector/route_space_keys is unsupported")
+    for name in ('route_query_proj', 'operation_space_keys'):
+        if name not in restored_selector:
+            incompatibilities.append(f"missing space_selector/{name}")
+            continue
+        if name not in target_selector:
+            incompatibilities.append(
+                f"missing target space_selector/{name}")
+            continue
+        restored_shape = tuple(
+            getattr(restored_selector[name], 'shape', ()))
+        target_shape = tuple(getattr(target_selector[name], 'shape', ()))
+        if restored_shape != target_shape:
+            incompatibilities.append(
+                f"space_selector/{name} checkpoint_shape={restored_shape} "
+                f"expected_shape={target_shape}")
+    operation_space_keys = restored_selector.get('operation_space_keys')
+    if (
+            operation_space_keys is not None
+            and getattr(operation_space_keys, 'ndim', None) != 2):
+        incompatibilities.append(
+            "space_selector/operation_space_keys must have shape [M,R]")
+    if incompatibilities:
+        raise RuntimeError(
+            "v4175 checkpoint is incompatible with the shared "
+            "operation-space-key architecture; start a fresh scratch run: "
+            + "; ".join(incompatibilities))
+
+
 def _validate_v4171_checkpoint_param_schema(
         restored_params, target_params, model_version=None):
     """Fail loud with the exact parameter path and shapes before mesh put."""
     if str(model_version) == V4173_MODEL_VERSION:
         _validate_v4173_native_local_write_checkpoint_schema(
+            restored_params, target_params)
+    if str(model_version) == V4175_MODEL_VERSION:
+        _validate_v4175_shared_operation_space_checkpoint_schema(
             restored_params, target_params)
     def _leaves(tree):
         return {
@@ -19497,7 +19537,11 @@ def main():
                            else "false"))
                     if str(model_version_cfg) == V4175_MODEL_VERSION:
                         print("  coordinate_atlas=shared_space_owned_read_write")
-                        print("  selector_scope=independent_q_k_v_rst")
+                        print("  shared_operation_space_keys=true")
+                        print("  operation_space_keys_shape="
+                              f"[{cfg['model']['n_operation_spaces']},"
+                              f"{cfg['model']['d_route']}]")
+                        print("  selector_query_scope=independent_q_k_v_rst")
                     print("  space_route=hard_top_k_relu_squared")
                 else:
                     _operator_key_mode = cfg['model']['operator_key_mode']
@@ -22047,7 +22091,7 @@ def main():
                     log_message("DAWN spatial-r1-v4.1.7.5")
                     log_message(
                         "Execution: shared space-owned read/write coordinate "
-                        "atlas with independent Q/K/V/RST selectors; "
+                        "atlas with independent Q/K/V/RST query routing; "
                         "all-space dense reference kernels")
                     log_message(
                         "Operation spaces: "
@@ -22056,8 +22100,10 @@ def main():
                         f"d_space=d_route={cfg['model']['d_route']}")
                     log_message(
                         "Addressing: each Q/K/V/RST route owns its D->R query "
-                        "projection and M route keys; space read/write maps "
+                        "projection and independently queries one shared MxR "
+                        "operation-space key table; space read/write maps "
                         "remain shared by space identity")
+                    log_message("shared_operation_space_keys=true")
                     log_message(
                         "Space gate: per-route hard top-k ReLU^2, non-softmax, "
                         "selected-space L1 sum=1 with deterministic top-1 "
