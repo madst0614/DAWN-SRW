@@ -1,5 +1,6 @@
 # Reproducible evaluator dependencies. lm-eval must never float.
 lm-eval==0.4.2
+peft==0.10.0
 orbax-checkpoint==0.11.24
 transformers==4.40.2
 tokenizers==0.19.1
