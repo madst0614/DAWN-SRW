@@ -49,7 +49,13 @@ from analysis.operator_interpretability.eligibility import tokenizer_vocab_hash
 from analysis.operator_interpretability.frozen_circuit import (
     FROZEN_IOI_CONTROL_ALGORITHM_VERSION,
     FROZEN_IOI_CONTROL_ORDER,
+    FROZEN_IOI_TEST_PAIRED_CORRECT_COUNT,
+    FROZEN_IOI_TEST_ROW_COUNT,
+    FROZEN_IOI_VALIDATION_ANALYSIS_COMMIT,
     FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT,
+    FROZEN_IOI_VALIDATION_RECORD_COMMIT,
+    FROZEN_IOI_VALIDATION_RESULT_ROOT,
+    FROZEN_IOI_VALIDATION_RESULT_SHA256,
     FROZEN_IOI_VALIDATION_ROW_COUNT,
     FrozenIOIControlSampler,
     bootstrap_restoration_recovery,
@@ -277,7 +283,7 @@ class OperatorInterpretabilityRunner:
         self._pool_host: dict[str, np.ndarray] | None = None
         self._requested_items: tuple[str, ...] = ()
         self._paired_trajectory_test_isolated = False
-        self._frozen_validation_test_isolated = False
+        self._frozen_circuit_phase_isolated = False
 
     def _print(self, message: str) -> None:
         if self.ctx.is_primary:
@@ -603,19 +609,31 @@ class OperatorInterpretabilityRunner:
     def run(self, items: Sequence[str]) -> dict[str, Any]:
         self._requested_items = tuple(str(item) for item in items)
         requested_set = set(self._requested_items)
-        frozen_validation_only_items = {
-            "mib_ioi.input_contract",
-            "mib_ioi.frozen_circuit_validation",
-        }
+        frozen_validation_item = "mib_ioi.frozen_circuit_validation"
+        frozen_test_item = "mib_ioi.frozen_circuit_test"
         frozen_validation_requested = (
-            "mib_ioi.frozen_circuit_validation" in requested_set)
-        if (frozen_validation_requested
-                and not requested_set <= frozen_validation_only_items):
+            frozen_validation_item in requested_set)
+        frozen_test_requested = frozen_test_item in requested_set
+        if frozen_validation_requested and frozen_test_requested:
             raise ValueError(
-                "mib_ioi.frozen_circuit_validation must be requested only "
-                "with its dedicated input-contract item so held-out test "
-                "access remains isolated")
-        self._frozen_validation_test_isolated = frozen_validation_requested
+                "frozen IOI validation and held-out test must run as "
+                "separate preset invocations")
+        frozen_circuit_item = (
+            frozen_validation_item if frozen_validation_requested
+            else frozen_test_item if frozen_test_requested
+            else None)
+        frozen_circuit_requested = frozen_circuit_item is not None
+        frozen_circuit_only_items = {
+            "mib_ioi.input_contract",
+            *({frozen_circuit_item} if frozen_circuit_item is not None else ()),
+        }
+        if (frozen_circuit_requested
+                and not requested_set <= frozen_circuit_only_items):
+            raise ValueError(
+                f"{frozen_circuit_item} must be requested only with its "
+                "dedicated input-contract item so split access remains "
+                "isolated")
+        self._frozen_circuit_phase_isolated = frozen_circuit_requested
         trajectory_only_items = {
             "mib_ioi.input_contract",
             "mib_ioi.behavioral_eligibility",
@@ -675,6 +693,8 @@ class OperatorInterpretabilityRunner:
             "artifact_warnings": artifact_warnings,
             "strongest_supported_claim": (
                 self.results.get("scientific_claims", {}).get(
+                    "strongest_supported_claim")
+                or self.results.get("frozen_circuit_test", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("frozen_circuit_validation", {}).get(
                     "strongest_supported_claim")
@@ -865,14 +885,26 @@ class OperatorInterpretabilityRunner:
             }
         return {"status": "ready", "benchmarks": output}
 
-    def _run_frozen_circuit_validation(self) -> dict[str, Any]:
-        """Run only the frozen 4,096-site IOI confirmatory validation."""
-        if self._scope("frozen_circuit_validation") != ("mib_ioi",):
+    def _run_frozen_circuit_phase(self, phase: str) -> dict[str, Any]:
+        """Run one isolated phase of the frozen 4,096-site IOI protocol."""
+        if phase not in {"validation", "test"}:
+            raise ValueError(f"unsupported frozen IOI evaluation phase={phase}")
+        kind = f"frozen_circuit_{phase}"
+        if self._scope(kind) != ("mib_ioi",):
             raise ValueError(
-                "frozen circuit validation is registered only for mib_ioi")
-        if not self._frozen_validation_test_isolated:
+                f"frozen circuit {phase} is registered only for mib_ioi")
+        if not self._frozen_circuit_phase_isolated:
             raise RuntimeError(
-                "frozen IOI validation did not enter test-isolated execution")
+                f"frozen IOI {phase} did not enter split-isolated execution")
+
+        row_count = (
+            FROZEN_IOI_VALIDATION_ROW_COUNT
+            if phase == "validation"
+            else FROZEN_IOI_TEST_ROW_COUNT)
+        paired_correct_count = (
+            FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT
+            if phase == "validation"
+            else FROZEN_IOI_TEST_PAIRED_CORRECT_COUNT)
 
         frozen = load_frozen_ioi_circuit(self.shape)
         frozen.validate_runtime(
@@ -891,10 +923,10 @@ class OperatorInterpretabilityRunner:
         bootstrap_samples = int(evaluation["bootstrap_samples"])
         permutation_samples = int(evaluation["permutation_samples"])
         alpha = float(evaluation["alpha"])
-        if self.config.max_examples_for("mib_ioi") != (
-                FROZEN_IOI_VALIDATION_ROW_COUNT):
+        if self.config.max_examples_for("mib_ioi") != row_count:
             raise ValueError(
-                "frozen IOI validation requires the exact 128-row phase")
+                f"frozen IOI {phase} requires the exact "
+                f"{row_count}-row phase")
         if (self.config.bootstrap_samples != bootstrap_samples
                 or self.config.permutation_samples != permutation_samples
                 or not np.isclose(
@@ -903,34 +935,31 @@ class OperatorInterpretabilityRunner:
                 "runtime resampling settings differ from the frozen IOI spec")
 
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             "stage=behavioral_eligibility status=running")
-        validation_rows = self._load_phase_examples(
-            "mib_ioi", "validation")
-        if len(validation_rows) != FROZEN_IOI_VALIDATION_ROW_COUNT:
+        phase_rows = self._load_phase_examples("mib_ioi", phase)
+        if len(phase_rows) != row_count:
             raise ValueError(
-                "frozen IOI canonical validation selection count drift: "
-                f"expected={FROZEN_IOI_VALIDATION_ROW_COUNT} "
-                f"actual={len(validation_rows)}")
+                f"frozen IOI canonical {phase} selection count drift: "
+                f"expected={row_count} actual={len(phase_rows)}")
         behavior = evaluate_behavior(
-            self.ctx, validation_rows,
+            self.ctx, phase_rows,
             pad_token_id=int(self.tokenizer.pad_token_id))
         known_correct = [
             example for example, keep in zip(
-                validation_rows, behavior["known_correct"])
+                phase_rows, behavior["known_correct"])
             if keep
         ]
-        if len(known_correct) != (
-                FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT):
+        if len(known_correct) != paired_correct_count:
             raise ValueError(
-                "frozen IOI paired-correct validation count drift: "
-                f"expected={FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT} "
+                f"frozen IOI paired-correct {phase} count drift: "
+                f"expected={paired_correct_count} "
                 f"actual={len(known_correct)}")
         eligible_example_ids_hash = canonical_hash([
             example.example_id for example in known_correct
         ])
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             f"stage=behavioral_eligibility status=ready "
             f"paired_correct={len(known_correct)}")
 
@@ -939,7 +968,7 @@ class OperatorInterpretabilityRunner:
             tokenizer=self.tokenizer,
             pad_token_id=int(self.tokenizer.pad_token_id))
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             "condition=intact status=running")
         intact = evaluate_frozen_circuit_condition(
             self.ctx, batch, shape=self.shape, condition="intact")
@@ -1001,7 +1030,7 @@ class OperatorInterpretabilityRunner:
             },
         }
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             f"condition=intact status=ready "
             f"margin={intact_summary['mean_margin']:.8f} "
             f"accuracy={intact_summary['exact_accuracy']:.8f} "
@@ -1011,7 +1040,7 @@ class OperatorInterpretabilityRunner:
             f"{float(np.max(np.abs(log_probability_errors))):.8f}")
 
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             "condition=frozen_suppression status=running")
         suppressed = evaluate_frozen_circuit_condition(
             self.ctx, batch, shape=self.shape, condition="suppression",
@@ -1024,7 +1053,7 @@ class OperatorInterpretabilityRunner:
         )
         frozen_effects = condition_effect_vectors(intact, suppressed)
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             f"condition=frozen_suppression status=ready "
             f"margin_drop={suppression_summary['mean_margin_drop']:.8f} "
             f"accuracy={suppression_summary['exact_accuracy']:.8f}")
@@ -1035,7 +1064,7 @@ class OperatorInterpretabilityRunner:
             frozen.controls["replicate_count_per_control"])
         for family_index, control_name in enumerate(FROZEN_IOI_CONTROL_ORDER):
             self._print(
-                "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+                f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
                 f"control={control_name} replicate=0/{replicate_count} "
                 "status=running")
             margin_drop_rows: list[np.ndarray] = []
@@ -1084,7 +1113,7 @@ class OperatorInterpretabilityRunner:
                 if ((replicate_index + 1) % 10 == 0
                         or replicate_index + 1 == replicate_count):
                     self._print(
-                        "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+                        f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
                         f"control={control_name} "
                         f"replicate={replicate_index + 1}/"
                         f"{replicate_count} status=running")
@@ -1137,7 +1166,7 @@ class OperatorInterpretabilityRunner:
                 } if control_name == "activation_matched" else {}),
             }
             self._print(
-                "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+                f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
                 f"control={control_name} status=ready "
                 f"mean_drop={float(np.mean(mean_margin_drop)):.8f} "
                 "frozen_minus_control="
@@ -1146,7 +1175,7 @@ class OperatorInterpretabilityRunner:
             gc.collect()
 
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             "condition=exact_restoration status=running")
         restored = evaluate_frozen_circuit_condition(
             self.ctx, batch, shape=self.shape, condition="restoration",
@@ -1175,7 +1204,7 @@ class OperatorInterpretabilityRunner:
             "restored_values_source": "same_example_intact_execution",
         })
         self._print(
-            "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
+            f"TRAIN_ANALYSIS_POOL frozen_ioi phase={phase} "
             f"condition=exact_restoration status=ready "
             "recovery="
             f"{restoration_summary['restoration_recovery_fraction']}")
@@ -1206,18 +1235,20 @@ class OperatorInterpretabilityRunner:
                 and intact_reference_prediction_agreement):
             decision = "strong_success"
             strongest_claim = (
-                "validation_level_causal_ioi_qk_centered_rw_operator_circuit")
+                "validation_level_causal_ioi_qk_centered_rw_operator_circuit"
+                if phase == "validation"
+                else "held_out_test_confirmed_causal_ioi_qk_centered_"
+                "rw_operator_circuit")
         elif (suppression_gate and not controls_gate
                 and intact_reference_prediction_agreement):
             decision = (
                 "partial_success_general_attention_damage_not_excluded")
             strongest_claim = (
-                "validation_level_frozen_suppression_without_control_"
-                "separation")
+                f"{phase}_level_frozen_suppression_without_control_separation")
         elif (not suppression_gate
                 and not controls_gate
                 and not restoration_gate):
-            decision = "failure_not_a_validated_causal_circuit"
+            decision = f"failure_not_a_{phase}_causal_circuit"
             strongest_claim = None
         else:
             decision = "mixed_inconclusive"
@@ -1232,10 +1263,24 @@ class OperatorInterpretabilityRunner:
             abs(unrelated_damage) / max(abs(correct_logp_damage), 1.0e-12))
         result = {
             "status": "ready",
-            "phase": "validation",
+            "phase": phase,
             "decision": decision,
             "strongest_supported_claim": strongest_claim,
-            "validation_record_status": "complete",
+            "record_status": "complete",
+            f"{phase}_record_status": "complete",
+            **({
+                "prior_validation_record": {
+                    "status": "final_before_test_access",
+                    "analysis_commit": (
+                        FROZEN_IOI_VALIDATION_ANALYSIS_COMMIT),
+                    "canonical_record_commit": (
+                        FROZEN_IOI_VALIDATION_RECORD_COMMIT),
+                    "result_root": FROZEN_IOI_VALIDATION_RESULT_ROOT,
+                    "validation_artifact_sha256": (
+                        FROZEN_IOI_VALIDATION_RESULT_SHA256),
+                    "configuration_changed_after_validation": False,
+                },
+            } if phase == "test" else {}),
             "frozen_specification": {
                 "path": frozen.spec_path,
                 "content_hash": frozen.spec_content_hash,
@@ -1256,8 +1301,8 @@ class OperatorInterpretabilityRunner:
                 "operator_ids_changed": False,
                 "layers_or_routes_changed": False,
             },
-            "validation_cohort": {
-                "runtime_selected_row_count": len(validation_rows),
+            f"{phase}_cohort": {
+                "runtime_selected_row_count": len(phase_rows),
                 "selection_rule": (
                     "canonical_hash_example_id_then_example_id_first_128"),
                 "paired_correct_independent_count": len(known_correct),
@@ -1312,7 +1357,7 @@ class OperatorInterpretabilityRunner:
                 "matched_controls": controls_output,
                 "frozen_circuit_exact_restoration": restoration_summary,
             },
-            "validation_gates": {
+            f"{phase}_gates": {
                 "suppression_margin_drop_ci_low_above_zero": {
                     "passed": suppression_gate,
                     "observed_ci_low": suppression_ci_low,
@@ -1334,10 +1379,12 @@ class OperatorInterpretabilityRunner:
                 "execution_reference_prediction_sign_agreement": {
                     "passed": intact_reference_prediction_agreement,
                     "rule": (
-                        "all_123_intervention_graph_intact_margin_signs_"
-                        "match_production_diagnostics"),
+                        f"all_{paired_correct_count}_intervention_graph_"
+                        "intact_margin_signs_match_production_diagnostics"),
                     "preregistered_statistical_gate": False,
                 },
+                "threshold_source": (
+                    "frozen_spec.evaluation.validation_gates"),
             },
             "unrelated_behavior_audit": {
                 "mean_log_probability_damage": unrelated_damage,
@@ -1348,13 +1395,16 @@ class OperatorInterpretabilityRunner:
             },
             "split_isolation": {
                 "selection_phase": "discovery",
-                "evaluation_phase": "validation",
+                "evaluation_phase": phase,
                 "validation_used_to_change_specification": False,
-                "test_evaluated": False,
-                "test_evaluation_count": 0,
-                "test_data_accessor_called": False,
-                "held_out_test_opened": False,
-                "held_out_test_allowed_after_this_record": True,
+                "configuration_changed_after_validation": False,
+                "test_evaluated": phase == "test",
+                "test_evaluation_count": (
+                    len(known_correct) if phase == "test" else 0),
+                "test_data_accessor_called": phase == "test",
+                "held_out_test_opened": phase == "test",
+                "held_out_test_allowed_after_this_record": (
+                    phase == "validation"),
             },
             "storage_audit": {
                 "status": "passed",
@@ -1376,9 +1426,15 @@ class OperatorInterpretabilityRunner:
             "status": "ready",
             "benchmarks": {"mib_ioi": result},
             "strongest_supported_claim": strongest_claim,
-            "test_evaluated": False,
-            "test_data_accessor_called": False,
+            "test_evaluated": phase == "test",
+            "test_data_accessor_called": phase == "test",
         }
+
+    def _run_frozen_circuit_validation(self) -> dict[str, Any]:
+        return self._run_frozen_circuit_phase("validation")
+
+    def _run_frozen_circuit_test(self) -> dict[str, Any]:
+        return self._run_frozen_circuit_phase("test")
 
     def _capture_kwargs(self, benchmark_id: str) -> dict[str, Any]:
         return {

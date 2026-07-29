@@ -78,8 +78,8 @@ model:
   # K:   1,108 * 0.1805054 ~= 200
   # V:   6,898 * 0.0869817 ~= 600
   # RST: 13,896 * 0.0863558 ~= 1,200
-  tau_init_target_qk_frac: 0.12
-  tau_init_target_v_frac: 0.06
+  tau_init_target_qk_frac: 0.1805054
+  tau_init_target_v_frac: 0.0869817
   tau_init_target_rst_frac: 0.0863558
 
   srw_composition_mode: linear_angular

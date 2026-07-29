@@ -157,6 +157,21 @@ _register("mib_ioi.frozen_circuit_validation", _mechanistic_item(
     claim_role="checkpoint_specific",
     test_used=False))
 
+_register("mib_ioi.frozen_circuit_test", _mechanistic_item(
+    "mib_ioi", "frozen_circuit_test",
+    "IOI frozen-circuit held-out test",
+    "Does the discovery-frozen 4,096-site IOI circuit retain its validation "
+    "causal effect on the completely held-out paired-correct test cohort?",
+    "Load the same hash-bound frozen YAML and discovery artifact without "
+    "re-localization or threshold changes; evaluate only the 114 paired-correct "
+    "held-out test units under intact execution, the identical frozen "
+    "suppression, the same 100 replicates of each equal-count/same-layer/"
+    "activation/route-frequency control, and exact selected-numerator "
+    "restoration.",
+    "mib_ioi.input_contract",
+    claim_role="checkpoint_specific",
+    test_used=True))
+
 _register("mib_ioi.paired_operator_trajectory", _mechanistic_item(
     "mib_ioi", "paired_operator_trajectory",
     "IOI paired operator trajectory",
@@ -244,6 +259,8 @@ TRAIN_ANALYSIS_POOL_PRESETS: dict[str, tuple[str, ...]] = {
     "mechanistic_screen": MECHANISTIC_SCREEN_ITEMS,
     "ioi_frozen_validation": (
         "mib_ioi.frozen_circuit_validation",),
+    "ioi_frozen_test": (
+        "mib_ioi.frozen_circuit_test",),
     "ioi_native_program": ("mib_ioi.native_operator_program",),
     "ioi_paired_operator_trajectory": (
         "mib_ioi.paired_operator_trajectory",),
