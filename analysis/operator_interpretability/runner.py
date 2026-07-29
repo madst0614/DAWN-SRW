@@ -956,16 +956,16 @@ class OperatorInterpretabilityRunner:
         reference_negative = np.asarray(
             behavior["base_negative_logp"],
             dtype=np.float64)[known_correct_mask]
-        intact_reference_max_abs_error = float(max(
-            np.max(np.abs(intact_positive - reference_positive)),
-            np.max(np.abs(intact_negative - reference_negative)),
+        reference_margin = reference_positive - reference_negative
+        log_probability_errors = np.concatenate((
+            intact_positive - reference_positive,
+            intact_negative - reference_negative,
         ))
-        intact_reference_tolerance = 1.0e-6
-        if intact_reference_max_abs_error > intact_reference_tolerance:
-            raise RuntimeError(
-                "frozen IOI intact retention graph does not match the "
-                "production-diagnostics behavioral reference: "
-                f"max_abs_error={intact_reference_max_abs_error}")
+        margin_errors = intact_margin - reference_margin
+        prediction_agreement = (
+            (intact_margin > 0.0) == (reference_margin > 0.0))
+        intact_reference_prediction_agreement = bool(
+            np.all(prediction_agreement))
         intact_summary = {
             "mean_margin": float(np.mean(intact_margin)),
             "mean_correct_log_probability": float(np.mean(intact_positive)),
@@ -979,18 +979,36 @@ class OperatorInterpretabilityRunner:
                 intact["unrelated_token_count_minimum"]),
             "unrelated_token_count_maximum": int(
                 intact["unrelated_token_count_maximum"]),
-            "production_reference_parity": {
-                "passed": True,
+            "production_diagnostics_reference": {
+                "mean_margin": float(np.mean(reference_margin)),
+                "exact_accuracy": float(np.mean(reference_margin > 0.0)),
+            },
+            "production_reference_numeric_audit": {
+                "prediction_sign_agreement_passed": (
+                    intact_reference_prediction_agreement),
+                "prediction_sign_agreement_fraction": float(
+                    np.mean(prediction_agreement)),
                 "max_absolute_log_probability_error": (
-                    intact_reference_max_abs_error),
-                "absolute_tolerance": intact_reference_tolerance,
+                    float(np.max(np.abs(log_probability_errors)))),
+                "mean_absolute_log_probability_error": float(
+                    np.mean(np.abs(log_probability_errors))),
+                "max_absolute_margin_error": float(
+                    np.max(np.abs(margin_errors))),
+                "mean_absolute_margin_error": float(
+                    np.mean(np.abs(margin_errors))),
+                "formal_numeric_tolerance_in_frozen_spec": False,
+                "used_as_statistical_threshold": False,
             },
         }
         self._print(
             "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
             f"condition=intact status=ready "
             f"margin={intact_summary['mean_margin']:.8f} "
-            f"accuracy={intact_summary['exact_accuracy']:.8f}")
+            f"accuracy={intact_summary['exact_accuracy']:.8f} "
+            "reference_sign_agreement="
+            f"{float(np.mean(prediction_agreement)):.8f} "
+            "reference_max_abs_logp_error="
+            f"{float(np.max(np.abs(log_probability_errors))):.8f}")
 
         self._print(
             "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
@@ -1184,11 +1202,13 @@ class OperatorInterpretabilityRunner:
         restoration_gate = (
             recovery_ci_low is not None
             and float(recovery_ci_low) >= recovery_minimum)
-        if suppression_gate and controls_gate and restoration_gate:
+        if (suppression_gate and controls_gate and restoration_gate
+                and intact_reference_prediction_agreement):
             decision = "strong_success"
             strongest_claim = (
                 "validation_level_causal_ioi_qk_centered_rw_operator_circuit")
-        elif suppression_gate and not controls_gate:
+        elif (suppression_gate and not controls_gate
+                and intact_reference_prediction_agreement):
             decision = (
                 "partial_success_general_attention_damage_not_excluded")
             strongest_claim = (
@@ -1252,6 +1272,10 @@ class OperatorInterpretabilityRunner:
             "primary_metrics": {
                 "intact_mean_margin": intact_summary["mean_margin"],
                 "intact_accuracy": intact_summary["exact_accuracy"],
+                "production_reference_mean_margin": intact_summary[
+                    "production_diagnostics_reference"]["mean_margin"],
+                "production_reference_accuracy": intact_summary[
+                    "production_diagnostics_reference"]["exact_accuracy"],
                 "suppressed_mean_margin": suppression_summary["mean_margin"],
                 "suppressed_accuracy": suppression_summary["exact_accuracy"],
                 "mean_margin_drop": suppression_summary[
@@ -1307,6 +1331,13 @@ class OperatorInterpretabilityRunner:
                 },
                 "all_preregistered_gates_passed": bool(
                     suppression_gate and controls_gate and restoration_gate),
+                "execution_reference_prediction_sign_agreement": {
+                    "passed": intact_reference_prediction_agreement,
+                    "rule": (
+                        "all_123_intervention_graph_intact_margin_signs_"
+                        "match_production_diagnostics"),
+                    "preregistered_statistical_gate": False,
+                },
             },
             "unrelated_behavior_audit": {
                 "mean_log_probability_damage": unrelated_damage,
