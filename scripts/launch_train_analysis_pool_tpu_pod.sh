@@ -6,6 +6,7 @@ set -euo pipefail
 TPU_NAME=""
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
+readonly REMOTE_USER="madst0614"
 BRANCH="main"
 REPO_URL="https://github.com/madst0614/DAWN-SRW.git"
 CHECKPOINT=""
@@ -262,7 +263,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     exit 0
 fi
 
-gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
     --zone="$ZONE" --project="$PROJECT" --worker=all \
     --command="$REMOTE_CMD"
 
