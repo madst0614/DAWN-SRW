@@ -7,7 +7,7 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 - Current goal: use `codex/v4167-poc` as the sole canonical integration, baseline-source, and final experiment-reporting branch for all POC work. Experimental branches may isolate candidate code and runs, but every material result and current decision must be synchronized back to this notebook on POC and pushed. Only accepted source changes are integrated into POC.
 - Paper-analysis track: `configs/paper_checkpoint_registry.yaml` is the descriptive source for the user-designated DAWN-SRW v4172 400M/1.3B and baseline-JAX 400M/1.3B run roots. The 400M DAWN and baseline are the matched 40B-token performance pair; DAWN 1.3B is available for 20B-token scale evaluation and selected mechanistic replication. The baseline-JAX 1.3B run is still training and is excluded from evaluation and comparison until the user declares it complete.
-- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398` and froze a 4,096-site Q/K-dominant circuit. The exact frozen-spec validation in `2026-07-29/#17` and fully held-out test in `2026-07-29/#20` are both strong successes: suppression, separation from all four 100-replicate matched controls, and exact restoration passed every preregistered gate over 123 validation and 114 test paired-correct units. The first test launch in `2026-07-29/#19` remains recorded as a pre-condition operational incident with no effect estimate. The discovery-frozen Q/K-centered RW operator circuit is now an independently validated and held-out-confirmed paper-central causal result. The preregistered RAVEL discovery localization in `2026-07-29/#22` is a fail-closed negative result: Continent/Country/Language rank stability was `0.62876/0.67624/0.66062`, no audited prefix passed both discovery gates, and no variable circuit was frozen. RAVEL validation, transfer, and test were not opened. The preregistered ARC discovery-only localization in `2026-07-29/#24` passed with rank stability `0.89386` and froze a 4,096-site Q/K-only circuit, but the unchanged circuit failed causal validation in `2026-07-30/#02`: suppression increased rather than decreased the correct-minus-source margin, the frozen effect was smaller than the 100 layer-route-matched random controls, and only the restoration gate passed. ARC is therefore a valid auxiliary negative result, and its held-out test was not opened. The matched dense Transformer 400M target and its exact committed step `76293` are pre-effect frozen in `2026-07-30/#03`. Its first C4 restore attempt in `2026-07-30/#04` stopped before data evaluation at a v417x-only kernel-profile guard; the model-compatible production-kernel selection is fixed and C4/zero-shot effects remain unmeasured. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
+- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398` and froze a 4,096-site Q/K-dominant circuit. The exact frozen-spec validation in `2026-07-29/#17` and fully held-out test in `2026-07-29/#20` are both strong successes: suppression, separation from all four 100-replicate matched controls, and exact restoration passed every preregistered gate over 123 validation and 114 test paired-correct units. The first test launch in `2026-07-29/#19` remains recorded as a pre-condition operational incident with no effect estimate. The discovery-frozen Q/K-centered RW operator circuit is now an independently validated and held-out-confirmed paper-central causal result. The preregistered RAVEL discovery localization in `2026-07-29/#22` is a fail-closed negative result: Continent/Country/Language rank stability was `0.62876/0.67624/0.66062`, no audited prefix passed both discovery gates, and no variable circuit was frozen. RAVEL validation, transfer, and test were not opened. The preregistered ARC discovery-only localization in `2026-07-29/#24` passed with rank stability `0.89386` and froze a 4,096-site Q/K-only circuit, but the unchanged circuit failed causal validation in `2026-07-30/#02`: suppression increased rather than decreased the correct-minus-source margin, the frozen effect was smaller than the 100 layer-route-matched random controls, and only the restoration gate passed. ARC is therefore a valid auxiliary negative result, and its held-out test was not opened. The matched dense Transformer 400M target and exact committed step `76293` were pre-effect frozen in `2026-07-30/#03`; the first C4 attempt in `2026-07-30/#04` remains an operational non-result. The corrected, unchanged 10M-token C4 evaluation completed in `2026-07-30/#05`: dense CE `2.935893940` versus DAWN `2.940212858`, with identical eligible token count and a measured dense parameter count of `393,896,960`. The matched dense C4 row is complete; its unchanged unlimited six-task zero-shot run remains pending. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
 - v4175 40M POC state: accepted `spatial-r1-v4.1.7.5` shared-atlas source is integrated on `codex/v4167-poc` at exact commit `4da8bd8891fb1413ffb8570241ab817a9791a8e5`, with no compatibility version or migration path. One shared eight-space atlas owns `operation_space_keys [M,R]`, `space_read_proj`, and `space_write_proj`; Q, K, V, and RST retain independent query projections, independently choose top-2 atlas entries, and retain separate tau maps and operator banks. Current config commit `4fe89796c6960c7a8e6fb8715a24daf7d4720041` uses QK/V/RST denominator powers `0.5/0.8/1.0`, initial active targets approximately `67/67/207/600`, and scratch root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_shared_keys_40M_c4_5B_den_modify`. The exact tree is 40,341,088 parameters, 2,528 (`0.00627%`) below the 40,343,616 Transformer reference.
 - v4175 evidence boundary: repository-local Python/JAX/Flax `3.12.7/0.6.2/0.10.7` compilation, abstract-tree/symbolic-count, shared-key and independent-route selection, legacy-checkpoint rejection, reduced JIT forward/backward, complete selector metrics, and focused v4174 regression checks passed. User-provided TPU v4-4 observations through step 100 show that `0.5/0.8/1.0` avoids the all-`0.5` RST gain spike and improves early loss, but route-space concentration and attention/residual growth remain under observation. The exact TPU resource, deployed commit, generated run folder, checkpoint step, compile/HBM, step time, and throughput were not provided or independently measured in this reporting turn; no TPU command was run.
 - Publication state: accepted QKV+RST outer analytic-pullback source is integrated by merge commit `62417b239d5b79c5dfa8684563532958ed212385` on `codex/v4167-poc`. User-approved QK/V/RST initializer target fractions `0.08/0.08/0.05` are integrated by merge commit `bb2a3ada9a0c281df9439043162dde8045d62bfd` and measured at clean POC commit `ae12416b40607ef8dd21fe79a64d86b4335e18b3`. Generation-`g5` registry and the rejected matched chunk4 report are centralized by POC commit `4e896c00b63f9b0523bb95ebe8357c37cc824740`. The chunk4 source remains only on `codex/v4174-g4-frac885-rst-chunk4` at `a3879f21dcd3b786bdc2cde270bcca2a382796a4`.
@@ -16,8 +16,8 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Current conclusion: use generation `g5` with RST chunk8 for production. The matched chunk4 candidate produced `0.634587` s combined F+B (`0.9222%` slower than the matched chunk8 control) and failed the mandatory `0.565677` s gate. Its full-step mean was `8.923707` s/it, only `0.2242%` faster than chunk8 and below the required `2%`; p90 was `0.2863%` worse. The noise-level mean does not override the failed gates, so chunk4 is rejected.
 - Baseline state: `docs/v4174_dense_rw_baselines.yaml` generation `g5` is active for QK/V/RST fractions `0.08/0.08/0.05` and chunks `1/1/2/8`. Generation `g4` is superseded historical evidence under the prior initializer fingerprint; generations `g1` through `g3` remain historical.
 - Last verified v4174 production state (2026-07-27): fresh generation-`g5` production was running on the then-explicitly-authorized existing TPU `spatial-se-400m` from exact POC commit `4e896c00`. The GCS run folder is `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_20B_v4_64/run_vspatial-r1-v4.1.7.4_20260727_002935_3201`; all eight workers then retained one `scripts/train_jax.py --from-scratch` process in `tmux train`. Step 20 was finite at loss `9.3893`, and its latest 10-step timing window was `8.530` s/it (`61,343.2` tokens/s). No live status refresh was authorized or performed for this v4175 task.
-- Current blocker: no IOI infrastructure blocker. The final IOI held-out artifact used clean analysis commit `75b0e0157bce670d1ca6f7801a8393014ce09ffb`, checkpoint step `76293`, mesh `16x2`, frozen-spec hash `6ec2661823bb52aa3bc336fb69fed1eef317f9cced02f836eaaade8c116a418c`, and result root ending `20260729T123731Z-3cb89374`; all preregistered test gates passed. RAVEL is blocked from confirmatory work by its discovery specification: every variable missed the `0.80` stability gate and no audited prefix jointly reached cumulative importance `0.70` and split overlap `0.95`. ARC is blocked from held-out test by its frozen validation result rather than by infrastructure: suppression and frozen-minus-control both failed in the opposite direction, so the preregistered protocol does not permit test access. The remaining paper-performance blocker is the missing matched dense Transformer 400M C4 and six-task zero-shot row.
-- Next experiment: publish the model-compatible C4 kernel-profile fix and its pre-effect incident record, then deploy the exact clean pushed descendant on `spatial-se-400m`, restore only baseline-JAX 400M step `76293`, run the unchanged locked 10M-token C4 validation first, and then run the unchanged unlimited six-task zero-shot preset. Do not change the checkpoint, model, C4 cap, task set, harness, batch, mesh, or protocol between results.
+- Current blocker: no IOI infrastructure blocker. The final IOI held-out artifact used clean analysis commit `75b0e0157bce670d1ca6f7801a8393014ce09ffb`, checkpoint step `76293`, mesh `16x2`, frozen-spec hash `6ec2661823bb52aa3bc336fb69fed1eef317f9cced02f836eaaade8c116a418c`, and result root ending `20260729T123731Z-3cb89374`; all preregistered test gates passed. RAVEL is blocked from confirmatory work by its discovery specification: every variable missed the `0.80` stability gate and no audited prefix jointly reached cumulative importance `0.70` and split overlap `0.95`. ARC is blocked from held-out test by its frozen validation result rather than by infrastructure: suppression and frozen-minus-control both failed in the opposite direction, so the preregistered protocol does not permit test access. The matched dense Transformer 400M C4 row is complete; the remaining 400M paper-performance blocker is its unchanged unlimited six-task zero-shot row.
+- Next experiment: publish the completed dense 400M C4 artifact and notebook record, then deploy that exact clean pushed descendant on `spatial-se-400m` and run target `baseline_jax_400m`, preset `zero_shot`, without changing checkpoint step `76293`, task set, harness, batch, mesh, seed, or protocol. Do not run any mechanistic item on the dense baseline.
 
 ## Paper Writing Ledger
 
@@ -59,7 +59,7 @@ contain raw per-example vectors.
 
 | Claim | Required evidence | Current status | Manuscript wording now allowed |
 |---|---|---|---|
-| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | DAWN 400M C4 and zero-shot measured; dense 400M pending | Report DAWN absolute C4 and zero-shot results; do not yet claim parity with the dense baseline |
+| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | Matched DAWN/dense 400M C4 complete with CE difference `0.004319`; dense zero-shot pending | Claim matched C4 retention at 400M; do not yet claim full benchmark parity |
 | B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | IOI discovery localization, independent validation, and fully held-out test all passed; every suppression/control/restoration gate passed | Claim that the discovery-frozen Q/K-centered RW operator circuit is causally necessary for IOI computation and recoverable on independent validation and held-out test |
 | C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | The same frozen IOI circuit generalized to independent validation and held-out inputs; preregistered RAVEL discovery was unstable and froze no variable circuit, so transfer was not eligible | Claim held-out reuse of the frozen IOI circuit across inputs; do not claim variable-level transfer |
 | D. Scale replication | 1.3B performance and selected causal effect with the same control design | DAWN 1.3B checkpoint available; evaluation pending | Describe the planned replication only |
@@ -69,7 +69,7 @@ contain raw per-example vectors.
 | Model | Parameters | Training tokens | Checkpoint state | Paper role |
 |---|---:|---:|---|---|
 | DAWN-SRW v4172 400M | `393,800,708` measured | `39,999,504,384` in the evaluation manifest | Step `76,293` resolved, restored, parity-validated, C4 and zero-shot measured | Discovery model, full mechanistic analysis, primary causal result |
-| Dense Transformer 400M | Config estimate `~393.9M`; exact restore count pending | `39,999,504,384` in step-76,293 metadata | Committed step `76,293` frozen; restore and C4/zero-shot evaluation pending | Matched 400M performance control |
+| Dense Transformer 400M | `393,896,960` measured | `39,999,504,384` in step-76,293 metadata | Step `76,293` restored; C4 measured, zero-shot pending | Matched 400M performance control |
 | DAWN-SRW v4172 1.3B | `1,272,038,404` configured; restore verification pending | `20B` configured | User-designated run available; exact numeric step/evaluation pending | Larger-scale performance and selected causal replication |
 | Dense Transformer 1.3B | Pending completed training | `20B` configured | Training in progress; excluded by user decision | No current paper result |
 
@@ -111,10 +111,11 @@ manifest records tokenizer vocabulary hash
 The configured dense control uses the same C4 40B data, seed 1, global batch
 1,024, sequence length 512, 18 layers, dropout 0, mesh `16x2`, learning rate
 `3e-4`, 8% warmup, and weight decay `0.1`. Its architecture is width 1,280,
-FFN width 5,120, and 20 attention heads. The config estimates approximately
-393.9M parameters. Exact parameter count, numeric checkpoint step, full C4
-validation, tokenizer parity, and the identical zero-shot protocol remain
-required before any DAWN-versus-dense performance statement.
+FFN width 5,120, and 20 attention heads. The restored dense checkpoint contains
+`393,896,960` parameters, only `96,252` (`0.0244%`) above the DAWN checkpoint,
+and its exact numeric step and full C4 validation are complete. The identical
+zero-shot protocol and tokenizer contract still must complete before a full
+DAWN-versus-dense benchmark statement.
 
 ### Evaluation protocol locked for paper tables
 
@@ -132,18 +133,24 @@ required before any DAWN-versus-dense performance statement.
   performance table. The eligible v4172 400M run has `limit=null`,
   `smoke_test_only=false`, all six tasks complete, and `comparable=true`.
 
-### Table-ready v4172 400M C4 validation
+### Table-ready matched 400M C4 validation
 
 | Model | Validation protocol | Valid target tokens | Cross-entropy | Perplexity | Token accuracy |
 |---|---|---:|---:|---:|---:|
 | DAWN-SRW v4172 400M | packed C4 validation, 10M-token cap | `9,974,720` | `2.940212858` | `18.919873132` | `0.424911877` (`42.4912%`) |
+| Dense Transformer 400M | packed C4 validation, 10M-token cap | `9,974,720` | `2.935893940` | `18.838335950` | `0.427100310` (`42.7100%`) |
 
 The locked `packed_c4_validation_v1` run evaluated all 610 complete global
 batches admitted by the 10M-token cap: 19,520 sequences at length 512 and
 global batch 32. The capped dataset view contained 19,531 sequences; the final
 11 could not form a complete global batch and were excluded before scoring.
-The result is `comparable=true` and uses the same fixed protocol required for
-the dense 400M and DAWN 1.3B rows.
+Both 400M results are `comparable=true` and use the same fixed data hash,
+batching, token count, sequence length, checkpoint step, training-token count,
+and `16x2` mesh. Relative to dense, DAWN CE is higher by `0.004318918`
+(`0.1471%` of dense CE), perplexity is higher by `0.081537182`, and token
+accuracy is lower by `0.002188432` absolute (`0.2188` percentage point). This
+supports matched C4 performance retention; zero-shot remains a separate
+pending comparison.
 
 The paper-eligible C4 result root is
 `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T044410Z-37fa6082`.
@@ -151,6 +158,13 @@ Use `validation_summary.json` for table cells, `run_manifest.json` for the
 source, software, data, mesh, checkpoint, and hash contract, and `summary.log`
 for the canonical text summary. This run used clean evaluation commit
 `37fa60822af9ae13a8cd2fddb361b563cbdc3304`.
+
+The paper-eligible dense C4 result root is
+`gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T153730Z-cad4d93c`.
+Its result hash is
+`10f3aef9ce805072f33cbeb2f58bdb16d437f2b0e625c81e5f5361e36dbf4be9`;
+the run used clean evaluation commit
+`53a6d8e6aafa21b4c6f04a8f3c8ecfd791ee01a7`.
 
 ### Table-ready v4172 400M performance
 
@@ -181,9 +195,10 @@ accuracy 42.49% over 9.97M valid target tokens. On the six stock zero-shot
 tasks, it obtained mean accuracy 46.29%, with its strongest absolute result on
 PIQA (71.22%) and lower results on ARC-Challenge (25.68%) and LAMBADA
 (35.20%). These measurements establish that the checkpoint is a functioning
-language model suitable for causal analysis. They do not yet establish
-performance retention relative to a dense Transformer, because the matched
-400M dense-control cells remain unmeasured.
+language model suitable for causal analysis. The matched dense C4 row now
+supports 400M C4 performance retention: DAWN differs from dense by `+0.004319`
+CE and `-0.2188` percentage point token accuracy. Full benchmark parity remains
+unresolved until the dense six-task zero-shot row completes.
 
 ### Mechanistic screening result and locked causal design
 
@@ -484,11 +499,11 @@ closed and must not be opened under this frozen protocol.
 
 | Output | Required content | Current evidence source |
 |---|---|---|
-| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; `2026-07-29/#03`, `#05`, and `#06`; baseline rows pending |
-| Table 2: C4 validation | Loss, perplexity, token accuracy for DAWN/dense 400M and DAWN 1.3B | DAWN 400M row complete in `#06`; comparison rows pending |
+| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; DAWN 400M from `2026-07-29/#03/#05/#06`, dense 400M from `2026-07-30/#03/#05`; 1.3B pending |
+| Table 2: C4 validation | Loss, perplexity, token accuracy for DAWN/dense 400M and DAWN 1.3B | Matched 400M rows complete in `2026-07-29/#06` and `2026-07-30/#05`; DAWN 1.3B pending |
 | Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
 | Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
-| Figure 2: performance | C4 and benchmark comparison with uncertainty | DAWN 400M C4 and zero-shot complete; comparison cells pending |
+| Figure 2: performance | C4 and benchmark comparison with uncertainty | Matched 400M C4 complete; DAWN 400M zero-shot complete; dense zero-shot and 1.3B pending |
 | Figure 3: circuit localization | Layer x operator discovery contribution, split overlap, trajectory, held-out overlap | IOI localization/validation/test complete in `2026-07-29/#09/#17/#20`; RAVEL discovery negative in `2026-07-29/#22`; ARC localization passed in `2026-07-29/#24` but validation was negative in `2026-07-30/#02` |
 | Figure 4: causal intervention | Intact, suppressed, matched control, restored | IOI validation and held-out test panels complete in `2026-07-29/#17/#20`; ARC negative validation may be shown as an auxiliary contrast from `2026-07-30/#02` |
 | Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | RAVEL transfer not eligible because `#22` froze no variable circuit; no transfer claim |
@@ -499,8 +514,9 @@ closed and must not be opened under this frozen protocol.
 - Supported now: the exact v4172 400M checkpoint restores reproducibly; the
   production and analysis forwards agree within `3.31e-7` CE; the locked
   10M-token C4 validation and full unlimited stock six-task results above are
-  reproducible and paper-eligible; and IOI, MCQA, ARC, and RAVEL have enough
-  paired-correct independent examples for mechanistic follow-up under the
+  reproducible and paper-eligible; the matched dense 400M C4 row is complete
+  and supports C4 performance retention within `0.004319` CE; and IOI, MCQA,
+  ARC, and RAVEL have enough paired-correct independent examples for mechanistic follow-up under the
   preregistered threshold. IOI has a stable discovery aggregate operator
   ranking, a frozen 4,096-site intervention specification, and independently
   confirmed validation/test causal evidence from suppression, all four matched
@@ -509,9 +525,9 @@ closed and must not be opened under this frozen protocol.
   valid negative frozen validation result: suppression and control separation
   failed in the opposite direction, restoration passed, and test stayed closed.
 - Not supported: auxiliary ARC causal replication or variable-level transfer.
-  Not supported yet: matched dense performance retention, IOI trajectory
-  confirmation, scale replication, pruning-quality tradeoffs, or hardware
-  speedup.
+  Not supported yet: full matched dense benchmark parity, matched dense
+  zero-shot retention, IOI trajectory confirmation, scale replication,
+  pruning-quality tradeoffs, or hardware speedup.
 - Do not infer a full validation loss from the Phase 0 fixed batch or from a
   training-log summary. Do not use `limit=1` task scores.
 - Do not call 400M-to-1.3B a scaling curve. Do not include baseline 1.3B until
@@ -1499,6 +1515,16 @@ closed and must not be opened under this frozen protocol.
 - Cause/fix: the standalone C4 evaluator had hard-coded the v417x `production_diagnostics` profile added for DAWN token-accuracy reporting, while the existing zero-shot evaluator already selects diagnostics only for v417x and uses the canonical `production` profile for other registered models. Exact fix commit `e366dc0193517b86e4c1d14d9d5093dafed127e9` applies the same model-version branch in `scripts/c4_validation_eval_jax.py`: v417x behavior remains byte-for-byte selected as `production_diagnostics`; baseline-JAX uses `production`; the manifest records the actual profile. The loss/accuracy evaluator, data cap, batching, mesh, checkpoint, and result schema are unchanged.
 - Validation/boundary: repository-local Python/JAX/Flax remained `3.12.7/0.6.2/0.10.7`; module compilation and `git diff --check` passed. No debug script or test file was created or run. An all-host post-failure process audit found no remaining C4 Python owner. Because the failure occurred before dataset access and metric evaluation, this compatibility correction is pre-effect and is not a result-dependent protocol change.
 - Decision/next: preserve this failed root as an operational non-result. Publish this record, then use one new unique result root and the exact clean pushed notebook descendant to repeat the unchanged frozen C4 protocol. Only after a complete comparable C4 artifact may the six-task zero-shot run begin.
+
+#### #05 — Measure the matched dense Transformer 400M packed C4 row
+
+- Status/decision: `TPU measured; complete; comparable paper result`. The unchanged frozen `packed_c4_validation_v1` protocol completed over all 610 complete global batches admitted by the 10M-token cap. Accept this artifact as the matched dense Transformer 400M C4 paper row and open only the already-frozen unlimited six-task zero-shot preset.
+- Exact run identity: canonical branch `codex/v4167-poc`, exact clean deployed/evaluation commit `53a6d8e6aafa21b4c6f04a8f3c8ecfd791ee01a7`, existing user-authorized TPU `spatial-se-400m`, TPU v4-64 with 32 devices/eight hosts, mesh `data=16, model=2`, model `baseline-JAX`, config `configs/train_config_baseline_tpu_400M_c4_40B_v4_64_tp2.yaml`, and exact concrete checkpoint `gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/checkpoints/000000076293`. The restored checkpoint contains `393,896,960` parameters, records 39,999,504,384 pretraining tokens, full-config hash `c3ce5d7215388f18287658a7b6603fe00e0ea32c2ed84c6b625545c73a82fc25`, and restored parameter-identity hash `1ca4f147733c55539baa19e03b4362afcd4ff41216b2ac2a0faa19debce3d053`.
+- Frozen protocol and environment: no-update float32 scoring, global batch `32`, sequence length `512`, `max_val_tokens=10,000,000`, `max_batches=0`, token-reduction chunk `32,768`, canonical baseline `production` kernel, and no checkpoint write. The run used Python 3.10.6 and software JAX/jaxlib/Flax/NumPy/Orbax `0.6.2/0.6.2/0.10.7/2.2.6/0.11.24`; `working_tree_clean=true`.
+- Cohort/result: the capped view contained 19,531 sequences and 9,999,872 source tokens. Exactly 19,520 sequences formed 610 complete global batches; 11 incomplete-tail sequences were dropped, leaving 9,974,720 valid next-token targets. Cross-entropy was `2.9358939398800166`, perplexity `18.838335950080342`, and token accuracy `0.42710030958262485` (`42.7100309583%`). The artifact records `comparable=true`.
+- Matched DAWN comparison: the DAWN row used the identical complete-batch/token counts and produced CE `2.94021285810529`, perplexity `18.919873132016434`, and token accuracy `0.4249118772256264`. Dense-minus-DAWN differences are CE `-0.004318918225273638`, perplexity `-0.08153718193609194`, and accuracy `+0.0021884323569984487` absolute (`+0.218843` percentage point). DAWN CE is `0.1471%` above dense CE. This supports matched C4 performance retention, not yet full benchmark parity.
+- Data/evidence: validation metadata `gs://dawn-tpu-data-c4/c4_val_meta.json` has SHA-256 `4c2fc359ddd7542052442e5deab2eecd37f5cdf7f3dca19a0943ea47eaf4aaf7`, identical to the DAWN paper row. Result root `gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T153730Z-cad4d93c`; `run_manifest.json`, `validation_summary.json`, and `summary.log` are the canonical artifacts; result hash `10f3aef9ce805072f33cbeb2f58bdb16d437f2b0e625c81e5f5361e36dbf4be9`. Downloaded audit copies of the manifest and summary had SHA-256 `5f311d31c2012a28b614284d1104b1adc38e0cfb5ce35dff627d0c929babdd3a` and `17820f7efad60f4c1c76840e2fb1631df1db132b4fe28eab118ce92aaff52a6e`.
+- Decision/next: preserve the exact checkpoint, target, task set, harness, batch, mesh, seed, and frozen zero-shot protocol from `2026-07-30/#03`. Publish this C4 result on POC, then run only target `baseline_jax_400m` with preset `zero_shot`; do not run mechanistic analysis or revise any threshold from the C4 result.
 
 ## Backfill Boundary
 
