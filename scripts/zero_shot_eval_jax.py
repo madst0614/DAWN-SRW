@@ -990,8 +990,15 @@ def run_evaluation(args: argparse.Namespace) -> Dict[str, Any]:
     print(f"source_checkpoint_params_hash={params_hash}", flush=True)
 
     runtime_state = canonical._checkpoint_final_runtime(config, resolved)
+    eval_sharding_kwargs = {
+        "for_eval": True,
+        "analysis": False,
+    }
+    if canonical._is_v417x_version(model_cfg["model_version"]):
+        eval_sharding_kwargs["kernel_profile"] = (
+            "production_diagnostics")
     base_sharded_fns = canonical.build_canonical_sharded_fns(
-        config, mesh, for_eval=True, analysis=False)
+        config, mesh, **eval_sharding_kwargs)
     from dawn.eval.jax_runtime import JaxDawnScorer
     from dawn.eval.lm_eval_dawn_adapter import DawnJaxLM
 
