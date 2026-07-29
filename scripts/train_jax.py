@@ -11300,40 +11300,6 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     return avg_loss, avg_acc
 
 
-def _format_prune_eps(eps):
-    return f"{float(eps):.0e}".replace('-', 'm')
-
-
-def run_eval_prune_sweep(eval_prune_step_fns, params, val_loader, n_devices,
-                         data_sharding_spec, current_step, base_loss, base_acc,
-                         verbose=False):
-    records = {}
-    for eps, step_fn in eval_prune_step_fns.items():
-        val_loader.reset()
-        loss, acc, stats = evaluate(
-            step_fn, params, val_loader, n_devices, verbose=verbose,
-            data_sharding_spec=data_sharding_spec, return_dead_stats=True,
-            return_prune_stats=True, current_step=current_step)
-        tag = _format_prune_eps(eps)
-        records[f'val_loss_prune_eps_{tag}'] = loss
-        records[f'val_acc_prune_eps_{tag}'] = acc
-        records[f'val_loss_delta_prune_eps_{tag}'] = loss - base_loss
-        records[f'val_acc_delta_prune_eps_{tag}'] = acc - base_acc
-        records[f'estimated_compute_frac_prune_eps_{tag}'] = float(
-            stats.get('estimated_compute_frac', 0.0))
-        records[f'gate_mass_retained_prune_eps_{tag}'] = float(
-            stats.get('gate_mass_retained', 1.0))
-        records[f'prune_gate_den_mean_eps_{tag}'] = float(
-            stats.get('prune_gate_den_mean', 0.0))
-        records[f'prune_gate_den_min_eps_{tag}'] = float(
-            stats.get('prune_gate_den_min', 0.0))
-        records[f'prune_no_active_frac_eps_{tag}'] = float(
-            stats.get('prune_no_active_frac', 0.0))
-        records[f'prune_unpruned_gate_den_mean_eps_{tag}'] = float(
-            stats.get('prune_unpruned_gate_den_mean', 0.0))
-    return records
-
-
 # ============================================================
 # Orbax checkpoint save / load
 # ============================================================
@@ -17547,17 +17513,6 @@ def main():
         'regular_console_drive_max_warn', 1.20))
     regular_console_logging_overhead_warn = float(tcfg.get(
         'regular_console_logging_overhead_warn', 0.05))
-    eval_effective_prune_enabled = bool(tcfg.get(
-        'eval_effective_prune_enabled',
-        _is_active_srw_version(model_version_cfg)))
-    eval_effective_prune_eps_list = list(tcfg.get(
-        'eval_effective_prune_eps_list', [1.0e-6, 1.0e-5, 1.0e-4]))
-    if not _is_active_srw_version(model_version_cfg):
-        eval_effective_prune_enabled = False
-        eval_effective_prune_eps_list = []
-    if operation_space_tau_free_enabled:
-        eval_effective_prune_enabled = False
-        eval_effective_prune_eps_list = []
     ignored_tau_ce_grad_scale_keys = (
         sorted(k for k in tcfg if k.startswith('tau_ce_grad_scale'))
         if _is_active_srw_version(model_version_cfg)
@@ -18061,20 +18016,6 @@ def main():
                 saved_training_config.get(
                     'regular_console_logging_overhead_warn',
                     regular_console_logging_overhead_warn))
-            eval_effective_prune_enabled = bool(
-                saved_training_config.get(
-                    'eval_effective_prune_enabled',
-                    eval_effective_prune_enabled))
-            eval_effective_prune_eps_list = list(
-                saved_training_config.get(
-                    'eval_effective_prune_eps_list',
-                    eval_effective_prune_eps_list))
-            if not _is_active_srw_version(model_version_cfg):
-                eval_effective_prune_enabled = False
-                eval_effective_prune_eps_list = []
-            if operation_space_tau_free_enabled:
-                eval_effective_prune_enabled = False
-                eval_effective_prune_eps_list = []
             soft_gate_boundary_power_start = float(
                 saved_training_config.get(
                     'soft_gate_boundary_power_start',
@@ -18596,8 +18537,6 @@ def main():
         'regular_console_drive_max_warn': regular_console_drive_max_warn,
         'regular_console_logging_overhead_warn':
             regular_console_logging_overhead_warn,
-        'eval_effective_prune_enabled': eval_effective_prune_enabled,
-        'eval_effective_prune_eps_list': eval_effective_prune_eps_list,
         'inactive_aux_start_frac': inactive_aux_start_frac,
         'inactive_aux_full_frac': inactive_aux_full_frac,
         'inactive_aux_schedule': inactive_aux_schedule,
@@ -19702,7 +19641,6 @@ def main():
                 "tau_init_required_for_qk_v_rst=false "
                 f"dropout={cfg['model'].get('dropout', None)} "
                 f"router_dropout={cfg['model'].get('router_dropout', None)}")
-            print("  Effective pruning: disabled for operation-space QK/V/RST")
         else:
             if is_linear_direct_tau_cfg:
                 _linear_family_label = (
@@ -19718,7 +19656,6 @@ def main():
                 print("  tau = -1 + 2 * sigmoid(raw_tau)")
                 print(f"  Gate: linear angular-depth from {_margin_label}")
                 print("  gate = clip((rho - tau) / max(1 - tau, 1e-4), 0, 1)")
-                print("  execution_prune_eps: training=0.0; eval zeros gates below eps")
                 if is_v417x_cfg:
                     print(
                         "  denominator: max(sum(unpruned_admission), 1.0) "
@@ -19776,13 +19713,6 @@ def main():
                     print("tau init: fresh quantile calibration")
                     print("tau update: frozen by v4169 code policy")
                     print("effective_tau_lr_mult=0.0")
-                print("  Effective pruning:")
-                print(
-                    f"    console={regular_console_level} "
-                    f"host_timing={regular_console_host_timing}")
-                print(
-                    f"    eval enabled={eval_effective_prune_enabled} "
-                    f"eps={eval_effective_prune_eps_list}")
                 if _is_active_srw_version(model_version_cfg):
                     gate_msg = (
                         f"  Gate ({cfg['model'].get('model_version')} canonical-rw-direct-tau): "
@@ -19870,11 +19800,6 @@ def main():
                 if ignored_tau_ce_grad_scale_keys:
                     print("  tau_ce_grad_scale config fields are ignored in "
                           "v4164; tau movement is controlled by tau_lr_mult.")
-                print("  Effective pruning:")
-                print(
-                    f"    console={regular_console_level} "
-                    f"host_timing={regular_console_host_timing}")
-                print(f"    eval enabled={eval_effective_prune_enabled} eps={eval_effective_prune_eps_list}")
                 if _is_active_srw_version(model_version_cfg):
                     _gate_intensity_part = ""
                     gate_msg = (
@@ -21134,34 +21059,6 @@ def main():
         soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
         admission_den_power=admission_den_power,
         ce_token_chunk_size=ce_token_chunk_size)
-    eval_prune_step_fns = {}
-    if eval_effective_prune_enabled:
-        for _eps in eval_effective_prune_eps_list:
-            _eps_f = float(_eps)
-            eval_prune_step_fns[_eps_f] = create_eval_step(
-                model, sharded_fns=_eval_sharded_fns, return_dead_stats=True,
-                return_prune_stats=True, execution_prune_eps=_eps_f,
-                total_training_steps=total_steps,
-                soft_gate_schedule_active=soft_gate_schedule_active,
-                soft_gate_t_start=soft_gate_t_start,
-                soft_gate_t_final=soft_gate_t_final,
-                soft_gate_t_hold_frac=soft_gate_t_hold_frac,
-                soft_gate_t_anneal_end_frac=soft_gate_t_anneal_end_frac,
-                soft_gate_schedule=soft_gate_schedule,
-                soft_gate_t_power=soft_gate_t_power,
-                soft_gate_t_gompertz_center=soft_gate_t_gompertz_center,
-                soft_gate_t_gompertz_steepness=soft_gate_t_gompertz_steepness,
-                pool_specific_gate_t=pool_specific_gate_t,
-                soft_gate_pool_schedules=soft_gate_pool_schedules,
-                boundary_power_schedule_active=boundary_power_schedule_active,
-                soft_gate_boundary_power_start=soft_gate_boundary_power_start,
-                soft_gate_boundary_power_mid=soft_gate_boundary_power_mid,
-                soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                soft_gate_boundary_power_start_frac=soft_gate_boundary_power_start_frac,
-                soft_gate_boundary_power_mid_frac=soft_gate_boundary_power_mid_frac,
-                soft_gate_boundary_power_final_frac=soft_gate_boundary_power_final_frac,
-                admission_den_power=admission_den_power,
-                ce_token_chunk_size=ce_token_chunk_size)
     # Initial operator-key drift snapshot. Identity here means drift=0 on the
     # first step; legacy pools use their route embeddings as the signature.
     def _drift_snap(p):
@@ -22865,12 +22762,6 @@ def main():
                     eval_step_fn, params, val_loader, n_local_devices,
                     verbose=is_host0, data_sharding_spec=data_sharding,
                     return_dead_stats=True, current_step=global_step)
-                prune_eval_log = {}
-                if eval_prune_step_fns:
-                    prune_eval_log = run_eval_prune_sweep(
-                        eval_prune_step_fns, params, val_loader,
-                        n_local_devices, data_sharding, global_step,
-                        val_loss, val_acc, verbose=False)
                 if is_host0:
                     _val_dead_ctx = {
                         'n_qk_cfg': cfg['model'].get(
@@ -22884,16 +22775,6 @@ def main():
                     log_message(
                         f"  Val path={main_val_path}, "
                         f"Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
-                    if prune_eval_log:
-                        for _eps in eval_effective_prune_eps_list:
-                            _tag = _format_prune_eps(_eps)
-                            log_message(
-                                f"  Pruned eval eps={float(_eps):.0e}: "
-                                f"loss={prune_eval_log.get('val_loss_prune_eps_' + _tag, 0.0):.4f} "
-                                f"delta_loss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
-                                f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
-                                f"compute={prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
-                                f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
                     _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
                     log_jsonl({
                         'type': 'val',
@@ -22903,7 +22784,6 @@ def main():
                         'val_loss': val_loss,
                         'val_acc': val_acc,
                         **val_dead_log,
-                        **prune_eval_log,
                         'timestamp': datetime.now().isoformat(),
                     })
                 if np.isfinite(val_loss) and val_loss < best_val_loss:
@@ -23006,11 +22886,6 @@ def main():
             eval_step_fn, params, val_loader, n_local_devices,
             verbose=is_host0, data_sharding_spec=data_sharding,
             return_dead_stats=True, current_step=global_step)
-        prune_eval_log = {}
-        if eval_prune_step_fns:
-            prune_eval_log = run_eval_prune_sweep(
-                eval_prune_step_fns, params, val_loader, n_local_devices,
-                data_sharding, global_step, val_loss, val_acc, verbose=False)
 
         is_best = np.isfinite(val_loss) and val_loss < best_val_loss
         if is_best:
@@ -23029,16 +22904,6 @@ def main():
             log_message(
                 f"  Val path={main_val_path}, "
                 f"Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
-            if prune_eval_log:
-                for _eps in eval_effective_prune_eps_list:
-                    _tag = _format_prune_eps(_eps)
-                    log_message(
-                        f"  Pruned eval eps={float(_eps):.0e}: "
-                        f"loss={prune_eval_log.get('val_loss_prune_eps_' + _tag, 0.0):.4f} "
-                        f"delta_loss={prune_eval_log.get('val_loss_delta_prune_eps_' + _tag, 0.0):+.4f} "
-                        f"acc={prune_eval_log.get('val_acc_prune_eps_' + _tag, 0.0):.4f} "
-                        f"compute={prune_eval_log.get('estimated_compute_frac_prune_eps_' + _tag, 0.0):.4f} "
-                        f"mass={prune_eval_log.get('gate_mass_retained_prune_eps_' + _tag, 0.0):.4f}")
             _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
             log_jsonl({
                 'type': 'val_epoch',
@@ -23048,7 +22913,6 @@ def main():
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 **val_dead_log,
-                **prune_eval_log,
                 'train_loss': epoch_avg_loss,
                 'train_acc': epoch_avg_acc,
                 'train_compute_accuracy': train_compute_accuracy,
