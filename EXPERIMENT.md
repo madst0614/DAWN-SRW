@@ -7,7 +7,7 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 
 - Current goal: use `codex/v4167-poc` as the sole canonical integration, baseline-source, and final experiment-reporting branch for all POC work. Experimental branches may isolate candidate code and runs, but every material result and current decision must be synchronized back to this notebook on POC and pushed. Only accepted source changes are integrated into POC.
 - Paper-analysis track: `configs/paper_checkpoint_registry.yaml` is the descriptive source for the user-designated DAWN-SRW v4172 400M/1.3B and baseline-JAX 400M/1.3B run roots. The 400M DAWN and baseline are the matched 40B-token performance pair; DAWN 1.3B is available for 20B-token scale evaluation and selected mechanistic replication. The baseline-JAX 1.3B run is still training and is excluded from evaluation and comparison until the user declares it complete.
-- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398` and froze a 4,096-site Q/K-dominant circuit. The exact frozen-spec validation in `2026-07-29/#17` and fully held-out test in `2026-07-29/#20` are both strong successes: suppression, separation from all four 100-replicate matched controls, and exact restoration passed every preregistered gate over 123 validation and 114 test paired-correct units. The first test launch in `2026-07-29/#19` remains recorded as a pre-condition operational incident with no effect estimate. The discovery-frozen Q/K-centered RW operator circuit is now an independently validated and held-out-confirmed paper-central causal result. The preregistered RAVEL discovery localization in `2026-07-29/#22` is a fail-closed negative result: Continent/Country/Language rank stability was `0.62876/0.67624/0.66062`, no audited prefix passed both discovery gates, and no variable circuit was frozen. RAVEL validation, transfer, and test were not opened. The preregistered ARC discovery-only localization in `2026-07-29/#24` passed with rank stability `0.89386` and froze a 4,096-site Q/K-only circuit, but the unchanged circuit failed causal validation in `2026-07-30/#02`: suppression increased rather than decreased the correct-minus-source margin, the frozen effect was smaller than the 100 layer-route-matched random controls, and only the restoration gate passed. ARC is therefore a valid auxiliary negative result, and its held-out test was not opened. The matched dense Transformer 400M target and exact committed step `76293` were pre-effect frozen in `2026-07-30/#03`; the first C4 attempt in `2026-07-30/#04` remains an operational non-result. The corrected, unchanged 10M-token C4 evaluation completed in `2026-07-30/#05`: dense CE `2.935893940` versus DAWN `2.940212858`, with identical eligible token count and a measured dense parameter count of `393,896,960`. The first zero-shot launch in `2026-07-30/#06` stopped before any task completed because `--no-install` found no `lm-eval`; the pinned dependency path is now installed and the exact independent retry is active. The matched dense C4 row is complete; zero-shot effects remain pending. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
+- Paper execution state: the v4172 400M Phase 0 gate is complete. Step 76,293 identity, clean restore, and immutable input contracts passed in `2026-07-29/#03`; two independent fixed-batch runs in `2026-07-29/#04` passed deterministic production/adapter parity. The full unlimited stock zero-shot suite completed as a comparable paper result in `2026-07-29/#05`, and the locked 10M-token C4 validation completed in `2026-07-29/#06`. The preregistered behavioral mechanistic screen completed in `2026-07-29/#07`: IOI, MCQA, ARC, and RAVEL passed the minimum-known-correct gate in discovery, validation, and test, while arithmetic did not. IOI discovery-only operator localization completed in `2026-07-29/#09` with rank stability `0.91398` and froze a 4,096-site Q/K-dominant circuit. The exact frozen-spec validation in `2026-07-29/#17` and fully held-out test in `2026-07-29/#20` are both strong successes: suppression, separation from all four 100-replicate matched controls, and exact restoration passed every preregistered gate over 123 validation and 114 test paired-correct units. The first test launch in `2026-07-29/#19` remains recorded as a pre-condition operational incident with no effect estimate. The discovery-frozen Q/K-centered RW operator circuit is now an independently validated and held-out-confirmed paper-central causal result. The preregistered RAVEL discovery localization in `2026-07-29/#22` is a fail-closed negative result: Continent/Country/Language rank stability was `0.62876/0.67624/0.66062`, no audited prefix passed both discovery gates, and no variable circuit was frozen. RAVEL validation, transfer, and test were not opened. The preregistered ARC discovery-only localization in `2026-07-29/#24` passed with rank stability `0.89386` and froze a 4,096-site Q/K-only circuit, but the unchanged circuit failed causal validation in `2026-07-30/#02`: suppression increased rather than decreased the correct-minus-source margin, the frozen effect was smaller than the 100 layer-route-matched random controls, and only the restoration gate passed. ARC is therefore a valid auxiliary negative result, and its held-out test was not opened. The matched dense Transformer 400M target and exact committed step `76293` were pre-effect frozen in `2026-07-30/#03`; the first C4 attempt in `2026-07-30/#04` remains an operational non-result. The corrected, unchanged 10M-token C4 evaluation completed in `2026-07-30/#05`: dense CE `2.935893940` versus DAWN `2.940212858`, with identical eligible token count and a measured dense parameter count of `393,896,960`. The first zero-shot launch in `2026-07-30/#06` stopped before any task completed because `--no-install` found no `lm-eval`; it remains an operational non-result. The exact retry completed in `2026-07-30/#07`: dense six-task mean `0.459651965` versus DAWN `0.462872460`, a DAWN-minus-dense difference of `+0.003220495` (`+0.3220` percentage point), with every task, tokenizer, dataset, harness, software, batch, and mesh contract exactly matched. The matched 400M performance track is complete and supports performance retention without a formal equivalence or superiority claim. DAWN 1.3B work remains sequential and selective, and no 1.3B baseline work is currently allowed.
 - v4175 40M POC state: accepted `spatial-r1-v4.1.7.5` shared-atlas source is integrated on `codex/v4167-poc` at exact commit `4da8bd8891fb1413ffb8570241ab817a9791a8e5`, with no compatibility version or migration path. One shared eight-space atlas owns `operation_space_keys [M,R]`, `space_read_proj`, and `space_write_proj`; Q, K, V, and RST retain independent query projections, independently choose top-2 atlas entries, and retain separate tau maps and operator banks. Current config commit `4fe89796c6960c7a8e6fb8715a24daf7d4720041` uses QK/V/RST denominator powers `0.5/0.8/1.0`, initial active targets approximately `67/67/207/600`, and scratch root `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_shared_keys_40M_c4_5B_den_modify`. The exact tree is 40,341,088 parameters, 2,528 (`0.00627%`) below the 40,343,616 Transformer reference.
 - v4175 evidence boundary: repository-local Python/JAX/Flax `3.12.7/0.6.2/0.10.7` compilation, abstract-tree/symbolic-count, shared-key and independent-route selection, legacy-checkpoint rejection, reduced JIT forward/backward, complete selector metrics, and focused v4174 regression checks passed. User-provided TPU v4-4 observations through step 100 show that `0.5/0.8/1.0` avoids the all-`0.5` RST gain spike and improves early loss, but route-space concentration and attention/residual growth remain under observation. The exact TPU resource, deployed commit, generated run folder, checkpoint step, compile/HBM, step time, and throughput were not provided or independently measured in this reporting turn; no TPU command was run.
 - Publication state: accepted QKV+RST outer analytic-pullback source is integrated by merge commit `62417b239d5b79c5dfa8684563532958ed212385` on `codex/v4167-poc`. User-approved QK/V/RST initializer target fractions `0.08/0.08/0.05` are integrated by merge commit `bb2a3ada9a0c281df9439043162dde8045d62bfd` and measured at clean POC commit `ae12416b40607ef8dd21fe79a64d86b4335e18b3`. Generation-`g5` registry and the rejected matched chunk4 report are centralized by POC commit `4e896c00b63f9b0523bb95ebe8357c37cc824740`. The chunk4 source remains only on `codex/v4174-g4-frac885-rst-chunk4` at `a3879f21dcd3b786bdc2cde270bcca2a382796a4`.
@@ -16,8 +16,8 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
 - Current conclusion: use generation `g5` with RST chunk8 for production. The matched chunk4 candidate produced `0.634587` s combined F+B (`0.9222%` slower than the matched chunk8 control) and failed the mandatory `0.565677` s gate. Its full-step mean was `8.923707` s/it, only `0.2242%` faster than chunk8 and below the required `2%`; p90 was `0.2863%` worse. The noise-level mean does not override the failed gates, so chunk4 is rejected.
 - Baseline state: `docs/v4174_dense_rw_baselines.yaml` generation `g5` is active for QK/V/RST fractions `0.08/0.08/0.05` and chunks `1/1/2/8`. Generation `g4` is superseded historical evidence under the prior initializer fingerprint; generations `g1` through `g3` remain historical.
 - Last verified v4174 production state (2026-07-27): fresh generation-`g5` production was running on the then-explicitly-authorized existing TPU `spatial-se-400m` from exact POC commit `4e896c00`. The GCS run folder is `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4174_400M_c4_20B_v4_64/run_vspatial-r1-v4.1.7.4_20260727_002935_3201`; all eight workers then retained one `scripts/train_jax.py --from-scratch` process in `tmux train`. Step 20 was finite at loss `9.3893`, and its latest 10-step timing window was `8.530` s/it (`61,343.2` tokens/s). No live status refresh was authorized or performed for this v4175 task.
-- Current blocker: no IOI infrastructure blocker. The final IOI held-out artifact used clean analysis commit `75b0e0157bce670d1ca6f7801a8393014ce09ffb`, checkpoint step `76293`, mesh `16x2`, frozen-spec hash `6ec2661823bb52aa3bc336fb69fed1eef317f9cced02f836eaaade8c116a418c`, and result root ending `20260729T123731Z-3cb89374`; all preregistered test gates passed. RAVEL is blocked from confirmatory work by its discovery specification: every variable missed the `0.80` stability gate and no audited prefix jointly reached cumulative importance `0.70` and split overlap `0.95`. ARC is blocked from held-out test by its frozen validation result rather than by infrastructure: suppression and frozen-minus-control both failed in the opposite direction, so the preregistered protocol does not permit test access. The matched dense Transformer 400M C4 row is complete; the remaining 400M paper-performance blocker is its unchanged unlimited six-task zero-shot row.
-- Next experiment: complete and audit the active exact independent dense zero-shot retry at result root ending `20260729T155031Z-89157be7`. It uses clean commit `5f6abc6a42020bcb2f9729afc240c6541660b238`, target `baseline_jax_400m`, preset `zero_shot`, checkpoint step `76293`, and the unchanged task set, harness, batch, mesh, seed, and protocol. Do not run any mechanistic item on the dense baseline.
+- Current blocker: no IOI infrastructure blocker. The final IOI held-out artifact used clean analysis commit `75b0e0157bce670d1ca6f7801a8393014ce09ffb`, checkpoint step `76293`, mesh `16x2`, frozen-spec hash `6ec2661823bb52aa3bc336fb69fed1eef317f9cced02f836eaaade8c116a418c`, and result root ending `20260729T123731Z-3cb89374`; all preregistered test gates passed. RAVEL is blocked from confirmatory work by its discovery specification: every variable missed the `0.80` stability gate and no audited prefix jointly reached cumulative importance `0.70` and split overlap `0.95`. ARC is blocked from held-out test by its frozen validation result rather than by infrastructure: suppression and frozen-minus-control both failed in the opposite direction, so the preregistered protocol does not permit test access. The matched 400M C4 and zero-shot rows are complete. The remaining paper-performance blocker is DAWN-SRW v4172 1.3B exact-step resolution and same-protocol C4/zero-shot evaluation; selected 1.3B IOI replication remains downstream of that performance gate.
+- Next experiment: resolve one committed numeric checkpoint from the registered DAWN-SRW v4172 1.3B run, verify its exact config, parameter count, training-token count, mesh, and clean restore, then freeze the same 10M-token C4 and unlimited six-task zero-shot protocols before any performance effect is read. Do not evaluate the still-training baseline-JAX 1.3B run.
 
 ## Paper Writing Ledger
 
@@ -59,7 +59,7 @@ contain raw per-example vectors.
 
 | Claim | Required evidence | Current status | Manuscript wording now allowed |
 |---|---|---|---|
-| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | Matched DAWN/dense 400M C4 complete with CE difference `0.004319`; dense zero-shot pending | Claim matched C4 retention at 400M; do not yet claim full benchmark parity |
+| A. Performance retention | Matched C4 validation and six-task zero-shot versus dense 400M | Complete: DAWN CE is `0.004319` above dense and six-task mean is `0.3220` percentage point above dense | Claim matched 400M performance retention; do not claim formal equivalence or superiority |
 | B. Causal RW unit | Localized operators, suppression, matched controls, restoration, held-out confirmation | IOI discovery localization, independent validation, and fully held-out test all passed; every suppression/control/restoration gate passed | Claim that the discovery-frozen Q/K-centered RW operator circuit is causally necessary for IOI computation and recoverable on independent validation and held-out test |
 | C. Reusable circuit | Discovery/confirmatory separation and transfer to matched held-out inputs with negative controls | The same frozen IOI circuit generalized to independent validation and held-out inputs; preregistered RAVEL discovery was unstable and froze no variable circuit, so transfer was not eligible | Claim held-out reuse of the frozen IOI circuit across inputs; do not claim variable-level transfer |
 | D. Scale replication | 1.3B performance and selected causal effect with the same control design | DAWN 1.3B checkpoint available; evaluation pending | Describe the planned replication only |
@@ -69,7 +69,7 @@ contain raw per-example vectors.
 | Model | Parameters | Training tokens | Checkpoint state | Paper role |
 |---|---:|---:|---|---|
 | DAWN-SRW v4172 400M | `393,800,708` measured | `39,999,504,384` in the evaluation manifest | Step `76,293` resolved, restored, parity-validated, C4 and zero-shot measured | Discovery model, full mechanistic analysis, primary causal result |
-| Dense Transformer 400M | `393,896,960` measured | `39,999,504,384` in step-76,293 metadata | Step `76,293` restored; C4 measured, zero-shot pending | Matched 400M performance control |
+| Dense Transformer 400M | `393,896,960` measured | `39,999,504,384` in step-76,293 metadata | Step `76,293` restored; C4 and zero-shot measured | Matched 400M performance control |
 | DAWN-SRW v4172 1.3B | `1,272,038,404` configured; restore verification pending | `20B` configured | User-designated run available; exact numeric step/evaluation pending | Larger-scale performance and selected causal replication |
 | Dense Transformer 1.3B | Pending completed training | `20B` configured | Training in progress; excluded by user decision | No current paper result |
 
@@ -112,10 +112,11 @@ The configured dense control uses the same C4 40B data, seed 1, global batch
 1,024, sequence length 512, 18 layers, dropout 0, mesh `16x2`, learning rate
 `3e-4`, 8% warmup, and weight decay `0.1`. Its architecture is width 1,280,
 FFN width 5,120, and 20 attention heads. The restored dense checkpoint contains
-`393,896,960` parameters, only `96,252` (`0.0244%`) above the DAWN checkpoint,
-and its exact numeric step and full C4 validation are complete. The identical
-zero-shot protocol and tokenizer contract still must complete before a full
-DAWN-versus-dense benchmark statement.
+`393,896,960` parameters, only `96,252` (`0.0244%`) above the DAWN checkpoint.
+Its exact numeric step, full C4 validation, and unlimited six-task zero-shot
+evaluation are complete. The two zero-shot manifests match exactly on protocol,
+software, tokenizer, task configuration hashes, dataset fingerprints, batch,
+length buckets, mesh, and task limits.
 
 ### Evaluation protocol locked for paper tables
 
@@ -130,7 +131,7 @@ DAWN-versus-dense benchmark statement.
   ARC-Challenge; raw accuracy for LAMBADA and WinoGrande; LAMBADA perplexity is
   reported separately. Every accuracy includes its standard error.
 - `limit=1` executions are parity-only and must never populate a paper
-  performance table. The eligible v4172 400M run has `limit=null`,
+  performance table. Both eligible 400M runs have `limit=null`,
   `smoke_test_only=false`, all six tasks complete, and `comparable=true`.
 
 ### Table-ready matched 400M C4 validation
@@ -149,8 +150,8 @@ batching, token count, sequence length, checkpoint step, training-token count,
 and `16x2` mesh. Relative to dense, DAWN CE is higher by `0.004318918`
 (`0.1471%` of dense CE), perplexity is higher by `0.081537182`, and token
 accuracy is lower by `0.002188432` absolute (`0.2188` percentage point). This
-supports matched C4 performance retention; zero-shot remains a separate
-pending comparison.
+supports matched C4 performance retention and is interpreted jointly with the
+completed zero-shot comparison below.
 
 The paper-eligible C4 result root is
 `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_c4_validation_20260729T044410Z-37fa6082`.
@@ -187,6 +188,49 @@ fingerprint, protocol, and source identity, and `items/zero_shot/*.json` for
 per-task evidence. This run used clean evaluation commit
 `623eaee8fc30471db809cb7093d3ed28594bff35`.
 
+### Table-ready dense Transformer 400M performance
+
+| Benchmark | Split (`n`) | Metric | Score | Standard error |
+|---|---:|---|---:|---:|
+| LAMBADA OpenAI | test (`5,153`) | accuracy | `0.353192315` | `0.006658943` |
+| LAMBADA OpenAI | test (`5,153`) | perplexity | `24.004181895` | `0.807297727` |
+| HellaSwag | validation (`10,042`) | normalized accuracy | `0.457080263` | `0.004971364` |
+| PIQA | validation (`1,838`) | normalized accuracy | `0.698041349` | `0.010711733` |
+| ARC-Easy | test (`2,376`) | normalized accuracy | `0.475589226` | `0.010247549` |
+| ARC-Challenge | test (`1,172`) | normalized accuracy | `0.249146758` | `0.012639407` |
+| WinoGrande | validation (`1,267`) | accuracy | `0.524861878` | `0.014035103` |
+| Six-task aggregate | six primary accuracy metrics | arithmetic mean | `0.459651965` | not aggregated |
+
+The paper-eligible dense zero-shot result root is
+`gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/side_analysis/run_analysis_000000076293_zero_shot_20260729T155031Z-89157be7`.
+The backend host-result hash is
+`e941f5115a99ed3dd53c3c883a4e896eaa4eeda60ebcba819788e2eb7a37b99c`;
+`results_summary.json` and its backend `run_manifest.json` have SHA-256
+`31661e30f3c8780ae9e29f96949aa321e9c68271c789e121d6a132a479e37247`
+and `b32eeab6e787889828e1181fa0594783de0ad71dd2f88b6613c6c4f294ff7507`.
+The run used clean evaluation commit
+`5f6abc6a42020bcb2f9729afc240c6541660b238`.
+
+### Matched 400M zero-shot comparison
+
+| Primary metric | DAWN-SRW | Dense Transformer | DAWN minus dense |
+|---|---:|---:|---:|
+| LAMBADA accuracy | `0.352027945` | `0.353192315` | `-0.001164370` |
+| HellaSwag normalized accuracy | `0.458374826` | `0.457080263` | `+0.001294563` |
+| PIQA normalized accuracy | `0.712187160` | `0.698041349` | `+0.014145811` |
+| ARC-Easy normalized accuracy | `0.484006734` | `0.475589226` | `+0.008417508` |
+| ARC-Challenge normalized accuracy | `0.256825939` | `0.249146758` | `+0.007679181` |
+| WinoGrande accuracy | `0.513812155` | `0.524861878` | `-0.011049724` |
+| Six-task mean | `0.462872460` | `0.459651965` | `+0.003220495` |
+
+The maximum absolute task difference is `0.014145811` (`1.4146` percentage
+points). DAWN is higher on four primary metrics and dense is higher on two;
+the mean favors DAWN by `0.3220` percentage point. LAMBADA perplexity is
+`24.077383687` for DAWN and `24.004181895` for dense. These descriptive
+matched results support performance retention. No equivalence margin or
+model-superiority test was preregistered, so they do not establish statistical
+equivalence or superiority.
+
 ### Manuscript-ready performance result
 
 At the fixed step-76,293 checkpoint, the 393.8M-parameter DAWN-SRW model
@@ -195,10 +239,13 @@ accuracy 42.49% over 9.97M valid target tokens. On the six stock zero-shot
 tasks, it obtained mean accuracy 46.29%, with its strongest absolute result on
 PIQA (71.22%) and lower results on ARC-Challenge (25.68%) and LAMBADA
 (35.20%). These measurements establish that the checkpoint is a functioning
-language model suitable for causal analysis. The matched dense C4 row now
-supports 400M C4 performance retention: DAWN differs from dense by `+0.004319`
-CE and `-0.2188` percentage point token accuracy. Full benchmark parity remains
-unresolved until the dense six-task zero-shot row completes.
+language model suitable for causal analysis. Against the 393.9M-parameter
+dense control trained for the same 39,999,504,384 tokens, DAWN differs by
+`+0.004319` C4 CE and `-0.2188` percentage point token accuracy, while its
+six-task zero-shot mean is `+0.3220` percentage point higher. The largest
+absolute task difference is `1.4146` percentage points. This supports matched
+400M language-model performance retention alongside the causal analysis; it is
+not a formal statistical equivalence or superiority result.
 
 ### Mechanistic screening result and locked causal design
 
@@ -499,11 +546,11 @@ closed and must not be opened under this frozen protocol.
 
 | Output | Required content | Current evidence source |
 |---|---|---|
-| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; DAWN 400M from `2026-07-29/#03/#05/#06`, dense 400M from `2026-07-30/#03/#05`; 1.3B pending |
+| Table 1: model/training specification | Parameters, tokens, dimensions, pools, tokenizer, training conditions | This ledger; DAWN 400M from `2026-07-29/#03/#05/#06`, dense 400M from `2026-07-30/#03/#05/#07`; 1.3B pending |
 | Table 2: C4 validation | Loss, perplexity, token accuracy for DAWN/dense 400M and DAWN 1.3B | Matched 400M rows complete in `2026-07-29/#06` and `2026-07-30/#05`; DAWN 1.3B pending |
-| Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | DAWN 400M row complete in `#05`; comparison rows pending |
+| Table 3: zero-shot | Six tasks, mean, standard errors, model comparison | Matched 400M rows complete in `2026-07-29/#05` and `2026-07-30/#07`; DAWN 1.3B pending |
 | Figure 1: architecture | State -> route query -> selected RW read/write composition -> attention/RST residual update | v4172 method specification above |
-| Figure 2: performance | C4 and benchmark comparison with uncertainty | Matched 400M C4 complete; DAWN 400M zero-shot complete; dense zero-shot and 1.3B pending |
+| Figure 2: performance | C4 and benchmark comparison with uncertainty | Matched 400M C4 and zero-shot complete; DAWN 1.3B pending |
 | Figure 3: circuit localization | Layer x operator discovery contribution, split overlap, trajectory, held-out overlap | IOI localization/validation/test complete in `2026-07-29/#09/#17/#20`; RAVEL discovery negative in `2026-07-29/#22`; ARC localization passed in `2026-07-29/#24` but validation was negative in `2026-07-30/#02` |
 | Figure 4: causal intervention | Intact, suppressed, matched control, restored | IOI validation and held-out test panels complete in `2026-07-29/#17/#20`; ARC negative validation may be shown as an auxiliary contrast from `2026-07-30/#02` |
 | Figure 5: transfer | Source circuit, matched target, paraphrased target, negative control | RAVEL transfer not eligible because `#22` froze no variable circuit; no transfer claim |
@@ -514,10 +561,12 @@ closed and must not be opened under this frozen protocol.
 - Supported now: the exact v4172 400M checkpoint restores reproducibly; the
   production and analysis forwards agree within `3.31e-7` CE; the locked
   10M-token C4 validation and full unlimited stock six-task results above are
-  reproducible and paper-eligible; the matched dense 400M C4 row is complete
-  and supports C4 performance retention within `0.004319` CE; and IOI, MCQA,
-  ARC, and RAVEL have enough paired-correct independent examples for mechanistic follow-up under the
-  preregistered threshold. IOI has a stable discovery aggregate operator
+  reproducible and paper-eligible; the matched dense 400M C4 and zero-shot rows
+  are complete and support performance retention within `0.004319` CE and
+  `0.3220` percentage point mean zero-shot accuracy; and IOI, MCQA, ARC, and
+  RAVEL have enough paired-correct independent examples for mechanistic
+  follow-up under the preregistered threshold. IOI has a stable discovery
+  aggregate operator
   ranking, a frozen 4,096-site intervention specification, and independently
   confirmed validation/test causal evidence from suppression, all four matched
   controls, and exact restoration. RAVEL has a valid negative discovery result
@@ -525,9 +574,10 @@ closed and must not be opened under this frozen protocol.
   valid negative frozen validation result: suppression and control separation
   failed in the opposite direction, restoration passed, and test stayed closed.
 - Not supported: auxiliary ARC causal replication or variable-level transfer.
-  Not supported yet: full matched dense benchmark parity, matched dense
-  zero-shot retention, IOI trajectory confirmation, scale replication,
-  pruning-quality tradeoffs, or hardware speedup.
+  Formal dense equivalence or superiority is not supported because no such
+  inferential margin/test was preregistered. Not supported yet: IOI trajectory
+  confirmation, scale replication, pruning-quality tradeoffs, or hardware
+  speedup.
 - Do not infer a full validation loss from the Phase 0 fixed batch or from a
   training-log summary. Do not use `limit=1` task scores.
 - Do not call 400M-to-1.3B a scaling curve. Do not include baseline 1.3B until
@@ -1533,6 +1583,17 @@ closed and must not be opened under this frozen protocol.
 - Evidence: result root `gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/side_analysis/run_analysis_000000076293_zero_shot_20260729T154705Z-be365a8a`; its only objects are `run_manifest.json` and `summary.log`. Downloaded audit copies had SHA-256 `e18fc3cfe0c81906f40060057596b6787cf7020786560c42e9cdf9547c1c8157` and `61f57d39011f36c03d67e87c8eaf0cd82540b5ca226348b962e9dbe94cbbfdbd`.
 - Correction/retry: use the launcher's existing dependency path, which pins `requirements_zero_shot_eval.txt` and reasserts JAX/Flax/Optax/NumPy `0.6.2/0.10.7/0.2.8/2.2.6` independently on all eight hosts before starting `tmux train`. Do not change the checkpoint, tasks, task limit, scoring metrics, harness version, tokenizer, batch, mesh, seed, or protocol. Start a new independent run rather than resuming the failed root.
 - Live retry boundary: the exact independent retry root ends `run_analysis_000000076293_zero_shot_20260729T155031Z-89157be7` and still uses clean commit `5f6abc6a42020bcb2f9729afc240c6541660b238`. At the time this incident record was written, all host version assertions, exact checkpoint restore, tokenizer hash, and 16,352-target-token adapter CE cross-check had passed; six-task scoring was active and no effect result was yet available.
+
+#### #07 — Complete the matched dense Transformer 400M six-task zero-shot row
+
+- Status/decision: `TPU measured; complete; comparable paper result`. The exact independent retry completed all six frozen stock tasks with `limit=null`, zero few-shot examples, `smoke_test_only=false`, and `comparable=true`. Accept this as the matched dense Transformer 400M zero-shot paper row and close the 400M performance-retention track.
+- Exact run identity: canonical branch `codex/v4167-poc`, exact clean deployed/evaluation commit `5f6abc6a42020bcb2f9729afc240c6541660b238`, existing user-authorized TPU `spatial-se-400m`, TPU v4-64 with 32 devices/eight hosts, mesh `data=16, model=2`, target `baseline_jax_400m`, model `baseline-JAX`, config `configs/train_config_baseline_tpu_400M_c4_40B_v4_64_tp2.yaml`, exact checkpoint step `76293`, 393,896,960 parameters, 39,999,504,384 pretraining tokens, checkpoint-config hash `c3ce5d7215388f18287658a7b6603fe00e0ea32c2ed84c6b625545c73a82fc25`, and restored parameter-identity hash `1ca4f147733c55539baa19e03b4362afcd4ff41216b2ac2a0faa19debce3d053`.
+- Frozen protocol/environment: `mamba_table3_zero_shot_v1`, stock `lm-eval==0.4.2`, global batch `32`, maximum length `512`, length buckets `64/128/256/512`, token-reduction chunk `32,768`, zero few-shot examples, no optimizer, and no checkpoint write. Software versions datasets/Flax/fsspec/gcsfs/huggingface-hub/JAX/jaxlib/lm-eval/Orbax/PyArrow/tokenizers/Transformers were `2.19.2/0.10.7/2024.3.1/2024.3.1/0.36.2/0.6.2/0.6.2/0.4.2/0.11.24/20.0.0/0.19.1/4.40.2`; `working_tree_clean=true`. The 16,352-target-token adapter cross-check differed from the canonical evaluator by `1.8859737771492746e-7`, below tolerance `5e-5`.
+- Dense result: LAMBADA accuracy `0.3531923151562197 +/- 0.006658942751641765` and perplexity `24.004181895276243 +/- 0.8072977273791623`; HellaSwag normalized accuracy `0.4570802628958375 +/- 0.004971364031062592`; PIQA normalized accuracy `0.6980413492927094 +/- 0.010711732891588357`; ARC-Easy normalized accuracy `0.47558922558922556 +/- 0.010247548905242267`; ARC-Challenge normalized accuracy `0.24914675767918087 +/- 0.012639407111926435`; WinoGrande accuracy `0.5248618784530387 +/- 0.01403510288362775`. The six-task primary-metric mean is `0.45965196484436865`.
+- Exact matched audit: the DAWN and dense backend manifests are identical for batch, checkpoint mesh, task limit, lm-eval version, maximum sequence length, effective mesh, zero-shot count, protocol name/version, every task-config hash, task list/order, token chunk, vocab size, complete tokenizer object, complete dataset fingerprint/revision object, and complete software-version object. Their only unequal top-level fields are the expected model/checkpoint/result identities, timestamps, known validation loss, and validation cross-check values.
+- Matched comparison: DAWN six-task mean `0.46287245964071566` exceeds dense by `0.0032204947963470065` (`0.322049` percentage point). DAWN-minus-dense task differences are LAMBADA `-0.001164370269745807`, HellaSwag `+0.0012945628360884198`, PIQA `+0.014145810663764968`, ARC-Easy `+0.008417508417508435`, ARC-Challenge `+0.007679180887372017`, and WinoGrande `-0.011049723756906049`; the maximum absolute difference is `1.414581` percentage points. Dense LAMBADA perplexity is lower by `0.07320179152326745`. Jointly with `2026-07-30/#05`, these matched descriptive results support 400M performance retention, not formal equivalence or superiority.
+- Evidence/storage: result root `gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201/side_analysis/run_analysis_000000076293_zero_shot_20260729T155031Z-89157be7`; backend host-result hash `e941f5115a99ed3dd53c3c883a4e896eaa4eeda60ebcba819788e2eb7a37b99c`; `results_summary.json` SHA-256 `31661e30f3c8780ae9e29f96949aa321e9c68271c789e121d6a132a479e37247`; backend `run_manifest.json` SHA-256 `b32eeab6e787889828e1181fa0594783de0ad71dd2f88b6613c6c4f294ff7507`; outer `summary.json` SHA-256 `e1ccfb998760ce37463a28cde470129fc6dba464e4ad4287eb60026b131ece15`. The root contains 13 aggregate objects totaling 65,359 bytes, all six items are `ready`, artifact warnings are empty, and manifests record `sample_records_persisted=false`, `harness_raw_persisted=false`, `raw_parameters_persisted=false`, and `dense_capture_rows_persisted=false`. The post-run all-host audit returned the same exact commit, zero tracked changes, zero remaining analysis owners, and zero matches for traceback/failure/fatal patterns on every host.
+- Decision/next: freeze these matched 400M rows for the paper. Do not retune, rerun, or reinterpret IOI/RAVEL/ARC from the performance result. Proceed sequentially to exact numeric-step resolution and same-protocol C4/zero-shot performance evaluation of the registered DAWN-SRW v4172 1.3B run; baseline-JAX 1.3B remains excluded while training.
 
 ## Backfill Boundary
 
