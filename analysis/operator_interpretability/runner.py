@@ -905,13 +905,11 @@ class OperatorInterpretabilityRunner:
         self._print(
             "TRAIN_ANALYSIS_POOL frozen_ioi phase=validation "
             "stage=behavioral_eligibility status=running")
-        validation_rows = load_benchmark_examples(
-            self.build, "mib_ioi", phase="validation")
-        validation_rows.sort(key=lambda example: (
-            canonical_hash(example.example_id), example.example_id))
+        validation_rows = self._load_phase_examples(
+            "mib_ioi", "validation")
         if len(validation_rows) != FROZEN_IOI_VALIDATION_ROW_COUNT:
             raise ValueError(
-                "frozen IOI validation shard row count drift: "
+                "frozen IOI canonical validation selection count drift: "
                 f"expected={FROZEN_IOI_VALIDATION_ROW_COUNT} "
                 f"actual={len(validation_rows)}")
         behavior = evaluate_behavior(
@@ -928,7 +926,6 @@ class OperatorInterpretabilityRunner:
                 "frozen IOI paired-correct validation count drift: "
                 f"expected={FROZEN_IOI_VALIDATION_PAIRED_CORRECT_COUNT} "
                 f"actual={len(known_correct)}")
-        self._examples.setdefault("mib_ioi", {})["validation"] = validation_rows
         eligible_example_ids_hash = canonical_hash([
             example.example_id for example in known_correct
         ])
@@ -1239,7 +1236,9 @@ class OperatorInterpretabilityRunner:
                 "layers_or_routes_changed": False,
             },
             "validation_cohort": {
-                "physical_row_count": len(validation_rows),
+                "runtime_selected_row_count": len(validation_rows),
+                "selection_rule": (
+                    "canonical_hash_example_id_then_example_id_first_128"),
                 "paired_correct_independent_count": len(known_correct),
                 "paired_correct_example_ids_hash": (
                     eligible_example_ids_hash),
