@@ -514,7 +514,8 @@ def _build_context(
         sharded_fns_analysis = {
             profile: create_or_reuse_sharded_fns(
                 config, mesh, analysis=False, kernel_profile=profile)
-            for profile in ("retention", "suppression")
+            for profile in (
+                "production_diagnostics", "retention", "suppression")
         }
     steps_per_epoch = int(checkpoint_metadata.get("steps_per_epoch") or 0)
     num_epochs = int(config.get("training", {}).get("num_epochs") or 0)

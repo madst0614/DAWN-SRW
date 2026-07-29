@@ -49,6 +49,17 @@ def _runtime_kwargs(
         ctx: Any, *, kernel_profile: str = "production") -> dict[str, Any]:
     cfg = ctx.model_cfg
     kernel_profile = str(kernel_profile).strip().lower()
+    runtime_profiles = {
+        "production": "training",
+        "production_diagnostics": "diagnostics",
+        "retention": "retention",
+        "suppression": "suppression",
+        "trajectory": "trajectory",
+    }
+    if kernel_profile not in runtime_profiles:
+        raise ValueError(
+            f"unknown analysis kernel profile {kernel_profile!r}; "
+            f"expected one of {tuple(runtime_profiles)}")
     if kernel_profile == "production":
         sharded_fns = ctx.sharded_fns
     else:
@@ -80,6 +91,7 @@ def _runtime_kwargs(
         "deterministic": True,
         "rngs": {"dropout": jax.random.PRNGKey(0)},
         "sharded_fns": sharded_fns,
+        "minimal_runtime_profile": runtime_profiles[kernel_profile],
         "analysis": False,
         "soft_gate_temperature": temperature,
         "soft_gate_t_final": float(cfg.get("soft_gate_t_final", temperature)),
@@ -196,10 +208,11 @@ def _plain_score_executable(
     if cache is None:
         cache = {}
         setattr(ctx, "_operator_interpretability_executables", cache)
-    key = ("plain_score", "production", normalization)
+    key = ("plain_score", "production_diagnostics", normalization)
     if key in cache:
         return cache[key]
-    kwargs = _runtime_kwargs(ctx, kernel_profile="production")
+    kwargs = _runtime_kwargs(
+        ctx, kernel_profile="production_diagnostics")
 
     @jax.jit
     def score(params, input_ids, labels):
