@@ -120,5 +120,6 @@ training:
   # Keep expensive diagnostics outside the training hot path.
   log_analysis_multiplier: 1000000
   heavy_geometry_multiplier: 1000000
+  eval_effective_prune_enabled: false
 
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4175_40M_c4_5B
