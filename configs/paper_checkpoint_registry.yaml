@@ -1,0 +1,47 @@
+schema_version: 1
+
+# User-designated default checkpoint run roots for paper planning and future
+# evaluation setup. This registry is descriptive only: it does not select an
+# experiment, resolve a numeric Orbax step, or authorize access to any TPU.
+defaults:
+  dawn_srw:
+    v4172_400m:
+      family: dawn_srw
+      model_version: spatial-r1-v4.1.7.2
+      scale: 400m
+      train_tokens: 40000000000
+      availability: available
+      paper_role: primary_performance_and_mechanistic_model
+      config: configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+      checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201
+
+    v4172_1p3b:
+      family: dawn_srw
+      model_version: spatial-r1-v4.1.7.2
+      scale: 1p3b
+      train_tokens: 20000000000
+      availability: available
+      paper_role: scale_performance_and_selected_mechanistic_replication
+      config: configs/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+      checkpoint: gs://dawn-tpu-data-c4/checkpoints/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260717_173556_3201
+
+  baseline:
+    baseline_jax_400m:
+      family: baseline
+      model_version: baseline-JAX
+      scale: 400m
+      train_tokens: 40000000000
+      availability: available
+      paper_role: matched_400m_performance_control
+      config: configs/train_config_baseline_tpu_400M_c4_40B_v4_64_tp2.yaml
+      checkpoint: gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201
+
+    baseline_jax_1p3b:
+      family: baseline
+      model_version: baseline-JAX
+      scale: 1p3b
+      train_tokens: 20000000000
+      availability: training_in_progress
+      paper_role: excluded_until_training_completes
+      config: configs/train_config_baseline_tpu_1p3B_c4_20B_v4_64.yaml
+      checkpoint: gs://dawn-tpu-data-c4/checkpoints/baseline_jax_1p3B_c4_20B_v4_64/run_vbaseline-JAX_20260729_093206_3201

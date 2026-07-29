@@ -7,6 +7,23 @@
 - The shared repository is `madst0614/DAWN-SRW`. Record the exact branch, commit, config, checkpoint, mesh, and dirty-worktree state for every material experiment; never rely on a moving branch name alone.
 - Keep every TPU launcher and watcher on tmux session `train` and remote log `~/train.log`. Do not add per-task session/log names or `--session`/`--log` override options. Clear and start `~/train.log` before remote repo/dependency setup, capture setup failures there, and append the tmux task stream with combined stdout/stderr so `tail -f ~/train.log` never shows a stale prior run.
 
+## Default paper checkpoints
+
+- The machine-readable registry is `configs/paper_checkpoint_registry.yaml`.
+- Treat the following user-designated GCS run roots as the default checkpoints
+  for paper planning and future evaluation setup:
+  - DAWN-SRW v4172 400M:
+    `gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201`
+  - DAWN-SRW v4172 1.3B:
+    `gs://dawn-tpu-data-c4/checkpoints/train_config_v4172_1p3B_c4_20B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260717_173556_3201`
+  - baseline-JAX 400M:
+    `gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_v4_64/run_vbaseline-JAX_20260713_194029_3201`
+  - baseline-JAX 1.3B:
+    `gs://dawn-tpu-data-c4/checkpoints/baseline_jax_1p3B_c4_20B_v4_64/run_vbaseline-JAX_20260729_093206_3201`
+- This registry is descriptive only. A run must still resolve and record one
+  committed numeric checkpoint step. These paths do not choose, authorize,
+  create, resize, or otherwise grant access to any TPU resource.
+
 ## Canonical POC integration policy
 
 - `codex/v4167-poc` is the canonical integration branch and canonical baseline-source branch for all POC work.
