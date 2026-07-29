@@ -80,6 +80,32 @@ def _discovery_split_assignments(
     if len(benchmark_ids) != 1:
         raise ValueError("capture split requires exactly one benchmark")
     benchmark_id = next(iter(benchmark_ids))
+    if benchmark_id == "mib_arc":
+        example_ids = [str(example.example_id) for example in examples]
+        if len(set(example_ids)) != len(example_ids):
+            raise ValueError(
+                "ARC discovery split requires unique independent example_id "
+                "units")
+        ordered_indices = sorted(
+            range(len(examples)),
+            key=lambda index: (
+                canonical_hash({
+                    "seed": int(seed),
+                    "benchmark_id": benchmark_id,
+                    "example_id": example_ids[index],
+                }),
+                example_ids[index],
+            ),
+        )
+        assignments = [0] * len(examples)
+        for rank, index in enumerate(ordered_indices):
+            assignments[index] = rank % 2
+        return (
+            assignments,
+            "seeded_balanced_example_id_split",
+            {},
+            [assignments.count(0), assignments.count(1)],
+        )
     if benchmark_id != "ravel":
         assignments = [
             int(canonical_hash({

@@ -206,6 +206,19 @@ _register("ravel.discovery_operator_localization", _mechanistic_item(
     "ravel.input_contract",
     claim_role="checkpoint_specific",
     test_used=False))
+_register("mib_arc.discovery_operator_localization", _mechanistic_item(
+    "mib_arc", "arc_discovery_localization",
+    "ARC discovery-only operator-circuit localization",
+    "Which layer-route-operator sites carry the ARC answer-symbol "
+    "counterfactual on the 50 paired-correct independent discovery units?",
+    "Open discovery only; split the independent example_id units 25/25 by a "
+    "seeded balanced rule, require split-rank stability of at least 0.80, and "
+    "freeze the smallest audited prefix whose cumulative absolute importance "
+    "is at least 0.70 and split top-k overlap is at least 0.95. Validation and "
+    "test access are forbidden.",
+    "mib_arc.input_contract",
+    claim_role="auxiliary",
+    test_used=False))
 _register("ravel.operator_space_structure", _mechanistic_item(
     "ravel", "operator_space_structure", "RAVEL operator-space structure",
     "Do read/write maps form reproducible local functional families independent of address?",
@@ -279,6 +292,8 @@ TRAIN_ANALYSIS_POOL_PRESETS: dict[str, tuple[str, ...]] = {
         "mib_ioi.paired_operator_trajectory",),
     "ravel_discovery_localization": (
         "ravel.discovery_operator_localization",),
+    "arc_discovery_localization": (
+        "mib_arc.discovery_operator_localization",),
     "mib_ioi_circuit": _mib_circuit_preset("mib_ioi"),
     "mib_mcqa_circuit": _mib_circuit_preset("mib_mcqa"),
     "mib_arithmetic_circuit": _mib_circuit_preset("mib_arithmetic"),

@@ -1,0 +1,127 @@
+schema_version: 1
+status: preregistered_before_discovery_localization
+
+target:
+  target_id: v4172_400M
+  model_version: spatial-r1-v4.1.7.2
+  config: configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml
+  checkpoint_run: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201
+  checkpoint_step: 76293
+  checkpoint_identity: a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17
+  checkpoint_config_hash: 08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b
+  model_config_hash: 053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f
+
+discovery:
+  benchmark_id: mib_arc
+  phase: discovery
+  runtime_selected_row_count: 128
+  expected_paired_correct_independent_units: 50
+  independent_unit: example_id
+  localization_pair_type: symbol_counterfactual
+  benchmark_build_id: f056bb4f133cde4fc0ae02f9
+  benchmark_manifest_hash: f3fc05c12ac26c83e0cdf8089ef46bae7f26b517265545521605d767a8eafcb6
+  selection_uses_validation: false
+  selection_uses_test: false
+  validation_data_accessor_allowed: false
+  test_data_accessor_allowed: false
+  seed: 4172
+
+capture:
+  production_precision: true
+  target_position: official_last_prompt_token
+  capture_threshold: 0.95
+  initial_widths:
+    qk: 512
+    v: 2048
+    rst: 4096
+  maximum_widths:
+    qk: 2048
+    v: 8192
+    rst: 8192
+
+ranking:
+  score: absolute_discovery_mean_contribution_importance
+  denominator: qualified_rows_within_exact_layer_route
+  site_identity: [layer, route, operator_id]
+  routes: [q, k, v, rst]
+  tie_breaker: [layer, route, operator_id]
+  rank_stability:
+    split_rule: seeded_balanced_example_id_split
+    expected_split_independent_unit_counts: [25, 25]
+    threshold_minimum: 0.80
+  topk_overlap:
+    prefix_counts: [32, 64, 128, 256, 512, 1024, 2048, 4096]
+    metric: overlap_fraction_of_each_prefix
+
+circuit_freeze:
+  rule: smallest_audited_prefix_passing_both_discovery_gates
+  discovery_gates:
+    cumulative_absolute_importance_minimum: 0.70
+    split_topk_overlap_minimum: 0.95
+  no_passing_prefix_action: freeze_no_circuit
+  unstable_rank_action: freeze_no_circuit
+  route_presence_is_a_discovery_result: true
+  result_dependent_route_inclusion_forbidden: true
+  result_dependent_route_exclusion_forbidden: true
+  validation_may_change_circuit: false
+  test_may_change_circuit: false
+  operator_reselection_after_discovery: false
+
+confirmatory_protocol_if_frozen:
+  validation:
+    runtime_selected_row_count: 128
+    expected_paired_correct_independent_units: 51
+    conditions:
+      - intact
+      - frozen_circuit_suppression
+      - matched_random_control_x100
+      - exact_restoration
+  suppression:
+    mode: circuit_wide_execution_numerator_suppression
+    admission_denominator: full_production_denominator
+  matched_random_control:
+    replicate_count: 100
+    seed: 24172
+    match_fields: [layer, route]
+    match_exact_frozen_count_per_cell: true
+    sampling: uniform_without_replacement_within_layer_route_cell
+    sampling_population: frozen_site_complement
+    frozen_sites_excluded: true
+    duplicate_site_within_replicate_forbidden: true
+    control_site_set_hashes_must_be_unique: true
+  restoration:
+    mode: exact_selected_numerator_restore_after_suppression
+    admission_denominator: full_production_denominator
+    restored_values_source: same_example_intact_execution
+  score:
+    candidate_score: correct_minus_source_sum_log_probability
+    primary_effect: intact_margin_minus_suppressed_margin
+  statistics:
+    bootstrap_samples: 2000
+    permutation_samples: 2000
+    alpha: 0.05
+  validation_gates:
+    suppression_margin_drop_ci_low_above_zero: true
+    frozen_minus_matched_random_margin_drop_ci_low_above_zero: true
+    restoration_recovery_ci_low_minimum: 0.80
+  unrelated_output_damage:
+    role: selectivity_audit_only
+    threshold: null
+  held_out_test:
+    runtime_selected_row_count: 128
+    expected_paired_correct_independent_units: 57
+    opened_only_after_validation_record_is_final: true
+    validation_may_change_specification: false
+    same_frozen_sites: true
+    same_suppression: true
+    same_control_rule: true
+    same_restoration: true
+    same_thresholds: true
+
+storage:
+  preserve_aggregate_ranking: true
+  preserve_selected_prefix_and_identity_hashes: true
+  preserve_raw_per_example_behavior_vectors: false
+  preserve_raw_per_example_operator_vectors: false
+  preserve_raw_capture_rows: false
+  semantic_audit_after_run: true

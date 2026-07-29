@@ -16,6 +16,12 @@ from analysis.dawn_analysis_common import (
     git_info,
     materialize_global_array,
 )
+from analysis.operator_interpretability.arc_localization import (
+    ARC_DISCOVERY_PAIRED_CORRECT_COUNT,
+    ARC_DISCOVERY_ROW_COUNT,
+    build_arc_localization,
+    load_arc_discovery_spec,
+)
 from analysis.operator_interpretability.artifacts import (
     load_benchmark_examples,
     resolve_benchmark_build,
@@ -290,6 +296,7 @@ class OperatorInterpretabilityRunner:
         self._requested_items: tuple[str, ...] = ()
         self._paired_trajectory_test_isolated = False
         self._frozen_circuit_phase_isolated = False
+        self._arc_discovery_isolated = False
         self._ravel_discovery_isolated = False
 
     def _print(self, message: str) -> None:
@@ -641,6 +648,19 @@ class OperatorInterpretabilityRunner:
                 "dedicated input-contract item so split access remains "
                 "isolated")
         self._frozen_circuit_phase_isolated = frozen_circuit_requested
+        arc_discovery_item = "mib_arc.discovery_operator_localization"
+        arc_discovery_requested = arc_discovery_item in requested_set
+        arc_discovery_only_items = {
+            "mib_arc.input_contract",
+            arc_discovery_item,
+        }
+        if (arc_discovery_requested
+                and not requested_set <= arc_discovery_only_items):
+            raise ValueError(
+                "mib_arc.discovery_operator_localization must run only with "
+                "its input contract so validation and test access remain "
+                "forbidden")
+        self._arc_discovery_isolated = arc_discovery_requested
         ravel_discovery_item = "ravel.discovery_operator_localization"
         ravel_discovery_requested = ravel_discovery_item in requested_set
         ravel_discovery_only_items = {
@@ -717,6 +737,8 @@ class OperatorInterpretabilityRunner:
                 or self.results.get("frozen_circuit_test", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("frozen_circuit_validation", {}).get(
+                    "strongest_supported_claim")
+                or self.results.get("arc_discovery_localization", {}).get(
                     "strongest_supported_claim")
                 or self.results.get("ravel_discovery_localization", {}).get(
                     "strongest_supported_claim")
@@ -2941,6 +2963,244 @@ class OperatorInterpretabilityRunner:
             "test_used": False,
             "artifact_warnings": artifact_warnings,
             "human_summary": human_summary,
+        }
+
+    def _run_arc_discovery_localization(self) -> dict[str, Any]:
+        """Localize and freeze one ARC circuit without held-out access."""
+        if self._scope("arc_discovery_localization") != ("mib_arc",):
+            raise ValueError(
+                "ARC discovery localization is registered only for mib_arc")
+        if not self._arc_discovery_isolated:
+            raise RuntimeError(
+                "ARC discovery localization did not enter split-isolated "
+                "execution")
+
+        spec = load_arc_discovery_spec()
+        spec.validate_runtime(
+            target_id=str(self.ctx.model_info.get("target_id") or ""),
+            model_version=self.model_version,
+            checkpoint_step=int(self.ctx.checkpoint_step),
+            checkpoint_identity=str(self.contract["checkpoint_identity"]),
+            checkpoint_config_hash=str(
+                self.ctx.model_info.get("checkpoint_config_hash") or ""),
+            model_config_hash=str(self.contract["model_config_hash"]),
+            benchmark_build_id=self.build.build_id,
+            benchmark_manifest_hash=self.build.manifest_hash,
+            seed=self.config.seed,
+            max_examples_per_phase=self.config.max_examples_per_phase,
+            capture_threshold=self.config.capture_threshold,
+            capture_widths=(
+                self.config.capture_topk_qk,
+                self.config.capture_topk_v,
+                self.config.capture_topk_rst,
+                self.config.capture_max_topk_qk,
+                self.config.capture_max_topk_v,
+                self.config.capture_max_topk_rst,
+            ),
+            rank_stability_minimum=self.config.rank_stability_min,
+        )
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL arc_discovery "
+            "stage=behavioral_eligibility status=running")
+        phase_rows = self._load_phase_examples("mib_arc", "discovery")
+        if len(phase_rows) != ARC_DISCOVERY_ROW_COUNT:
+            raise ValueError(
+                "ARC discovery canonical row count drift: "
+                f"expected={ARC_DISCOVERY_ROW_COUNT} "
+                f"actual={len(phase_rows)}")
+        behavior = evaluate_behavior(
+            self.ctx, phase_rows,
+            pad_token_id=int(self.tokenizer.pad_token_id))
+        known_correct_mask = [
+            bool(value) for value in behavior["known_correct"]]
+        known_correct = [
+            example for example, keep in zip(
+                phase_rows, known_correct_mask)
+            if keep
+        ]
+        independent = self._independent_capture_examples(
+            "mib_arc", known_correct)
+        if len(independent) != ARC_DISCOVERY_PAIRED_CORRECT_COUNT:
+            raise ValueError(
+                "ARC discovery paired-correct independent-unit drift: "
+                f"expected={ARC_DISCOVERY_PAIRED_CORRECT_COUNT} "
+                f"actual={len(independent)}")
+        independent_ids = [str(example.example_id) for example in independent]
+        if len(set(independent_ids)) != len(independent_ids):
+            raise ValueError(
+                "ARC paired-correct discovery units must have unique "
+                "example_id values")
+        if any(
+                str(example.pair_type) != "symbol_counterfactual"
+                for example in independent):
+            raise ValueError(
+                "ARC discovery localization received an unexpected pair type")
+
+        behavior_vector_fields = (
+            "example_ids",
+            "base_positive_logp",
+            "base_negative_logp",
+            "base_margin",
+            "corrupted_margin",
+            "source_own_margin",
+            "source_behavior_scored",
+            "base_known_correct",
+            "source_known_correct",
+            "known_correct",
+        )
+        behavior_vector_payload = {
+            field: behavior[field] for field in behavior_vector_fields}
+        behavior_summary = {
+            "status": "ready",
+            "phase": "discovery",
+            "runtime_selected_row_count": len(phase_rows),
+            "known_correct_row_count": int(
+                behavior["known_correct_count"]),
+            "paired_correct_independent_unit_count": len(independent),
+            "independent_unit": "example_id",
+            "base_accuracy": float(behavior["accuracy"]),
+            "source_accuracy": behavior["source_accuracy"],
+            "pair_accuracy": float(behavior["pair_accuracy"]),
+            "mean_margin": float(behavior["mean_margin"]),
+            "mean_corrupted_margin": float(
+                behavior["mean_corrupted_margin"]),
+            "mean_source_own_margin": behavior["mean_source_own_margin"],
+            "runtime_selected_example_ids_hash": canonical_hash([
+                example.example_id for example in phase_rows]),
+            "known_correct_row_ids_hash": canonical_hash([
+                example.example_id for example in known_correct]),
+            "paired_correct_independent_unit_ids_hash": canonical_hash(
+                independent_ids),
+            "raw_behavior_vector_payload_hash": canonical_hash(
+                behavior_vector_payload),
+            "raw_behavior_vectors_persisted": False,
+        }
+        self._print(
+            "TRAIN_ANALYSIS_POOL arc_discovery "
+            "stage=behavioral_eligibility status=ready "
+            f"paired_correct={len(independent)}")
+
+        self._print(
+            "TRAIN_ANALYSIS_POOL arc_discovery "
+            "stage=operator_capture status=running")
+        capture = capture_discovery_candidates(
+            self.ctx, independent,
+            seed=self.config.seed,
+            retain_rows=False,
+            **self._capture_kwargs("mib_arc"))
+        ranked = [
+            dict(row) for row in capture.pop("ranked_sites", ())
+            if isinstance(row, Mapping)
+        ]
+        localization = build_arc_localization(
+            ranked,
+            capture=capture,
+            spec=spec,
+        )
+        raw_rows_materialized = bool(capture.pop(
+            "raw_rows_materialized_for_runtime", False))
+        capture.update({
+            "discovery_independent_example_count": len(independent),
+            "runtime_phase_cap": self.config.max_examples_for("mib_arc"),
+            "aggregate_ranked_site_count": len(ranked),
+            "aggregate_ranked_sites_content_hash": canonical_hash(ranked),
+            "aggregate_ranked_site_preview": ranked[:16],
+            "raw_capture_row_count": int(capture["total_row_count"]),
+            "raw_capture_rows_persisted": False,
+            "raw_capture_rows_used_transiently": raw_rows_materialized,
+            "raw_capture_retention": (
+                "aggregate_ranking_selected_prefix_and_identity_hashes"),
+        })
+
+        status = str(localization["status"])
+        circuit = dict(localization.get("circuit") or {})
+        if status == "ready":
+            decision = "arc_discovery_circuit_frozen"
+            strongest_claim = "arc_discovery_operator_circuit_frozen"
+        elif status == "unstable_localization":
+            decision = "no_validation_due_to_unstable_arc_localization"
+            strongest_claim = None
+        elif status == "no_preregistered_prefix":
+            decision = "no_validation_due_to_arc_discovery_freeze_rule_failure"
+            strongest_claim = None
+        else:
+            decision = "no_validation_due_to_arc_discovery_capture_failure"
+            strongest_claim = None
+        self._print(
+            "TRAIN_ANALYSIS_POOL arc_discovery "
+            f"stage=operator_capture status={status} "
+            f"rank_stability={localization.get('rank_stability', {}).get('rank_stability')} "
+            f"selected_k={circuit.get('selected_k', 0)} "
+            f"route_counts={circuit.get('selected_route_counts')}")
+
+        del ranked
+        gc.collect()
+        return {
+            "status": status,
+            "decision": decision,
+            "benchmark": "mib_arc",
+            "phase": "discovery",
+            "preregistered_specification": {
+                "path": spec.path,
+                "content_hash": spec.content_hash,
+                "status": spec.payload["status"],
+                "rank_stability_minimum": (
+                    spec.rank_stability_minimum),
+                "rank_stability_split_rule": (
+                    "seeded_balanced_example_id_split"),
+                "rank_stability_split_independent_unit_counts": [25, 25],
+                "audited_prefix_counts": list(spec.prefix_counts),
+                "cumulative_absolute_importance_minimum": (
+                    spec.cumulative_importance_minimum),
+                "split_topk_overlap_minimum": (
+                    spec.split_overlap_minimum),
+                "circuit_freeze_rule": (
+                    "smallest_audited_prefix_passing_both_discovery_gates"),
+                "result_dependent_route_changes_forbidden": True,
+                "matched_random_if_frozen": {
+                    "replicate_count": 100,
+                    "seed": 24172,
+                    "match_fields": ["layer", "route"],
+                    "sampling": (
+                        "uniform_without_replacement_within_layer_route_cell"),
+                    "sampling_population": "frozen_site_complement",
+                },
+                "suppression_if_frozen": (
+                    "circuit_wide_execution_numerator_suppression_with_"
+                    "full_production_denominator"),
+                "restoration_if_frozen": (
+                    "exact_selected_numerator_restore_from_same_example_"
+                    "intact_execution"),
+            },
+            "behavioral_eligibility": behavior_summary,
+            "capture": capture,
+            "localization": localization,
+            "confirmatory_eligible": status == "ready",
+            "split_isolation": {
+                "ranking_phase": "discovery",
+                "selection_phase": "discovery",
+                "validation_evaluated": False,
+                "validation_evaluation_count": 0,
+                "validation_data_accessor_called": False,
+                "test_evaluated": False,
+                "test_evaluation_count": 0,
+                "test_data_accessor_called": False,
+                "validation_used_for_selection": False,
+                "test_used_for_selection": False,
+                "validation_may_change_circuit": False,
+                "test_may_change_circuit": False,
+            },
+            "storage_audit": {
+                "aggregate_ranking_persisted": True,
+                "selected_prefix_and_identity_hashes_persisted": True,
+                "raw_per_example_behavior_vectors_persisted": False,
+                "raw_per_example_operator_vectors_persisted": False,
+                "raw_capture_rows_persisted": False,
+                "raw_parameters_persisted": False,
+                "dense_capture_persisted": False,
+            },
+            "strongest_supported_claim": strongest_claim,
         }
 
     def _run_ravel_discovery_localization(self) -> dict[str, Any]:
