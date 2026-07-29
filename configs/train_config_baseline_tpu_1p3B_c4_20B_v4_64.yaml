@@ -6,7 +6,7 @@ seed: 1
 data:
   bin_train: gs://dawn-tpu-data-c4/c4_train_40B
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
-  max_train_tokens: 40000000000
+  max_train_tokens: 20000000000
   max_val_tokens: 10000000
   local_cache_dir: /tmp/data
   evict_train_shard_cache: true
@@ -48,5 +48,4 @@ training:
 
 use_amp: true
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_jax_1p3B_c4_40B_v4_64_b512_trainonly
-log_dir: logs/baseline_jax_1p3B_c4_40B_v4_64_b512_trainonly
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_jax_1p3B_c4_20B_v4_64
