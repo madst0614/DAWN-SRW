@@ -220,8 +220,10 @@ if [[ "$DRY_RUN" == "1" ]]; then
     exit 0
 fi
 
-gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
+REMOTE_CMD_B64="$(printf '%s' "$REMOTE_CMD" | base64 | tr -d '\r\n')"
+REMOTE_WRAPPER="printf %s $REMOTE_CMD_B64 | base64 -d | bash"
+MSYS2_ARG_CONV_EXCL='*' gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
     --zone="$ZONE" --project="$PROJECT" --worker=all \
-    --command="$REMOTE_CMD"
+    --command="$REMOTE_WRAPPER"
 
 echo "PAPER COMPUTE launch complete"
