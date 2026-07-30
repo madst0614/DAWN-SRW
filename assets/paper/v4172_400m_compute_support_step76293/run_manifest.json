@@ -1,0 +1,107 @@
+{
+  "checkpoint": {
+    "c4_parameter_hash": "37039db095829caae9b2812d77947cedaf084f39d2f5ac36c0bf0138386cb8ca",
+    "checkpoint_config_hash": "08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b",
+    "checkpoint_dir": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/checkpoints",
+    "checkpoint_identity": "a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17",
+    "checkpoint_identity_record": {
+      "identity_algorithm": "resolved_path_step_run_metadata_and_parameter_schema",
+      "parameter_content_hash_included": false,
+      "parameter_schema_hash": "d5cbfc00422932c3921211ee4f00b001eb872b4f5382b13b4249311a478c41af",
+      "path": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/checkpoints",
+      "run_id": "run_vspatial-r1-v4.1.7.2_20260715_133004_3201",
+      "step": 76293,
+      "training_git_commit": "abed852efb4ff75c6ab00d647beb95edb5c41390"
+    },
+    "model_config_hash": "053a0b3d7cb8bdfffa2aa24441012b809dbd5f450728af6df0269645b266f52f",
+    "parameter_count": 393800708,
+    "resolved": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/checkpoints/000000076293",
+    "run_folder": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201",
+    "step": 76293
+  },
+  "completed_at": "2026-07-30T08:56:40.006474+00:00",
+  "execution": {
+    "analysis_code": {
+      "git_branch": "codex/v4167-poc",
+      "git_commit": "d229a246215a777e27a545ef6066422134a64b2c",
+      "git_dirty": false
+    },
+    "checkpoint_final_runtime": {
+      "admission_den_grad_scale": 1.0,
+      "admission_den_power": 1.0,
+      "admission_den_power_qk": 0.5,
+      "admission_den_power_rst": 1.2,
+      "admission_den_power_v": 1.0,
+      "admission_den_runtime_source": "full_config.model.admission_den_power",
+      "heat_kernel_beta": 2.0,
+      "heat_kernel_beta_runtime_source": "full_config.model.heat_kernel_beta_or_default",
+      "soft_gate_T_qk": 0.07,
+      "soft_gate_T_rst": 0.07,
+      "soft_gate_T_v": 0.07,
+      "soft_gate_boundary_power": 4.0,
+      "soft_gate_boundary_power_final": 4.0,
+      "soft_gate_effective_active_eps": 1e-06,
+      "soft_gate_t_final": 0.07,
+      "soft_gate_temperature": 0.07,
+      "srw_composition_mode": "linear_angular",
+      "tau_lr_mult": 0.001
+    },
+    "devices": 32,
+    "hosts": 8,
+    "mesh": {
+      "data": 16,
+      "model": 2
+    },
+    "software": {
+      "flax": "0.10.7",
+      "jax": "0.6.2",
+      "jaxlib": "0.6.2",
+      "numpy": "2.2.6",
+      "optax": "0.2.8",
+      "python": "3.10.6"
+    }
+  },
+  "flop_accounting": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_paper_compute_support_20260730T085517Z-333b900e/flop_accounting.json",
+  "flop_accounting_hash": "d7ad61152f358e8a450cee29ec48108135698d63b87c21ca2faec07ade5d984e",
+  "input_contract": {
+    "available_batches": 122,
+    "available_sequences": 19531,
+    "batch_size": 160,
+    "comparable_full_validation": true,
+    "configured_max_val_tokens": 10000000,
+    "dropped_incomplete_batch_sequences": 11,
+    "evaluated_batches": 122,
+    "evaluated_positions": 9994240,
+    "evaluated_sequences": 19520,
+    "requested_max_val_tokens": 10000000,
+    "sequence_length": 512,
+    "validation_metadata_hash": "4c2fc359ddd7542052442e5deab2eecd37f5cdf7f3dca19a0943ea47eaf4aaf7",
+    "validation_metadata_path": "gs://dawn-tpu-data-c4/c4_val_meta.json",
+    "validation_path": "gs://dawn-tpu-data-c4/c4_val.bin"
+  },
+  "output": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_paper_compute_support_20260730T085517Z-333b900e",
+  "protocol": {
+    "epsilon_thresholds": [
+      1e-06,
+      1e-05,
+      0.0001,
+      0.001
+    ],
+    "forward_path": "canonical production minimal kernels; address observation only",
+    "histograms_persisted": false,
+    "name": "v4172_packed_c4_operator_support_v1",
+    "per_token_vectors_persisted": false,
+    "support_definitions": {
+      "approximate": "admission_weight > epsilon",
+      "exact": "selection_margin > 0",
+      "qk_union": "Q active OR K active for the same operator"
+    },
+    "version": 1
+  },
+  "run_id": "20260730T085517Z-333b900e",
+  "schema_version": 1,
+  "started_at": "2026-07-30T08:55:03.873983+00:00",
+  "status": "complete",
+  "support_summary": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_paper_compute_support_20260730T085517Z-333b900e/support_summary.json",
+  "support_summary_hash": "b1eac5f53de9dabe61b1e0487b0fa9974e9930a833843c8b00447842c471bdc2"
+}

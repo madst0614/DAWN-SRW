@@ -131,11 +131,15 @@ fi
 run_worker_command() {
     local worker="$1"
     local command="$2"
-    gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
+    local command_b64
+    local command_wrapper
+    command_b64="$(printf '%s' "$command" | base64 | tr -d '\r\n')"
+    command_wrapper="printf %s $command_b64 | base64 -d | bash"
+    MSYS2_ARG_CONV_EXCL='--command=' gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT" \
         --worker="$worker" \
-        --command="$command"
+        --command="$command_wrapper"
 }
 
 echo "Preflighting SSH on every worker..."

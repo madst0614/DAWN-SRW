@@ -1,0 +1,451 @@
+scope,layer,route,threshold_id,kind,criterion,epsilon,output_equivalence,observations,mean,median,p90,p99,minimum,maximum,pool_size,mean_pool_fraction,no_active_fraction
+layer,0,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,322.2190956991227,306,414,485,186,567,4600,0.07004762949980928,0.0
+layer,1,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,286.5444041768058,285,318,343,187,455,4600,0.06229226177756648,0.0
+layer,2,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,271.8824443879675,271,301,334,173,443,4600,0.059104879214775544,0.0
+layer,3,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,257.2809368196081,257,275,288,182,342,4600,0.055930638439045235,0.0
+layer,4,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,240.90224649398053,241,267,286,153,325,4600,0.05237005358564794,0.0
+layer,5,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,218.4002854644275,220,267,290,80,338,4600,0.047478322927049454,0.0
+layer,6,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,246.99605802942494,247,313,345,99,430,4600,0.05369479522378803,0.0
+layer,7,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,290.99463841172513,292,364,402,114,490,4600,0.06325970400254895,0.0
+layer,8,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,289.1761919865843,290,355,388,117,471,4600,0.06286438956230093,0.0
+layer,9,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,460.9282599777472,459,559,640,179,787,4600,0.10020179564733635,0.0
+layer,10,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,269.62287767754225,264,330,382,137,452,4600,0.05861366906033527,0.0
+layer,11,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,333.4445550637167,326,410,478,156,603,4600,0.07248794675298188,0.0
+layer,12,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,426.1446365106301,423,499,563,211,678,4600,0.09264013837187611,0.0
+layer,13,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,969.4716558737833,983,1085,1166,360,1357,4600,0.21075470779864855,0.0
+layer,14,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,988.5378552045978,1005,1104,1176,296,1341,4600,0.21489953374012996,0.0
+layer,15,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1096.4621575027215,1118,1239,1325,282,1537,4600,0.23836133858754815,0.0
+layer,16,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1065.0594142225923,1085,1212,1308,289,1533,4600,0.23153465526578093,0.0
+layer,17,q,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,748.059005387103,763,856,928,216,1124,4600,0.16262152291023976,0.0
+layer,0,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,322.2197836954086,306,414,486,186,568,4600,0.07004777906421926,0.0
+layer,1,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,286.5407039454726,285,318,343,188,455,4600,0.06229145737945057,0.0
+layer,2,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,271.8786193847656,271,301,334,173,446,4600,0.05910404769234035,0.0
+layer,3,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,257.27838685082605,257,275,288,183,342,4600,0.055930084098005664,0.0
+layer,4,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,240.89948150134478,241,267,286,153,325,4600,0.052369452500292346,0.0
+layer,5,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,218.39731405289447,220,267,290,79,338,4600,0.047477676968020535,0.0
+layer,6,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,246.99255381099513,247,313,345,99,430,4600,0.053694033437172856,0.0
+layer,7,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,290.9901939517162,292,364,402,114,490,4600,0.06325873781559048,0.0
+layer,8,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,289.172176973937,290,355,387,118,469,4600,0.06286351673346456,0.0
+layer,9,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,460.9217133068648,459,559,640,178,785,4600,0.10020037245801408,0.0
+layer,10,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,269.61923207767677,264,330,382,137,452,4600,0.05861287653862538,0.0
+layer,11,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,333.4406360063397,326,410,478,156,605,4600,0.07248709478398689,0.0
+layer,12,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,426.13893102427,423,499,563,211,680,4600,0.09263889804875435,0.0
+layer,13,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,969.4600949146709,983,1085,1166,359,1351,4600,0.21075219454666758,0.0
+layer,14,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,988.5263770932057,1005,1104,1176,295,1344,4600,0.21489703849852299,0.0
+layer,15,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1096.4489972224,1118,1239,1325,282,1537,4600,0.2383584776570435,0.0
+layer,16,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1065.0484323970607,1085,1212,1308,291,1536,4600,0.2315322679124045,0.0
+layer,17,q,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,748.0486632300205,763,856,928,215,1128,4600,0.16261927461522183,0.0
+layer,0,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,322.18168755203,306,414,486,186,567,4600,0.07003949729391956,0.0
+layer,1,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,286.51530481557376,285,318,343,188,455,4600,0.062285935829472554,0.0
+layer,2,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,271.8532070472592,271,301,334,173,446,4600,0.05909852327114331,0.0
+layer,3,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,257.26024380042907,257,275,288,183,342,4600,0.055926139956615016,0.0
+layer,4,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,240.87929937644083,241,267,286,153,325,4600,0.052365065081834965,0.0
+layer,5,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,218.37086361744366,220,267,290,79,338,4600,0.047471926873357315,0.0
+layer,6,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,246.9623291015625,247,313,345,99,430,4600,0.05368746284816576,0.0
+layer,7,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,290.95469160236297,292,364,402,114,490,4600,0.06325101991355717,0.0
+layer,8,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,289.13877243292137,290,355,387,118,469,4600,0.06285625487672204,0.0
+layer,9,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,460.8650781850346,459,559,640,178,784,4600,0.10018806047500751,0.0
+layer,10,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,269.5883163702293,264,330,382,137,452,4600,0.05860615573265854,0.0
+layer,11,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,333.4037653688525,326,410,478,156,605,4600,0.0724790794280114,0.0
+layer,12,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,426.0931514552382,423,499,563,211,680,4600,0.09262894596853005,0.0
+layer,13,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,969.3619127617508,983,1084,1166,359,1351,4600,0.2107308506003806,0.0
+layer,14,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,988.4288179991676,1004,1103,1176,295,1344,4600,0.21487582999981902,0.0
+layer,15,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1096.34400534708,1118,1239,1325,282,1537,4600,0.23833565333632173,0.0
+layer,16,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1064.9509980748912,1085,1212,1308,291,1535,4600,0.23151108653801983,0.0
+layer,17,q,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,747.9681810722976,763,856,928,215,1128,4600,0.16260177849397775,0.0
+layer,0,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,321.7931628618084,306,413,485,186,567,4600,0.06995503540474096,0.0
+layer,1,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,286.26110279521004,285,317,343,187,455,4600,0.06223067452069783,0.0
+layer,2,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,271.59927588290856,271,301,333,173,446,4600,0.059043320844110556,0.0
+layer,3,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,257.07993484246924,257,275,288,182,342,4600,0.05588694235705853,0.0
+layer,4,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,240.67798021660477,241,267,286,153,325,4600,0.052321300047087994,0.0
+layer,5,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,218.10767001793033,220,267,290,79,337,4600,0.04741471087346311,0.0
+layer,6,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,246.6597888383709,246,313,345,99,430,4600,0.053621693225732805,0.0
+layer,7,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,290.59979738329275,291,363,402,113,490,4600,0.063173868996368,0.0
+layer,8,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,288.80441794473614,290,355,387,117,468,4600,0.0627835691184209,0.0
+layer,9,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,460.2998827324539,458,558,639,178,784,4600,0.10006519189835955,0.0
+layer,10,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,269.28002529456967,264,330,382,137,450,4600,0.058539135933602104,0.0
+layer,11,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,333.03533445264475,326,410,478,156,604,4600,0.07239898575057495,0.0
+layer,12,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,425.6339893778817,423,498,563,211,678,4600,0.09252912812562646,0.0
+layer,13,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,968.379939545178,982,1083,1165,359,1350,4600,0.21051737816199523,0.0
+layer,14,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,987.454612756948,1003,1102,1175,294,1343,4600,0.21466404625151042,0.0
+layer,15,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1095.2931962810578,1117,1238,1324,282,1535,4600,0.23810721658283865,0.0
+layer,16,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1063.9774641193328,1084,1211,1307,290,1533,4600,0.23129944872159408,0.0
+layer,17,q,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,747.1639712474386,762,855,927,215,1126,4600,0.16242695027118229,0.0
+layer,0,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,317.92768774814294,303,409,478,183,561,4600,0.06911471472785716,0.0
+layer,1,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,283.75081336850025,282,314,339,181,454,4600,0.06168495942793484,0.0
+layer,2,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,269.09150020411755,269,298,330,172,439,4600,0.05849815221828642,0.0
+layer,3,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,255.29680976242315,255,272,286,181,337,4600,0.05549930647009199,0.0
+layer,4,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,238.68549124295595,239,264,283,150,323,4600,0.051888150270207815,0.0
+layer,5,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,215.4954827980917,217,264,286,79,334,4600,0.046846844086541675,0.0
+layer,6,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,243.65464417504484,243,309,341,97,428,4600,0.052968400907618444,0.0
+layer,7,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,287.0777635918289,288,359,397,113,483,4600,0.062408209476484545,0.0
+layer,8,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,285.48518656746285,287,351,383,116,464,4600,0.062061997079883226,0.0
+layer,9,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,454.6833375024014,452,552,632,177,778,4600,0.09884420380486987,0.0
+layer,10,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,266.21834616739244,261,326,378,135,445,4600,0.05787355351465053,0.0
+layer,11,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,329.37951390000643,322,405,472,153,596,4600,0.07160424215217531,0.0
+layer,12,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,421.07406446112964,418,493,556,210,670,4600,0.09153784010024557,0.0
+layer,13,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,958.6014985631724,972,1073,1154,353,1335,4600,0.20839163012242878,0.0
+layer,14,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,977.745235855853,994,1092,1164,286,1327,4600,0.21255331214257675,0.0
+layer,15,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1084.8269462210233,1107,1227,1313,272,1522,4600,0.23583194483065723,0.0
+layer,16,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1054.2816260165855,1074,1201,1297,287,1524,4600,0.2291916578296925,0.0
+layer,17,q,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,739.1557469102203,754,847,918,210,1113,4600,0.1606860319370044,0.0
+layer,0,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,244.16961900054432,246,294,311,112,413,4600,0.05308035195664007,0.0
+layer,1,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,311.5259704589844,308,405,433,134,475,4600,0.06772303705630095,0.0
+layer,2,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,328.7191570344518,325,424,450,142,506,4600,0.07146068631183736,0.0
+layer,3,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,357.79080300252946,368,444,463,141,495,4600,0.07778060934837597,0.0
+layer,4,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,320.66002297323257,328,362,376,107,406,4600,0.06970870064635491,0.0
+layer,5,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,295.56592137070953,302,336,349,92,383,4600,0.06425346116754554,0.0
+layer,6,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,297.1740270395748,304,344,360,91,407,4600,0.06460304935642931,0.0
+layer,7,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,310.7475347800333,317,363,385,95,443,4600,0.06755381190870288,0.0
+layer,8,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,305.4878192839075,312,360,385,101,446,4600,0.06641039549650164,0.0
+layer,9,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,374.9546227627113,376,443,487,123,596,4600,0.0815118745136329,0.0
+layer,10,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,291.44181378474,294,346,371,107,425,4600,0.06335691604016087,0.0
+layer,11,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,307.4918463034708,309,361,389,111,455,4600,0.06684605354423279,0.0
+layer,12,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,338.38857942174695,338,390,428,145,517,4600,0.07356273465690151,0.0
+layer,13,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,664.4119034563909,672,766,834,150,999,4600,0.14443737031660672,0.0
+layer,14,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,733.563407022445,737,815,884,113,1085,4600,0.15947030587444455,0.0
+layer,15,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,661.6803667912718,677,755,818,128,1037,4600,0.14384355799810256,0.0
+layer,16,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,503.36150042424435,514,584,637,136,814,4600,0.1094264131357053,0.0
+layer,17,k,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,313.86350647973234,314,377,430,108,570,4600,0.06823119706081138,0.0
+layer,0,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,244.16690003441983,246,294,311,112,413,4600,0.053079760877047785,0.0
+layer,1,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,311.5220134797643,308,405,433,134,475,4600,0.06772217684342703,0.0
+layer,2,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,328.7147330862577,325,424,450,143,505,4600,0.07145972458396907,0.0
+layer,3,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,357.78694908267164,368,444,463,141,495,4600,0.07777977153971123,0.0
+layer,4,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,320.6569830222208,328,362,376,107,406,4600,0.06970803978743931,0.0
+layer,5,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,295.56342993564294,302,336,349,92,383,4600,0.06425291955122672,0.0
+layer,6,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,297.1712056144339,304,344,360,91,406,4600,0.06460243600313781,0.0
+layer,7,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,310.74452694752176,317,363,385,94,442,4600,0.06755315803206995,0.0
+layer,8,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,305.4846700699603,312,360,385,101,446,4600,0.06640971088477399,0.0
+layer,9,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,374.95010626120643,376,443,487,123,596,4600,0.08151089266547966,0.0
+layer,10,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,291.4387789366675,294,346,371,106,425,4600,0.0633562562905799,0.0
+layer,11,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,307.48868988537396,309,361,389,111,455,4600,0.06684536736638565,0.0
+layer,12,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,338.3849905545594,338,390,428,144,519,4600,0.07356195446838248,0.0
+layer,13,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,664.4048592989562,672,766,834,150,995,4600,0.14443583897803397,0.0
+layer,14,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,733.5566159107645,737,815,884,113,1086,4600,0.15946882954581837,0.0
+layer,15,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,661.6712457375448,677,755,818,128,1038,4600,0.14384157516033583,0.0
+layer,16,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,503.3536786188845,514,584,637,136,814,4600,0.10942471274323576,0.0
+layer,17,k,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,313.8582522532979,314,377,430,108,569,4600,0.06823005483767346,0.0
+layer,0,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,244.13751260726178,246,294,311,112,413,4600,0.05307337230592647,0.0
+layer,1,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,311.4918151855469,308,405,433,134,475,4600,0.06771561199685802,0.0
+layer,2,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,328.67991272973234,325,424,450,143,505,4600,0.07145215494124615,0.0
+layer,3,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,357.7571287061347,368,444,463,141,495,4600,0.07777328884915972,0.0
+layer,4,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,320.63402870053153,328,362,376,107,406,4600,0.06970304971750685,0.0
+layer,5,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,295.5447637839396,302,336,349,92,383,4600,0.06424886169216078,0.0
+layer,6,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,297.1513171586834,304,344,360,91,406,4600,0.06459811242580074,0.0
+layer,7,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,310.7213719102203,317,363,385,94,442,4600,0.06754812432830876,0.0
+layer,8,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,305.46263307665214,312,360,385,101,446,4600,0.06640492023405481,0.0
+layer,9,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,374.91525538710295,376,443,487,123,596,4600,0.08150331638850064,0.0
+layer,10,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,291.4190167536501,294,346,371,106,425,4600,0.06335196016383698,0.0
+layer,11,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,307.46680678070567,309,361,389,111,455,4600,0.06684061016971862,0.0
+layer,12,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,338.357772677062,338,389,428,144,519,4600,0.07355603753849173,0.0
+layer,13,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,664.3403883636975,672,766,834,150,995,4600,0.14442182355732552,0.0
+layer,14,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,733.4799890737064,737,815,883,113,1086,4600,0.15945217153776226,0.0
+layer,15,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,661.6000085048988,677,754,818,128,1038,4600,0.14382608880541278,0.0
+layer,16,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,503.29575025214524,514,584,637,136,814,4600,0.10941211962003157,0.0
+layer,17,k,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,313.8183478683722,314,377,429,108,569,4600,0.06822137997138526,0.0
+layer,0,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,243.83860483638577,245,294,311,112,413,4600,0.05300839235573604,0.0
+layer,1,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,311.189961317719,308,405,432,134,475,4600,0.06764999159080848,0.0
+layer,2,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,328.331256003458,324,424,449,142,504,4600,0.07137636000075175,0.0
+layer,3,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,357.4584577716765,367,444,463,141,495,4600,0.07770836038514706,0.0
+layer,4,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,320.4047790527344,327,362,375,107,406,4600,0.06965321283755095,0.0
+layer,5,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,295.358114473937,302,336,349,92,383,4600,0.0642082857552037,0.0
+layer,6,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,296.9523235383581,304,343,360,91,405,4600,0.06455485294312133,0.0
+layer,7,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,310.4903288294057,317,363,385,93,442,4600,0.06749789757160994,0.0
+layer,8,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,305.2423680039703,312,360,384,101,446,4600,0.06635703652260223,0.0
+layer,9,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,374.5670178022541,375,443,486,122,596,4600,0.08142761256570741,0.0
+layer,10,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,291.2225792056224,294,346,370,105,425,4600,0.06330925634904835,0.0
+layer,11,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,307.2480811947682,308,361,389,111,455,4600,0.06679306112929743,0.0
+layer,12,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,338.08554917632557,337,389,427,144,517,4600,0.07349685851659252,0.0
+layer,13,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,663.6961243676358,671,765,833,150,994,4600,0.14428176616687735,0.0
+layer,14,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,732.7137743340164,736,814,883,113,1085,4600,0.15928560311609052,0.0
+layer,15,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,660.8862449771068,676,754,818,128,1037,4600,0.1436709228211102,0.0
+layer,16,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,502.7178310706967,513,584,636,136,814,4600,0.10928648501536885,0.0
+layer,17,k,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,313.4188936827613,314,377,429,108,569,4600,0.0681345421049481,0.0
+layer,0,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,240.89727923283812,242,291,307,110,405,4600,0.05236897374626916,0.0
+layer,1,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,308.20394187051744,305,401,428,133,470,4600,0.06700085692837336,0.0
+layer,2,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,324.8789524766265,321,420,445,140,498,4600,0.07062585923404924,0.0
+layer,3,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,354.4971983862705,364,441,460,139,490,4600,0.07706460834484141,0.0
+layer,4,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,318.13363797547385,325,359,373,104,405,4600,0.06915948651640735,0.0
+layer,5,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,293.5070096375512,300,334,347,91,382,4600,0.06380587166033722,0.0
+layer,6,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,294.9841495701524,302,341,358,91,402,4600,0.06412698903698966,0.0
+layer,7,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,308.2041369829021,315,360,382,93,435,4600,0.06700089934410916,0.0
+layer,8,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,303.06174086273694,310,357,381,99,441,4600,0.06588298714407324,0.0
+layer,9,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,371.11408981573385,372,439,482,121,591,4600,0.08067697604689866,0.0
+layer,10,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,289.27461347736295,292,344,368,104,421,4600,0.06288578553855716,0.0
+layer,11,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,305.08044813812757,306,359,386,109,453,4600,0.06632183655176686,0.0
+layer,12,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,335.3914457727651,335,386,424,143,511,4600,0.07291118386364459,0.0
+layer,13,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,657.2820782770876,665,758,826,150,984,4600,0.142887408321106,0.0
+layer,14,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,725.0884863681481,728,806,874,112,1073,4600,0.15762793181916263,0.0
+layer,15,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,653.7854210024974,669,746,809,127,1031,4600,0.14212726543532553,0.0
+layer,16,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,496.9720213843174,507,578,630,135,803,4600,0.10803739595311247,0.0
+layer,17,k,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,309.4598936987705,310,372,424,107,565,4600,0.06727388993451533,0.0
+layer,0,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,532.4236011942879,518,677,757,298,796,4600,0.11574426112919303,0.0
+layer,1,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,568.9988303262679,568,682,718,319,815,4600,0.12369539789701477,0.0
+layer,2,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,570.5798178750961,572,671,710,319,805,4600,0.12403909084241219,0.0
+layer,3,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,587.1708835289127,597,680,705,326,757,4600,0.1276458442454158,0.0
+layer,4,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,547.3850179703509,556,610,630,279,684,4600,0.1189967430370328,0.0
+layer,5,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,498.4757959584721,510,578,604,208,667,4600,0.10836430346923306,0.0
+layer,6,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,525.9026902495838,538,626,663,206,738,4600,0.11432667179338778,0.0
+layer,7,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,578.2264358270364,590,687,733,230,820,4600,0.125701399092834,0.0
+layer,8,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,573.5547715484118,584,681,722,241,813,4600,0.12468581990182866,0.0
+layer,9,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,794.9049610575692,799,934,1025,339,1201,4600,0.17280542631686285,0.0
+layer,10,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,539.6102193863666,537,649,703,262,787,4600,0.11730656943181882,0.0
+layer,11,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,616.9526828453189,611,740,811,294,933,4600,0.13412014844463455,0.0
+layer,12,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,737.2007001032595,733,846,916,388,1079,4600,0.16026102176157814,0.0
+layer,13,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1451.5703439180968,1465,1602,1709,626,1963,4600,0.31555877041697755,0.0
+layer,14,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1463.8288213010694,1479,1604,1705,528,1943,4600,0.3182236568045803,0.0
+layer,15,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1585.956418897285,1616,1756,1855,548,2150,4600,0.34477313454288805,0.0
+layer,16,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1457.3168702172452,1480,1623,1723,475,2005,4600,0.31680801526461855,0.0
+layer,17,qk_union,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,992.928624187532,1002,1122,1212,378,1449,4600,0.21585404873642,0.0
+layer,0,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,532.421361604284,518,677,757,298,796,4600,0.11574377426180087,0.0
+layer,1,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,568.99169921875,568,682,718,320,817,4600,0.12369384765625,0.0
+layer,2,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,570.5721557617187,572,671,710,319,806,4600,0.12403742516559102,0.0
+layer,3,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,587.164841548732,597,680,705,328,757,4600,0.12764453077146348,0.0
+layer,4,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,547.3796429743533,556,610,630,279,685,4600,0.118995574559642,0.0
+layer,5,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,498.47058555728097,510,578,604,208,667,4600,0.10836317077332196,0.0
+layer,6,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,525.8969457407467,538,626,663,205,738,4600,0.11432542298711884,0.0
+layer,7,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,578.2194104804367,590,687,733,230,821,4600,0.1256998718435732,0.0
+layer,8,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,573.5479247046298,584,681,722,241,812,4600,0.12468433145752823,0.0
+layer,9,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,794.8950504490587,799,934,1025,340,1200,4600,0.17280327183675187,0.0
+layer,10,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,539.6039378682121,537,649,703,262,787,4600,0.11730520388439394,0.0
+layer,11,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,616.9460965516138,611,740,811,291,934,4600,0.13411871664165517,0.0
+layer,12,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,737.1921169593686,733,846,915,388,1079,4600,0.1602591558607323,0.0
+layer,13,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1451.555095334913,1465,1602,1709,626,1963,4600,0.3155554555075898,0.0
+layer,14,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1463.814422807537,1479,1604,1705,529,1947,4600,0.3182205266972907,0.0
+layer,15,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1585.9385001761013,1616,1756,1855,548,2151,4600,0.34476923916871766,0.0
+layer,16,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1457.3011665719455,1480,1623,1723,476,2004,4600,0.3168046014286838,0.0
+layer,17,qk_union,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,992.9148750680392,1002,1122,1212,378,1454,4600,0.21585105979739982,0.0
+layer,0,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,532.3591468685963,518,677,757,298,795,4600,0.11573024931926007,0.0
+layer,1,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,568.9395509813653,568,682,718,320,817,4600,0.1236825110829055,0.0
+layer,2,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,570.516056548572,572,671,710,319,806,4600,0.12402522968447217,0.0
+layer,3,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,587.119751376793,597,680,705,328,757,4600,0.1276347285601724,0.0
+layer,4,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,547.3396849585362,556,610,630,279,685,4600,0.11898688803446439,0.0
+layer,5,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,498.428544541656,510,578,604,207,667,4600,0.10835403142209912,0.0
+layer,6,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,525.850424744653,538,626,663,205,738,4600,0.11431530972709847,0.0
+layer,7,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,578.1655556600602,590,687,733,230,821,4600,0.12568816427392615,0.0
+layer,8,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,573.4965067879099,584,681,722,241,812,4600,0.12467315364954562,0.0
+layer,9,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,794.8130767321977,799,934,1025,340,1200,4600,0.17278545146352126,0.0
+layer,10,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,539.5568673555969,537,649,703,262,787,4600,0.11729497116426019,0.0
+layer,11,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,616.8916770059554,611,740,811,291,934,4600,0.1341068863056425,0.0
+layer,12,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,737.1248954397734,733,845,915,388,1079,4600,0.16024454248690725,0.0
+layer,13,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1451.424377741579,1465,1602,1709,626,1963,4600,0.31552703863947373,0.0
+layer,14,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1463.6815625800461,1479,1604,1705,529,1947,4600,0.31819164403914046,0.0
+layer,15,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1585.79724491307,1615,1756,1855,547,2151,4600,0.3447385315028413,0.0
+layer,16,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1457.1706317839075,1480,1623,1723,476,2003,4600,0.31677622430084945,0.0
+layer,17,qk_union,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,992.8085199074667,1002,1122,1212,378,1453,4600,0.21582793911031883,0.0
+layer,0,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,531.725622758709,517,676,757,298,793,4600,0.11559252668667588,0.0
+layer,1,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,568.4180826155866,567,681,717,319,815,4600,0.12356914839469274,0.0
+layer,2,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,569.9546872998848,571,671,710,319,806,4600,0.1239031928912793,0.0
+layer,3,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,586.6695257468301,596,679,705,327,756,4600,0.12753685342322393,0.0
+layer,4,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,546.9408542320376,555,609,629,279,685,4600,0.11890018570261687,0.0
+layer,5,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,498.0088535996734,510,578,603,206,667,4600,0.10826279426079856,0.0
+layer,6,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,525.3849686419378,537,625,662,205,738,4600,0.11421412361781257,0.0
+layer,7,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,577.6276009981749,590,687,732,230,820,4600,0.1255712176082989,0.0
+layer,8,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,572.9817553911053,584,681,721,240,812,4600,0.1245612511719794,0.0
+layer,9,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,793.9951181880763,798,933,1024,339,1198,4600,0.17260763438871224,0.0
+layer,10,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,539.0882076075819,537,649,702,262,786,4600,0.1171930886103439,0.0
+layer,11,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,616.3474021036117,611,739,810,291,933,4600,0.1339885656746982,0.0
+layer,12,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,736.4515608990779,733,845,915,386,1079,4600,0.16009816541284302,0.0
+layer,13,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1450.116784868084,1464,1601,1708,626,1960,4600,0.31524277931914874,0.0
+layer,14,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1462.353908651383,1478,1603,1704,528,1945,4600,0.3179030236198659,0.0
+layer,15,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1584.3831331847143,1614,1754,1853,547,2149,4600,0.34443111590972053,0.0
+layer,16,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1455.8665762479188,1479,1622,1722,474,2002,4600,0.3164927339669389,0.0
+layer,17,qk_union,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,991.7448057080878,1001,1121,1210,378,1452,4600,0.21559669689306257,0.0
+layer,0,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,525.4441861512231,511,668,748,296,782,4600,0.11422699698939633,0.0
+layer,1,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,563.2614668048797,562,675,711,314,801,4600,0.12244814495758254,0.0
+layer,2,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,564.3993207087283,565,664,703,316,800,4600,0.12269550450189745,0.0
+layer,3,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,582.2071181000256,592,674,700,323,750,4600,0.1265667648043534,0.0
+layer,4,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,542.990033059042,552,605,624,276,679,4600,0.11804131153457435,0.0
+layer,5,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,493.84435564885376,505,573,598,203,663,4600,0.10735746861931604,0.0
+layer,6,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,520.7680695080367,533,620,657,199,734,4600,0.11321044989305144,0.0
+layer,7,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,572.2921971055328,584,680,726,225,810,4600,0.12441134719685494,0.0
+layer,8,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,567.875364710073,579,675,715,238,804,4600,0.12345116624132021,0.0
+layer,9,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,785.8679217229123,790,924,1013,334,1188,4600,0.1708408525484592,0.0
+layer,10,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,534.4352777199667,532,643,696,260,780,4600,0.11618158211303625,0.0
+layer,11,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,610.9479278064165,606,733,803,286,925,4600,0.13281476691443836,0.0
+layer,12,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,729.7700230332672,726,837,907,380,1065,4600,0.15864565718114504,0.0
+layer,13,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1437.087269767386,1451,1587,1694,622,1943,4600,0.31241027603638827,0.0
+layer,14,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1449.1193676557698,1465,1589,1689,520,1928,4600,0.31502594949038476,0.0
+layer,15,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1570.2878929263256,1600,1740,1839,539,2135,4600,0.3413669332448534,0.0
+layer,16,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1442.8730316662397,1466,1609,1708,467,1987,4600,0.313668050362226,0.0
+layer,17,qk_union,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,981.1618555287846,991,1110,1199,372,1435,4600,0.21329605554973577,0.0
+layer,0,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,4277.461770779969,4250,5634,6385,1222,8957,14500,0.29499736350206684,0.0
+layer,1,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,3463.2995462386334,2590,7276,8423,194,9377,14500,0.23884824456818163,0.0
+layer,2,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2598.789358170306,1914,5590,7092,237,9360,14500,0.17922685228760732,0.0
+layer,3,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2604.902794909868,2229,4445,5594,526,8762,14500,0.17964846861447367,0.0
+layer,4,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2714.720111784388,2647,3446,3975,829,7143,14500,0.18722207667478538,0.0
+layer,5,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2074.7509253329918,2082,2593,2872,469,3717,14500,0.14308627071262012,0.0
+layer,6,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1591.0803863025103,1608,2126,2498,293,3269,14500,0.10972968181396622,0.0
+layer,7,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1395.7480151567304,1325,2109,2539,198,4244,14500,0.09625848380391244,0.0
+layer,8,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1303.0775545714332,1231,1901,2342,254,4768,14500,0.08986741755665056,0.0
+layer,9,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1136.8485854852395,1077,1594,2004,163,7063,14500,0.07840335072311996,0.0
+layer,10,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1555.0417024205942,1538,2098,2504,268,6047,14500,0.10724425533935132,0.0
+layer,11,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1356.3977777199666,1319,1854,2216,205,3440,14500,0.09354467432551494,0.0
+layer,12,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1276.0383574939165,1248,1757,2200,118,5802,14500,0.08800264534440803,0.0
+layer,13,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,738.4686342333184,683,975,1666,70,9445,14500,0.050928871326435754,0.0
+layer,14,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,534.9351737600858,524,664,800,18,9710,14500,0.03689208094897144,0.0
+layer,15,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,450.85951618132043,216,456,5725,10,8654,14500,0.031093759736642787,0.0
+layer,16,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,312.73990088290856,74,585,4084,4,6294,14500,0.02156826902640749,0.0
+layer,17,v,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,314.72422915599384,127,637,2796,7,4898,14500,0.021705119252137507,0.0
+layer,0,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,4277.402061787589,4250,5635,6383,1231,8956,14500,0.2949932456405234,0.0
+layer,1,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,3463.2563158379226,2590,7276,8423,194,9380,14500,0.23884526316123603,0.0
+layer,2,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2598.7449127697555,1913,5590,7092,237,9356,14500,0.17922378708756934,0.0
+layer,3,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2604.8621548011656,2229,4445,5594,525,8760,14500,0.17964566584835626,0.0
+layer,4,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2714.6780127353354,2647,3446,3974,829,7155,14500,0.1872191732920921,0.0
+layer,5,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2074.7132829509796,2082,2593,2872,470,3720,14500,0.14308367468627445,0.0
+layer,6,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1591.0516472488152,1608,2126,2498,293,3269,14500,0.10972769981026312,0.0
+layer,7,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1395.722505963435,1325,2109,2539,199,4241,14500,0.09625672454920241,0.0
+layer,8,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1303.054187211834,1231,1901,2342,253,4751,14500,0.08986580601460924,0.0
+layer,9,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1136.8280985847848,1077,1594,2004,158,7067,14500,0.07840193783343344,0.0
+layer,10,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1555.0072003474002,1538,2098,2504,269,6055,14500,0.1072418758860276,0.0
+layer,11,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1356.3719961697939,1319,1853,2216,198,3443,14500,0.093542896287572,0.0
+layer,12,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1276.014708171907,1248,1757,2200,118,5819,14500,0.08800101435668324,0.0
+layer,13,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,738.5148410484439,683,975,1666,70,9443,14500,0.05093205800334096,0.0
+layer,14,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,534.9293459032402,524,664,800,19,9712,14500,0.03689167902780967,0.0
+layer,15,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,450.87238759525485,216,456,5725,10,8659,14500,0.031094647420362404,0.0
+layer,16,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,312.7385796218622,74,585,4084,4,6303,14500,0.021568177904956014,0.0
+layer,17,v,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,314.72121271852586,127,637,2796,7,4884,14500,0.021704911221967303,0.0
+layer,0,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,4276.960401191086,4249,5634,6383,1230,8956,14500,0.29496278628904044,0.0
+layer,1,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,3462.8617111456197,2590,7276,8422,194,9380,14500,0.2388180490445255,0.0
+layer,2,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2598.3964275422645,1913,5589,7091,237,9355,14500,0.17919975362360446,0.0
+layer,3,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2604.505374395652,2228,4445,5594,525,8760,14500,0.1796210603031484,0.0
+layer,4,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2714.3274868324156,2647,3445,3974,829,7155,14500,0.18719499909189075,0.0
+layer,5,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2074.431148241387,2082,2593,2871,470,3720,14500,0.14306421712009565,0.0
+layer,6,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1590.8202518650742,1607,2126,2497,293,3269,14500,0.10971174150793615,0.0
+layer,7,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1395.5110014368277,1324,2108,2539,199,4241,14500,0.09624213803012605,0.0
+layer,8,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1302.851312055744,1231,1901,2342,253,4751,14500,0.08985181462453408,0.0
+layer,9,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1136.6456569984311,1076,1594,2004,158,7067,14500,0.07838935565506422,0.0
+layer,10,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1554.7654402936091,1538,2098,2503,269,6055,14500,0.1072252027788696,0.0
+layer,11,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1356.152089003266,1318,1853,2215,198,3443,14500,0.09352773027608731,0.0
+layer,12,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1275.8129477579087,1248,1757,2199,118,5817,14500,0.087987099845373,0.0
+layer,13,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,738.3977173852139,683,975,1665,70,9443,14500,0.0509239805093251,0.0
+layer,14,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,534.8517919321529,524,664,800,19,9710,14500,0.03688633047807951,0.0
+layer,15,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,450.8056525558722,216,456,5724,10,8659,14500,0.031090045003853255,0.0
+layer,16,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,312.6971538606237,74,585,4083,4,6303,14500,0.021565320955905083,0.0
+layer,17,v,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,314.6754789758901,127,637,2795,7,4883,14500,0.02170175717075104,0.0
+layer,0,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,4272.533769050973,4244,5630,6378,1228,8951,14500,0.2946575013138602,0.0
+layer,1,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,3458.9175076844263,2586,7271,8418,194,9378,14500,0.23854603501271907,0.0
+layer,2,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2594.9162233446464,1910,5584,7086,237,9348,14500,0.1789597395410101,0.0
+layer,3,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2600.9382626392803,2225,4440,5589,524,8757,14500,0.17937505259581243,0.0
+layer,4,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2710.8251210697363,2643,3441,3970,828,7149,14500,0.18695345662549906,0.0
+layer,5,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2071.6120769563267,2079,2590,2868,469,3717,14500,0.14286979841078115,0.0
+layer,6,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1588.5078198042072,1605,2123,2494,293,3264,14500,0.10955226343477291,0.0
+layer,7,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1393.3970535028177,1322,2105,2535,198,4234,14500,0.0960963485174357,0.0
+layer,8,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1300.8255397108735,1229,1898,2339,252,4745,14500,0.0897121061869568,0.0
+layer,9,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1134.822891685611,1075,1591,2001,157,7063,14500,0.07826364770245593,0.0
+layer,10,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1552.3497541583952,1535,2095,2500,269,6046,14500,0.10705860373506174,0.0
+layer,11,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1353.9570127393379,1316,1850,2212,197,3440,14500,0.09337634570616123,0.0
+layer,12,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1273.7945743748398,1246,1754,2196,118,5811,14500,0.08784790168102344,0.0
+layer,13,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,737.2260266913743,682,974,1663,70,9438,14500,0.05084317425457754,0.0
+layer,14,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,534.0762844398373,523,663,799,18,9706,14500,0.036832847202747404,0.0
+layer,15,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,450.1404487985079,215,455,5720,10,8654,14500,0.03104416888265572,0.0
+layer,16,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,312.2838127761591,74,584,4080,4,6300,14500,0.02153681467421787,0.0
+layer,17,v,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,314.2202767794249,127,636,2792,7,4880,14500,0.02167036391582241,0.0
+layer,0,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,4228.45763789943,4196,5584,6332,1199,8913,14500,0.29161776813099516,0.0
+layer,1,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,3419.636650610752,2546,7221,8375,191,9329,14500,0.2358370103869484,0.0
+layer,2,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2560.2843124639794,1878,5531,7035,231,9308,14500,0.17657133189406754,0.0
+layer,3,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2565.4522686067176,2191,4392,5537,509,8721,14500,0.17692774266253225,0.0
+layer,4,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2675.963289454726,2608,3402,3927,814,7102,14500,0.184549192376188,0.0
+layer,5,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2043.6022556992828,2050,2558,2834,458,3688,14500,0.14093808659995052,0.0
+layer,6,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1565.5507502321336,1581,2094,2462,287,3230,14500,0.10796901725738853,0.0
+layer,7,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1372.4115219366356,1302,2076,2502,190,4193,14500,0.09464907047838866,0.0
+layer,8,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1280.7291199731046,1210,1870,2307,245,4691,14500,0.0883261462050417,0.0
+layer,9,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1116.7407117499679,1057,1567,1972,154,7014,14500,0.07701660081034262,0.0
+layer,10,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1528.3685428806994,1511,2064,2466,265,5982,14500,0.10540472709522064,0.0
+layer,11,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1332.1701115842725,1294,1823,2182,190,3389,14500,0.09187380079891534,0.0
+layer,12,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1253.7588442943136,1226,1728,2166,117,5742,14500,0.08646612719271128,0.0
+layer,13,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,725.6202744780994,671,959,1641,64,9394,14500,0.05004277755021375,0.0
+layer,14,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,526.3905976842661,515,654,787,18,9669,14500,0.03630279984029422,0.0
+layer,15,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,443.55861616290986,211,447,5673,10,8610,14500,0.03059024939054551,0.0
+layer,16,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,308.1831401887487,72,576,4047,4,6260,14500,0.021254009668189567,0.0
+layer,17,v,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,309.7066391241355,124,628,2765,7,4833,14500,0.021359078560285207,0.0
+layer,0,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2981.597751204694,2837,5168,5961,223,6903,29300,0.1017610153994776,0.0
+layer,1,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,4282.283369620902,4286,6477,7073,550,7505,29300,0.1461530160280171,0.0
+layer,2,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,4951.870612772957,5065,6612,7064,735,7879,29300,0.16900582296153438,0.0
+layer,3,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,3027.818385490042,3142,3878,4133,587,4590,29300,0.10333851145017209,0.0
+layer,4,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2863.3043845254865,2904,3587,3973,513,4660,29300,0.09772369913056268,0.0
+layer,5,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1998.262907034452,2046,2677,3189,268,4065,29300,0.0682000992161929,0.0
+layer,6,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1818.3210147044697,1885,2497,2941,166,4023,29300,0.062058737703224225,0.0
+layer,7,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1822.4916777063588,1868,2433,2873,181,4130,29300,0.06220108115038767,0.0
+layer,8,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1817.0688268442623,1832,2419,2868,208,4126,29300,0.06201600091618643,0.0
+layer,9,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,2074.050402131628,2086,2747,3278,263,4862,29300,0.07078670314442416,0.0
+layer,10,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1462.2182080878586,1473,1877,2212,235,3216,29300,0.04990505829651394,0.0
+layer,11,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1561.7002675541112,1552,2033,2526,225,4107,29300,0.05330035042846796,0.0
+layer,12,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1437.4372196385118,1437,1824,2254,208,3587,29300,0.04905929077264545,0.0
+layer,13,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,1416.9367053422773,1422,1823,2287,120,3981,29300,0.04835961451680127,0.0
+layer,14,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,715.0737979075948,713,928,1128,66,1863,29300,0.024405249075344533,0.0
+layer,15,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,873.81687762151,881,1116,1370,50,4328,29300,0.02982310162530751,0.0
+layer,16,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,736.0399440077484,742,984,1203,28,3208,29300,0.02512081720162964,0.0
+layer,17,rst,exact_margin_gt_0,exact,selection_margin > 0,,mathematically exact,9994240,478.36131401687373,486,641,779,15,1409,29300,0.016326324710473506,0.0
+layer,0,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2981.593208788262,2837,5168,5961,223,6892,29300,0.10176086036820006,0.0
+layer,1,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,4282.2696798355855,4286,6477,7073,544,7509,29300,0.14615254879984935,0.0
+layer,2,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,4951.818564593205,5065,6612,7064,735,7884,29300,0.16900404657314694,0.0
+layer,3,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,3028.109944227875,3142,3879,4133,594,4588,29300,0.10334846226033703,0.0
+layer,4,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2863.6715475113665,2904,3588,3973,521,4667,29300,0.09773623029049032,0.0
+layer,5,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1998.502135930296,2047,2677,3190,269,4070,29300,0.06820826402492478,0.0
+layer,6,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1818.4193102226882,1885,2497,2941,169,4016,29300,0.062062092499067856,0.0
+layer,7,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1822.6007071072938,1868,2433,2873,181,4147,29300,0.06220480229035132,0.0
+layer,8,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1817.2008223736873,1832,2419,2868,205,4131,29300,0.062020505883061,0.0
+layer,9,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,2074.178846415535,2086,2747,3278,263,4866,29300,0.07079108690838004,0.0
+layer,10,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1462.1972052902472,1473,1877,2212,235,3219,29300,0.04990434147748284,0.0
+layer,11,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1561.7048699050654,1552,2033,2526,224,4095,29300,0.05330050750529233,0.0
+layer,12,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1437.4833568135246,1437,1824,2254,211,3587,29300,0.04906086542025681,0.0
+layer,13,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,1416.9340667224321,1422,1823,2287,120,3972,29300,0.04835952446151646,0.0
+layer,14,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,715.0452479628266,713,928,1128,65,1882,29300,0.0244042746744992,0.0
+layer,15,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,873.7855109543096,881,1116,1370,51,4329,29300,0.029822031090590773,0.0
+layer,16,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,736.0096124367636,742,984,1202,28,3193,29300,0.025119781994428794,0.0
+layer,17,rst,admission_weight_gt_1e-06,approximate,admission_weight > 1e-06,1e-06,not asserted; approximate pruning threshold,9994240,478.3397687067751,486,641,779,14,1417,29300,0.016325589375657854,0.0
+layer,0,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2981.146385918289,2837,5167,5960,223,6892,29300,0.10174561044089724,0.0
+layer,1,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,4281.697193483446,4286,6476,7072,544,7509,29300,0.14613301001649986,0.0
+layer,2,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,4951.201914902984,5064,6612,7063,735,7883,29300,0.16898300050863427,0.0
+layer,3,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,3027.726408111072,3142,3878,4133,594,4588,29300,0.10333537229048027,0.0
+layer,4,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2863.250323186155,2904,3587,3973,521,4666,29300,0.09772185403365717,0.0
+layer,5,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1998.15808305584,2046,2677,3189,269,4070,29300,0.06819652160600137,0.0
+layer,6,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1818.1051273533556,1885,2496,2941,169,4016,29300,0.06205136953424422,0.0
+layer,7,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1822.2826466044442,1868,2433,2873,181,4146,29300,0.062193946983086834,0.0
+layer,8,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1816.884569211866,1831,2418,2867,205,4130,29300,0.06200971225979065,0.0
+layer,9,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,2073.834111948482,2086,2747,3277,263,4865,29300,0.07077932122691065,0.0
+layer,10,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1461.9362115578574,1472,1876,2211,235,3219,29300,0.0498954338415651,0.0
+layer,11,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1561.4328958480085,1552,2032,2526,224,4095,29300,0.053291225114266504,0.0
+layer,12,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1437.2331524958377,1437,1824,2254,210,3586,29300,0.049052326023748725,0.0
+layer,13,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,1416.6823408283171,1422,1822,2287,120,3971,29300,0.04835093313407226,0.0
+layer,14,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,714.9190517738217,713,928,1127,65,1882,29300,0.0243999676373318,0.0
+layer,15,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,873.6279738129163,880,1116,1370,51,4328,29300,0.029816654396345264,0.0
+layer,16,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,735.8732743060002,742,984,1202,28,3192,29300,0.025115128815904445,0.0
+layer,17,rst,admission_weight_gt_1e-05,approximate,admission_weight > 1e-05,1e-05,not asserted; approximate pruning threshold,9994240,478.2528697529777,486,641,778,14,1416,29300,0.01632262354105726,0.0
+layer,0,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2976.6809381203575,2832,5161,5953,223,6883,29300,0.10159320607919309,0.0
+layer,1,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,4275.976358182313,4280,6469,7064,543,7502,29300,0.14593775966492534,0.0
+layer,2,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,4945.044399173924,5058,6604,7055,734,7874,29300,0.16877284638818854,0.0
+layer,3,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,3023.8898807713244,3138,3874,4128,594,4585,29300,0.10320443279083019,0.0
+layer,4,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2859.0400501688973,2899,3583,3968,520,4659,29300,0.09757815870883609,0.0
+layer,5,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1994.7178208648181,2043,2673,3185,268,4066,29300,0.06807910651415762,0.0
+layer,6,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1814.9666979180008,1881,2493,2936,169,4010,29300,0.061944255901638254,0.0
+layer,7,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1819.1075858694608,1865,2429,2868,181,4139,29300,0.06208558313547648,0.0
+layer,8,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1813.719148829726,1828,2414,2863,204,4124,29300,0.061901677434461636,0.0
+layer,9,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,2070.3889538374106,2082,2743,3273,262,4858,29300,0.07066173903881948,0.0
+layer,10,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1459.3290188148374,1470,1873,2208,235,3215,29300,0.04980645115409001,0.0
+layer,11,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1558.7154942246734,1549,2029,2522,224,4089,29300,0.05319848103155882,0.0
+layer,12,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1434.7308603755764,1435,1821,2250,208,3583,29300,0.048966923562306364,0.0
+layer,13,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,1414.1709939925397,1419,1819,2283,120,3965,29300,0.04826522163797064,0.0
+layer,14,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,713.6604151991547,711,926,1126,65,1876,29300,0.024357010757650333,0.0
+layer,15,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,872.0535637527215,879,1114,1367,51,4322,29300,0.029762920264598005,0.0
+layer,16,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,734.5118624327613,741,982,1200,28,3183,29300,0.025068664246851922,0.0
+layer,17,rst,admission_weight_gt_1e-04,approximate,admission_weight > 1e-04,0.0001,not asserted; approximate pruning threshold,9994240,477.38573658427254,485,640,777,14,1414,29300,0.01629302855236425,0.0
+layer,0,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2932.3455050108864,2784,5098,5883,218,6812,29300,0.10008005136555927,0.0
+layer,1,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,4219.133027824027,4221,6396,6985,526,7423,29300,0.1439977142602057,0.0
+layer,2,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,4883.824776871478,4997,6532,6978,712,7780,29300,0.1666834394836682,0.0
+layer,3,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2985.801634441438,3100,3832,4085,576,4535,29300,0.1019044926430525,0.0
+layer,4,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2817.24579317687,2857,3537,3921,504,4593,29300,0.09615173355552457,0.0
+layer,5,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1960.6082972792328,2007,2634,3142,256,3998,29300,0.06691495895150966,0.0
+layer,6,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1783.844605192591,1849,2455,2893,164,3956,29300,0.0608820684366072,0.0
+layer,7,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1787.6108495493404,1832,2391,2826,176,4082,29300,0.06101060919963619,0.0
+layer,8,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1782.3405263431737,1796,2376,2820,195,4063,29300,0.06083073468748033,0.0
+layer,9,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,2036.1933813876792,2048,2701,3227,252,4803,29300,0.06949465465486959,0.0
+layer,10,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1433.4844601490458,1444,1843,2174,227,3165,29300,0.048924384305428184,0.0
+layer,11,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1531.7695682713243,1522,1996,2482,223,4050,29300,0.052278824855676594,0.0
+layer,12,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1409.9335256107518,1410,1791,2212,202,3529,29300,0.04812059814371166,0.0
+layer,13,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,1389.2761506627817,1394,1789,2245,118,3909,29300,0.0474155682820062,0.0
+layer,14,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,701.1875320184427,699,911,1107,61,1845,29300,0.023931315085953673,0.0
+layer,15,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,856.4619252689549,863,1095,1343,50,4250,29300,0.02923078243238754,0.0
+layer,16,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,721.0316968573899,727,964,1179,28,3126,29300,0.02460859033642969,0.0
+layer,17,rst,admission_weight_gt_1e-03,approximate,admission_weight > 1e-03,0.001,not asserted; approximate pruning threshold,9994240,468.80111594278304,477,628,763,14,1378,29300,0.016000038086784404,0.0

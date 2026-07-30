@@ -1,0 +1,22 @@
+PAPER COMPUTE SUPPORT PROFILE
+status=complete
+protocol=v4172_packed_c4_operator_support_v1
+checkpoint_step=76293
+checkpoint_identity=a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17
+summary_hash=b1eac5f53de9dabe61b1e0487b0fa9974e9930a833843c8b00447842c471bdc2
+positions=9994240
+thresholds=exact_margin_gt_0,admission_weight_gt_1e-06,admission_weight_gt_1e-05,admission_weight_gt_1e-04,admission_weight_gt_1e-03
+exact_q_mean=487.895928827 median=318 p90=1052 p99=1233 min=80 max=1537 pool_fraction=0.106064332 no_active_fraction=0.000000000
+exact_k_mean=386.722134522 median=335 p90=677 p99=805 min=91 max=1085 pool_fraction=0.084070029 no_active_fraction=0.000000000
+exact_qk_union_mean=812.388193688 median=641 p90=1517 p99=1727 min=206 max=2150 pool_fraction=0.176606129 no_active_fraction=0.000000000
+exact_v_mean=1649.993574477 median=1368 p90=3448 p99=6656 min=4 max=9710 pool_fraction=0.113792660 no_active_fraction=0.000000000
+exact_rst_mean=2017.702981456 median=1685 p90=3862 p99=6597 min=15 max=7879 pool_fraction=0.068863583 no_active_fraction=0.000000000
+dawn_current_backbone_TFLOPs=4.741260116
+dawn_exact_support_backbone_TFLOPs=0.818230250
+dense_transformer_backbone_TFLOPs=0.386547057
+current_dawn_vs_dense=12.265673828
+exact_support_vs_current=0.172576537
+exact_support_vs_dense=2.116767509
+current_execution_sparse=false
+indexed_addressing_included=false
+measured_latency_claimed=false

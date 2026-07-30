@@ -1,0 +1,17 @@
+column,component,macs,flops,gflops
+dawn_current_dense_execution,route_and_tau_projections,21828206592.0,43656413184.0,43.656413184
+dawn_current_dense_execution,full_pool_address_scoring,125042688000.0,250085376000.0,250.085376
+dawn_current_dense_execution,full_pool_rw_application,2153093529600.0,4306187059200.0,4306.1870592
+dawn_current_dense_execution,causal_attention,21743271936.0,43486543872.0,43.486543872
+dawn_current_dense_execution,attention_output_projection,48922361856.0,97844723712.0,97.844723712
+dawn_current_dense_execution,TOTAL_BACKBONE,2370630057984.0,4741260115968.0,4741.260115968
+dawn_exact_support_estimate,route_and_tau_projections,21828206592.0,43656413184.0,43.656413184
+dawn_exact_support_estimate,full_pool_address_scoring,125042688000.0,250085376000.0,250.085376
+dawn_exact_support_estimate,exact_support_rw_application,191578596673.10162,383157193346.20325,383.15719334620326
+dawn_exact_support_estimate,causal_attention,21743271936.0,43486543872.0,43.486543872
+dawn_exact_support_estimate,attention_output_projection,48922361856.0,97844723712.0,97.844723712
+dawn_exact_support_estimate,TOTAL_BACKBONE,409115125057.1016,818230250114.2032,818.2302501142033
+dense_transformer,qkv_and_output_projections,60397977600.0,120795955200.0,120.7959552
+dense_transformer,ffn,120795955200.0,241591910400.0,241.5919104
+dense_transformer,causal_attention,12079595520.0,24159191040.0,24.15919104
+dense_transformer,TOTAL_BACKBONE,193273528320.0,386547056640.0,386.54705664

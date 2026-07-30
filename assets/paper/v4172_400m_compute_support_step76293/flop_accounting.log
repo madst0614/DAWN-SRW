@@ -1,0 +1,12 @@
+PAPER FLOP ACCOUNTING
+result_hash=d7ad61152f358e8a450cee29ec48108135698d63b87c21ca2faec07ade5d984e
+batch_size=1 sequence_length=512
+1_MAC=2_FLOPs
+current_dawn_backbone_TFLOPs=4.741260116
+exact_support_backbone_TFLOPs=0.818230250
+dense_transformer_backbone_TFLOPs=0.386547057
+current_dawn_vs_dense=12.265673828
+exact_support_vs_current=0.172576537
+exact_support_vs_dense=2.116767509
+indexed_addressing_included=false
+measured_latency_claimed=false

@@ -1,0 +1,4 @@
+model,parameter_count,address_execution,rw_execution,backbone_gflops,output_equivalence,measured_latency
+Dense Transformer,393896960,none,none,386.54705664,reference,
+DAWN current,393800708,full pool,full pool dense contraction,4741.260115968,reference,
+DAWN exact-support estimate,393800708,full pool,measured margin>0 support,818.2302501142033,mathematically exact,not implemented

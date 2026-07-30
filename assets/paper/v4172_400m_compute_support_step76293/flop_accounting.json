@@ -1,0 +1,365 @@
+{
+  "columns": {
+    "dawn_current_dense_execution": {
+      "components_flops": {
+        "attention_output_projection": 97844723712.0,
+        "causal_attention": 43486543872.0,
+        "full_pool_address_scoring": 250085376000.0,
+        "full_pool_rw_application": 4306187059200.0,
+        "route_and_tau_projections": 43656413184.0
+      },
+      "components_macs": {
+        "attention_output_projection": 48922361856.0,
+        "causal_attention": 21743271936.0,
+        "full_pool_address_scoring": 125042688000.0,
+        "full_pool_rw_application": 2153093529600.0,
+        "route_and_tau_projections": 21828206592.0
+      },
+      "total_flops": 4741260115968.0,
+      "total_macs": 2370630057984.0
+    },
+    "dawn_exact_support_estimate": {
+      "components_flops": {
+        "attention_output_projection": 97844723712.0,
+        "causal_attention": 43486543872.0,
+        "exact_support_rw_application": 383157193346.20325,
+        "full_pool_address_scoring": 250085376000.0,
+        "route_and_tau_projections": 43656413184.0
+      },
+      "components_macs": {
+        "attention_output_projection": 48922361856.0,
+        "causal_attention": 21743271936.0,
+        "exact_support_rw_application": 191578596673.10162,
+        "full_pool_address_scoring": 125042688000.0,
+        "route_and_tau_projections": 21828206592.0
+      },
+      "total_flops": 818230250114.2032,
+      "total_macs": 409115125057.1016
+    },
+    "dense_transformer": {
+      "components_flops": {
+        "causal_attention": 24159191040.0,
+        "ffn": 241591910400.0,
+        "qkv_and_output_projections": 120795955200.0
+      },
+      "components_macs": {
+        "causal_attention": 12079595520.0,
+        "ffn": 120795955200.0,
+        "qkv_and_output_projections": 60397977600.0
+      },
+      "total_flops": 386547056640.0,
+      "total_macs": 193273528320.0
+    }
+  },
+  "comparisons": {
+    "current_dawn_vs_dense_transformer": 12.265673828125,
+    "exact_support_fixed_cost_only_vs_dense_transformer": 1.125537109375,
+    "exact_support_vs_current_dawn": 0.17257653663811887,
+    "exact_support_vs_dense_transformer": 2.11676750879063
+  },
+  "counting_convention": {
+    "counted": "major matmul/einsum operations",
+    "current_dawn_execution": "all addresses and all high-dimensional RW operators execute",
+    "direction": "forward_only",
+    "exact_support_execution": "full dense address scan plus only margin>0 RW application",
+    "exact_support_output_equivalence": "mathematically exact",
+    "indexed_addressing_included": false,
+    "mac_to_flops": 2,
+    "measured_latency_claimed": false,
+    "omitted": [
+      "softmax",
+      "normalization",
+      "gate elementwise arithmetic",
+      "embedding lookup",
+      "residual additions",
+      "communication collectives"
+    ]
+  },
+  "dimensions": {
+    "baseline": {
+      "d_ff": 5120,
+      "d_model": 1280,
+      "d_route": 0,
+      "n_heads": 20,
+      "n_layers": 18,
+      "n_qk": 0,
+      "n_rst": 0,
+      "n_v": 0,
+      "vocab_size": 30522
+    },
+    "dawn": {
+      "d_ff": 9216,
+      "d_model": 2304,
+      "d_route": 256,
+      "n_heads": 36,
+      "n_layers": 18,
+      "n_qk": 4600,
+      "n_rst": 29300,
+      "n_v": 14500,
+      "vocab_size": 30522
+    }
+  },
+  "exact_support_layer_rw_macs": [
+    {
+      "layer": 0,
+      "rw_flops": 36844963689.6,
+      "rw_macs": 18422481844.8,
+      "support_means": {
+        "k": 244.16961900054432,
+        "q": 322.2190956991227,
+        "qk_union": 532.4236011942879,
+        "rst": 2981.597751204694,
+        "v": 4277.461770779969
+      }
+    },
+    {
+      "layer": 1,
+      "rw_flops": 39301707289.10164,
+      "rw_macs": 19650853644.55082,
+      "support_means": {
+        "k": 311.5259704589844,
+        "q": 286.5444041768058,
+        "qk_union": 568.9988303262679,
+        "rst": 4282.283369620902,
+        "v": 3463.2995462386334
+      }
+    },
+    {
+      "layer": 2,
+      "rw_flops": 38391647371.436066,
+      "rw_macs": 19195823685.718033,
+      "support_means": {
+        "k": 328.7191570344518,
+        "q": 271.8824443879675,
+        "qk_union": 570.5798178750961,
+        "rst": 4951.870612772957,
+        "v": 2598.789358170306
+      }
+    },
+    {
+      "layer": 3,
+      "rw_flops": 29414959312.36721,
+      "rw_macs": 14707479656.183605,
+      "support_means": {
+        "k": 357.79080300252946,
+        "q": 257.2809368196081,
+        "qk_union": 587.1708835289127,
+        "rst": 3027.818385490042,
+        "v": 2604.902794909868
+      }
+    },
+    {
+      "layer": 4,
+      "rw_flops": 28936756663.554096,
+      "rw_macs": 14468378331.777048,
+      "support_means": {
+        "k": 320.66002297323257,
+        "q": 240.90224649398053,
+        "qk_union": 547.3850179703509,
+        "rst": 2863.3043845254865,
+        "v": 2714.720111784388
+      }
+    },
+    {
+      "layer": 5,
+      "rw_flops": 21607540852.721313,
+      "rw_macs": 10803770426.360657,
+      "support_means": {
+        "k": 295.56592137070953,
+        "q": 218.4002854644275,
+        "qk_union": 498.4757959584721,
+        "rst": 1998.262907034452,
+        "v": 2074.7509253329918
+      }
+    },
+    {
+      "layer": 6,
+      "rw_flops": 18612192594.098362,
+      "rw_macs": 9306096297.049181,
+      "support_means": {
+        "k": 297.1740270395748,
+        "q": 246.99605802942494,
+        "qk_union": 525.9026902495838,
+        "rst": 1818.3210147044697,
+        "v": 1591.0803863025103
+      }
+    },
+    {
+      "layer": 7,
+      "rw_flops": 17969455288.209835,
+      "rw_macs": 8984727644.104918,
+      "support_means": {
+        "k": 310.7475347800333,
+        "q": 290.99463841172513,
+        "qk_union": 578.2264358270364,
+        "rst": 1822.4916777063588,
+        "v": 1395.7480151567304
+      }
+    },
+    {
+      "layer": 8,
+      "rw_flops": 17478871655.606556,
+      "rw_macs": 8739435827.803278,
+      "support_means": {
+        "k": 305.4878192839075,
+        "q": 289.1761919865843,
+        "qk_union": 573.5547715484118,
+        "rst": 1817.0688268442623,
+        "v": 1303.0775545714332
+      }
+    },
+    {
+      "layer": 9,
+      "rw_flops": 18998433512.49836,
+      "rw_macs": 9499216756.24918,
+      "support_means": {
+        "k": 374.9546227627113,
+        "q": 460.9282599777472,
+        "qk_union": 794.9049610575692,
+        "rst": 2074.050402131628,
+        "v": 1136.8485854852395
+      }
+    },
+    {
+      "layer": 10,
+      "rw_flops": 16834036390.111477,
+      "rw_macs": 8417018195.055738,
+      "support_means": {
+        "k": 291.44181378474,
+        "q": 269.62287767754225,
+        "qk_union": 539.6102193863666,
+        "rst": 1462.2182080878586,
+        "v": 1555.0417024205942
+      }
+    },
+    {
+      "layer": 11,
+      "rw_flops": 16737046776.472132,
+      "rw_macs": 8368523388.236066,
+      "support_means": {
+        "k": 307.4918463034708,
+        "q": 333.4445550637167,
+        "qk_union": 616.9526828453189,
+        "rst": 1561.7002675541112,
+        "v": 1356.3977777199666
+      }
+    },
+    {
+      "layer": 12,
+      "rw_flops": 16346818971.61967,
+      "rw_macs": 8173409485.809835,
+      "support_means": {
+        "k": 338.38857942174695,
+        "q": 426.1446365106301,
+        "qk_union": 737.2007001032595,
+        "rst": 1437.4372196385118,
+        "v": 1276.0383574939165
+      }
+    },
+    {
+      "layer": 13,
+      "rw_flops": 17449977444.196724,
+      "rw_macs": 8724988722.098362,
+      "support_means": {
+        "k": 664.4119034563909,
+        "q": 969.4716558737833,
+        "qk_union": 1451.5703439180968,
+        "rst": 1416.9367053422773,
+        "v": 738.4686342333184
+      }
+    },
+    {
+      "layer": 14,
+      "rw_flops": 13414834435.986885,
+      "rw_macs": 6707417217.993443,
+      "support_means": {
+        "k": 733.563407022445,
+        "q": 988.5378552045978,
+        "qk_union": 1463.8288213010694,
+        "rst": 715.0737979075948,
+        "v": 534.9351737600858
+      }
+    },
+    {
+      "layer": 15,
+      "rw_flops": 14140326694.662296,
+      "rw_macs": 7070163347.331148,
+      "support_means": {
+        "k": 661.6803667912718,
+        "q": 1096.4621575027215,
+        "qk_union": 1585.956418897285,
+        "rst": 873.81687762151,
+        "v": 450.85951618132043
+      }
+    },
+    {
+      "layer": 16,
+      "rw_flops": 12087375238.740984,
+      "rw_macs": 6043687619.370492,
+      "support_means": {
+        "k": 503.36150042424435,
+        "q": 1065.0594142225923,
+        "qk_union": 1457.3168702172452,
+        "rst": 736.0399440077484,
+        "v": 312.73990088290856
+      }
+    },
+    {
+      "layer": 17,
+      "rw_flops": 8590249165.219671,
+      "rw_macs": 4295124582.609836,
+      "support_means": {
+        "k": 313.86350647973234,
+        "q": 748.059005387103,
+        "qk_union": 992.928624187532,
+        "rst": 478.36131401687373,
+        "v": 314.72422915599384
+      }
+    }
+  ],
+  "extras": {
+    "dawn_lm_head": {
+      "flops": 72010432512.0,
+      "macs": 36005216256.0
+    },
+    "dawn_operator_key_materialization_per_model_call": {
+      "amortized_flops_per_sequence": 114189926400.0,
+      "cacheability_claim": "possible future optimization only",
+      "current_inference_cache_used": false,
+      "flops": 114189926400.0,
+      "macs": 57094963200.0
+    },
+    "dense_baseline_lm_head": {
+      "flops": 40005795840.0,
+      "macs": 20002897920.0
+    }
+  },
+  "identity": {
+    "accounting_script": "scripts/paper_flop_accounting.py",
+    "accounting_script_sha256": "ea8de02c2c0b7f20600d584bd5088119cabe203a768c59a505b68077c2a2b11a",
+    "analysis_code": {
+      "git_branch": "codex/v4167-poc",
+      "git_commit": "d229a246215a777e27a545ef6066422134a64b2c",
+      "git_dirty": false
+    },
+    "baseline_config": "configs/train_config_baseline_tpu_400M_c4_40B_v4_64_tp2.yaml",
+    "baseline_config_sha256": "dc9ec8c3d06fb0cb70b0c682628c831a7cdab446fc5f77ccd4f6139b599ded5b",
+    "dawn_config": "configs/train_config_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2.yaml",
+    "dawn_config_sha256": "43fc32919b553ab9db80a296fce3f9aeb2a5e77cedde0d20fef77a817e87a3d0",
+    "support_json": "gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4172_400M_c4_40B_v4_64_ver1_den_qk0p5_v1p0_rst1p2/run_vspatial-r1-v4.1.7.2_20260715_133004_3201/side_analysis/run_analysis_000000076293_paper_compute_support_20260730T085517Z-333b900e/support_summary.json",
+    "support_json_sha256": "b190b77a4bd49d00172e4549a7a5ce730ccb363103d84cd1134b3da798520b13"
+  },
+  "input": {
+    "batch_size": 1,
+    "sequence_length": 512,
+    "support_summary_hash": "b1eac5f53de9dabe61b1e0487b0fa9974e9930a833843c8b00447842c471bdc2",
+    "support_threshold_id": "exact_margin_gt_0",
+    "tokens": 512
+  },
+  "parameter_counts": {
+    "dawn": 393800708,
+    "dense_baseline": 393896960
+  },
+  "result_hash": "d7ad61152f358e8a450cee29ec48108135698d63b87c21ca2faec07ade5d984e",
+  "schema_version": 1
+}
