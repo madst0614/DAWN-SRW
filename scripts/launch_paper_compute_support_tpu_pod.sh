@@ -102,7 +102,6 @@ printf -v Q_REPO '%q' "$REPO_URL"
 printf -v Q_BRANCH '%q' "$BRANCH"
 printf -v Q_CHECKPOINT '%q' "$CHECKPOINT"
 printf -v Q_OUTPUT_PARENT '%q' "$OUTPUT_PARENT"
-printf -v Q_LOG '%q' "$REMOTE_LOG"
 
 read -r -d '' REMOTE_CMD <<EOF || true
 set -euo pipefail
@@ -111,9 +110,8 @@ BRANCH=$Q_BRANCH
 CHECKPOINT=$Q_CHECKPOINT
 OUTPUT_PARENT=$Q_OUTPUT_PARENT
 SESSION=train
-REMOTE_LOG=$Q_LOG
 WORK_DIR="\$HOME/DAWN-SRW"
-REMOTE_LOG="\${REMOTE_LOG/#\~/\$HOME}"
+REMOTE_LOG="\$HOME/train.log"
 
 mkdir -p "\$(dirname "\$REMOTE_LOG")"
 tmux kill-session -t "\$SESSION" 2>/dev/null || true
@@ -130,21 +128,31 @@ if [[ "$UPDATE_REPO" == "1" ]]; then
             echo "ERROR: remote checkout has uncommitted changes" >&2
             exit 1
         fi
-        git fetch origin "\$BRANCH" --depth 2
-        git cat-file -e "$EXACT_COMMIT^{commit}"
-        git merge-base --is-ancestor "$EXACT_COMMIT" FETCH_HEAD
-        git checkout -B "\$BRANCH" "$EXACT_COMMIT"
     elif [[ -e "\$WORK_DIR" ]]; then
         echo "ERROR: \$WORK_DIR exists but is not a git checkout" >&2
         exit 1
     else
-        git clone --single-branch --depth 2 --branch "\$BRANCH" \
+        git clone --no-checkout --single-branch --depth 1 --branch "\$BRANCH" \
             "\$REPO_URL" "\$WORK_DIR"
         cd "\$WORK_DIR"
-        git cat-file -e "$EXACT_COMMIT^{commit}"
-        git merge-base --is-ancestor "$EXACT_COMMIT" HEAD
-        git checkout -B "\$BRANCH" "$EXACT_COMMIT"
     fi
+
+    DEPLOY_DEPTH=8
+    while true; do
+        git fetch origin "\$BRANCH" --depth "\$DEPLOY_DEPTH"
+        BRANCH_TIP=\$(git rev-parse FETCH_HEAD)
+        if git cat-file -e "$EXACT_COMMIT^{commit}" 2>/dev/null &&
+                git merge-base --is-ancestor "$EXACT_COMMIT" "\$BRANCH_TIP"; then
+            break
+        fi
+        if (( DEPLOY_DEPTH >= 4096 )); then
+            echo "ERROR: pinned commit $EXACT_COMMIT is not a connected ancestor of \$BRANCH at \$BRANCH_TIP" >&2
+            exit 1
+        fi
+        DEPLOY_DEPTH=\$((DEPLOY_DEPTH * 2))
+    done
+    echo "[setup] pinned_commit=$EXACT_COMMIT branch_tip=\$BRANCH_TIP fetch_depth=\$DEPLOY_DEPTH"
+    git checkout -B "\$BRANCH" "$EXACT_COMMIT"
 else
     [[ -d "\$WORK_DIR/.git" ]] || {
         echo "ERROR: --skip-repo-update requires \$WORK_DIR/.git" >&2
