@@ -21,6 +21,7 @@ DRY_RUN=0
 
 readonly SESSION="train"
 readonly REMOTE_LOG="~/train.log"
+readonly EXACT_COMMIT="d229a246215a777e27a545ef6066422134a64b2c"
 readonly EXPECTED_STEP="76293"
 readonly EXPECTED_CONFIG_HASH="08733ae4fefdfcda2bb8e61e51a6e6fce40c0b0e4d84cb80d715085da645039b"
 readonly EXPECTED_CHECKPOINT_IDENTITY="a7ce8afcd0242bc4e9b567c9e5066c36ca223461eaa6ae6f251e6525d1f91c17"
@@ -129,15 +130,20 @@ if [[ "$UPDATE_REPO" == "1" ]]; then
             echo "ERROR: remote checkout has uncommitted changes" >&2
             exit 1
         fi
-        git fetch origin "\$BRANCH" --depth 1
-        git checkout -B "\$BRANCH" FETCH_HEAD
+        git fetch origin "\$BRANCH" --depth 2
+        git cat-file -e "$EXACT_COMMIT^{commit}"
+        git merge-base --is-ancestor "$EXACT_COMMIT" FETCH_HEAD
+        git checkout -B "\$BRANCH" "$EXACT_COMMIT"
     elif [[ -e "\$WORK_DIR" ]]; then
         echo "ERROR: \$WORK_DIR exists but is not a git checkout" >&2
         exit 1
     else
-        git clone --single-branch --depth 1 --branch "\$BRANCH" \
+        git clone --single-branch --depth 2 --branch "\$BRANCH" \
             "\$REPO_URL" "\$WORK_DIR"
         cd "\$WORK_DIR"
+        git cat-file -e "$EXACT_COMMIT^{commit}"
+        git merge-base --is-ancestor "$EXACT_COMMIT" HEAD
+        git checkout -B "\$BRANCH" "$EXACT_COMMIT"
     fi
 else
     [[ -d "\$WORK_DIR/.git" ]] || {
@@ -195,6 +201,7 @@ EOF
 
 echo "PAPER COMPUTE SUPPORT LAUNCH"
 echo "  tpu=$TPU_NAME zone=$ZONE project=$PROJECT branch=$BRANCH"
+echo "  exact_commit=$EXACT_COMMIT"
 echo "  checkpoint=$CHECKPOINT expected_step=$EXPECTED_STEP"
 echo "  batch_size=$BATCH_SIZE max_val_tokens=$MAX_VAL_TOKENS"
 echo "  session=$SESSION log=$REMOTE_LOG"
