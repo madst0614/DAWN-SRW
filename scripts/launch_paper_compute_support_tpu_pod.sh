@@ -222,7 +222,7 @@ fi
 
 REMOTE_CMD_B64="$(printf '%s' "$REMOTE_CMD" | base64 | tr -d '\r\n')"
 REMOTE_WRAPPER="printf %s $REMOTE_CMD_B64 | base64 -d | bash"
-MSYS2_ARG_CONV_EXCL='*' gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
+MSYS2_ARG_CONV_EXCL='--command=' gcloud compute tpus tpu-vm ssh "$REMOTE_USER@$TPU_NAME" \
     --zone="$ZONE" --project="$PROJECT" --worker=all \
     --command="$REMOTE_WRAPPER"
 
