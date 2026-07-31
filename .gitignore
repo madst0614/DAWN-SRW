@@ -52,23 +52,24 @@ htmlcov/
 
 # Output
 *.pdf
-!/paper/main.pdf
+!/paper/v9/DAWN-SRW-v9.pdf
+!/paper/v10/DAWN-SRW-v10.pdf
 logs/
 outputs/
 .generated/
 
 # LaTeX paper
 /paper/build/
-/paper/imports/*.zip
-/paper/*.aux
-/paper/*.bbl
-/paper/*.blg
-/paper/*.fdb_latexmk
-/paper/*.fls
-/paper/*.log
-/paper/*.out
-/paper/*.synctex.gz
-/paper/*.toc
+/paper/v9/source/dawn_srw-original.zip
+/paper/*/source/*.aux
+/paper/*/source/*.bbl
+/paper/*/source/*.blg
+/paper/*/source/*.fdb_latexmk
+/paper/*/source/*.fls
+/paper/*/source/*.log
+/paper/*/source/*.out
+/paper/*/source/*.synctex.gz
+/paper/*/source/*.toc
 
 # Local TPU launcher captures (canonical runtime logs stay on the TPU/GCS)
 /launch_*_worker_*.log

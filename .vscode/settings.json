@@ -4,22 +4,22 @@
   "latex-workshop.latex.recipe.default": "first",
   "latex-workshop.latex.recipes": [
     {
-      "name": "MiKTeX texify",
+      "name": "Build versioned paper PDF",
       "tools": [
-        "miktex-texify"
+        "paper-build-script"
       ]
     }
   ],
   "latex-workshop.latex.tools": [
     {
-      "name": "miktex-texify",
-      "command": "texify",
+      "name": "paper-build-script",
+      "command": "powershell",
       "args": [
-        "--pdf",
-        "--max-iterations=5",
-        "--tex-option=--synctex=1",
-        "--tex-option=--halt-on-error",
-        "%DOC%"
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "%DIR%/build.ps1"
       ],
       "env": {}
     }
