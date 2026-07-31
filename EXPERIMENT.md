@@ -1762,6 +1762,14 @@ closed and must not be opened under this frozen protocol.
 - Evidence boundary: archived patches and tags preserve rejected, comparison-control, profiling, and benchmark-only implementations as research evidence. They are not merged into active production source and must not be treated as accepted architecture or benchmark baselines. Existing experiment decisions and remote runtime evidence paths remain authoritative in this notebook.
 - Validation/next: verify every patch mail header and commit SHA against its source branch, reconstruct each archived series from its recorded merge base, commit and push the archive on `main`, push all archive tags, then delete all non-main local and remote branches. Preserve the `paper-v9` release tag.
 
+#### #02 — Complete single-branch consolidation
+
+- Status/result: complete. Archive commit `3fd8f6acd7fa7eb13a04d90169449dc2aeaa6bb0` was pushed to `origin/main`. All 15 non-main remote branches and both non-main local branches were deleted; the remote and local branch inventories now contain only `main`.
+- Preservation audit: all eight `research-archive/...` annotated tags were pushed and independently dereferenced to the exact branch-tip commits recorded in `branches.yaml`. The `paper-v9` release tag still dereferences to `0ff69a642a44aa76409582a7b801448bb3a34e7c`.
+- Patch validation: all 13 patch headers matched the original commit order. Replaying each of the eight series from its recorded merge base produced an exact Git-tree match with the corresponding archived tag. Manifest parsing confirmed 15 retired branches, eight archived tips, and 13 branch-only commits.
+- Runtime boundary: repository-only Git operation; no Python model execution, checkpoint access, GCS access, TPU command, or runtime measurement.
+- Decision/next: `main` is the only working branch. Use `research/branch_archive/` and its immutable tags for historical inspection; create new short-lived branches only for future isolated experiments and report every result back to `main`.
+
 ## Backfill Boundary
 
 - The initial notebook covered evidence-backed work from 2026-07-21 through the step-1500 resume attempt.
