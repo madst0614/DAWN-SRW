@@ -36,6 +36,10 @@ ENV/
 
 # IDE
 .vscode/
+!/.vscode/
+/.vscode/*
+!/.vscode/settings.json
+!/.vscode/extensions.json
 .idea/
 *.swp
 *.swo
@@ -48,9 +52,23 @@ htmlcov/
 
 # Output
 *.pdf
+!/paper/main.pdf
 logs/
 outputs/
 .generated/
+
+# LaTeX paper
+/paper/build/
+/paper/imports/*.zip
+/paper/*.aux
+/paper/*.bbl
+/paper/*.blg
+/paper/*.fdb_latexmk
+/paper/*.fls
+/paper/*.log
+/paper/*.out
+/paper/*.synctex.gz
+/paper/*.toc
 
 # Local TPU launcher captures (canonical runtime logs stay on the TPU/GCS)
 /launch_*_worker_*.log

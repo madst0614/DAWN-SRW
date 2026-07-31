@@ -1,0 +1,1686 @@
+%%%%%%% DAWN-SRW PAPER — Preprint %%%%%%%%%%%%%%%%%
+
+\documentclass{article}
+
+% Recommended packages
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage[preprint]{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{multirow}
+\usepackage{float}
+\usepackage{caption}
+
+\icmltitlerunning{DAWN-SRW: Computational Model of Learned State Transitions}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{DAWN-SRW: A Computational Model of Learned State Transitions}
+
+\begin{icmlauthorlist}
+\icmlauthor{Seungho Choi}{ind}
+\end{icmlauthorlist}
+
+\icmlaffiliation{ind}{Independent Researcher}
+
+\icmlcorrespondingauthor{Seungho Choi}{madst0614@gmail.com}
+
+\icmlkeywords{Neural Architecture, State Transitions, Read-Write Neurons, Conditional Computation, Language Modeling}
+
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+%==============================================================================
+% ABSTRACT
+%==============================================================================
+
+\begin{abstract}
+At the most general level, a state-transition system can be described by a state space, a transition rule or family of transition rules, and a transition protocol specifying how those transitions are applied to form a trajectory. Observable computational systems add initialization and readout maps: an external input or initial condition initializes a state, a transition protocol applies transition rules to evolve that state, and an observable output is read from the resulting state. For a language model, an input sequence initializes a residual representation state, a fixed transition protocol---the layer schedule---applies a finite sequence of learned layer-wise transitions, and a readout produces the token distribution. We propose the DAWN-CEU state-transition formulation, which factorizes individual transition rules into Control, Execution, and Update maps. We specialize this formulation to Operator-Coordinate CEU, in which Control maps a representation state into an operator space and parameterizes a sparse state-to-operator execution relation.
+
+DAWN-SRW (DAWN Select--Read--Write) is a learned residual-state instance of this specialization. Select produces an operator-coordinate execution specification, RWCompose executes explicit rank-1 read/write transition operators, and a fixed residual update integrates the resulting state change. The current v4.1.6.7 implementation additionally introduces Global CEU Operator Pages: a page-routed candidate-retrieval mechanism that scores fixed-size operator blocks by live centroids in operator space and then applies the same DirectTau read/write execution inside the selected candidate pages. A completed 40M v4.1.6.6 operator-key run trains on 5B C4 tokens and reaches validation loss 3.6553 and accuracy 34.73\%, compared with 3.5986 and 35.44\% for a parameter-matched dense Transformer baseline. Under execution pruning at \(\epsilon=10^{-1}\), validation loss remains 3.6552 with an estimated compute fraction of 0.0424 under the pruning accounting. A legacy v4.1.5.5 route-embedding implementation provides an additional empirical anchor for hard-pruned execution and context-dependent RW-neuron traces, and an earlier 400M SRW-family pilot provides preliminary scaling and transfer evidence. Overall, DAWN-SRW trains as a language model with observable control outputs, traceable execution, and a concrete path toward candidate-restricted sparse operator execution.
+\end{abstract}
+
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+Dense transformations are a central substrate of modern neural architectures. They are expressive, stable to optimize, and efficient on contemporary accelerators. However, this computational form is also opaque: a dense layer maps an input representation to an output representation through parameterized operations, without producing an observable account of which identifiable operations were selected, executed, and composed for a given input.\footnote{Code is available at \url{https://github.com/madst0614/dawn-srw}.}
+
+The distinction from existing conditional-computation architectures is therefore not sparsity alone. A dense Transformer learns a global dense transition over the representation state. A Mixture-of-Experts model routes states to sparse opaque expert modules. DAWN-SRW routes states to explicit read-write transition operators, forming a functional transition-operator space and state-dependent execution domains.
+
+At the most general level, a state-transition system is described by a state space $\mathcal{S}$, a transition rule or family $\mathcal{T}$, and a transition protocol $\Pi$ specifying how rules are applied to form trajectories:
+\begin{equation}
+    \mathcal{D}=(\mathcal{S},\Pi,\mathcal{T}).
+    \label{eq:intro_state_transition_system}
+\end{equation}
+Here $\mathcal{T}$ denotes a transition family and $T\in\mathcal{T}$ an individual transition rule; $\Pi$ governs trajectory formation, such as fixed schedules, recurrence, conditional application, external interaction, or termination.
+
+Observable input-output systems add initialization and readout maps:
+\begin{equation}
+    \mathcal{M}=(\mathcal{E},\mathcal{S},\mathcal{O};\Phi,\Pi,\mathcal{T},H),
+    \label{eq:intro_observable_state_transition_system}
+\end{equation}
+where $\mathcal{E}$ and $\mathcal{O}$ are input and output spaces, $\Phi$ initializes $s_0$ from $e$, $\Pi$ applies transitions from $\mathcal{T}$ to form a trajectory, and $H$ reads the resulting state:
+\begin{equation}
+    s_0=\Phi(e),\qquad
+    s_0 \xrightarrow{\Pi,\mathcal{T}} s_1 \xrightarrow{\Pi,\mathcal{T}} \cdots \xrightarrow{\Pi,\mathcal{T}} s_\star,\qquad
+    o=H(s_\star).
+    \label{eq:intro_protocol_trajectory}
+\end{equation}
+The unconditioned form $s_{t+1}=T(s_t)$ is the special case of repeatedly applying a single transition rule.
+
+For a language model, the initialization map is an encoding map that maps an input sequence into an initial residual representation state,
+\begin{equation}
+    s_0=\Phi_\theta(x),
+    \label{eq:intro_input_initialization}
+\end{equation}
+where $\Phi_\theta$ includes token embedding, positional information, and initial residual-state construction. The transition protocol is fixed by the architecture: a finite sequence of learned layer-wise transition maps is applied,
+\begin{equation}
+    \Pi_{\mathrm{fixed}}=(T_{\theta,1},T_{\theta,2},\ldots,T_{\theta,L}).
+    \label{eq:intro_lm_fixed_protocol}
+\end{equation}
+This yields
+\begin{equation}
+    s_L=T_{\theta,L}\circ\cdots\circ T_{\theta,1}(s_0),
+    \label{eq:intro_lm_state_trajectory}
+\end{equation}
+and the output map is a readout map from the final state to a token distribution,
+\begin{equation}
+    p(y\mid x)=R_\theta(s_L).
+    \label{eq:intro_lm_readout}
+\end{equation}
+Thus standard fixed-depth language models are a special case in which the transition protocol is a fixed layer schedule, while the internal computation is a learned trajectory over residual representation states.
+
+DAWN-CEU factorizes the transition rule itself, not the transition protocol. The transition protocol $\Pi$ determines how transition rules are applied to form a trajectory; CEU decomposes an individual transition into Control, Execution, and Update components. Given a transition rule $T\in\mathcal{T}$ applied under a transition protocol $\Pi$, DAWN-CEU factorizes $T$ as
+\begin{equation}
+    T(s)=U(s,E(s,C(s))).
+    \label{eq:intro_ceu_factorized_transition}
+\end{equation}
+At the general, not necessarily learned, level, we denote a CEU factorization by
+\begin{equation}
+    \mathfrak{F}=(\mathcal{S},\mathcal{U}_{\mathrm{spec}},\mathcal{Z};C,E,U),
+    \label{eq:intro_ceu_formulation}
+\end{equation}
+where $\mathcal{U}_{\mathrm{spec}}$ is an execution-specification space and $\mathcal{Z}$ is an execution-result space. Equivalently, given a current system state $s_t\in\mathcal{S}$, a DAWN-CEU transition proceeds as
+\begin{align}
+    u_t &= C(s_t), \label{eq:intro_general_control}\\
+    z_t &= E(s_t,u_t), \label{eq:intro_general_exec}\\
+    s_{t+1} &= U(s_t,z_t) .
+    \label{eq:intro_general_transition}
+\end{align}
+Here $C$ is the control rule, which produces an execution specification $u_t$ from the current state; $E$ is the execution rule, which realizes an execution result $z_t$ from the current state and specification; and $U$ is the update rule, which applies that result to obtain the next state. Control should not be confused with the transition protocol: the protocol governs when and how transitions are applied, while the control rule operates inside a transition and specifies how that transition is executed. A transition without explicit control can be represented by a degenerate control rule that produces a fixed or null specification. Dense layers are not excluded from the DAWN-CEU formulation: they can also be written as state-transition maps, but typically correspond to implicit or unstructured cases in which no observable execution specification is produced.
+
+\paragraph{Operator-coordinate CEU.}
+In this specialization, the execution specification space is an operator-coordinate space. The control map sends the current representation state into this space, where coordinates parameterize a sparse relation between the state and a family of transition operators. Execution realizes the selected operators, and Update integrates the resulting state change back into the representation state.
+Formally, for a representation state $x\in\mathcal{S}$,
+\begin{equation}
+    C:\mathcal{S}\to\mathcal{Z}_{\mathrm{op}},\qquad
+    z_{\mathrm{op}}=C(x),
+    \label{eq:intro_operator_coordinate_control}
+\end{equation}
+where $\mathcal{Z}_{\mathrm{op}}$ is an operator-coordinate space. The coordinate $z_{\mathrm{op}}$ does not directly produce the next state; it parameterizes a sparse execution relation over a transition-operator family.
+
+For a fixed execution specification $u\in\mathcal{U}_{\mathrm{spec}}$, the execution map induces an execution function
+\begin{equation}
+    f_u:\mathcal{S}\to\mathcal{Z},\qquad f_u(s)=E(s,u).
+    \label{eq:intro_induced_execution_function}
+\end{equation}
+We call the resulting ability \emph{state-transition traceability}: the ability to follow a transition through exposed CEU objects and the execution function induced by its specification. The CEU formulation alone does not imply interpretability; detailed space and function traceability conditions are given in Appendix~\ref{app:ceu_traceability_formalization}.
+
+Throughout, subscripts $\theta$ indicate learned parameterization; fixed architectural rules are written without $\theta$. A learned computation is therefore not the general formulation itself, but a parameterized instance of it:
+\begin{align}
+    u_t &= C_{\theta_C}(s_t), \label{eq:intro_learned_control}\\
+    z_t &= E_{\theta_E}(s_t,u_t), \label{eq:intro_learned_exec}\\
+    s_{t+1} &= U_{\theta_U}(s_t,z_t),
+    \label{eq:intro_learned_transition}
+\end{align}
+with $\theta=(\theta_C,\theta_E,\theta_U)$. This induces a learned transition rule
+\begin{equation}
+    T_\theta(s)=U_{\theta_U}\!\left(s,E_{\theta_E}(s,C_{\theta_C}(s))\right).
+    \label{eq:intro_learned_factorized_transition}
+\end{equation}
+When the update rule is fixed by the architecture, the learned transition instead takes the form
+\begin{equation}
+    T_\theta(s)=U\!\left(s,E_{\theta_E}(s,C_{\theta_C}(s))\right).
+    \label{eq:intro_fixed_update_factorized_transition}
+\end{equation}
+Rules fixed by the architecture can be viewed as having empty or singleton parameter spaces. Thus, the DAWN-CEU formulation separates the structural skeleton of a transition from the learnable parameter dimensions that instantiate it.
+
+DAWN-SRW is not the general state-transition system itself; it is an explicit residual-state implementation of Operator-Coordinate CEU. Its transition protocol in the fixed-depth experiments is the model's layer schedule, and its state is the residual representation $s_t=x_t$:
+\begin{align}
+    u_t &= \mathrm{Select}_{\theta_C}(x_t), \label{eq:intro_select}\\
+    z_t &= \mathrm{RWCompose}_{\theta_E}(x_t,u_t). \label{eq:intro_rwcompose}
+\end{align}
+In DAWN-SRW, the update rule is the fixed residual update,
+\begin{equation}
+    x_{t+1}=U(x_t,z_t)=x_t+z_t,
+    \label{eq:intro_srw_transition}
+\end{equation}
+so $z_t=\Delta x_t$ is the residual state change.
+
+The DAWN-CEU formulation does not require a particular control mechanism, execution mechanism, update rule, or unit decomposition. DAWN-SRW adds a learned functional read-write transition-operator family stored in reusable RW-neuron pools. Each RW operator implements the minimal rank-1 read/write map
+\begin{equation}
+    W_i(x)=O_i^{RW}(x)=\langle x,r_i\rangle w_i,
+\end{equation}
+where $r_i$ reads a scalar component of the current residual state and $w_i$ writes a direction of change back into the residual stream. In the v4.1.6.6 formulation, the routing key of an operator is derived from its own read/write directions,
+\begin{equation}
+    k_i=K(r_i,w_i),
+    \label{eq:intro_rw_derived_key}
+\end{equation}
+tying the control-facing identity of the operator to its execution-facing read/write map. Select compares the current operator-coordinate query with the RW-derived operator key,
+\begin{equation}
+    \rho_i(x)=\cos(C(x),k_i),
+    \label{eq:intro_rw_operator_score}
+\end{equation}
+and produces a soft gate from the boundary relation
+\begin{equation}
+    m_i(x)=\rho_i(x)-\tau(x),\qquad
+    \gamma_i(x)=\mathrm{admission}_i(x)\,\mathrm{drive}_i(x).
+    \label{eq:intro_rw_gate}
+\end{equation}
+Schedule and gate-shape details are implementation choices and are kept in the method and appendix. With $\mathcal{O}_{RW}=\{W_i\}$, the execution and full residual transition are
+\begin{align}
+    E(x,C(x)) &= \sum_i \gamma_i(x)\langle x,r_i\rangle w_i, \\
+    U(x,\Delta x) &= x+\Delta x, \\
+    T(x) &= x+\sum_i \gamma_i(x)\langle x,r_i\rangle w_i .
+    \label{eq:intro_operator_coordinate_srw_transition}
+\end{align}
+Thus, DAWN-SRW learns a representation geometry, a functional read-write transition-operator family, and a sparse state-to-operator execution relation between representation states and explicit transition operators.
+
+Because routing is soft, these relations should be read as overlapping soft domains rather than disjoint partitions. For an operator $W_i$, its $\epsilon$-active execution domain is
+\begin{equation}
+    \Omega_i^\epsilon=\{x\in\mathcal{S}\mid \gamma_i(x)>\epsilon\}.
+    \label{eq:intro_execution_domain}
+\end{equation}
+The resulting routing-induced execution domains form an overlapping soft domain decomposition over the residual state space.
+
+For a given Select output, the induced execution function takes the read/write form
+\begin{equation}
+    f_{u_t}(s)=\sum_{i\in A(x_t)} \gamma_i(x_t)\langle s,r_i\rangle w_i .
+    \label{eq:intro_srw_induced_execution}
+\end{equation}
+Evaluated at $s=x_t$, this gives $z_t=f_{u_t}(x_t)$ and the residual transition
+\begin{equation}
+    x_{t+1}=x_t+f_{u_t}(x_t)
+    =x_t+
+    \sum_{i\in A(x_t)} \gamma_i(x_t)\langle x_t,r_i\rangle w_i .
+    \label{eq:intro_srw_expanded_transition}
+\end{equation}
+Thus the transition rule is traceable through the selected read/write component functions.
+
+
+Each DAWN-SRW block consists of an Attention Layer followed by a Residual State Transition (RST) Layer. Attention contextualizes token states using Select/RWCompose-constructed Q, K, and V; the RST Layer then applies a gate-normalized read/write transition over the RST pool to move the residual state forward.
+
+
+DAWN-SRW inherits DAWN's signature--operation abstraction while instantiating it under the DAWN-CEU state-transition formulation: operator identities serve Select, operations become read/write maps for RWCompose, and residual addition applies the execution output. Appendix~\ref{app:terminology} compares DAWN, the formulation, and DAWN-SRW; Appendix~\ref{app:dense_attention_ceu} shows how dense attention fits the formulation while leaving dense interface construction implicit and semantically entangled.
+
+This draft is organized around the current operator-key and page-based formulation. The completed v4.1.6.6 experiment is used as the primary 40M validation of the RW-derived operator-key path. The v4.1.6.7 page implementation is described as the current scalable extension of the same operator-coordinate mechanism; its final loss and wall-clock trade-off are not yet claimed. The earlier v4.1.5.5 route-embedding run is retained as a legacy preliminary pilot because it provides the strongest completed package of hard-pruned evaluation and context-dependent RW-neuron trace analysis. We also retain a 400M earlier SRW-family pilot for scaling and downstream transfer evidence.
+
+Our contributions are as follows:
+\begin{itemize}
+    \item \textbf{DAWN-CEU state-transition formulation.} We propose the DAWN-CEU formulation over general state-transition systems: a transition protocol forms trajectories from transition rules, and CEU factorizes individual transition rules into Control, Execution, and Update maps.
+    \item \textbf{Operator-coordinate DAWN-SRW architecture.} We instantiate the formulation over the residual representation space using Select as the control rule, RWCompose as the execution rule, and a fixed residual update as the update rule. DAWN-SRW learns a sparse state-to-operator execution relation over explicit read/write transition operators.
+    \item \textbf{RW-derived operator-key Select.} The current DAWN-SRW formulation ties the Select-facing identity of each operator to its read/write operation by deriving operator keys from the same read and write directions that execute the transition. The completed v4.1.6.6 run validates that this final operator-key path trains at 40M scale.
+    \item \textbf{Global CEU Operator Pages.} The v4.1.6.7 implementation adds a coarse page-retrieval layer over the global operator atlas. Pages are fixed-size candidate blocks scored by live centroids in operator space, while DirectTau and RWCompose still determine token-specific operator execution inside the selected blocks.
+    \item \textbf{Preliminary execution and trace evidence.} We report 40M operator-key validation, legacy hard-pruned execution and RW-neuron trajectory analysis, and an earlier 400M SRW-family scaling and transfer pilot. We explicitly separate structural sparsity and theoretical pruning accounting from measured wall-clock speedup.
+\end{itemize}
+
+\section{Related Work}
+%==============================================================================
+
+\paragraph{Transformer computation and residual representations.}
+Transformer language models update token representations through repeated attention and feedforward transformations \cite{vaswani2017attention}. Mechanistic analyses often describe these models in terms of a residual stream that carries information between layers \cite{elhage2021mathematical}. In standard architectures, however, the transformations applied to this stream are implemented by dense parameterized maps whose internal operation structure is not directly observable as selected and executed units. DAWN-SRW starts from the same residual-stream perspective on language modeling, but represents computation through the DAWN-CEU formulation over RW neurons. The goal is not only to produce an output, but to make observable which RW neurons were selected and how they were gated, and to make traceable how their execution contributed to the residual-state change.
+
+\paragraph{Conditional computation and sparse expert models.}
+Mixture-of-Experts models route tokens to a small number of expert networks \cite{shazeer2017outrageously, fedus2022switch}. These methods introduce conditional computation at the level of large subnetworks, typically whole feedforward experts. Under the CEU view, MoE layers are space-traceable at the expert-routing level because the router exposes selected experts and gates; however, unless the experts expose their internal computation, the induced execution function remains opaque inside each dense expert. DAWN-SRW uses a finer-grained form of control: Select maps states into an operator-coordinate space, compares them with explicit RW operator keys, and RWCompose composes the resulting read/write transitions into an output. The selected unit is not a full expert block, but a minimal read/write transition operator that reads a scalar component of the current state and writes a learned direction of change.
+
+
+\paragraph{Low-rank and factorized transformations.}
+Low-rank methods such as LoRA introduce trainable low-rank updates to dense weights, often for parameter-efficient adaptation \cite{hu2022lora}. DAWN-SRW also uses factorized structure, but in a different role. RW neurons are not auxiliary updates to a frozen dense model; they are the primary computational substrate. Each RW neuron executes a rank-1 transition $O_i(x)=\langle x,r_i\rangle w_i$, and different RW neurons are selected for different states.
+
+\paragraph{State-space models and learned dynamics.}
+State-space models formulate sequence modeling as the evolution of a hidden state over time, and selective SSMs make the transition dynamics input-dependent \cite{gu2022efficiently, gu2024mamba}. DAWN-SRW shares the state-transition perspective, but applies it along a different axis. SSMs primarily model temporal memory dynamics along the sequence dimension: what information should be propagated, forgotten, or decayed across tokens. DAWN-SRW models residual-state computation across layers: each layer treats the residual representation as the current state and moves it by selecting RW neurons that transform it into the next computation state. Thus, DAWN-SRW is not a replacement for sequence recurrence, but a model of how learned transformations themselves can be decomposed through explicit DAWN Select--Read--Write transitions.
+
+
+\paragraph{Post-hoc interpretability and architectural observability.}
+Sparse autoencoders and related interpretability tools discover features in the activations of already-trained dense models \cite{cunningham2023sparse}. DAWN-SRW instead builds identifiable components into the architecture. A RW neuron has an explicit read/write transition operation and, in the final operator-coordinate formulation, a routing key derived from that operation, allowing the model's internal computation to be analyzed as control over identifiable transition operators followed by executed contributions. This does not remove the need for analysis, but it changes the object of analysis from post-hoc discovered features to architecturally observable selection traces and traceable execution contributions.
+
+\paragraph{From DAWN to DAWN-SRW.}
+DAWN \cite{choi2026dawn} is the closest predecessor to DAWN-SRW: it introduced the signature--operation abstraction and replaced Transformer projection matrices with dynamic compositions of low-rank Feature--Restore neurons from shared pools. DAWN-SRW retains the abstraction but recasts it under the DAWN-CEU state-transition formulation: the control-facing identity is tied to an explicit read/write transition operator, execution becomes a composition of rank-1 read/write maps, and the transition is implemented through Select, RWCompose, and a fixed residual update. Thus, DAWN-SRW is not a direct reimplementation of the original DAWN architecture, but a CEU-factorized residual-state implementation.
+
+\section{Method}
+\label{sec:method}
+%==============================================================================
+
+The method instantiates Operator-Coordinate CEU as a learned residual-state model. The current method has a two-stage operator-selection path. First, the v4.1.6.6 operator-key path maps a residual state into an operator-coordinate query, compares that query with RW-derived operator keys, and executes selected read/write transition operators through DirectTau admission and RWCompose. Second, the v4.1.6.7 page path adds a coarse candidate-retrieval stage over the same global operator atlas: it ranks fixed-size operator pages by live centroid similarity before applying the original operator-level DirectTau and read/write execution inside the selected candidate blocks. Thus v4.1.6.7 should be read as the page-routed extension of the v4.1.6.6 operator-key formulation, not as a separate expert architecture.
+
+\subsection{DAWN-SRW as a Learned Residual-State Instance}
+
+In DAWN-SRW, the abstract system state \(s_t\) is instantiated as the residual representation state \(x_t\). At each layer and token position, the residual-stream vector is treated as the current residual state. DAWN-SRW instantiates the CEU control rule as Select, the execution rule as RWCompose, and the update rule as a fixed residual update:
+\begin{align}
+    u_t &= \mathrm{Select}_{\theta_C}(x_t), \\
+    z_t &= \mathrm{RWCompose}_{\theta_E}(x_t,u_t), \\
+    x_{t+1} &= U(x_t,z_t)=x_t+z_t .
+\end{align}
+Here \(u_t\) identifies participating RW operators and gates, and \(z_t=\Delta x_t\) is the composed residual state change. The equations in this section describe the current v4.1.6.7 method structure. The completed 40M result in Section~\ref{sec:operator_key_results} evaluates the full-pool v4.1.6.6 operator-key path; Section~\ref{sec:page_status} describes the v4.1.6.7 page-routed implementation status.
+
+For a single RW-neuron pool \(p\), Select produces a pool execution specification
+\begin{equation}
+    u_p(x_t)=\mathrm{Select}^p_\theta(x_t)=\{(i,\gamma_i^p(x_t))\}_{i=1}^{N_p},
+\end{equation}
+where \(\gamma_i^p(x_t)\) is the gate assigned to RW operator \(i\). Each selected RW operator has a read/write operation
+\begin{equation}
+    O_i^{RW,p}(x_t)=\langle x_t,r_i^p\rangle w_i^p .
+\end{equation}
+RWCompose then gates, normalizes, and sums these RW contributions:
+\begin{equation}
+    y_p(x_t)=
+    \alpha_p
+    \frac{\sum_{i=1}^{N_p}\gamma_i^p(x_t)\langle x_t,r_i^p\rangle w_i^p}
+    {\max\left(\sum_{i=1}^{N_p}\gamma_i^p(x_t),1\right)} .
+    \label{eq:method_rwcompose_compact}
+\end{equation}
+The residual update is fixed by the architecture; the learnable components are the control and execution parameterizations.
+
+\subsection{Operator Space and RW-Derived Operator Keys}
+
+DAWN-SRW separates the representation space in which token states live from the operator space in which transition operators are addressed. The model does not route directly over representation features. It first maps the current residual state into an operator-coordinate query and then selects read/write transition operators near that coordinate.
+
+Each RW operator is an identifiable transition unit with an execution-facing read/write map and a control-facing operator key. For operator \(i\), let
+\begin{equation}
+    r_i,w_i\in\mathbb{R}^{d_{\mathrm{model}}},\qquad k_i\in\mathbb{R}^{d_{\mathrm{route}}}.
+\end{equation}
+The read/write operation is
+\begin{equation}
+    O_i^{RW}(x)=\langle x,r_i\rangle w_i .
+    \label{eq:method_rw_operator}
+\end{equation}
+The read vector extracts a scalar component from the current residual state, and the write vector maps that scalar into a direction of residual-state change.
+
+In the operator-key formulation, the Select-facing key is derived from the RW operation itself:
+\begin{equation}
+    k_i = K_\theta(r_i,w_i).
+    \label{eq:method_rw_derived_key}
+\end{equation}
+The implementation uses normalized read and write directions, projects them into the route dimension, multiplies the two compressed signatures elementwise, and normalizes the result. This ties the control-facing identity of an operator to the same read/write directions that execute the transition.
+
+The current operator query is also RW-matched. A read-side query is produced from the residual state, and a write-side query is produced by projecting the same state into the operator route dimension. The resulting query has the form
+\begin{equation}
+    h(x)=\operatorname{normalize}\!\left(
+    \operatorname{normalize}(q_r(x))\odot
+    \operatorname{normalize}(q_w(x))
+    \right),
+    \label{eq:method_rw_matched_query}
+\end{equation}
+where \(\odot\) denotes elementwise multiplication. Select compares \(h(x)\) with RW-derived operator keys by cosine similarity:
+\begin{equation}
+    \rho_i(x)=\left\langle \operatorname{normalize}(h(x)),\operatorname{normalize}(k_i)\right\rangle .
+    \label{eq:method_operator_score}
+\end{equation}
+
+\subsection{DirectTau Admission and Boundary-Relative Drive}
+
+The operator-key path uses a cosine-space DirectTau boundary. A learned raw threshold is mapped into the cosine interval,
+\begin{equation}
+    \tau(x)=-1+2\sigma(\tau_{\mathrm{raw}}(x)),
+\end{equation}
+and the selection margin is
+\begin{equation}
+    m_i(x)=\rho_i(x)-\tau(x).
+\end{equation}
+DirectTau separates whether an operator is admitted near the boundary from how strongly it is driven once admitted:
+\begin{equation}
+    \gamma_i(x)=\mathrm{admission}_i(x)\,\mathrm{drive}_i(x).
+    \label{eq:method_directtau_gate}
+\end{equation}
+The admission term is a one-sided boundary function of the negative margin, and the drive term is a boundary-relative positive contribution scale. The main point is structural: Select produces an observable state-to-operator execution relation, while RWCompose executes the selected read/write maps. Schedule details, boundary temperature, boundary power, and execution-pruning thresholds are implementation choices.
+
+\subsection{RWCompose: Executing the Selected Transition}
+
+RWCompose receives the current state and the execution specification produced by Select. For a candidate operator set \(\mathcal{C}(x)\), which may be the full pool or the page-retrieved candidate set, the composed output is
+\begin{equation}
+    y_p(x)=
+    \alpha_p
+    \frac{\sum_{i\in\mathcal{C}(x)}\gamma_i^p(x)\langle x,r_i^p\rangle w_i^p}
+    {\max\left(\sum_{i\in\mathcal{C}(x)}\mathrm{admission}_i^p(x),1\right)^{\eta}} ,
+    \label{eq:method_candidate_rwcompose}
+\end{equation}
+where \(\eta\) is the admission-denominator power used by the implementation. The v4.1.6.6 full-pool path takes \(\mathcal{C}(x)\) to be the full pool. The v4.1.6.7 page-routed path first constructs \(\mathcal{C}(x)\) from selected operator pages and then applies the same DirectTau/RWCompose equations inside that candidate set.
+
+For an operator \(W_i\), the soft gate induces an \(\epsilon\)-active execution domain
+\begin{equation}
+    \Omega_i^\epsilon=\{x\in\mathcal{S}\mid \gamma_i(x)>\epsilon\}.
+\end{equation}
+These routing-induced execution domains may overlap across operators. They should therefore be understood as an overlapping soft domain decomposition rather than a disjoint partition.
+
+\subsection{Global CEU Operator Pages}
+\label{sec:operator_pages_method}
+
+The global operator atlas gives DAWN-SRW an explicit set of reusable transition operators, but a full-pool implementation still compares each query with every operator. Global CEU Operator Pages add a coarse candidate-retrieval layer over the same operator space.
+
+Let the operator pool be partitioned into fixed-size pages \(P_j\). Each page contains a fixed-size block of RW transition operators from the global operator pool. In the current implementation, pages are fixed candidate blocks rather than learned clusters or periodically repacked semantic regions. For page \(P_j\), define a live page centroid from the RW-derived operator keys in that block:
+\begin{equation}
+    c_j=\operatorname{normalize}\left(
+        \frac{1}{|P_j|}\sum_{i\in P_j} k_i
+    \right).
+    \label{eq:method_page_centroid}
+\end{equation}
+Given an operator query \(h(x)\), page scores are computed by cosine similarity,
+\begin{equation}
+    s_j(h)=\left\langle \operatorname{normalize}(h),c_j\right\rangle .
+    \label{eq:method_page_score}
+\end{equation}
+The model selects the top-\(K\) nearest pages and forms a temporary candidate operator set
+\begin{equation}
+    \mathcal{C}_{\mathrm{page}}(h)=
+    \bigcup_{j\in\operatorname{TopK}(s(h))}P_j .
+    \label{eq:method_page_candidate_set}
+\end{equation}
+DirectTau admission and RWCompose execution are then applied only inside \(\mathcal{C}_{\mathrm{page}}(h)\).
+
+This distinction is important. Page selection is a coarse, Voronoi-like neighborhood selection over live page centroids in operator space. It should not be read as a claim that operators inside each fixed page already form a learned semantic cluster. A page is not an expert layer and it does not itself perform the computation. The actual computation is still performed by token-specific read/write transition operators selected and weighted by DirectTau inside the selected candidate pages. In the current implementation, page selection may be shared by a small microgroup for efficient dense candidate execution, but each token retains its own operator query, threshold, admission, drive, and read/write contribution weights inside the selected candidate set.
+
+\subsection{DAWN-SRW Block: Attention Followed by RST}
+
+Each DAWN-SRW block consists of an Attention Layer followed by a Residual State Transition (RST) Layer. Both apply Select and RWCompose, but for different roles. The Attention Layer uses Select and RWCompose to construct Q, K, and V for relational token interaction. The RST Layer uses Select and RWCompose to produce the post-attention residual-state transition.
+
+\paragraph{Attention Layer.}
+Given a residual state \(x_{\ell,t}\), the Attention Layer first applies normalization and constructs Q, K, and V through attention pools. Query and key use the shared attention-QK pool but make separate Select control passes; value uses the attention-V pool:
+\begin{align}
+    Q_{\ell,t} &= \mathrm{RWCompose}^{Q}_\theta(x_{\ell,t},\mathrm{Select}^{Q}_\theta(x_{\ell,t})), \\
+    K_{\ell,t} &= \mathrm{RWCompose}^{K}_\theta(x_{\ell,t},\mathrm{Select}^{K}_\theta(x_{\ell,t})), \\
+    V_{\ell,t} &= \mathrm{RWCompose}^{V}_\theta(x_{\ell,t},\mathrm{Select}^{V}_\theta(x_{\ell,t})).
+\end{align}
+The resulting Q, K, and V are passed through standard causal self-attention to produce the attention output \(a_{\ell,t}\), and the intermediate residual state is
+\begin{equation}
+    \tilde{x}_{\ell,t}=x_{\ell,t}+a_{\ell,t}.
+\end{equation}
+
+\paragraph{RST Layer.}
+The RST Layer receives the contextualized state \(\tilde{x}_{\ell,t}\) and applies the explicit DAWN-SRW transition directly:
+\begin{align}
+    u^{RST}_{\ell,t} &= \mathrm{Select}^{RST}_\theta(\tilde{x}_{\ell,t}), \\
+    \Delta x^{RST}_{\ell,t} &= \mathrm{RWCompose}^{RST}_\theta(\tilde{x}_{\ell,t},u^{RST}_{\ell,t}), \\
+    x_{\ell+1,t} &= \tilde{x}_{\ell,t}+\Delta x^{RST}_{\ell,t} .
+\end{align}
+Select determines which RST-pool operators participate, and RWCompose executes their gate-weighted read/write transition. The Attention Layer therefore contextualizes token states, while the RST Layer moves the contextualized state to the next residual state.
+
+\subsection{Implementation Roles of v4.1.5.5, v4.1.6.6, and v4.1.6.7}
+\label{sec:implementation_roles}
+
+The paper separates three implementation roles. The v4.1.6.6 implementation is the completed full-pool operator-key path and is used as the primary 40M validation of the final RW-derived-key formulation. The v4.1.6.7 implementation keeps the same operator-key Select and DirectTau/RWCompose execution but adds Global CEU Operator Pages for page-routed candidate execution. Its current role in this draft is architectural and implementation-level: final page capacity, validation loss, and wall-clock trade-offs are not claimed until the page run completes. The older v4.1.5.5 implementation is retained as a legacy preliminary pilot because it provides completed hard-pruned evaluation and context-dependent trace analysis under a route-embedding Select mechanism.
+
+\section{Experiments}
+\label{sec:experiments}
+%==============================================================================
+
+We report experiments in four roles. First, the completed 40M v4.1.6.6 run is the primary validation that the RW-derived operator-key formulation trains as a language model. Second, the legacy 40M v4.1.5.5 route-embedding implementation is retained as a preliminary empirical anchor for hard-pruned execution and context-dependent RW-neuron traces. Third, the v4.1.6.7 page implementation is described as the current scalable extension, with final empirical page results left for the completed version. Fourth, a 400M earlier SRW-family DAWN pilot is summarized for scaling and transfer evidence.
+
+\subsection{40M Operator-Key Validation}
+\label{sec:operator_key_results}
+
+We train DAWN-SRW v4.1.6.6 and a dense Transformer baseline on the same 5B-token C4 budget for 76{,}293 steps. The DAWN-SRW run has 40.220M parameters and uses the full-pool RW-derived operator-key path: live-gradient RW keys, RW-matched operator queries, DirectTau admission, boundary-relative drive, and read/write composition. The dense Transformer baseline has 40.344M parameters and uses a larger residual width with a standard feed-forward layer.
+
+The v4.1.6.6 model trains to completion and reaches validation loss 3.6553 with validation accuracy 34.73\%. The dense Transformer baseline reaches validation loss 3.5986 with validation accuracy 35.44\%. Thus the completed operator-key run is not presented as outperforming the dense baseline; its role is to validate that the final RW-derived operator-key formulation remains trainable at 40M scale and supports sparse execution pruning without loss degradation under the reported pruning accounting.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.04}
+\begin{tabular}{llrrrr}
+\toprule
+Model & Eval & Params & Loss & Acc. & Exec. note \\
+\midrule
+Dense TF & full & 40.344M & 3.5986 & 35.44 & dense \\
+DAWN v4.1.6.6 & full & 40.220M & 3.6553 & 34.73 & full pool \\
+DAWN v4.1.6.6 & prune $\epsilon=10^{-1}$ & -- & 3.6552 & 34.73 & 0.0424 est. \\
+\bottomrule
+\end{tabular}
+\caption{Primary 40M operator-key validation. The execution note for the pruned row is the estimated compute fraction reported by the pruning accounting, not a measured wall-clock speedup and not directly comparable to the dense baseline row.}
+\label{tab:v4166_main}
+\end{table}
+
+At end-of-epoch validation, execution pruning at \(\epsilon=10^{-2}\) gives loss 3.6552 with estimated compute fraction 0.0426, and execution pruning at \(\epsilon=10^{-1}\) gives loss 3.6552 with estimated compute fraction 0.0424. Both rows leave validation loss effectively unchanged relative to the full v4.1.6.6 evaluation. This supports the limited claim that the operator-key DirectTau/RWCompose path concentrates executed read/write computation into a small retained set under the pruning convention.
+
+\subsection{Legacy v4.1.5.5 Preliminary Pilot}
+\label{sec:legacy_v4155_pilot}
+
+We retain the v4.1.5.5 run as a legacy preliminary pilot because it provides a completed package of hard-pruned evaluation and RW-neuron trace analysis. This implementation predates the final RW-derived-key Select mechanism and uses legacy independent route embeddings. It should therefore not be read as an evaluation of the current v4.1.6.6/v4.1.6.7 operator-key path. It is used to show that the Select/RWCompose residual-state architecture trains, supports strict hard-pruned forward passes, and exposes traceable context-dependent RW-neuron trajectories.
+
+Under the paper evaluation protocol, v4.1.5.5 reaches validation loss 3.62589 and accuracy 35.153\%, compared with 3.60568 and 35.397\% for its parameter-matched dense baseline. At the strict threshold \(\rho=0.99\), hard-pruned evaluation retains only about 13\% of estimated RW execution while leaving validation loss unchanged within \(10^{-5}\). The detailed hard-pruning protocol and FLOPs accounting are given in Appendix~\ref{app:hard_pruned_eval}.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.04}
+\begin{tabular}{lcccc}
+\toprule
+Execution & Loss & Acc. & RST kept & RW-only \\
+\midrule
+Dense TF & 3.60568 & 35.397 & -- & -- \\
+DAWN v4.1.5.5 full & 3.62589 & 35.153 & 20{,}560 & 1.000$\times$ \\
+DAWN v4.1.5.5 hard .99 & 3.62590 & 35.152 & 3{,}031 & 0.131$\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Legacy 40M v4.1.5.5 hard-pruned preliminary pilot. RW-only FLOPs are estimated selected-read/write execution costs, not measured wall-clock speedups.}
+\label{tab:hard_pruned_main}
+\end{table}
+
+\subsection{Context-Dependent RST Control Traces}
+\label{sec:context_dependent_decisions}
+
+The trace analysis is performed on the v4.1.5.5 legacy pilot. Our main analysis asks whether the RST Layer applies a fixed token-specific RW-neuron set or a context-dependent trace. For contextually underdetermined token states, we compare two short probe contexts with different plausible resolutions, e.g., financial \emph{bank} versus river \emph{bank}. At each layer, we compare Jaccard overlap for three RST sets: broad active neurons, top-$k$ projected contributors, and effective-mass contributors. Figure~\ref{fig:mean_jaccard} averages this overlap over \emph{bank}, \emph{charge}, \emph{light}, and \emph{apple}; formal definitions are given in Appendix~\ref{app:analysis_quantities}.
+
+\begin{figure*}[t]
+\centering
+\IfFileExists{figures/mean_jaccard_by_layer.png}{%
+    \includegraphics[width=0.78\textwidth]{figures/mean_jaccard_by_layer.png}%
+}{%
+    \fbox{\parbox[c][0.26\textheight][c]{0.88\textwidth}{\centering Placeholder: mean layer-wise RST control/transition overlap.}}%
+}
+\caption{Mean context-dependent RST control/transition overlap for contextually underdetermined token states in the v4.1.5.5 legacy pilot. Broad active sets remain partially shared across contexts, while top-$k$ projected contributors and effective-mass contributors diverge sharply after the early layers. This indicates that the RST Layer maintains a broad shared candidate space while forming context-dependent high-contribution RW-neuron compositions.}
+\label{fig:mean_jaccard}
+\end{figure*}
+
+The mean trajectory shows a consistent pattern. In the earliest layers, the two contexts share many RST RW neurons, including high-contribution RW neurons. After the first few layers, the top-$k$ and effective-mass contributor overlaps drop sharply and remain low. In contrast, the broad active set remains more overlapping. This pattern indicates that DAWN-SRW does not simply apply a fixed token-specific RW-neuron set. Instead, the RST Layer maintains a broad shared candidate space while composing different high-contribution RW neurons as the residual state becomes contextualized.
+
+\paragraph{Bank and execution traces.}
+Appendices~\ref{app:bank_case} and~\ref{app:execution_trace} provide the single-token \emph{bank} case and a final-layer execution trace. They show the same pattern at finer resolution and distinguish routing evidence from executed contribution, which also depends on the read scalar, gate, write direction, and alignment with the composed RST output.
+
+\subsection{v4.1.6.7 Page-Routed Implementation Status}
+\label{sec:page_status}
+
+The v4.1.6.7 implementation adds Global CEU Operator Pages to the v4.1.6.6 operator-key path. The implementation supports page-enabled QK, V, and RST pools; page selection retrieves top-\(K\) fixed-size candidate pages according to live centroid similarity in operator space, and DirectTau/RWCompose is then applied inside the resulting candidate set. This section is intentionally not a final empirical comparison. At the time of this draft, v4.1.6.7 is included as the current method and implementation path, while final page-size, page-capacity, validation-loss, and wall-clock trade-off results remain pending.
+
+\subsection{400M Scaling and Transfer Pilot}
+\label{sec:downstream_400m}
+
+We also summarize a 400M-scale pilot with spatial-r1-v3.9.4, an earlier SRW-family DAWN model. This result is used only as scaling and transfer evidence, not as evidence for the v4.1.6.6 operator-key mechanism, the v4.1.6.7 page mechanism, or implemented sparse inference efficiency. Table~\ref{tab:transfer_400m_compact} gives a compact downstream summary; full setup, checkpoint metrics, utilization diagnostics, and compute accounting are given in Appendix~\ref{app:v394_400m_pilot}.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.04}
+\begin{tabular}{lrrrr}
+\toprule
+Model & SST-2 & RTE & WiC & BoolQ \\
+\midrule
+TF rand. & 75.57 & 53.07 & 56.27 & 64.86 \\
+DAWN rand. & 76.49 & 51.26 & 55.96 & 65.63 \\
+TF C4 & 93.69 & 68.95 & 69.75 & 78.13 \\
+DAWN C4 & 94.04 & 71.48 & 67.24 & 77.52 \\
+\bottomrule
+\end{tabular}
+\caption{400M transfer pilot. Accuracies are percentages.}
+\label{tab:transfer_400m_compact}
+\end{table}
+
+These results support the limited claim that RW-neuron composition can scale beyond the 40M setting and learn transferable representations, while leaving final sparse-execution and page-retrieval claims to the later v4.1.6.6/v4.1.6.7 path.
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+%==============================================================================
+
+The central architectural idea is that DAWN-SRW computes by locating a residual state in an operator space and executing selected read/write state-transition operators. The v4.1.6.6 result validates the completed RW-derived operator-key path at 40M scale. The v4.1.6.7 page mechanism then extends the same operator-coordinate structure into a candidate-retrieval architecture: fixed-size pages are ranked by live centroid similarity first, and the original token-specific DirectTau/RWCompose execution remains responsible for the actual computation.
+
+\paragraph{Language modeling as residual-state transition.}
+Under the DAWN-CEU state-transition formulation, language modeling can be interpreted as learning a sequence of transitions over residual representation states. Each block updates the current state so that, after repeated contextualization and residual-state transitions, the final representation better supports the next-token distribution under the output readout. DAWN-SRW makes this process explicit: Select exposes \(u_t\) as a state-to-operator execution relation, RWCompose produces \(z_t=\Delta x_t\) through rank-1 read/write contributions, and the RST Layer applies this transition after attention contextualization.
+
+\paragraph{Scalable operator-space execution.}
+Global CEU Operator Pages provide an implementation path from traceable sparse operators to practical candidate-restricted execution. A full-pool DAWN-SRW layer compares each operator query against the entire global RW-operator atlas. The page mechanism first ranks fixed-size pages by live centroid similarity in operator space and then applies DirectTau admission and read/write composition only over selected candidate pages. This preserves the global operator-atlas interpretation while avoiding the requirement that every token scan every operator at execution time. The current draft treats this as an architectural and implementation extension; final wall-clock efficiency, page capacity, page geometry, and validation-loss trade-offs still need to be measured.
+
+\paragraph{Traceability and empirical roles.}
+The v4.1.5.5 trace analysis shows a contrast between broad candidate RW neurons and effective transition contributors: active RST sets remain moderately overlapping across contexts, but top projected and effective-mass contributor sets diverge after the early layers. Because that run uses legacy route embeddings, it is not evidence for the final RW-derived-key mechanism. Its role is narrower: it demonstrates the type of trace analysis enabled by Select/RWCompose and motivates the same analysis on the v4.1.6.6/v4.1.6.7 path after the current runs complete.
+
+\paragraph{Scope of the general formulation.}
+The general state-transition form is intentionally broad: it can describe discrete machines, continuous dynamical systems, biological regulatory systems, recurrent computation, and fixed-depth neural architectures at the level of state, transition, and protocol. DAWN-CEU does not claim that all such systems are interpretable; it factorizes a transition rule into roles whose structure may be fixed, learned, exposed, or implicit. DAWN-SRW realizes one explicit and traceable neural language-model instance.
+
+Several limitations remain. The v4.1.6.6 operator-key run is a completed 40M validation but does not outperform the dense Transformer baseline. The v4.1.6.7 page mechanism is implemented but not yet reported as a final empirical comparison. The context-dependence analysis is observational and currently comes from the v4.1.5.5 legacy pilot; same-sense controls, random-token baselines, sensitivity checks, and interventions are needed to establish causal necessity. The 400M results use spatial-r1-v3.9.4, an earlier SRW-family implementation, and should be read only as scaling and transfer evidence. Finally, structural sparsity and pruning-accounting estimates do not imply measured wall-clock speedup. Realizing computational benefits will require optimized retrieval, dispatch, sparse read/write kernels, and hardware-aware implementations.
+
+\paragraph{Externally conditioned state-transition computation.}
+External conditions may enter the hierarchy at three levels: initialization, transition protocol, and transition-rule factorization. An external input or initial condition may initialize the state through \(\Phi\); external signals may condition the transition protocol \(\Pi\), changing which transition rules are applied or how the trajectory is formed; and external signals may condition the CEU maps \(C\), \(E\), and \(U\) of an individual transition. The present DAWN-SRW instantiation is internally conditioned and fixed-protocol; externally conditioned DAWN-CEU computation is a natural extension.
+
+\section{Conclusion}
+%==============================================================================
+
+DAWN-SRW instantiates the DAWN-CEU state-transition formulation through Operator-Coordinate CEU, Select, RWCompose, and a fixed residual update. The current formulation maps residual states into an operator-coordinate space, selects RW-derived read/write transition operators, and executes traceable rank-1 residual-state updates. The completed v4.1.6.6 40M run validates that the final RW-derived operator-key path trains to completion and preserves validation loss under aggressive execution pruning. The v4.1.6.7 implementation extends this path with Global CEU Operator Pages, which retrieve fixed-size candidate blocks from the global operator atlas before applying the original token-specific DirectTau and read/write execution. Legacy v4.1.5.5 and 400M earlier SRW-family pilots provide preliminary evidence for hard-pruned execution, trace analysis, scaling, and transfer. Together, these results support DAWN-SRW as a trainable language-model architecture with observable control outputs, traceable execution dynamics, and a concrete route toward scalable sparse operator-space computation.
+
+\section*{Impact Statement}
+%==============================================================================
+
+This paper presents work whose goal is to advance neural network architecture design, learned computation, and interpretability. By structuring model computation around identifiable RW-neuron operations, explicit control, and executed transition contributions, this work may contribute to better tools for analyzing internal model behavior and for studying efficient conditional computation. There are many potential societal consequences of neural language models; none are specific enough to this architectural study to require separate discussion here.
+
+%==============================================================================
+\section*{Acknowledgments}
+%==============================================================================
+
+The author thanks Anthropic Claude, Claude Code, and OpenAI ChatGPT for assistance throughout this research. This work was developed with extensive use of AI systems for literature exploration, conceptual exploration, cross-domain framing, abstraction and terminology refinement, implementation support, debugging, and manuscript preparation. In particular, these systems were used as interactive assistants for refining the DAWN-CEU state-transition formulation and the exposition of DAWN-SRW. The research direction, architectural decisions, experimental design, experiments, analyses, interpretations, and final claims remain the responsibility of the author.
+
+This research was supported by the Google TPU Research Cloud (TRC) program, which provided computational resources for training and analysis.
+
+
+%==============================================================================
+\clearpage
+\bibliographystyle{icml2026}
+\bibliography{references}
+
+%==============================================================================
+\clearpage
+\onecolumn
+\appendix
+\raggedbottom
+\setlength{\textfloatsep}{8pt plus 2pt minus 2pt}
+\setlength{\floatsep}{6pt plus 2pt minus 2pt}
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+\setlength{\abovecaptionskip}{4pt}
+\setlength{\belowcaptionskip}{2pt}
+
+\section{Terminology}
+\label{app:terminology}
+
+This appendix collects the main terms used in the paper and gives a compact formalization of the state-transition-system view, transition protocols, CEU-factorized transitions, and traceability. We keep the distinction between general state-transition systems, observable input-output systems, transition protocols, learned DAWN-CEU instances, and the DAWN-SRW instantiation.
+
+\subsection{State-Transition System Hierarchy}
+
+At the most general level, a state-transition system may be written schematically as
+\begin{equation}
+    \mathcal{D}=(\mathcal{S},\Pi,\mathcal{T}),
+    \label{eq:app_state_transition_system}
+\end{equation}
+where $\mathcal{S}$ is a state space, $\mathcal{T}$ is a transition rule or family of transition rules, and $\Pi$ is a transition protocol. The protocol governs how transition rules are applied to configurations of the system to form a trajectory. It may encode a fixed schedule, recurrent iteration, conditional transition application, interaction with external signals, or termination of a transition sequence. Throughout this appendix, $\mathcal{T}$ denotes a transition family or a transition-rule family, while $T\in\mathcal{T}$ denotes an individual transition rule.
+
+Observable input-output systems add initialization and readout maps:
+\begin{equation}
+    \mathcal{M}=(\mathcal{E},\mathcal{S},\mathcal{O};\Phi,\Pi,\mathcal{T},H).
+    \label{eq:app_observable_state_transition_system}
+\end{equation}
+Here $\Phi$ initializes the system state from an external input or initial condition $e\in\mathcal{E}$, $\Pi$ applies transition rules from $\mathcal{T}$ to form a trajectory, and $H$ reads an observable output from the resulting state:
+\begin{equation}
+    s_0=\Phi(e),\qquad
+    s_0 \xrightarrow{\Pi,\mathcal{T}} s_1 \xrightarrow{\Pi,\mathcal{T}} \cdots \xrightarrow{\Pi,\mathcal{T}} s_\star,\qquad
+    o=H(s_\star).
+    \label{eq:app_protocol_trajectory}
+\end{equation}
+The familiar unconditioned state-space dynamics form is the special case in which a single transition rule is repeatedly applied under a simple transition protocol:
+\begin{equation}
+    s_{t+1}=T(s_t), \,\qquad T:\mathcal{S}\to\mathcal{S}.
+    \label{eq:app_state_space_dynamics}
+\end{equation}
+For a language model, the initialization map is an encoding map into an initial residual representation state, the transition protocol is the fixed layer schedule, and the output map is a readout from the final state to a token distribution:
+\begin{align}
+    s_0 &= \Phi_\theta(x), \label{eq:app_lm_init}\\
+    \Pi_{\mathrm{fixed}} &= (T_{\theta,1},T_{\theta,2},\ldots,T_{\theta,L}), \label{eq:app_lm_protocol}\\
+    s_L &= T_{\theta,L}\circ\cdots\circ T_{\theta,1}(s_0), \label{eq:app_lm_dynamics}\\
+    p(y\mid x) &= R_\theta(s_L). \label{eq:app_lm_readout}
+\end{align}
+Within this hierarchy, DAWN-CEU factorizes the transition rule itself, not the transition protocol. Given an individual transition rule $T\in\mathcal{T}$, the CEU factorization is
+\begin{equation}
+    T(s)=U(s,E(s,C(s))),
+    \label{eq:app_ceu_factorized_transition}
+\end{equation}
+with control, execution, and update maps producing
+\begin{equation}
+    u=C(s),\qquad z=E(s,u),\qquad s'=U(s,z).
+    \label{eq:app_ceu_step}
+\end{equation}
+A learned DAWN-CEU instance parameterizes one or more of these rules:
+\begin{equation}
+    T_\theta(s)=U_{\theta_U}\!\left(s,E_{\theta_E}(s,C_{\theta_C}(s))\right),
+    \label{eq:app_learned_ceu_transition}
+\end{equation}
+or, when the update is fixed by the architecture,
+\begin{equation}
+    T_\theta(s)=U\!\left(s,E_{\theta_E}(s,C_{\theta_C}(s))\right).
+    \label{eq:app_learned_ceu_fixed_update}
+\end{equation}
+DAWN-SRW is the residual-state instance in which $s_t=x_t$, Select supplies $u_t$, RWCompose supplies $z_t$, and $U(x,z)=x+z$:
+\begin{align}
+    u_t &= \mathrm{Select}_{\theta_C}(x_t), \\
+    z_t &= \mathrm{RWCompose}_{\theta_E}(x_t,u_t), \\
+    x_{t+1} &= x_t+z_t.
+\end{align}
+In the operator-coordinate specialization, Select first maps the residual state into an operator-coordinate space and then parameterizes a sparse state-to-operator execution relation:
+\begin{equation}
+    C:\mathcal{S}\to\mathcal{Z}_{\mathrm{op}},\qquad z_{\mathrm{op}}=C(x).
+\end{equation}
+For DAWN-SRW, the transition-operator family is \(\mathcal{O}_{RW}=\{W_i\}\), where
+\begin{equation}
+    W_i(x)=\langle x,r_i\rangle w_i.
+\end{equation}
+In the final v4.1.6.6 formulation, the Select key is derived from the RW operator itself:
+\begin{equation}
+    k_i=K(r_i,w_i),\qquad \rho_i(x)=\cos(C(x),k_i).
+\end{equation}
+The gate \(\gamma_i(x)\) is produced from the boundary relation between \(\rho_i(x)\) and \(\tau(x)\), and RWCompose executes
+\begin{equation}
+    E(x,C(x))=\sum_i \gamma_i(x)\langle x,r_i\rangle w_i.
+\end{equation}
+For a fixed Select output $u_t$, RWCompose induces an execution function
+\begin{equation}
+    f_{u_t}(s)=\sum_{i\in A(x_t)}\gamma_i(x_t)\langle s,r_i\rangle w_i,
+\end{equation}
+so that $z_t=f_{u_t}(x_t)$ and $x_{t+1}=x_t+f_{u_t}(x_t)$.
+
+\subsection{Relationship between DAWN, DAWN-CEU, and DAWN-SRW}
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Aspect}
+& \textbf{DAWN}
+& \textbf{DAWN-CEU state-transition formulation}
+& \textbf{DAWN-SRW} \\
+\midrule
+Role
+& Original signature--operation architecture
+& Transition-factorization formulation over general state-transition systems
+& Explicit operator-coordinate residual-state instantiation \\
+
+Control
+& Signature matching selects neurons
+& \(C\) produces an execution specification \(u_t\)
+& Select maps the state to an operator-coordinate query and outputs selected RW operators and gates \\
+
+Execution
+& Selected operations form an input-dependent transformation
+& \(E\) produces an execution result \(z_t\)
+& RWCompose composes traceable RW-operation contributions into \(z_t=\Delta x_t\) \\
+
+Update
+& Residual block update applies the transformation
+& \(U\) maps \((s_t,z_t)\) to \(s_{t+1}\)
+& Fixed residual update \(x_{t+1}=x_t+z_t\) \\
+
+Units
+& Identifiable low-rank neurons
+& Unit decomposition is not required by the formulation itself
+& RW neurons instantiate explicit read/write transition operators \\
+
+Operation form
+& Rank-\(r\) Feature--Restore pathway
+& Execution may take many computational forms
+& Rank-1 read/write operation, \(O_i^{RW}(x)=\langle x,r_i\rangle w_i\) \\
+
+Result
+& Input-dependent low-rank transformation within a residual block
+& State transition \(s_t\rightarrow s_{t+1}\) through \(u_t,z_t,U\)
+& Explicit RW-composed residual state change \(\Delta x_t=z_t\) \\
+\bottomrule
+\end{tabularx}
+\captionof{table}{Relationship between DAWN, the DAWN-CEU state-transition formulation, and DAWN-SRW. DAWN-SRW retains DAWN's signature--operation abstraction, but instantiates it as Operator-Coordinate CEU through Select, RWCompose, and a fixed residual update with traceable rank-1 read/write transition operators.}
+\label{tab:dawn_to_srw}
+\end{center}
+
+\par\medskip
+\noindent\begin{minipage}{\textwidth}
+\paragraph{System-level terms.}
+\vspace{-0.35em}
+\begin{center}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.06}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Meaning} \\
+\midrule
+General state-transition system & A system described by a state space \(\mathcal{S}\), a transition rule or family of transition rules \(\mathcal{T}\), and a transition protocol \(\Pi\) that specifies how transitions are applied to form a trajectory. \\
+Observable state-transition system & A state-transition system with initialization and readout maps, written as \(\mathcal{M}=(\mathcal{E},\mathcal{S},\mathcal{O};\Phi,\Pi,\mathcal{T},H)\). An external input or initial condition initializes the state, the transition protocol forms a trajectory, and the readout map observes the resulting state. \\
+Transition protocol \(\Pi\) & The protocol that determines how transition rules are applied to system configurations. It may be a fixed schedule, recurrent iteration rule, conditional application rule, interaction protocol, or termination protocol. \(\Pi\) governs trajectory formation; CEU factorizes an individual transition. \\
+Transition family \(\mathcal{T}\) & A transition rule or family of transition rules available to the system. A fixed-depth neural network may use a sequence of layer-wise transition rules; an adaptive or interactive system may select among transition rules under \(\Pi\). \\
+Computational configuration \(\chi\) & The full configuration used by the transition protocol, which may include the system state, step or layer index, external signals, memory, context, environment state, or protocol variables. The internal state \(s\) is the part of the configuration transformed by the transition rule. \\
+State-space dynamics & The state evolution induced by a transition map \(T\), with the unconditioned form \(s_{t+1}=T(s_t)\). \\
+DAWN-CEU state-transition formulation & A transition-factorization formulation over general state-transition systems. It factorizes individual transition rules into Control, Execution, and Update maps; it does not define the global transition protocol. \\
+CEU decomposition & The decomposition of an individual transition rule into a control rule \(C\), an execution rule \(E\), and an update rule \(U\): \(u_t=C(s_t)\), \(z_t=E(s_t,u_t)\), and \(s_{t+1}=U(s_t,z_t)\). \\
+Operator-Coordinate CEU & A CEU specialization in which \(C:\mathcal{S}\to\mathcal{Z}_{\mathrm{op}}\) maps a representation state into an operator-coordinate space, and the coordinate parameterizes a sparse execution relation over a transition-operator family. \\
+Learned DAWN-CEU instance & A parameterized instance with \(C_{\theta_C}\), \(E_{\theta_E}\), and optionally \(U_{\theta_U}\). Rules fixed by architecture correspond to empty or singleton parameter spaces. \\
+Notation convention & Subscripts \(\theta\) indicate learned parameterization; fixed architectural rules are written without \(\theta\). \\
+State space \(\mathcal{S}\) & The abstract system-state space. In DAWN-SRW, this is instantiated as the model's residual representation space, called the residual state space. \\
+Execution-specification space \(\mathcal{U}_{\mathrm{spec}}\) & The space of possible execution specifications. The subscript avoids confusion with the update rule \(U\). \\
+Operator-coordinate space \(\mathcal{Z}_{\mathrm{op}}\) & The coordinate space used by Operator-Coordinate CEU. A coordinate in this space does not directly produce the next state; it parameterizes a state-to-operator execution relation. \\
+Execution-result space \(\mathcal{Z}\) & The space of execution results produced before the update rule is applied. \\
+Current system state \(s_t\) & The general state read by the control rule and updated through the update rule. In DAWN-SRW, this is instantiated as the residual state \(x_t\). \\
+Residual state \(x_t\) & The current residual-stream vector at a computation step, layer, or token position; the DAWN-SRW instantiation of \(s_t\). \\
+Execution specification \(u_t\) & The output of the control rule. In DAWN-SRW, \(u_t\) is the set of participating RW operator identities and gates. \\
+Execution result \(z_t\) & The output of the execution rule before the update rule is applied. In DAWN-SRW, \(z_t=\Delta x_t\). \\
+Induced execution function \(f_u\) & For a fixed execution specification \(u\), the function \(f_u:\mathcal{S}\to\mathcal{Z}\) defined by \(f_u(s)=E(s,u)\). \\
+Space traceability & Exposure of CEU-space objects, such as \(u\in\mathcal{U}_{\mathrm{spec}}\) or \(z\in\mathcal{Z}\), in identifiable form. \\
+Function traceability & Exposure of the induced execution function \(f_u\) as a composition of identifiable component functions. \\
+Control rule \(C\) / \(C_{\theta_C}\) & The rule that maps the current system state to an execution specification. In DAWN-SRW: Select. \\
+Execution rule \(E\) / \(E_{\theta_E}\) & The rule that uses the current system state and execution specification to produce an execution result. In DAWN-SRW: RWCompose. \\
+Update rule \(U\) / \(U_{\theta_U}\) & The rule that maps the current system state and execution result to the next system state. In DAWN-SRW, this is the fixed residual update \(U(x_t,z_t)=x_t+z_t\). \\
+Residual-state transition & DAWN-SRW transition between residual states, \(x_t\to x_{t+1}\), with \(x_{t+1}=x_t+z_t\) and \(z_t=\Delta x_t\). \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\end{minipage}
+\par\medskip
+
+\noindent\begin{minipage}{\textwidth}
+\paragraph{DAWN abstraction and DAWN-SRW implementation.}
+\vspace{-0.35em}
+\begin{center}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.06}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Meaning} \\
+\midrule
+DAWN unit / neuron & An identifiable computational entity with a control-facing signature and an execution-facing operation. \\
+Signature & The conceptual control-facing identity of a DAWN unit. In final DAWN-SRW, this identity is tied to the RW operator through an RW-derived operator key. \\
+RW-derived operator key \(k_i\) & The Select-facing key of an RW operator, derived from its read/write directions as \(k_i=K(r_i,w_i)\). \\
+Legacy route embedding \(e_i\) & The independent route embedding used in the reported v4.1.5.5 implementation. It is an implementation detail of the reported experiments, not the conceptual operator identity in the final formulation. \\
+Operation & The execution-facing computation performed when the unit participates. \\
+RW neuron & The DAWN-SRW implementation of a DAWN unit as an explicit read/write transition operator, parameterized by a read vector \(r_i\), a write vector \(w_i\), and a Select-facing operator key \(k_i\). \\
+RW operation & The rank-1 read/write map \(O_i^{RW}(x)=\langle x,r_i\rangle w_i\). \\
+State-to-operator execution relation & The sparse relation induced by Select between residual states and RW transition operators. \\
+Routing-induced execution domain & For operator \(W_i\), the soft domain \(\Omega_i^\epsilon=\{x\in\mathcal{S}\mid \gamma_i(x)>\epsilon\}\). These domains can overlap and are not assumed to form a disjoint partition. \\
+Select & The DAWN-SRW instantiation of the control rule: a learned differentiable control rule whose output is an observable execution specification \(u_t\) identifying participating RW operator identities and gates. \\
+RWCompose & The DAWN-SRW instantiation of the execution rule: it applies selected RW operators and composes traceable rank-1 read/write contributions into the execution result \(z_t=\Delta x_t\). \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\end{minipage}
+\par\medskip
+
+\noindent\begin{minipage}{\textwidth}
+\paragraph{Operator-page terms.}
+\vspace{-0.35em}
+\begin{center}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.06}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Meaning} \\
+\midrule
+Global CEU operator page & A fixed-size candidate block over the global RW-operator atlas. Its live centroid summarizes the current RW-derived operator keys in that block for coarse retrieval; semantic compactness is an empirical property, not assumed by definition. A page is not itself an expert and does not perform computation. \\
+Page centroid & A live representative coordinate for a page, computed from the RW-derived operator keys in that page. It is used for coarse page scoring in operator space. \\
+Page-routed candidate set & The temporary union of operators in the selected top-$K$ pages. DirectTau admission and RWCompose execution are applied inside this set. \\
+Microgroup page selection & A hardware-oriented implementation option in which a small group of sequences shares the selected page set, while each token keeps its own operator query and token-specific operator weights inside the selected pages. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\end{minipage}
+\par\medskip
+
+\noindent\begin{minipage}{\textwidth}
+\paragraph{Layer terms.}
+\vspace{-0.35em}
+\begin{center}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.06}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Meaning} \\
+\midrule
+Attention Layer & Constructs Q, K, and V through Select and RWCompose. QK attention determines how token states interact, and value aggregation carries the relational information flow. \\
+RST Layer & The post-attention Residual State Transition layer. It applies Select and RWCompose over the RST pool to produce the residual state change; the residual update completes the residual-state transition. \\
+Dense transition & Dense layers can be written as state transitions, but usually do not produce an observable execution specification $u_t$. \\
+Trace condition & An execution specification is useful for analysis when it is identifiable, input-dependent, and directly tied to executed contributions. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\end{minipage}
+\par\medskip
+
+\noindent\begin{minipage}{\textwidth}
+\paragraph{Execution and evaluation terms.}
+\begin{center}
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Term} & \textbf{Meaning} \\
+\midrule
+Full soft-gated evaluation & The default DAWN-SRW evaluation: all RW-neuron pools are evaluated with differentiable gates. This is the implemented full-pool/chunked computation path. \\
+Active RW neuron & A RW neuron whose Select activation exceeds 0.5. This is a broad candidate-participation diagnostic. \\
+Strong RW neuron & A RW neuron whose Select activation exceeds 0.9. This is the high-confidence participation diagnostic; the main hard-pruned result uses the stricter threshold $\rho=0.99$. \\
+Hard-pruned evaluation & An evaluation-only forward pass in which RW neurons below a chosen activation threshold have their gates set to zero and RWCompose is renormalized over the retained gates. \\
+Retained gate mass & The fraction of full soft-gated gate mass retained after thresholding: $\sum_i m_i g_i / (\sum_i g_i+\epsilon)$. \\
+Estimated sparse-execution FLOPs & Theoretical FLOPs under a selected-RW execution accounting convention. These estimates are not measured wall-clock speedups of the current dense/chunked implementation. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\end{minipage}
+\par\medskip
+
+\subsection{CEU Traceability Formalization}
+\label{app:ceu_traceability_formalization}
+
+This subsection makes explicit the traceability concepts used in the main text. It is not needed to define DAWN-SRW, but it clarifies how the DAWN-CEU formulation separates spaces, maps, transitions, induced execution functions, and traceability.
+
+\paragraph{Spaces.}
+Let $\mathcal{S}$, $\mathcal{U}_{\mathrm{spec}}$, and $\mathcal{Z}$ denote the system-state space, execution-specification space, and execution-result space.
+
+\paragraph{Maps.}
+A CEU transition is defined by maps
+\[
+C:\mathcal{S}\to\mathcal{U}_{\mathrm{spec}},\qquad
+E:\mathcal{S}\times\mathcal{U}_{\mathrm{spec}}\to\mathcal{Z},\qquad
+U:\mathcal{S}\times\mathcal{Z}\to\mathcal{S}.
+\]
+
+\paragraph{Transition.}
+Given $s\in\mathcal{S}$, the transition proceeds as
+\[
+u=C(s),\qquad z=E(s,u),\qquad s'=U(s,z),
+\]
+with factorized state-transition function
+\[
+T(s)=U(s,E(s,C(s))).
+\]
+
+\paragraph{Induced execution function.}
+For a fixed execution specification $u\in\mathcal{U}_{\mathrm{spec}}$, the execution map $E$ induces an execution function
+\[
+f_u:\mathcal{S}\to\mathcal{Z},\qquad f_u(s)=E(s,u).
+\]
+Thus the transition can also be followed as
+\[
+s\mapsto u=C(s)\mapsto f_u\mapsto z=f_u(s)\mapsto s'=U(s,z).
+\]
+
+\paragraph{State-transition traceability.}
+We distinguish two forms. \emph{Space traceability} concerns whether objects in the CEU spaces, such as $u\in\mathcal{U}_{\mathrm{spec}}$ and $z\in\mathcal{Z}$, are exposed in identifiable form. \emph{Function traceability} concerns whether the execution function $f_u$ induced by $u$ is exposed as a composition of identifiable component functions:
+\[
+f_u(s)=\sum_{i\in A(u)}\alpha_i(u)f_i(s).
+\]
+The CEU decomposition by itself does not guarantee interpretability; it only identifies where specification, execution, and update structure may be exposed or hidden.
+DAWN-SRW instantiates this traceable case over the residual state space: Select exposes $u_t$ as participating RW neurons and gates, RWCompose exposes $f_{u_t}$ as a composition of read/write component functions, and the fixed residual update applies the resulting execution result.
+
+\subsection{Dense Attention and the Interpretability Boundary}
+\label{app:dense_attention_ceu}
+
+The DAWN-CEU formulation is not restricted to DAWN-SRW. It can also describe standard dense transformations and dense attention. This subsection makes explicit how dense attention fits into the formulation and where its interpretability boundary lies.
+
+\paragraph{Dense maps as transitions.}
+A dense map is a state transition in the broad sense: it maps a current state to a new state. Let \(x\in\mathbb{R}^{d_{\mathrm{in}}}\) and let
+\[
+M\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}.
+\]
+A dense transition is
+\[
+y = Mx.
+\]
+Under the DAWN-CEU formulation, this corresponds to a transition with degenerate control over a singleton null-specification space:
+\[
+\mathcal{U}_{\mathrm{spec}}=\{\varnothing\},\qquad
+C_{\varnothing}(x)=\varnothing,\qquad
+E_M(x,\varnothing)=Mx,\qquad
+U_{\mathrm{rep}}(x,z)=z.
+\]
+Thus,
+\[
+x_{t+1}=U_{\mathrm{rep}}(x_t,E_M(x_t,\varnothing))=Mx_t.
+\]
+When the input and output spaces coincide, the same map can be algebraically written in residual form as
+\[
+Mx = x + (M-I)x,
+\]
+but this is only a residual reparameterization of a learned dense transformation. The dense map itself does not expose an execution specification analogous to \(u_t\).
+
+\paragraph{Dense maps at the linear-combination level.}
+Although a dense map does not expose a nontrivial control rule, it can be mechanically decomposed at the linear-algebraic level. Writing the columns of \(M\) as
+\[
+M=[m_1,\ldots,m_{d_{\mathrm{in}}}],
+\]
+we have
+\[
+Mx=\sum_{p=1}^{d_{\mathrm{in}}}x_p m_p.
+\]
+This exposes a coordinate-column contribution trace:
+\[
+\mathrm{contrib}_p(x)=x_p m_p.
+\]
+Thus, at the linear-combination level, one can inspect how much each input coordinate contributes along the corresponding learned column direction. However, these coordinate-column contributions are not necessarily semantically identifiable computational units. Dense representations may distribute a single meaningful feature across many coordinates, and a single coordinate or column direction may participate in multiple functions. Therefore, dense maps are mechanically decomposable at the linear level, but their lower-level contributions remain semantically entangled.
+
+\paragraph{Dense feed-forward layers.}
+A dense feed-forward layer also admits a read/write-like algebraic form. For
+\[
+W_2\sigma(W_1x),
+\]
+write the rows of $W_1$ as $r_i^\top$ and the columns of $W_2$ as $w_i$. Then
+\[
+W_2\sigma(W_1x)
+=
+\sum_i \sigma(\langle x,r_i\rangle)w_i.
+\]
+This shows that dense feed-forward layers can be mechanically written as component functions. However, the component identities are not exposed by a separate execution specification, and the resulting components remain entangled in dense hidden coordinates.
+
+\paragraph{Dense attention under a hierarchical CEU view.}
+The CEU view can be applied hierarchically: a higher-level transition may contain subcomputations that themselves admit CEU descriptions. Standard dense attention can be written as a higher-level transition built on top of dense maps. Let \(X=(x_1,\ldots,x_n)\) denote the token-state sequence, with \(x_i\in\mathbb{R}^{d_{\mathrm{model}}}\). Dense projections construct attention interface states:
+\[
+q_i=M_Qx_i,\qquad k_j=M_Kx_j,\qquad v_j=M_Vx_j.
+\]
+The attention-level routing specification is
+\[
+u^{\mathrm{attn}}_{ij}
+=
+\mathrm{softmax}_j
+\left(
+\frac{q_i^\top k_j}{\sqrt{d_h}}
+\right).
+\]
+The execution rule aggregates routed value content:
+\[
+z_i^{\mathrm{attn}}
+=
+M_O
+\left(
+\sum_j u^{\mathrm{attn}}_{ij}v_j
+\right),
+\]
+and the standard Transformer residual update gives
+\[
+x_i' = x_i + z_i^{\mathrm{attn}}.
+\]
+Substituting the dense projections, the full attention transition is
+\[
+x_i'
+=
+x_i+
+M_O
+\left(
+\sum_j
+\mathrm{softmax}_j
+\left(
+\frac{
+(M_Qx_i)^\top(M_Kx_j)
+}{
+\sqrt{d_h}
+}
+\right)
+M_Vx_j
+\right).
+\]
+In DAWN-CEU terms, dense attention exposes an attention-level routing specification through query-key weights, but its Q/K/V interface construction is performed by implicit learned dense maps rather than by an exposed function-level execution trace.
+
+\paragraph{Expanding the query-key interaction.}
+At the attention-interface level, one can observe which query vector interacts with which key vector. At the dense-linear level, the score can be expanded further. For the input-column decompositions of \(M_Q\) and \(M_K\), write
+\[
+M_Q=[m^Q_1,\ldots,m^Q_{d_{\mathrm{model}}}],\qquad
+M_K=[m^K_1,\ldots,m^K_{d_{\mathrm{model}}}].
+\]
+Then
+\[
+q_i=\sum_p x_{i,p}m^Q_p,\qquad
+k_j=\sum_r x_{j,r}m^K_r.
+\]
+The query-key score becomes
+\[
+q_i^\top k_j
+=
+\left(\sum_p x_{i,p}m^Q_p\right)^\top
+\left(\sum_r x_{j,r}m^K_r\right),
+\]
+or
+\[
+q_i^\top k_j
+=
+\sum_{p,r}
+x_{i,p}x_{j,r}
+{m^Q_p}^{\top}m^K_r.
+\]
+This shows that a dense attention score is an aggregate interaction between two already-superposed dense interfaces. The contribution of coordinate \(p\) of token \(i\) and coordinate \(r\) of token \(j\) can be mechanically computed through
+\[
+x_{i,p}x_{j,r}{m^Q_p}^{\top}m^K_r.
+\]
+However, this decomposition does not imply that the coordinate pair \((p,r)\) corresponds to a stable semantic relation. It is a linear contribution decomposition, not an architecturally exposed function-level execution trace.
+
+\paragraph{Value aggregation and output mixing.}
+The value pathway has the same structure. If
+\[
+M_V=[m^V_1,\ldots,m^V_{d_{\mathrm{model}}}],
+\]
+then
+\[
+v_j = \sum_r x_{j,r}m^V_r.
+\]
+The contextual content received by token \(i\) is
+\[
+c_i
+=
+\sum_j u^{\mathrm{attn}}_{ij}v_j
+=
+\sum_{j,r}
+u^{\mathrm{attn}}_{ij}x_{j,r}m^V_r.
+\]
+Thus, the attention execution can be mechanically decomposed into routed coordinate-column value contributions. The output projection \(M_O\) then mixes these contributions into the residual update:
+\[
+z_i^{\mathrm{attn}}=M_Oc_i.
+\]
+Again, this operation is decomposable algebraically, but the resulting residual update superposes the routed value contributions in the output representation.
+
+\paragraph{Interpretability boundary.}
+This analysis localizes the interpretability boundary of dense attention. At the attention level, the interaction is observable: one can inspect query-key scores, attention weights, routed values, aggregated content, and residual updates. At the dense-linear level, Q/K/V formation can be decomposed into coordinate-column contributions. However, these contributions are immediately summed into dense interface vectors and need not correspond to semantically identifiable computational units. Therefore, standard dense attention is interpretable at the attention-routing level and mechanically decomposable at the dense-linear level, but remains semantically entangled at the level of interface construction.
+
+In contrast, DAWN-SRW exposes both space and function traceability. Select produces an observable execution specification over RW transition operators, and RWCompose produces an execution result through an induced execution function that decomposes into identifiable read/write component functions. Thus, DAWN-SRW moves part of the computation that is implicit in dense Q/K/V formation into an exposed Select/RWCompose pathway.
+
+
+
+\section{Current Operator-Key and Page Implementation Notes}
+\label{app:operator_key_pages}
+
+This appendix summarizes the implementation path corresponding to the current method section. The purpose is to separate the completed v4.1.6.6 operator-key path, the v4.1.6.7 page-routed extension, and the older v4.1.5.5 legacy route-embedding pilot.
+
+\subsection{v4.1.6.6 Operator-Key DirectTau Path}
+
+The v4.1.6.6 path removes the independent legacy route embedding from the conceptual Select identity. Each operator key is derived from the operator's own read/write directions, and each token produces an RW-matched operator query. Select compares the query with RW-derived operator keys by cosine similarity, maps the resulting margin through DirectTau admission and boundary-relative drive, and passes the resulting execution weights to RWCompose.
+
+In the completed 40M run, this path is evaluated in full-pool form: the model still computes scores over the complete operator pool, while execution-pruning evaluations zero weak execution weights according to an evaluation threshold. Thus the v4.1.6.6 result validates trainability and pruning stability of the final operator-key formulation, not implemented sparse wall-clock efficiency.
+
+\subsection{v4.1.6.7 Global CEU Operator Pages}
+
+The v4.1.6.7 path keeps the v4.1.6.6 operator-key, DirectTau, and RWCompose equations, but introduces a page-routed candidate set before operator-level selection. Operators are grouped into fixed-size pages. These pages are implementation-level candidate blocks, not assumed learned clusters. A live page centroid is computed from the RW-derived operator keys in each block. A page routing pass selects the top-scoring pages by centroid similarity in operator space and constructs a dense candidate matrix from the operators in those pages.
+
+The page mechanism should not be interpreted as Mixture-of-Experts routing. A page is a fixed-size candidate block over the global operator atlas, not a computational expert. It only restricts the candidate set. Inside that set, each token still has its own operator query, tau boundary, admission, drive, read scalar, and write-vector contribution. In the current implementation, page selection can be shared by a microgroup for hardware efficiency, but the operator weights inside selected pages remain token-specific.
+
+Future implementation work includes learned page anchors, page compactness or separation objectives, periodic operator repacking, load-balance analysis, hardware-specific read/write kernels, and direct wall-clock benchmarking.
+
+\section{Legacy v4.1.5.5 Implementation Details}
+\label{app:select_parameterization}
+
+This appendix gives the implementation-level parameterization used by the legacy DAWN-SRW v4.1.5.5 preliminary pilot. These details instantiate the reported experimental gate \(g_i^p(x)\), corresponding to the abstract soft gate \(\gamma_i^p(x)\) in the main text. They are not separate architectural contributions. The main architectural objects remain Select, RWCompose, and the observable execution specification $u_t$.
+
+\subsection{Layer Flow and Shared RW-Neuron Pools}
+
+Each DAWN-SRW block consists of an Attention Layer followed by an RST Layer. The Attention Layer constructs Q, K, and V through Select and RWCompose over attention RW-neuron pools, then applies standard causal self-attention and a dense output projection. The RST Layer applies Select and RWCompose over the RST pool to produce the post-attention residual state change.
+
+The RW-neuron pools are shared across layers. In the reported v4.1.5.5 implementation, each pool contains legacy route embeddings, read vectors, write vectors, and a learned pool scale:
+\begin{equation}
+    \{e_i^p,r_i^p,w_i^p\}_{i=1}^{N_p}, \qquad \alpha_p .
+\end{equation}
+The legacy route embedding $e_i^p$ implements the Select-facing signature used by the reported experiments; the read/write vectors $(r_i^p,w_i^p)$ implement the execution-facing RW operation. In the final v4.1.6.6 conceptual formulation, this independent route embedding is replaced by an RW-derived operator key \(k_i^p=K_\theta^p(r_i^p,w_i^p)\), so the control-facing identity is tied to the execution-facing read/write map. Separate Select passes are used for Q and K, while Q and K share the attention-QK pool.
+
+\subsection{Route-Space Scoring}
+
+For each pool $p$, DAWN-SRW forms a route query
+\begin{equation}
+    h^p(x)=W^p_{\mathrm{route}}x+b^p_{\mathrm{route}},
+\end{equation}
+and scores each RW neuron by matching this query against the legacy route embedding:
+\begin{equation}
+    s_i^p(x)=h^p(x)^\top e_i^p .
+\end{equation}
+This route-space scoring is the implementation-level v4.1.5.5 mechanism by which Select compares the current residual state with reusable RW-neuron signatures. It should be read separately from the final operator-coordinate formulation, where routing compares an operator-coordinate query against RW-derived operator keys.
+
+\subsection{Pool-Relative Threshold and Bounded Scan Offset}
+
+Select uses a pool-relative threshold so that participation is determined relative to the score distribution for the current token and pool. Let
+\begin{align}
+    \mu_s^p(x) &= \frac{1}{N_p}\sum_{j=1}^{N_p}s_j^p(x), \\
+    \sigma_s^p(x) &= \sqrt{\frac{1}{N_p}\sum_{j=1}^{N_p}(s_j^p(x)-\mu_s^p(x))^2+\epsilon_\sigma} .
+\end{align}
+The bounded scan offset is
+\begin{equation}
+    \delta_{\mathrm{scan}}^p(x)
+    = c_{\mathrm{scan}}\tanh(\omega_{\mathrm{scan}}^p(x)),
+\end{equation}
+and the pool-relative threshold is
+\begin{equation}
+    \tau^p(x)
+    = \mu_s^p(x) + \lambda_\tau^p(x)\sigma_s^p(x)
+      - \frac{\delta_{\mathrm{scan}}^p(x)}{\max(\sigma_s^p(x),\sigma_{\min})} .
+\end{equation}
+The tau offset controls the relative participation boundary in score-standard-deviation units. The bounded scan term allows a small local shift of this boundary while preventing unbounded threshold movement, especially when the score standard deviation is small.
+
+\subsection{Two-Axis Gate: Activation and Intensity}
+
+After thresholding, DAWN-SRW separates participation into two factors: activation and intensity. Define the raw margin and activation margin as
+\begin{align}
+    z_i^p(x) &= s_i^p(x)-\tau^p(x), \\
+    m_i^p(x) &= z_i^p(x)-a_0 .
+\end{align}
+The activation term is
+\begin{equation}
+    a_i^p(x)=\sigma(\beta m_i^p(x)),
+\end{equation}
+and the intensity term is
+\begin{equation}
+    \eta_i^p(x)
+    = \epsilon + \min\left(\max(m_i^p(x)-c_0,0),\eta_{\max}\right).
+\end{equation}
+The final gate used by RWCompose is
+\begin{equation}
+    g_i^p(x)=a_i^p(x)\eta_i^p(x).
+\end{equation}
+
+The activation term acts as a near-binary participation indicator. In the v4.1.5.5 experiments, the sigmoid sharpness $\beta$ is large, so activation rapidly switches around the participation boundary. The intensity term controls how strongly a participating RW neuron contributes once it is beyond the boundary. Thus, activation answers whether an RW neuron participates, while intensity controls the strength of the executed read/write contribution.
+
+This two-axis gate is useful for analysis: active and strong sets are defined from activation, while the executed contribution depends on the full gate $g_i^p(x)=a_i^p(x)\eta_i^p(x)$ together with the read scalar and write direction.
+
+\subsection{Active and Strong RW Neurons}
+
+We use activation-based diagnostic sets:
+\begin{align}
+    \mathcal{A}^p(x) &= \{i:a_i^p(x)>0.5\}, \\
+    \mathcal{S}^p(x) &= \{i:a_i^p(x)>0.9\}.
+\end{align}
+The active set is a broad candidate-participation set. The strong set contains high-confidence participating RW neurons; the main hard-pruned result uses an even stricter threshold, $\rho=0.99$. These sets are diagnostics of Select; they are distinct from ranking RW neurons by executed contribution, which additionally depends on read values, write directions, gates, and normalization.
+
+\subsection{RWCompose and Gate Normalization}
+\label{app:rwcompose_details}
+
+Given gates $g_i^p(x)$, RWCompose forms
+\begin{equation}
+    y_p(x)
+    =
+    \alpha_p
+    \frac{
+    \sum_{i=1}^{N_p}g_i^p(x)\langle x,r_i^p\rangle w_i^p
+    }{
+    \max\left(\sum_{i=1}^{N_p}g_i^p(x),1\right)
+    } .
+\end{equation}
+The denominator uses the same activation-weighted intensity that appears in the numerator. It prevents unstable amplification when very few neurons participate while still allowing broad combinations of RW-neuron contributions. In the RST Layer, this output is the residual state change. In attention pools, Select and RWCompose construct Q, K, or V projections before causal self-attention.
+
+\subsection{Dense/Chunked Full-Pool Evaluation}
+
+The present implementation evaluates scores and gate-weighted read/write contributions over the full RW-neuron pools using chunked dense computation. This implementation choice prioritizes differentiable training and architectural clarity. Consequently, active and strong RW-neuron counts should not be interpreted as measured wall-clock speedups of the current implementation. They characterize the sparsity of the learned execution specification.
+
+The hard-pruned evaluations in Appendix~\ref{app:hard_pruned_eval} are actual forward passes with gates zeroed below an activation threshold, but the FLOPs reported there remain theoretical sparse-execution estimates unless otherwise stated.
+
+\section{Experimental Setup and Model Configurations}
+\label{app:forty_m_setup}
+
+The primary 40M validation in this draft is the v4.1.6.6 operator-key run. It uses the same 5B-token C4 budget and 76{,}293 training steps as the dense Transformer baseline. The completed run has 40.220M parameters and reaches end-of-epoch validation loss 3.6553 and accuracy 34.73\%. The dense Transformer baseline has 40.344M parameters and reaches validation loss 3.5986 and accuracy 35.44\%. The older v4.1.5.5 configuration below is retained because it is the source of the legacy hard-pruning and trace-analysis pilot.
+
+
+Table~\ref{tab:model_config} gives the full 40M DAWN-SRW configuration and the dense Transformer baseline used for language-modeling comparison. The baseline is parameter-matched and uses a larger residual width with a standard $4\times$ FFN. Table~\ref{tab:operator_health} reports mean RW-neuron vector norms after training; these diagnostics are not treated as main results, but confirm that the migrated checkpoint loads correctly and that the renamed RW-neuron pools remain populated.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrr}
+\toprule
+Quantity & DAWN-SRW & Dense baseline \\
+\midrule
+Parameters & 40.221M & 40.344M \\
+Layers & 12 & 12 \\
+Hidden dimension $d$ & 384 & 432 \\
+FFN dimension & -- & 1,728 \\
+Routing dimension $d_r$ & 128 & -- \\
+Attention heads & 6 & 6 \\
+RW-neuron pools & 1,480 / 7,330 / 20,560 & -- \\
+Vocabulary & 30,522 & 30,522 \\
+Sequence length & 512 & 512 \\
+Training tokens & 5B & 5B \\
+Paper-eval loss & 3.62589 & 3.60568 \\
+Paper-eval accuracy & 35.153\% & 35.397\% \\
+\bottomrule
+\end{tabular}
+\caption{40M language-modeling setup. The dense baseline is parameter-matched and uses a larger residual width with a standard $4\times$ FFN.}
+\label{tab:model_config}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Pool & Embedding & Read & Write \\
+\midrule
+Attention-QK & 0.8028 & 3.4099 & 2.7556 \\
+Attention-V  & 1.0943 & 1.8823 & 1.7216 \\
+RST          & 1.1631 & 1.7592 & 1.7550 \\
+\bottomrule
+\end{tabular}
+\caption{Mean RW-neuron vector norms for the trained 40M DAWN-SRW model.}
+\label{tab:operator_health}
+\end{table}
+
+The effective ranks of the attention-QK, attention-V, and RST legacy route embeddings are 120.0, 122.9, and 122.1 respectively out of a 128-dimensional route space.
+
+
+\section{Hard-Pruned Evaluation and FLOPs Accounting}
+\label{app:hard_pruned_eval}
+\label{app:flops_accounting_40m}
+
+\subsection{Hard-Pruned Forward Definition}
+
+The hard-pruned evaluation in this appendix belongs to the legacy v4.1.5.5 preliminary pilot. It tests whether the learned soft-gated computation is concentrated in high-confidence selected RW neurons. For an activation threshold $\rho$, define the retained mask
+\begin{equation}
+    M_i^{p,\rho}(x)=\mathbf{1}\bigl[a_i^p(x)>\rho\bigr].
+\end{equation}
+The pruned gate is
+\begin{equation}
+    \tilde g_i^{p,\rho}(x)=M_i^{p,\rho}(x)g_i^p(x),
+\end{equation}
+and the hard-pruned RWCompose output is
+\begin{equation}
+    \tilde y_p^\rho(x)=\alpha_p
+    \frac{\sum_i \tilde g_i^{p,\rho}(x)\langle x,r_i^p\rangle w_i^p}
+    {\max(\sum_i \tilde g_i^{p,\rho}(x),1)} .
+\end{equation}
+Thus, hard-pruned evaluation is an actual forward pass with weak gates removed, not merely a diagnostic count. The diagnostic strong-neuron threshold is $\rho=0.9$. The main text reports a stricter representative setting, $\rho=0.99$, over all RW-neuron pools.
+
+\subsection{Evaluation Variants}
+
+The main text reports the full soft-gated model and a strict representative hard-pruned evaluation at $\rho=0.99$. The full appendix sweep evaluates $\rho\in\{0.50,0.70,0.80,0.90,0.95,0.99\}$ over all pools. We also reserve optional variants for RST-only, attention-only, QK-only, and V-only pruning to distinguish which component is most sensitive to hard execution.
+
+For each variant, we report validation cross-entropy, accuracy, retained RW-neuron counts, retained gate mass, and theoretical sparse-execution FLOPs. The validation loss is always the language-modeling cross-entropy; auxiliary losses are reported only as training diagnostics in Appendix~\ref{app:exploration_sweep}.
+
+\subsection{FLOPs Accounting Convention}
+
+We separate three compute accounting regimes. First, \emph{implemented full-pool DAWN-SRW} evaluates routing, scores, gates, and read/write composition over the full RW-neuron pools using dense/chunked computation. Second, \emph{exact-routing sparse execution} assumes the model still computes full-pool routing scores, but executes read/write operations only for the retained RW neurons. Third, \emph{ideal selected-RW execution} counts only selected read/write execution and should be read as an implementation target rather than a property of the current code.
+
+All FLOPs use the convention that a multiply-add counts as two FLOPs. For a pool with $N_p$ RW neurons, route dimension $d_r$, residual dimension $d$, and retained count $k_p^\rho$, full score computation costs approximately $2N_p d_r$ FLOPs per token per route. We count one retained RW operation as approximately $4d$ FLOPs: $2d$ for the read dot product and $2d$ for writing/accumulating the scaled write vector. Thus, full-pool and pruned RW costs are
+\begin{align}
+    F_{p,\mathrm{RW}}^{\mathrm{full}} &\approx 4N_p d, \\
+    F_{p,\mathrm{RW}}^{\rho} &\approx 4k_p^\rho d .
+\end{align}
+For attention Q/K construction, the QK pool is used through separate Q and K Select/RWCompose passes; V and RST use their corresponding pools. Attention interaction and any dense output projections are reported separately from RW-neuron execution.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{lrrrrr}
+\toprule
+Compute regime & Core FLOPs/token & Total incl. LM head & Ratio vs TF & Ratio vs DAWN full & Notes \\
+\midrule
+Dense Transformer & 59.07M & 85.44M & 1.000 & -- & dense baseline \\
+DAWN-SRW full pool & 676.38M & 699.82M & 11.451 & 1.000 & current code path \\
+Exact routing + hard .99 RW & 180.53M & 203.97M & 3.056 & 0.267 & full routing, pruned RW \\
+Selected-RW only .99 & 72.77M & 96.22M & 1.232 & 0.128 & idealized target \\
+\bottomrule
+\end{tabular}
+\caption{Theoretical FLOPs accounting for the 40M v4.1.5.5 experiment. Ratios and FLOPs are accounting estimates; they are reported separately from measured validation loss and are not wall-clock speedups.}
+\label{tab:flops_accounting_40m}
+\end{table*}
+
+
+\section{Sweep Results}
+\label{app:exploration_sweep}
+
+
+\subsection{Hard-Pruning Threshold Sweep}
+
+The threshold sweep evaluates whether the soft-gated computation remains concentrated in high-confidence selected RW neurons as the activation threshold increases. The main text reports the strict threshold $\rho=0.99$; the full sweep is reserved for this appendix.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Variant & $\rho$ & Val loss & $\Delta$loss & Acc. & QK kept & V kept & RST kept & Gate mass & RW-only \\
+\midrule
+full soft & -- & 3.62589 & 0.00000 & 35.153 & 1,480 & 7,330 & 20,560 & 1.000 & 1.000 \\
+hard all & 0.50 & 3.62589 & -0.00001 & 35.153 & 110.32 & 706.51 & 3,049.23 & 1.000 & 0.132 \\
+hard all & 0.70 & 3.62590 & 0.00000 & 35.153 & 109.99 & 704.68 & 3,043.63 & 1.000 & 0.131 \\
+hard all & 0.80 & 3.62590 & 0.00001 & 35.153 & 110.23 & 706.20 & 3,052.16 & 1.000 & 0.132 \\
+hard all & 0.90 & 3.62589 & -0.00001 & 35.153 & 109.91 & 704.45 & 3,046.79 & 1.000 & 0.131 \\
+hard all & 0.95 & 3.62589 & -0.00001 & 35.153 & 109.49 & 702.77 & 3,038.04 & 1.000 & 0.131 \\
+hard all & 0.99 & 3.62590 & 0.00000 & 35.152 & 108.99 & 699.31 & 3,030.97 & 1.000 & 0.131 \\
+\bottomrule
+\end{tabular}
+\caption{Hard-pruned threshold sweep. Gate mass is reported from the evaluation table rounded to three decimals; the unchanged loss indicates that the soft-gated computation is concentrated in high-confidence RW neurons. RW-only is the estimated selected-read/write execution ratio, not measured wall-clock speedup.}
+\label{tab:hard_pruned_threshold_sweep}
+\end{table*}
+
+\subsection{Exploration-Loss Sweep}
+
+The main text reports validation cross-entropy and accuracy. Exploration-loss and asymmetry sweeps are used only to characterize the sparsity--performance trade-off and are therefore reported in the appendix. For each sweep checkpoint, we evaluate the full soft-gated model and a specified hard-pruned variant. The reported validation loss is the language-modeling cross-entropy; auxiliary exploration losses are training diagnostics and are not used as the primary comparison metric.
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.08}
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+Run & Weight & Asym. & Full loss & Strong loss & $\Delta$loss & QK strong & V strong & RST strong & RW-only \\
+\midrule
+\texttt{tag128} & 0.001 & 1.5 & 3.63294 & 3.63294 & -0.00001 & 122.00 & 386.13 & 3,381.57 & 0.133 \\
+\texttt{ex10} & 0.001 & 10.0 & 3.66154 & 3.66153 & -0.00001 & 55.35 & 82.78 & 527.53 & 0.023 \\
+\texttt{ex20} & 0.001 & 20.0 & 3.66953 & 3.66955 & 0.00001 & 57.00 & 86.32 & 564.89 & 0.024 \\
+\bottomrule
+\end{tabular}
+\caption{Exploration-asymmetry sweep. Strong-loss rows use hard-pruned strong-only evaluation for the corresponding checkpoint. Higher asymmetry produces much sparser selected RW execution but increases validation loss; these runs are diagnostic and are not used as the primary language-modeling comparison.}
+\label{tab:exploration_sweep}
+\end{table*}
+
+\section{RW-Neuron Trajectory Analysis Details}
+\label{app:analysis_quantities}
+
+For context-dependence experiments, we compare RST control and execution traces using three RW-neuron sets at each layer.
+
+\paragraph{Active set.}
+The active set contains RW neurons whose activation exceeds a threshold:
+\begin{equation}
+    A_{\ell,t} = \{i : a_i > 0.5\}.
+\end{equation}
+This measures the broad candidate set participating in Select's control trace.
+
+\paragraph{Top-$k$ projected contributors.}
+For each RW neuron, we compute its contribution vector
+\begin{equation}
+    c_i = \alpha_p \frac{g_i O_i^{RW}(x)}{\max(\sum_j g_j,1)}.
+\end{equation}
+We then rank RW neurons by their signed projection onto the composed transition output $y_p(x)$:
+\begin{equation}
+    \pi_i = \left\langle c_i, \frac{y_p(x)}{\|y_p(x)\| + \epsilon} \right\rangle .
+\end{equation}
+The top-$k$ contributor set contains the RW neurons with the largest projected contribution.
+
+\paragraph{Effective-mass contributors.}
+We also define an effective contributor set as the smallest set of RW neurons whose cumulative absolute projected contribution reaches a fixed fraction of the total mass. In our experiments, this threshold is 80\%.
+
+For two contexts containing the same surface token, we compare these sets layer by layer using Jaccard overlap:
+\begin{equation}
+    J(A,B) = \frac{|A\cap B|}{|A\cup B|}.
+\end{equation}
+This lets us distinguish broad candidate overlap from overlap among the RW neurons that actually dominate the RST transition.
+
+\subsection{Bank Case Study}
+\label{app:bank_case}
+
+We examine \emph{bank} more closely using the contexts \emph{I deposited money in the bank} and \emph{He sat by the river bank}. Figure~\ref{fig:bank_case} shows both the layer-wise overlap and the output-norm comparison for this token. The two contexts start with high overlap in the early layers, but the top-$k$ and effective-mass contributor sets separate strongly in the middle layers. For example, top-$k$ Jaccard overlap falls near zero around layers 4--5, while the active-set overlap remains substantially higher.
+
+The norm comparison shows that the RST transition output grows in later layers and becomes especially large in the final layer. This supports the interpretation that middle layers separate context-dependent RW-neuron sets, while later layers amplify the context-specific residual state transition.
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\IfFileExists{figures/bank_jaccard_by_layer.png}{%
+    \includegraphics[width=\linewidth]{figures/bank_jaccard_by_layer.png}%
+}{%
+    \fbox{\parbox[c][0.22\textheight][c]{0.92\linewidth}{\centering Placeholder: layer-wise Jaccard overlap for \emph{bank}.}}%
+}
+\caption{RST control/transition overlap.}
+\label{fig:bank_jaccard}
+\end{subfigure}
+\hfill
+\begin{subfigure}[t]{0.48\textwidth}
+\centering
+\IfFileExists{figures/bank_rst_norm_by_layer.png}{%
+    \includegraphics[width=\linewidth]{figures/bank_rst_norm_by_layer.png}%
+}{%
+    \fbox{\parbox[c][0.22\textheight][c]{0.92\linewidth}{\centering Placeholder: attention and RST output norms for \emph{bank}.}}%
+}
+\caption{Attention and RST output norms.}
+\label{fig:bank_norm}
+\end{subfigure}
+\caption{Case study for the initially underdetermined token state \emph{bank}. The financial and river-bank contexts share many broad RST candidates in early layers, but their high-contribution and effective-mass contributor sets separate in the middle layers. In later layers, the RST transition norm grows, indicating a stronger context-specific residual state transition.}
+\label{fig:bank_case}
+\end{figure}
+
+\subsection{RW-Neuron Execution Trace}
+\label{app:execution_trace}
+
+Because each RST RW neuron has an explicit read/write transition, we can trace individual contributions to the composed transition. Table~\ref{tab:decision_trace} shows the top projected contributors for \emph{bank} in the final layer under the financial context. The table separates routing evidence (score, activation, intensity, gate) from RW-neuron evidence (read value, contribution norm, projection onto the final RST transition, and cosine alignment).
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{rrrrrrrrr}
+\toprule
+Rank & Neuron & Score & Act. & Int. & Gate & Read & Contrib. & Projection / Align. \\
+\midrule
+1 & 9537  & 12.917 & 1.000 & 8.775 & 8.775 & 10.393  & 0.1466 & 0.0578 / 0.394 \\
+2 & 4504  & 10.740 & 1.000 & 6.598 & 6.598 & -7.487  & 0.0968 & 0.0385 / 0.397 \\
+3 & 216   & 11.512 & 1.000 & 7.370 & 7.370 & 7.253   & 0.1070 & 0.0310 / 0.290 \\
+4 & 4729  & 10.306 & 1.000 & 6.164 & 6.164 & -8.440  & 0.0863 & 0.0308 / 0.357 \\
+5 & 15651 & 10.119 & 1.000 & 5.976 & 5.976 & -8.826  & 0.0917 & 0.0298 / 0.325 \\
+6 & 16201 & 9.553  & 1.000 & 5.411 & 5.411 & 7.792   & 0.0850 & 0.0252 / 0.296 \\
+7 & 7272  & 16.177 & 1.000 & 12.035& 12.035& -3.367  & 0.0768 & 0.0241 / 0.314 \\
+8 & 15419 & 8.702  & 1.000 & 4.560 & 4.560 & -9.003  & 0.0757 & 0.0166 / 0.219 \\
+\bottomrule
+\end{tabular}
+\caption{RW-neuron execution trace for the token \emph{bank} in the final RST Layer. Top contributors are ranked by signed projection onto the composed RST transition output. The effective role of an RW neuron is not determined by score alone; it depends on the full read/write contribution. Alignment is the cosine similarity between the individual contribution vector and the composed RST transition output.}
+\label{tab:decision_trace}
+\end{table}
+
+The trace illustrates why Select control cannot be reduced to routing scores alone. An RW neuron with a high score may not dominate the transition if its read value or write direction contributes weakly to the composed output. Conversely, an RW neuron with a moderate score can become a high projected contributor when its read/write contribution aligns with the final transition direction. Thus, DAWN-SRW provides an observable selection output and traceable RW-neuron execution contributions that follow selection.
+
+\section{Formal Low-Rank Property}
+\label{app:rw_low_rank_property}
+
+The read/write composition has a simple algebraic interpretation. For a fixed input state, a selected or thresholded pool output is equivalent to applying an input-conditioned low-rank matrix to the current state. The resulting map is not globally linear, since the gates and selected set depend on the input state. In implementations with soft gates, the exact dense-gated pool output is recovered by including all nonzero gates; the thresholded form below characterizes the effective or sparse executed transition used for analysis and sparse-execution accounting.
+
+\textbf{Proposition 1 (Pointwise input-conditioned low-rank transition).}
+For a fixed input state $x$ and threshold $\gamma \ge 0$, let
+\begin{equation}
+    S_p^{\gamma}(x)=\{i:g_i(x)>\gamma\}
+\end{equation}
+be the thresholded RW-neuron set in pool $p$. Define the thresholded pool output
+\begin{equation}
+    y_p^{\gamma}(x)
+    =
+    \alpha_p
+    \frac{\sum_{i\in S_p^{\gamma}(x)} g_i(x) O_i^{RW}(x)}
+    {\max\left(\sum_{i\in S_p^{\gamma}(x)} g_i(x),1\right)} .
+\end{equation}
+Then
+\begin{equation}
+    y_p^{\gamma}(x)=A_p^{\gamma}(x)x,
+\end{equation}
+where
+\begin{equation}
+    A_p^{\gamma}(x)
+    =
+    \frac{\alpha_p}{\max\left(\sum_{i\in S_p^{\gamma}(x)} g_i(x),1\right)}
+    \sum_{i\in S_p^{\gamma}(x)} g_i(x) w_i r_i^{\top} .
+\end{equation}
+Therefore, for this thresholded executed composition,
+\begin{equation}
+    \operatorname{rank}(A_p^{\gamma}(x)) \le |S_p^{\gamma}(x)| .
+\end{equation}
+
+\textit{Proof.}
+Using $O_i^{RW}(x)=\langle x,r_i\rangle w_i = w_i r_i^{\top}x$, the thresholded pool output is
+\begin{equation}
+\begin{aligned}
+    y_p^{\gamma}(x)
+    &=
+    \frac{\alpha_p}{\max\left(\sum_{i\in S_p^{\gamma}(x)} g_i(x),1\right)}
+    \sum_{i\in S_p^{\gamma}(x)} g_i(x) w_i r_i^{\top}x \\
+    &= A_p^{\gamma}(x)x .
+\end{aligned}
+\end{equation}
+Since $A_p^{\gamma}(x)$ is a scalar multiple of a sum of $|S_p^{\gamma}(x)|$ rank-1 matrices, its rank is at most $|S_p^{\gamma}(x)|$. The exact soft-gated output in Equation~\ref{eq:rw_composition} is the special case obtained by taking $S_p^{\gamma}(x)$ to include all nonzero gates, in which case the rank bound becomes the number of included RW neurons, at most $N_p$.
+
+\textbf{Corollary 1 (Linear transitions as a special case).}
+Any linear transition $Ax$ with $\operatorname{rank}(A)=r$ can be represented by an unnormalized sum of at most $r$ RW neurons. With a fixed nonzero pool normalization, the resulting scalar can be absorbed into the write vectors or the pool scale.
+
+\textit{Proof.}
+By rank factorization, any rank-$r$ matrix can be written as
+\begin{equation}
+    A=\sum_{k=1}^{r} w_k r_k^{\top} .
+\end{equation}
+Setting each RW neuron to $O_k(x)=\langle x,r_k\rangle w_k$ and selecting these $r$ RW neurons gives
+\begin{equation}
+    \sum_{k=1}^{r} O_k(x)=Ax .
+\end{equation}
+Thus, a single RW neuron is rank-1, but compositions of RW neurons can represent higher-rank linear transitions; DAWN-SRW makes this composition state-dependent through Select and gates.
+
+\section{400M Pilot with an Earlier SRW Variant}
+\label{app:v394_400m_pilot}
+%==============================================================================
+
+This appendix reports a 400M pilot using spatial-r1-v3.9.4, an earlier SRW-family implementation. The purpose of this pilot is narrow: to test whether RW-neuron composition can train at the 400M scale and produce transferable representations. We do not use this experiment as evidence for the v4.1.6.6 RW-derived operator-key formulation, the v4.1.6.7 page-routed mechanism, or implemented compute efficiency.
+
+\subsection{Relation to Later DAWN-SRW Implementations}
+
+Table~\ref{tab:app_v394_v4155_diff} summarizes the implementation differences that matter for interpreting the 400M pilot. Both models use route-space scoring and read/write neuron composition, but v3.9.4 predates the final DAWN-SRW terminology and gate parameterization used in the main 40M experiments. In particular, v3.9.4 uses a ReLU gate with gate-sum normalization and a ``knowledge'' pool, whereas v4.1.5.5 uses the RST terminology and a two-axis activation--intensity gate with bounded scan offset.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+Aspect & spatial-r1-v3.9.4 pilot & DAWN-SRW v4.1.5.5 \\ 
+\midrule
+Layer naming & Attention + knowledge layer; knowledge pool & Attention Layer + RST Layer; RST pool \\ 
+Gate form & ReLU/linear gate, clipped and gate-sum normalized & Activation--intensity gate, multiplied into final gate \\ 
+Threshold & Relative tau from score mean and std & Relative tau plus bounded scan offset \\ 
+Read/write vectors & Forward-normalized read/write directions & Raw read/write vectors; norms are diagnostics \\ 
+Sparsity evidence & Utilization diagnostics only; not final sparsity evidence & Full-soft and strict hard-pruned evaluation for final DAWN-SRW \\ 
+Role in paper & 400M scaling and transfer pilot & Main architecture and sparsity/trace analysis \\ 
+\bottomrule
+\end{tabular}
+\captionof{table}{Key differences between the 400M spatial-r1-v3.9.4 pilot and the later DAWN-SRW implementations used for 40M operator-key validation, legacy hard-pruning, and page-routed development.}
+\label{tab:app_v394_v4155_diff}
+\end{center}
+
+\subsection{Pilot Result Summary}
+
+Table~\ref{tab:app_v394_pilot_summary} summarizes the limited conclusions supported by the 400M pilot before the detailed pretraining, downstream, utilization, and compute tables. The pilot supports scaling and transfer of the SRW family, but not implemented sparse inference efficiency.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{p{0.25\linewidth}p{0.31\linewidth}p{0.31\linewidth}}
+\toprule
+Question & Result & Interpretation \\ 
+\midrule
+400M pretraining & DAWN v3.9.4 re-eval loss 2.9330 vs. dense Transformer 2.9588 & SRW-family RW composition trains competitively at 400M scale \\ 
+Downstream transfer & DAWN pretraining improves over random initialization on all five tasks & C4 pretraining learns transferable representations \\ 
+Dense comparison & DAWN is higher on SST-2, RTE, and MNLI; lower on WiC and BoolQ & Broadly comparable, not uniform task dominance \\ 
+Sparsity/efficiency & Large active fractions in V and knowledge pools; dense/chunked implementation & Not evidence for final sparse-efficiency claim \\ 
+\bottomrule
+\end{tabular}
+\captionof{table}{Summary of what the 400M v3.9.4 pilot does and does not establish. Detailed task metrics and compute accounting are reported in Tables~\ref{tab:app_checkpoint_summary}--\ref{tab:app_compute}.}
+\label{tab:app_v394_pilot_summary}
+\end{center}
+
+\paragraph{Fine-tuning protocol.}
+All downstream evaluations use a single fine-tuning run per model and task. The shared protocol is AdamW with learning rate $2\times 10^{-5}$, warmup ratio 0.06, weight decay 0.01, batch size 64, maximum sequence length 512, and one seed. Evaluation intervals are 100 steps for RTE, SST-2, and WiC; 150 steps for BoolQ; and 300 steps for MNLI.
+
+\subsection{Pretraining and Checkpoint Metrics}
+
+Table~\ref{tab:app_checkpoint_summary} summarizes the pretraining setup and checkpoint re-evaluation metrics. DAWN v3.9.4 reaches a validation loss of 2.9330, compared with 2.9588 for the dense Transformer baseline. This supports the limited claim that SRW-style RW-neuron composition can train competitively at the 400M scale.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Params & Tokens & Seq. len & Ckpt step & Best val loss & Re-eval val loss / ppl \\
+\midrule
+DAWN v3.9.4 & 399.5M & 40B & 512 & 76{,}293 & 2.9387 & 2.9330 / 18.78 \\
+Transformer & 393.9M & 40B & 512 & 75{,}800 & 2.9701 & 2.9588 / 19.27 \\
+\bottomrule
+\end{tabular}
+\captionof{table}{400M pretraining setup and checkpoint metrics. DAWN uses spatial-r1-v3.9.4, an earlier SRW-family implementation.}
+\label{tab:app_checkpoint_summary}
+\end{center}
+
+\subsection{Downstream Transfer}
+
+Table~\ref{tab:app_downstream_best} reports best downstream accuracy across five classification tasks. DAWN v3.9.4 pretraining improves substantially over random initialization on every task, with gains ranging from +11.28 to +32.63 percentage points. Relative to the dense Transformer baseline, the pretrained DAWN model is higher on SST-2, RTE, and MNLI, lower on WiC and BoolQ, and broadly comparable overall. We therefore interpret these results as evidence for transfer, not as a claim of uniform task dominance.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{7pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{lrrrrrrr}
+\toprule
+Task & DAWN pre. & DAWN rand. & DAWN $\Delta$ & Dense pre. & Dense rand. & Dense $\Delta$ & DAWN-Dense \\
+\midrule
+SST-2 & 94.04 & 76.49 & +17.55 & 93.69 & 75.57 & +18.12 & +0.35 \\
+RTE & 71.48 & 51.26 & +20.22 & 68.95 & 53.07 & +15.88 & +2.53 \\
+WiC & 67.24 & 55.96 & +11.28 & 69.75 & 56.27 & +13.48 & -2.51 \\
+BoolQ & 77.52 & 65.63 & +11.89 & 78.13 & 64.86 & +13.27 & -0.61 \\
+MNLI & 82.76 & 50.13 & +32.63 & 82.63 & 51.13 & +31.50 & +0.13 \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Best downstream accuracy for the 400M pilot. Deltas are percentage-point differences. DAWN-Dense compares pretrained DAWN v3.9.4 against the pretrained dense Transformer baseline.}
+\label{tab:app_downstream_best}
+\end{center}
+
+\subsection{Utilization and Compute Diagnostics}
+
+The following diagnostics are included for transparency. They are not used as the main sparsity evidence for DAWN-SRW because v3.9.4 uses an earlier ReLU/gate-sum-normalized routing scheme and activates large portions of the RW-neuron pools, especially the V and knowledge pools.
+
+\begin{center}
+\small
+\begin{minipage}{0.46\textwidth}
+\centering
+\setlength{\tabcolsep}{7pt}
+\begin{tabular}{lrr}
+\toprule
+Pool & Active frac. & Active ops/token \\
+\midrule
+QK & 0.0649 & 415.52 \\
+V & 0.4024 & 4{,}185.48 \\
+Knowledge & 0.2334 & 23{,}337.13 \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Utilization diagnostics for the earlier v3.9.4 400M pilot.}
+\label{tab:app_utilization}
+\end{minipage}\hfill
+\begin{minipage}{0.46\textwidth}
+\centering
+\setlength{\tabcolsep}{7pt}
+\begin{tabular}{lr}
+\toprule
+Metric & Value \\
+\midrule
+Gate-sum mean & 2{,}852.3666 \\
+Gate-max mean & 1.4163 \\
+Gate concentration mean & 6.6673 \\
+Score-std mean & 0.3087 \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Additional routing diagnostics for spatial-r1-v3.9.4.}
+\label{tab:app_routing_diagnostics}
+\end{minipage}
+\end{center}
+
+Table~\ref{tab:app_compute} separates implemented compute from theoretical active-RW-neuron estimates. The current spatial-r1-v3.9.4 implementation should be read as a dense-routing implementation: it computes routing scores over the full RW-neuron pools and also applies read/write operations over those pools before gate normalization. We therefore do not use this appendix as evidence for implemented compute efficiency. The active-read/write rows are theoretical accounting regimes: they ask how the cost would change if read/write execution, and then routing itself, were restricted to the measured active RW-neuron set. These estimates illustrate the algorithmic distinction between learned RW-neuron capacity and executed transition computation; they are not measured wall-clock results.
+
+\begin{center}
+\small
+\setlength{\tabcolsep}{8pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{lrr}
+\toprule
+Compute regime & Core FLOPs/token & Total incl. LM head \\
+\midrule
+Dense Transformer & $7.550\times 10^8$ & $8.331\times 10^8$ \\
+v3.9.4 implemented dense routing & $1.348\times 10^{10}$ & $1.356\times 10^{10}$ \\
+v3.9.4 dense routing + active RW & $5.037\times 10^9$ & $5.116\times 10^9$ \\
+v3.9.4 route-gated active RW & $3.289\times 10^9$ & $3.367\times 10^9$ \\
+\bottomrule
+\end{tabular}
+\captionof{table}{Approximate compute accounting for the 400M pilot. The implemented v3.9.4 row reflects the current dense-routing implementation. The active-RW rows are theoretical accounting estimates based on measured active counts; the sparse-routing row assumes candidate-restricted routing over the active set and is not a measured wall-clock result.}
+\label{tab:app_compute}
+\end{center}
+
+\subsection{Interpretation}
+
+The 400M pilot supports two limited conclusions. First, an SRW-family model with RW-neuron composition can be trained at 400M scale and can reach competitive language-modeling validation loss. Second, C4 pretraining produces transferable representations, as shown by large gains over random initialization and downstream performance broadly comparable to a dense Transformer baseline. At the same time, the utilization and compute diagnostics show that spatial-r1-v3.9.4 is not yet an efficient sparse inference implementation. The final sparsity mechanism and compute-efficiency direction should therefore be evaluated using the later v4.1.6.6 operator-key path and the v4.1.6.7 page-routed implementation.
+
+\end{document}

@@ -1,0 +1,29 @@
+{
+  "latex-workshop.latex.autoBuild.run": "onSave",
+  "latex-workshop.latex.outDir": "%DIR%",
+  "latex-workshop.latex.recipe.default": "first",
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "MiKTeX texify",
+      "tools": [
+        "miktex-texify"
+      ]
+    }
+  ],
+  "latex-workshop.latex.tools": [
+    {
+      "name": "miktex-texify",
+      "command": "texify",
+      "args": [
+        "--pdf",
+        "--max-iterations=5",
+        "--tex-option=--synctex=1",
+        "--tex-option=--halt-on-error",
+        "%DOC%"
+      ],
+      "env": {}
+    }
+  ],
+  "latex-workshop.view.pdf.viewer": "tab",
+  "latex-workshop.view.pdf.tab.editorGroup": "right"
+}
