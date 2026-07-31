@@ -1,0 +1,22 @@
+From a3879f21dcd3b786bdc2cde270bcca2a382796a4 Mon Sep 17 00:00:00 2001
+From: sh <madst0614@gmail.com>
+Date: Sun, 26 Jul 2026 23:48:02 +0900
+Subject: [PATCH] Test v4174 RST chunk4 with tau fractions 8 8 5
+
+
+diff --git a/configs/train_config_v4174_400M_c4_20B_v4_64.yaml b/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+index 33b63502bfce873a34965c2846709f39b4102a3a..0e90516d0fb4d323a2e81103c07b02646158b775 100644
+--- a/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
++++ b/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+@@ -80,7 +80,7 @@ training:
+   n_chunks_q: 1
+   n_chunks_k: 1
+   n_chunks_v: 2
+-  n_chunks_rst: 8
++  n_chunks_rst: 4
+ 
+   lr: 3.0e-4
+   tau_lr_mult: 0.001
+-- 
+2.54.0.windows.1
+

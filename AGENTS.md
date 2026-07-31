@@ -24,14 +24,14 @@
   committed numeric checkpoint step. These paths do not choose, authorize,
   create, resize, or otherwise grant access to any TPU resource.
 
-## Canonical POC integration policy
+## Canonical integration and research archive policy
 
-- `codex/v4167-poc` is the canonical integration branch and canonical baseline-source branch for all POC work.
-- A feature, optimization, profiling, or comparison branch is candidate evidence only. A final accepted architecture, parameter/config schema, variable or metric name, runtime/launcher change, optimization, and baseline decision is not canonical or complete until it is synchronized back to `codex/v4167-poc` and pushed.
-- Experiments may run on candidate branches, but final reporting is centralized on `codex/v4167-poc`: after every material attempt, synchronize the resulting `EXPERIMENT.md` entry and current-state decision to POC as a reporting-only commit and push it, whether the candidate was accepted, rejected, blocked, or inconclusive.
-- Rejected or inconclusive candidate source stays on its experiment branch; synchronize its report to POC without merging the candidate code merely to make every branch an ancestor of POC.
-- Measure every new canonical baseline from a clean exact commit reachable from `origin/codex/v4167-poc`. Preserve the actual branch and commit of historical measurements instead of relabeling old evidence after synchronization.
-- Before starting or reporting a POC/baseline experiment, fetch the remote branches and verify that every accepted decision relevant to the run is present on `origin/codex/v4167-poc`. Record any intentional unmerged comparison snapshot or rejected branch in `EXPERIMENT.md`.
+- `main` is the sole canonical integration, baseline-source, and final-reporting branch. The former `codex/v4167-poc` integration branch was fast-forwarded into `main` during the 2026-07-31 project consolidation.
+- A feature, optimization, profiling, or comparison branch is candidate evidence only. A final accepted architecture, parameter/config schema, variable or metric name, runtime/launcher change, optimization, and baseline decision is not canonical or complete until it is synchronized back to `main` and pushed.
+- Experiments may run on short-lived candidate branches, but final reporting is centralized on `main`: after every material attempt, synchronize the resulting `EXPERIMENT.md` entry and current-state decision to `main`, whether the candidate was accepted, rejected, blocked, or inconclusive.
+- Rejected or inconclusive source must not be merged into active production code merely for ancestry. Preserve it as commit patches under `research/branch_archive/`, record its exact commit identity in the manifest, and retain an immutable `research-archive/...` tag before deleting its working branch.
+- Measure every new canonical baseline from a clean exact commit reachable from `origin/main`. Preserve the actual branch and commit of historical measurements instead of relabeling old evidence after consolidation.
+- Before starting or reporting an experiment, fetch `origin/main` and verify that every accepted decision relevant to the run is present there. Archived patches and tags are research evidence, not canonical executable source.
 
 ## TPU access policy
 
@@ -59,5 +59,5 @@
 - Update `Current State` only when the accepted conclusion, current blocker, or next experiment changes. Preserve old entries; record corrections in a later entry instead of rewriting history.
 - Separate TPU measurements, local validation, user-provided context, and inference. Never report an unrun validation as successful, and write `not measured` when evidence is absent.
 - Record the hypothesis, change, exact run identity, result, lesson, decision, next step, and stable evidence location. Keep raw logs out of Git; preserve them remotely and link their paths.
-- Candidate code/config may be committed on its experiment branch. Commit its final notebook report separately on `codex/v4167-poc`; for runtime-only or rejected/inconclusive results, use a POC reporting-only commit. An experiment is not complete until the centralized POC notebook entry is committed and pushed to GitHub.
+- Candidate code/config may be committed on a short-lived experiment branch. Commit its final notebook report separately on `main`; for runtime-only or rejected/inconclusive results, use a reporting-only commit and archive the candidate patch series. An experiment is not complete until the centralized notebook entry is committed and pushed to GitHub.
 - Never stage or commit unrelated dirty-worktree changes while publishing an experiment record.

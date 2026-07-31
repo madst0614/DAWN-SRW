@@ -1,0 +1,2 @@
+# Preserve generated research patch mail exactly as archived.
+research/branch_archive/patches/** -text -whitespace

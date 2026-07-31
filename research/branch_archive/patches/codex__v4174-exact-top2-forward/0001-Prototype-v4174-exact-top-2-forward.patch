@@ -1,0 +1,710 @@
+From 1a1b8c7180891aa0704072264434cf0434df0326 Mon Sep 17 00:00:00 2001
+From: sh <madst0614@gmail.com>
+Date: Sun, 26 Jul 2026 17:01:15 +0900
+Subject: [PATCH 1/4] Prototype v4174 exact top-2 forward
+
+
+diff --git a/EXPERIMENT.md b/EXPERIMENT.md
+index 6989ea5d3eeb970c3f7d51ab1612c562dee0b10c..493613618dd76418114e2edd2a542af2db075524 100644
+--- a/EXPERIMENT.md
++++ b/EXPERIMENT.md
+@@ -12,8 +12,8 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
+ - Current conclusion: bundle4 dense forward, exact selected-top-2 backward, and the accepted analytic pullback remain unchanged. Generation `g3` at clean POC commit `8313cb07` establishes the independently keyed semi-orthogonal initializer as the current execution baseline: its two-layer F+B time was 0.726526 s and its five-step mean was 9.895410 s/it, within 0.20% and 1.16% of historical `g2`, respectively.
+ - Baseline state: `docs/v4174_dense_rw_baselines.yaml` generation `g3` is active and pins the independent per-space initializer, exact POC commit, real-data protocols, runtime, mesh, and evidence paths. Generation `g2` is superseded and remains historical evidence for the old shared-base/row-sign-derived initializer.
+ - Active run: the old-sign generation `g2` from-scratch workload was observed through step 400, archived, and replaced as authorized. Both `g3` benchmark protocols completed successfully; the TPU benchmark tmux wrappers are idle after completion.
+-- Current blocker: no baseline or local implementation blocker. The exact top-2 forward candidate is not yet implemented or measured.
+-- Next experiment: replace bundle4 forward with exact selected-top-2 space buckets using `Tcap=3072` plus compact exact overflow, while retaining the accepted analytic backward. Screen against `g3` with the two-layer gate, then the matched five-step full benchmark, and require retained benefit under step-100-skew routing before promotion.
++- Current blocker: the exact top-2 forward candidate is locally validated but not TPU measured.
++- Next experiment: screen `codex/v4174-exact-top2-forward` against stored generation `g3` with the two-layer gate. Continue to the matched five-step full benchmark only if combined QKV+RST F+B improves by at least 10%, then require retained benefit under step-100-skew routing before promotion.
+ 
+ ## Fixed Context
+ 
+@@ -507,6 +507,16 @@ Dates are KST. Experiment IDs are stable as `YYYY-MM-DD/#NN`.
+ - Next: implement exact selected-top-2 forward with `Tcap=3072` plus compact exact overflow while retaining the accepted analytic backward. Require at least 10% two-layer F+B improvement, 2% full-step improvement, at most 5% compile regression, at most 0.05 GiB HBM regression, and retained benefit under step-100-skew routing.
+ - Evidence: gate JSONL `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_g3_independent_control_8313cb07_gate/benchmark_metrics_host_6.jsonl`; full-step JSONL `/home/madst0614/DAWN-SRW/benchmark_runs/v4174_dense_rw_g3_independent_control_8313cb07_fullstep/benchmark_metrics_host_6.jsonl`; archived gate/full logs `/home/madst0614/train.v4174_dense_rw_g3_independent_control_8313cb07_gate_20260726T1629KST.log` and `/home/madst0614/train.v4174_dense_rw_g3_independent_control_8313cb07_fullstep_20260726T1637KST.log`; local untracked launcher captures `launch_srw_benchmark_spatial-se-400m_20260726_162428_worker_{0..7}.log` and `launch_srw_benchmark_spatial-se-400m_20260726_163232_worker_{0..7}.log`; `docs/v4174_dense_rw_baselines.yaml`; this notebook.
+ 
++#### #25 — Implement exact selected-top-2 forward with compact overflow
++
++- Status: implemented and locally validated on a candidate branch; TPU not yet measured.
++- Hypothesis/change: after the analytic pullback reduced backward, bundle4 forward still executes four physical spaces for each routed bundle and commonly computes 4–8 spaces per token despite semantic top-2 selection. Add a distinct `exact_top2` production execution mode that directly reuses the accepted per-space `Tcap=3072` bucket and compact exact overflow executor for both primal forward and analytic backward. Preserve `bundle_dense` and `dense_all_space`, all parameter roots/shapes/counts, routing weights, Q/K pairing, Q/K/V grouped execution, RST reselection, BF16/FP32 boundaries, no-drop overflow, and the final output collective.
++- Implementation: `models/dawn_srw_v4174.py` adds fail-loud `exact_top2` schema validation, exact attention/RST factories, primal exact packing, the existing custom-VJP exact pullback, exact-capacity packing metrics through the stable metric keys, and forward/backward kernel contracts. `scripts/train_jax.py` selects and reports the new mode. The candidate config replaces only bundle execution fields with `operation_space_execution_mode: exact_top2`; the canonical g3 config blob remains pinned historically in the baseline registry.
++- Local identity: branch `codex/v4174-exact-top2-forward`; clean parent `300a8966` on canonical POC; dirty model/trainer/config SHA-256 values `1a83e4c3fccfb605a66a3bd1342c8bda34e72f9f7009b7853f5a30dbe0c7f5ca`, `74c4305d0935561ace35b772598f760186346a17bab1d78d39f78e76b827347c`, and `052dfda7315297ab93c8a8e2b9628c2fe16a0584fcba64f7cd34ee6e1c5c6b84`; no checkpoint or TPU/GCS execution. Local environment: Python 3.12.7, JAX 0.6.2, Flax 0.10.7.
++- Local validation: `py_compile` passed for the model, trainer, and benchmark; config materialization selected `exact_top2` with no legacy bundle fields and retained 393,803,872 symbolic parameters; one-device factory construction reported exact forward and backward contracts for attention and RST. Small FP32 bundle-versus-exact attention outputs differed by at most `2.3283e-10` / `6.8530e-8` relative, while RST was bit-identical. With forced overflow (`Tcap=2`, maximum selected-space count 8), attention/RST loss differences were `3.4925e-10` and `7.2760e-11`; all input/parameter gradients were bit-identical with zero relative L2 difference. The focused canonical count and trainer-factory contracts passed `2 passed in 49.28s`; `git diff --check` passed.
++- Decision/next: publish the candidate branch and run only the real-data two-layer `--fast --backward-profile --detailed-profile-layers 2 --no-xla-dump` gate against stored `g3`. Require at least 10% combined QKV+RST F+B improvement with no compile/HBM/process failure before any full-step or skew-state run.
++- Evidence: `models/dawn_srw_v4174.py`; `scripts/train_jax.py`; `configs/train_config_v4174_400M_c4_20B_v4_64.yaml`; local validation output from 2026-07-26 KST; this notebook.
++
+ ## Backfill Boundary
+ 
+ - The initial notebook covered evidence-backed work from 2026-07-21 through the step-1500 resume attempt.
+diff --git a/configs/train_config_v4174_400M_c4_20B_v4_64.yaml b/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+index d1b0e0895a7238eb01d6f513cb8ed340ea697bf5..6bd72b7337468fa73f8d7e7875cf5d5fd0191743 100644
+--- a/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
++++ b/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+@@ -1,7 +1,7 @@
+ # DAWN-SRW v4.1.7.4 canonical 400M production configuration.
+ #
+-# Execution topology retained from the accepted exact-backward path:
+-#   forward: bundle4
++# Exact selected-space candidate topology:
++#   forward: exact selected-top-2 spaces
+ #   backward: exact selected-top-2 spaces
+ #   bucket capacity: 3072 with compact exact overflow
+ #
+@@ -47,9 +47,7 @@ model:
+ 
+   n_operation_spaces: 24
+   operation_space_top_k: 2
+-  operation_space_execution_mode: bundle_dense
+-  operation_space_bundle_size: 4
+-  operation_space_bundle_token_block_size: 2048
++  operation_space_execution_mode: exact_top2
+ 
+   n_q: 21504
+   n_k: 21504
+diff --git a/models/dawn_srw_v4174.py b/models/dawn_srw_v4174.py
+index 4fe109a5508343275f806373d94d5930dfdfc090..2d44c778c84c070c0313cdbd08a8594ea6ca3416 100644
+--- a/models/dawn_srw_v4174.py
++++ b/models/dawn_srw_v4174.py
+@@ -61,11 +61,14 @@ ROUTES = ("q", "k", "v", "rst")
+ POOLS = ROUTES
+ ATTENTION_CORE_NAME = "causal_dot_product_fp32_softmax"
+ LAYER_EXECUTION_NAME = "rematerialized"
+-OPERATION_SPACE_EXECUTION_MODES = ("dense_all_space", "bundle_dense")
++OPERATION_SPACE_EXECUTION_MODES = (
++    "dense_all_space", "bundle_dense", "exact_top2")
+ BUNDLE_DENSE_SIZE = 4
+ DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE = 1024
+ SPACE_GATE_L1_EPS = 1.0e-8
+ _BUNDLE_PACKING_CHECKPOINT_NAME = "v4174_bundle_packing_metadata"
++_EXACT_SPACE_ROUTING_CHECKPOINT_NAME = (
++    "v4174_exact_space_routing_metadata")
+ _SPACE_ROUTING_COMPACT_METRIC_SUFFIXES = (
+     "gate_mass_mean",
+     "active_count_mean",
+@@ -143,6 +146,21 @@ def materialize_operation_space_config(
+         model_cfg["operation_space_bundle_size"] = bundle_size
+         model_cfg[
+             "operation_space_bundle_token_block_size"] = token_block_size
++    elif execution_mode == "exact_top2":
++        if n_spaces != 24:
++            raise ValueError(
++                "v4174 exact_top2 production requires "
++                f"model.n_operation_spaces=24, got {n_spaces}")
++        if top_k != 2:
++            raise ValueError(
++                "v4174 exact_top2 requires "
++                f"model.operation_space_top_k=2, got {top_k}")
++        if (
++                "operation_space_bundle_size" in model_cfg
++                or "operation_space_bundle_token_block_size" in model_cfg):
++            raise ValueError(
++                "v4174 exact_top2 does not accept "
++                "model.operation_space_bundle_* fields")
+     elif (
+             "operation_space_bundle_size" in model_cfg
+             or "operation_space_bundle_token_block_size" in model_cfg):
+@@ -1629,6 +1647,10 @@ class DAWN_SRW_V4174(nn.Module):
+                 checkpoint_kwargs["policy"] = (
+                     jax.checkpoint_policies.save_only_these_names(
+                         _BUNDLE_PACKING_CHECKPOINT_NAME))
++            elif self.operation_space_execution_mode == "exact_top2":
++                checkpoint_kwargs["policy"] = (
++                    jax.checkpoint_policies.save_only_these_names(
++                        _EXACT_SPACE_ROUTING_CHECKPOINT_NAME))
+             layer_impl = jax.checkpoint(layer_forward, **checkpoint_kwargs)
+ 
+         block_params = [
+@@ -1781,8 +1803,12 @@ class DAWN_SRW_V4174(nn.Module):
+                 f"{self.operation_space_bundle_token_block_size}"
+                 if self.operation_space_execution_mode == "bundle_dense"
+                 else (
+-                    "execution: semantic hard top-k, physical all-space "
+-                    "dense with fused operation-space writeback")),
++                    "execution: semantic and physical exact selected-top-2 "
++                    "space buckets with compact exact overflow"
++                    if self.operation_space_execution_mode == "exact_top2"
++                    else (
++                        "execution: semantic hard top-k, physical all-space "
++                        "dense with fused operation-space writeback"))),
+             "layer execution: lax.scan with "
+             + ("full-layer rematerialization"
+                if self.gradient_checkpointing
+@@ -2562,6 +2588,81 @@ def _pack_top2_bundle_entries_sharded(
+     }, metrics)
+ 
+ 
++def _exact_top2_packing_metrics_sharded(
++        routing: Mapping[str, jax.Array], *,
++        bucket_capacity: int,
++        task_group_size: int,
++        stage: str) -> dict[str, jax.Array]:
++    """Report exact-space capacity and skew through the stable metric schema."""
++    selected_ids = routing["selected_ids"].astype(jnp.int32)
++    dense_weights = routing["dense_space_weights"]
++    token_count, n_spaces = map(int, dense_weights.shape)
++    if selected_ids.shape != (token_count, 2):
++        raise ValueError("exact_top2 routing requires selected_ids[T,2]")
++    bucket_size = min(int(bucket_capacity), token_count)
++    group_size = int(task_group_size)
++    if bucket_size <= 0 or group_size <= 0:
++        raise ValueError("exact_top2 metrics require positive capacities")
++
++    candidate_space = jnp.concatenate(
++        (selected_ids[:, 0], selected_ids[:, 1]))
++    counts = jax.nn.one_hot(
++        candidate_space, n_spaces, dtype=jnp.int32
++    ).sum(axis=0, dtype=jnp.int32)
++    overflow_counts = jnp.maximum(
++        counts - jnp.int32(bucket_size), jnp.int32(0))
++    overflow_tasks = (
++        (overflow_counts + jnp.int32(bucket_size - 1))
++        // jnp.int32(bucket_size)
++    ).sum(dtype=jnp.int32)
++    executed_overflow_tasks = (
++        (overflow_tasks + jnp.int32(group_size - 1))
++        // jnp.int32(group_size)
++        * jnp.int32(group_size))
++
++    valid_entries = jnp.float32(2 * token_count)
++    physical_entries = (
++        jnp.int32(n_spaces * bucket_size)
++        + executed_overflow_tasks * jnp.int32(bucket_size)
++    ).astype(jnp.float32)
++    padding_entries = jnp.maximum(
++        physical_entries - valid_entries, jnp.float32(0.0))
++    same_bundle = (
++        selected_ids[:, 0] // BUNDLE_DENSE_SIZE
++        == selected_ids[:, 1] // BUNDLE_DENSE_SIZE)
++
++    tokens_f32 = jnp.float32(token_count)
++    valid_mean = jax.lax.pmean(valid_entries, "data")
++    physical_mean = jax.lax.pmean(physical_entries, "data")
++    padding_mean = jax.lax.pmean(padding_entries, "data")
++    same_mean = jax.lax.pmean(
++        same_bundle.astype(jnp.float32).sum(), "data")
++    count_f32 = counts.astype(jnp.float32)
++    count_min = jax.lax.pmin(count_f32.min(), "data")
++    count_mean = jax.lax.pmean(count_f32.mean(), "data")
++    count_max = jax.lax.pmax(count_f32.max(), "data")
++    entries_per_token = valid_mean / tokens_f32
++    physical_spaces = physical_mean / tokens_f32
++    metric_values = (
++        valid_mean,
++        entries_per_token,
++        same_mean / tokens_f32,
++        physical_spaces,
++        physical_spaces / jnp.float32(n_spaces),
++        padding_mean,
++        padding_mean / jnp.maximum(
++            physical_mean, jnp.float32(1.0)),
++        count_min,
++        count_mean,
++        count_max,
++        jnp.float32(0.0),
++    )
++    return {
++        name: jax.lax.stop_gradient(value)
++        for name, value in zip(
++            _bundle_packing_metric_names(stage), metric_values)}
++
++
+ def _prefix_pack_top2_space_buckets(
+         selected_ids: jax.Array,
+         selected_weights: jax.Array, *,
+@@ -3817,9 +3918,11 @@ def _make_sharded_attention_space_bundle_dense(
+         heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
+         soft_gate_effective_active_eps: float = 1.0e-6,
+         throughput_bf16: bool,
+-        output_collective_bf16: bool):
+-    """Create compact fixed-four-space production Q/K/V execution."""
++        output_collective_bf16: bool,
++        exact_forward: bool = False):
++    """Create bundle4 or exact-top-2 production Q/K/V execution."""
+     composition_mode = str(srw_composition_mode)
++    exact_forward = bool(exact_forward)
+     top_k = int(operation_space_top_k)
+     bundle_size = int(operation_space_bundle_size)
+     token_block_size = int(operation_space_bundle_token_block_size)
+@@ -4236,6 +4339,41 @@ def _make_sharded_attention_space_bundle_dense(
+         return _psum_dense_rw_representation_sharded(
+             local_grouped_output, output_collective_bf16)
+ 
++    def exact_top2_execute(
++            flat_state,
++            state_params,
++            operator_params,
++            controls,
++            selected_ids,
++            dense_space_weights):
++        selected_weights = jnp.take_along_axis(
++            dense_space_weights, selected_ids, axis=1)
++        token_count = int(flat_state.shape[0])
++        n_spaces = int(state_params[0].shape[0])
++        bucket_capacity = min(
++            _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY, token_count)
++        packed = _prefix_pack_top2_space_buckets(
++            selected_ids, selected_weights,
++            operation_space_count=n_spaces,
++            bucket_capacity=bucket_capacity,
++            task_group_size=_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
++        packed_metadata = {
++            "primary_token_id": packed["primary_token_id"],
++            "primary_token_valid": packed["primary_token_valid"],
++            "overflow_task_space_id": packed["overflow_task_space_id"],
++            "overflow_task_token_id": packed["overflow_task_token_id"],
++            "overflow_task_token_valid": packed[
++                "overflow_task_token_valid"],
++        }
++        return exact_space_execute(
++            flat_state,
++            state_params,
++            operator_params,
++            controls,
++            packed_metadata,
++            packed["primary_routing_weight"],
++            packed["overflow_task_routing_weight"])
++
+     @jax.custom_vjp
+     def execute_with_exact_space_backward(
+             flat_state,
+@@ -4245,6 +4383,14 @@ def _make_sharded_attention_space_bundle_dense(
+             packing,
+             selected_ids,
+             dense_space_weights):
++        if exact_forward:
++            return exact_top2_execute(
++                flat_state,
++                state_params,
++                operator_params,
++                controls,
++                selected_ids,
++                dense_space_weights)
+         del selected_ids, dense_space_weights
+         return bundle_execute(
+             flat_state, state_params, operator_params, controls, packing)
+@@ -4257,10 +4403,26 @@ def _make_sharded_attention_space_bundle_dense(
+             packing,
+             selected_ids,
+             dense_space_weights):
+-        grouped_output = bundle_execute(
+-            flat_state, state_params, operator_params, controls, packing)
++        if exact_forward:
++            grouped_output = exact_top2_execute(
++                flat_state,
++                state_params,
++                operator_params,
++                controls,
++                selected_ids,
++                dense_space_weights)
++        else:
++            grouped_output = bundle_execute(
++                flat_state, state_params, operator_params, controls, packing)
+         selected_weights = jnp.take_along_axis(
+             dense_space_weights, selected_ids, axis=1)
++        if exact_forward:
++            selected_ids = ad_checkpoint.checkpoint_name(
++                selected_ids,
++                name=_EXACT_SPACE_ROUTING_CHECKPOINT_NAME)
++            selected_weights = ad_checkpoint.checkpoint_name(
++                selected_weights,
++                name=_EXACT_SPACE_ROUTING_CHECKPOINT_NAME)
+         residual = (
+             flat_state,
+             state_params,
+@@ -4362,17 +4524,26 @@ def _make_sharded_attention_space_bundle_dense(
+             qk_scale, v_scale, collect_metrics):
+         routing = _select_operation_spaces(
+             global_state, space_query_kernel, space_route_keys, top_k)
+-        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
+-            routing,
+-            bundle_size=bundle_size,
+-            token_block_size=token_block_size,
+-            stage="attention")
+         token_count = int(global_state.shape[0])
+         n_spaces = int(space_read_proj.shape[0])
+         if n_spaces % bundle_size:
+             raise ValueError(
+                 "bundle_dense attention space count is not divisible by 4")
+         n_bundles = n_spaces // bundle_size
++        if exact_forward:
++            packing = ()
++            packing_metrics = _exact_top2_packing_metrics_sharded(
++                routing,
++                bucket_capacity=min(
++                    _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY, token_count),
++                task_group_size=_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE,
++                stage="attention")
++        else:
++            packing, packing_metrics = _pack_top2_bundle_entries_sharded(
++                routing,
++                bundle_size=bundle_size,
++                token_block_size=token_block_size,
++                stage="attention")
+         qk_reads = jnp.stack((q_read, k_read), axis=0)
+         qk_tau_kernels = jnp.stack(
+             (q_tau_kernel, k_tau_kernel), axis=0)
+@@ -4564,14 +4735,35 @@ def _make_sharded_attention_space_bundle_dense(
+             {name: P() for name in all_metric_names}),
+         check_rep=False)
+     kernel._v4174_kernel_profile = "production"
+-    kernel._v4174_dense_grouped_execution = "attention_qkv_bundle4"
+-    kernel._v4174_execution_mode = "bundle_dense"
+-    kernel._v4174_bundle_size = bundle_size
+-    kernel._v4174_bundle_token_block_size = token_block_size
+-    kernel._v4174_packed_entry_capacity = (
+-        "2*T + n_bundles*(token_block_size-1)")
+-    kernel._v4174_bundle_packing = "prefix_count_exact"
+-    kernel._v4174_bundle_packing_vjp = "saved_metadata_scatter"
++    kernel._v4174_dense_grouped_execution = (
++        "attention_qkv_exact_top2"
++        if exact_forward else "attention_qkv_bundle4")
++    kernel._v4174_execution_mode = (
++        "exact_top2" if exact_forward else "bundle_dense")
++    if exact_forward:
++        kernel._v4174_forward_execution_mode = (
++            "exact_top2_space_batched_dense_with_overflow")
++        kernel._v4174_forward_bucket_capacity = (
++            _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
++        kernel._v4174_forward_overflow_task_group_size = (
++            _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
++        kernel._v4174_packed_entry_capacity = (
++            "n_spaces*min(T,3072) + compact exact overflow tasks")
++        kernel._v4174_bundle_packing = "exact_space_prefix_count"
++        kernel._v4174_bundle_packing_vjp = "repacked_exact_scatter"
++        kernel._v4174_packing_metric_semantics = (
++            "exact_space_executed_capacity")
++    else:
++        kernel._v4174_forward_execution_mode = (
++            "bundle4_prefix_packed_dense")
++        kernel._v4174_bundle_size = bundle_size
++        kernel._v4174_bundle_token_block_size = token_block_size
++        kernel._v4174_packed_entry_capacity = (
++            "2*T + n_bundles*(token_block_size-1)")
++        kernel._v4174_bundle_packing = "prefix_count_exact"
++        kernel._v4174_bundle_packing_vjp = "saved_metadata_scatter"
++        kernel._v4174_packing_metric_semantics = (
++            "bundle4_executed_capacity")
+     kernel._v4174_attention_packing_count = 1
+     kernel._v4174_qk_paired = True
+     kernel._v4174_dynamic_metric_flag = True
+@@ -4609,6 +4801,32 @@ def make_sharded_attention_space_bundle_dense_fp32_reference(mesh, **kwargs):
+         mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
+ 
+ 
++def make_sharded_attention_space_exact_top2_minimal(mesh, **kwargs):
++    """Create the mixed-precision exact selected-top-2 attention executor."""
++    return _make_sharded_attention_space_bundle_dense(
++        mesh,
++        operation_space_bundle_size=BUNDLE_DENSE_SIZE,
++        operation_space_bundle_token_block_size=(
++            DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE),
++        throughput_bf16=True,
++        output_collective_bf16=True,
++        exact_forward=True,
++        **kwargs)
++
++
++def make_sharded_attention_space_exact_top2_fp32_reference(mesh, **kwargs):
++    """Create the exact selected-top-2 FP32 attention reference."""
++    return _make_sharded_attention_space_bundle_dense(
++        mesh,
++        operation_space_bundle_size=BUNDLE_DENSE_SIZE,
++        operation_space_bundle_token_block_size=(
++            DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE),
++        throughput_bf16=False,
++        output_collective_bf16=False,
++        exact_forward=True,
++        **kwargs)
++
++
+ def _make_sharded_rst_space_dense(
+         mesh, *,
+         max_chunk_size: int,
+@@ -4812,9 +5030,11 @@ def _make_sharded_rst_space_bundle_dense(
+         heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA,
+         soft_gate_effective_active_eps: float = 1.0e-6,
+         throughput_bf16: bool,
+-        output_collective_bf16: bool):
+-    """Create compact fixed-four-space production RST execution."""
++        output_collective_bf16: bool,
++        exact_forward: bool = False):
++    """Create bundle4 or exact-top-2 production RST execution."""
+     composition_mode = str(srw_composition_mode)
++    exact_forward = bool(exact_forward)
+     top_k = int(operation_space_top_k)
+     bundle_size = int(operation_space_bundle_size)
+     token_block_size = int(operation_space_bundle_token_block_size)
+@@ -5107,6 +5327,41 @@ def _make_sharded_rst_space_bundle_dense(
+         return _psum_dense_rw_representation_sharded(
+             local_update, output_collective_bf16)
+ 
++    def exact_top2_execute(
++            flat_state,
++            state_params,
++            operator_params,
++            controls,
++            selected_ids,
++            dense_space_weights):
++        selected_weights = jnp.take_along_axis(
++            dense_space_weights, selected_ids, axis=1)
++        token_count = int(flat_state.shape[0])
++        n_spaces = int(state_params[0].shape[0])
++        bucket_capacity = min(
++            _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY, token_count)
++        packed = _prefix_pack_top2_space_buckets(
++            selected_ids, selected_weights,
++            operation_space_count=n_spaces,
++            bucket_capacity=bucket_capacity,
++            task_group_size=_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
++        packed_metadata = {
++            "primary_token_id": packed["primary_token_id"],
++            "primary_token_valid": packed["primary_token_valid"],
++            "overflow_task_space_id": packed["overflow_task_space_id"],
++            "overflow_task_token_id": packed["overflow_task_token_id"],
++            "overflow_task_token_valid": packed[
++                "overflow_task_token_valid"],
++        }
++        return exact_space_execute(
++            flat_state,
++            state_params,
++            operator_params,
++            controls,
++            packed_metadata,
++            packed["primary_routing_weight"],
++            packed["overflow_task_routing_weight"])
++
+     @jax.custom_vjp
+     def execute_with_exact_space_backward(
+             flat_state,
+@@ -5116,6 +5371,14 @@ def _make_sharded_rst_space_bundle_dense(
+             packing,
+             selected_ids,
+             dense_space_weights):
++        if exact_forward:
++            return exact_top2_execute(
++                flat_state,
++                state_params,
++                operator_params,
++                controls,
++                selected_ids,
++                dense_space_weights)
+         del selected_ids, dense_space_weights
+         return bundle_execute(
+             flat_state, state_params, operator_params, controls, packing)
+@@ -5128,10 +5391,26 @@ def _make_sharded_rst_space_bundle_dense(
+             packing,
+             selected_ids,
+             dense_space_weights):
+-        update = bundle_execute(
+-            flat_state, state_params, operator_params, controls, packing)
++        if exact_forward:
++            update = exact_top2_execute(
++                flat_state,
++                state_params,
++                operator_params,
++                controls,
++                selected_ids,
++                dense_space_weights)
++        else:
++            update = bundle_execute(
++                flat_state, state_params, operator_params, controls, packing)
+         selected_weights = jnp.take_along_axis(
+             dense_space_weights, selected_ids, axis=1)
++        if exact_forward:
++            selected_ids = ad_checkpoint.checkpoint_name(
++                selected_ids,
++                name=_EXACT_SPACE_ROUTING_CHECKPOINT_NAME)
++            selected_weights = ad_checkpoint.checkpoint_name(
++                selected_weights,
++                name=_EXACT_SPACE_ROUTING_CHECKPOINT_NAME)
+         residual = (
+             flat_state,
+             state_params,
+@@ -5230,17 +5509,26 @@ def _make_sharded_rst_space_bundle_dense(
+             route_scale, collect_metrics):
+         routing = _select_operation_spaces(
+             global_state, space_query_kernel, space_route_keys, top_k)
+-        packing, packing_metrics = _pack_top2_bundle_entries_sharded(
+-            routing,
+-            bundle_size=bundle_size,
+-            token_block_size=token_block_size,
+-            stage="rst")
+         token_count = int(global_state.shape[0])
+         n_spaces = int(space_read_proj.shape[0])
+         if n_spaces % bundle_size:
+             raise ValueError(
+                 "bundle_dense RST space count is not divisible by 4")
+         n_bundles = n_spaces // bundle_size
++        if exact_forward:
++            packing = ()
++            packing_metrics = _exact_top2_packing_metrics_sharded(
++                routing,
++                bucket_capacity=min(
++                    _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY, token_count),
++                task_group_size=_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE,
++                stage="rst")
++        else:
++            packing, packing_metrics = _pack_top2_bundle_entries_sharded(
++                routing,
++                bundle_size=bundle_size,
++                token_block_size=token_block_size,
++                stage="rst")
+         state_params = (
+             space_read_proj, space_write_proj,
+             tau_kernel, tau_bias,
+@@ -5375,14 +5663,35 @@ def _make_sharded_rst_space_bundle_dense(
+             {name: P() for name in all_metric_names}),
+         check_rep=False)
+     kernel._v4174_kernel_profile = "production"
+-    kernel._v4174_dense_grouped_execution = "rst_end_to_end_bundle4"
+-    kernel._v4174_execution_mode = "bundle_dense"
+-    kernel._v4174_bundle_size = bundle_size
+-    kernel._v4174_bundle_token_block_size = token_block_size
+-    kernel._v4174_packed_entry_capacity = (
+-        "2*T + n_bundles*(token_block_size-1)")
+-    kernel._v4174_bundle_packing = "prefix_count_exact"
+-    kernel._v4174_bundle_packing_vjp = "saved_metadata_scatter"
++    kernel._v4174_dense_grouped_execution = (
++        "rst_end_to_end_exact_top2"
++        if exact_forward else "rst_end_to_end_bundle4")
++    kernel._v4174_execution_mode = (
++        "exact_top2" if exact_forward else "bundle_dense")
++    if exact_forward:
++        kernel._v4174_forward_execution_mode = (
++            "exact_top2_space_batched_dense_with_overflow")
++        kernel._v4174_forward_bucket_capacity = (
++            _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY)
++        kernel._v4174_forward_overflow_task_group_size = (
++            _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE)
++        kernel._v4174_packed_entry_capacity = (
++            "n_spaces*min(T,3072) + compact exact overflow tasks")
++        kernel._v4174_bundle_packing = "exact_space_prefix_count"
++        kernel._v4174_bundle_packing_vjp = "repacked_exact_scatter"
++        kernel._v4174_packing_metric_semantics = (
++            "exact_space_executed_capacity")
++    else:
++        kernel._v4174_forward_execution_mode = (
++            "bundle4_prefix_packed_dense")
++        kernel._v4174_bundle_size = bundle_size
++        kernel._v4174_bundle_token_block_size = token_block_size
++        kernel._v4174_packed_entry_capacity = (
++            "2*T + n_bundles*(token_block_size-1)")
++        kernel._v4174_bundle_packing = "prefix_count_exact"
++        kernel._v4174_bundle_packing_vjp = "saved_metadata_scatter"
++        kernel._v4174_packing_metric_semantics = (
++            "bundle4_executed_capacity")
+     kernel._v4174_rst_packing_count = 1
+     kernel._v4174_dynamic_metric_flag = True
+     kernel._v4174_chunk_remat_policy = "always"
+@@ -5417,6 +5726,32 @@ def make_sharded_rst_space_bundle_dense_fp32_reference(mesh, **kwargs):
+         mesh, throughput_bf16=False, output_collective_bf16=False, **kwargs)
+ 
+ 
++def make_sharded_rst_space_exact_top2_minimal(mesh, **kwargs):
++    """Create the mixed-precision exact selected-top-2 RST executor."""
++    return _make_sharded_rst_space_bundle_dense(
++        mesh,
++        operation_space_bundle_size=BUNDLE_DENSE_SIZE,
++        operation_space_bundle_token_block_size=(
++            DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE),
++        throughput_bf16=True,
++        output_collective_bf16=True,
++        exact_forward=True,
++        **kwargs)
++
++
++def make_sharded_rst_space_exact_top2_fp32_reference(mesh, **kwargs):
++    """Create the exact selected-top-2 FP32 RST reference."""
++    return _make_sharded_rst_space_bundle_dense(
++        mesh,
++        operation_space_bundle_size=BUNDLE_DENSE_SIZE,
++        operation_space_bundle_token_block_size=(
++            DEFAULT_BUNDLE_TOKEN_BLOCK_SIZE),
++        throughput_bf16=False,
++        output_collective_bf16=False,
++        exact_forward=True,
++        **kwargs)
++
++
+ def _validate_v4174_sharded_fns(
+         sharded_fns, admission_den_power, srw_composition_mode,
+         heat_kernel_beta, **kwargs):
+@@ -5460,6 +5795,33 @@ def _validate_v4174_sharded_fns(
+                 raise ValueError(
+                     f"v4174 {name} bundle executor requires exact top-2 "
+                     "space-batched dense backward with exact overflow")
++    elif attention_mode == "exact_top2":
++        for name, kernel in (("attention", attention), ("rst", rst)):
++            if getattr(
++                    kernel, "_v4174_forward_execution_mode", None
++            ) != "exact_top2_space_batched_dense_with_overflow":
++                raise ValueError(
++                    f"v4174 {name} exact_top2 executor requires exact "
++                    "selected-space forward with compact overflow")
++            if int(getattr(
++                    kernel, "_v4174_forward_bucket_capacity", 0
++            )) != _EXACT_SPACE_BACKWARD_BUCKET_CAPACITY:
++                raise ValueError(
++                    f"v4174 {name} exact_top2 forward bucket capacity "
++                    f"must be {_EXACT_SPACE_BACKWARD_BUCKET_CAPACITY}")
++            if int(getattr(
++                    kernel,
++                    "_v4174_forward_overflow_task_group_size",
++                    0)) != _EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE:
++                raise ValueError(
++                    f"v4174 {name} exact_top2 forward overflow task group "
++                    f"must be {_EXACT_SPACE_BACKWARD_TASK_GROUP_SIZE}")
++            if getattr(
++                    kernel, "_v4174_backward_execution_mode", None
++            ) != "exact_top2_space_batched_dense_with_overflow":
++                raise ValueError(
++                    f"v4174 {name} exact_top2 executor requires exact "
++                    "selected-space backward with compact overflow")
+ 
+ 
+ def get_model_version() -> str:
+diff --git a/scripts/train_jax.py b/scripts/train_jax.py
+index 1e58b89e244594cec54a0f51ae566c0938968749..4bc09037a282cd904a682b69dcc71cd4fe1dc5e3 100644
+--- a/scripts/train_jax.py
++++ b/scripts/train_jax.py
+@@ -16497,6 +16497,11 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
+                     'make_sharded_attention_space_bundle_dense_minimal')
+                 rst_factory_name = (
+                     'make_sharded_rst_space_bundle_dense_minimal')
++            elif execution_mode == 'exact_top2':
++                attention_factory_name = (
++                    'make_sharded_attention_space_exact_top2_minimal')
++                rst_factory_name = (
++                    'make_sharded_rst_space_exact_top2_minimal')
+             elif execution_mode == 'dense_all_space':
+                 attention_factory_name = (
+                     'make_sharded_attention_space_dense_minimal')
+@@ -16504,7 +16509,7 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
+             else:
+                 raise ValueError(
+                     "v4174 operation_space_execution_mode must be "
+-                    "'dense_all_space' or 'bundle_dense', got "
++                    "'dense_all_space', 'bundle_dense', or 'exact_top2', got "
+                     f"{execution_mode!r}")
+             attention_factory = getattr(
+                 module, attention_factory_name, None)
+@@ -21849,6 +21854,16 @@ def main():
+                             f"{bundle_size}"
+                             "-space Q/K/V/RST bundles and token blocks of "
+                             f"{token_block_size}")
++                    elif (
++                            str(cfg["model"].get(
++                                "operation_space_execution_mode",
++                                "dense_all_space"))
++                            == "exact_top2"):
++                        log_message(
++                            "Execution: independent operation-space "
++                            "coordinates with exact selected-top-2 "
++                            "Q/K/V/RST buckets, Tcap=3072, and compact "
++                            "exact overflow")
+                     else:
+                         log_message(
+                             "Execution: independent operation-space "
+-- 
+2.54.0.windows.1
+

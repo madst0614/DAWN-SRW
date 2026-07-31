@@ -1,0 +1,113 @@
+archive_date_kst: 2026-07-31
+canonical_branch: main
+inventory_main_commit: 391f7b02a31fb9bb1769d2782ee54ee387e98bd3
+source_remote: origin
+release_tags_preserved:
+  - paper-v9
+
+branches:
+  - branch: codex/v4167-poc
+    tip: 391f7b02a31fb9bb1769d2782ee54ee387e98bd3
+    merge_base: 391f7b02a31fb9bb1769d2782ee54ee387e98bd3
+    branch_only_commits: 0
+    disposition: merged-into-main
+
+  - branch: codex/v4174-accepted-8187
+    tip: 8187c00d4b767a743c3178a5bcb8caac1c6124c5
+    merge_base: 8187c00d4b767a743c3178a5bcb8caac1c6124c5
+    branch_only_commits: 0
+    disposition: already-reachable-from-main
+
+  - branch: codex/v4174-accepted-profile-gate
+    tip: 001c2c27fd7baf6998937530cdca3e55e57fccf0
+    merge_base: 1ff2e57b811175a875795c85f7c2f14a7d71bb0b
+    branch_only_commits: 1
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-accepted-profile-gate
+    patches: patches/codex__v4174-accepted-profile-gate
+
+  - branch: codex/v4174-dense-rw-analytic-vjp
+    tip: ee326ae0b2e8b2575d460cb57f04d1b134f84389
+    merge_base: ee326ae0b2e8b2575d460cb57f04d1b134f84389
+    branch_only_commits: 0
+    disposition: already-reachable-from-main
+
+  - branch: codex/v4174-exact-top2-forward
+    tip: 37fd6c3cbad1bbb78b9d80e6913df5e060ddbe3d
+    merge_base: 300a8966f9261904fa1a7e685b8e4e648f89a1f2
+    branch_only_commits: 4
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-exact-top2-forward
+    patches: patches/codex__v4174-exact-top2-forward
+
+  - branch: codex/v4174-exact-top2-forward-all24
+    tip: 1a1b8c7180891aa0704072264434cf0434df0326
+    merge_base: 300a8966f9261904fa1a7e685b8e4e648f89a1f2
+    branch_only_commits: 1
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-exact-top2-forward-all24
+    patches: patches/codex__v4174-exact-top2-forward-all24
+
+  - branch: codex/v4174-g4-frac885-rst-chunk4
+    tip: a3879f21dcd3b786bdc2cde270bcca2a382796a4
+    merge_base: ae12416b40607ef8dd21fe79a64d86b4335e18b3
+    branch_only_commits: 1
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-g4-frac885-rst-chunk4
+    patches: patches/codex__v4174-g4-frac885-rst-chunk4
+
+  - branch: codex/v4174-g4-rst-chunk4
+    tip: e99bda13149fedab1e05de2a9638db7703c5bbb1
+    merge_base: 77db242774ba7cfdcfbb3fcad4705358af4f1dda
+    branch_only_commits: 1
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-g4-rst-chunk4
+    patches: patches/codex__v4174-g4-rst-chunk4
+
+  - branch: codex/v4174-g4-stage-attribution
+    tip: f3859cc61d00cd303172b9f4337a2b44364ff8a7
+    merge_base: 8b9a0fcec45e835e1a0570ddb64cab17bc03cdf4
+    branch_only_commits: 1
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-g4-stage-attribution
+    patches: patches/codex__v4174-g4-stage-attribution
+
+  - branch: codex/v4174-g4-tau-frac885
+    tip: ce0e92699e49c793a29279fb0aecc62a195b8a47
+    merge_base: ce0e92699e49c793a29279fb0aecc62a195b8a47
+    branch_only_commits: 0
+    disposition: already-reachable-from-main
+
+  - branch: codex/v4174-operator-bank-row-norm-cache
+    tip: 737b699b1906ee96396b2b27023b86dc87b43475
+    merge_base: 3fde111530aa69c1c04e6c27f72b937aa2baf45d
+    branch_only_commits: 2
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-operator-bank-row-norm-cache
+    patches: patches/codex__v4174-operator-bank-row-norm-cache
+
+  - branch: codex/v4174-p-rw-u-analytic-vjp
+    tip: 46f0a77eb3d09eb6385f580dc55484479591b952
+    merge_base: 7123dffa9400ba8ddf79b979a3dd6e3f79f1d229
+    branch_only_commits: 2
+    disposition: archived-unmerged-research
+    archive_tag: research-archive/codex/v4174-p-rw-u-analytic-vjp
+    patches: patches/codex__v4174-p-rw-u-analytic-vjp
+
+  - branch: codex/v4174-p-rw-u-analytic-vjp-rst
+    tip: aa7ed52117d5dc4427454815b70ca6533dab3589
+    merge_base: aa7ed52117d5dc4427454815b70ca6533dab3589
+    branch_only_commits: 0
+    disposition: already-reachable-from-main
+
+  - branch: codex/v4174-p-rw-u-profile-gate
+    tip: 1ff2e57b811175a875795c85f7c2f14a7d71bb0b
+    merge_base: 1ff2e57b811175a875795c85f7c2f14a7d71bb0b
+    branch_only_commits: 0
+    disposition: already-reachable-from-main
+
+  - branch: selection-calibration
+    tip: 74cd0e5f80ed639e8434145b98bc7e823cfe1611
+    merge_base: 74cd0e5f80ed639e8434145b98bc7e823cfe1611
+    branch_only_commits: 0
+    disposition: already-reachable-from-main

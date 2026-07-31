@@ -1,0 +1,22 @@
+From e99bda13149fedab1e05de2a9638db7703c5bbb1 Mon Sep 17 00:00:00 2001
+From: sh <madst0614@gmail.com>
+Date: Sun, 26 Jul 2026 23:30:56 +0900
+Subject: [PATCH] Reduce v4174 RST chunk count to four
+
+
+diff --git a/configs/train_config_v4174_400M_c4_20B_v4_64.yaml b/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+index d1b0e0895a7238eb01d6f513cb8ed340ea697bf5..f8623ee48f28750feb79e96103aedd6511bde658 100644
+--- a/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
++++ b/configs/train_config_v4174_400M_c4_20B_v4_64.yaml
+@@ -80,7 +80,7 @@ training:
+   n_chunks_q: 1
+   n_chunks_k: 1
+   n_chunks_v: 2
+-  n_chunks_rst: 8
++  n_chunks_rst: 4
+ 
+   lr: 3.0e-4
+   tau_lr_mult: 0.001
+-- 
+2.54.0.windows.1
+
