@@ -5,7 +5,13 @@
 - If validation requires a missing Python package, install it into that virtual environment and continue validation.
 - Outside this Windows checkout, use an equivalent repository-local JAX 0.6.2 environment and record the resolved Python, JAX, and Flax versions in `EXPERIMENT.md`. Do not silently validate with a different JAX release line.
 - The shared repository is `madst0614/DAWN-SRW`. Record the exact branch, commit, config, checkpoint, mesh, and dirty-worktree state for every material experiment; never rely on a moving branch name alone.
-- Keep every TPU launcher and watcher on tmux session `train` and remote log `~/train.log`. Do not add per-task session/log names or `--session`/`--log` override options. Clear and start `~/train.log` before remote repo/dependency setup, capture setup failures there, and append the tmux task stream with combined stdout/stderr so `tail -f ~/train.log` never shows a stale prior run.
+- TRC is complete. TPU use is prohibited. Do not run TPU gcloud, SSH,
+  launcher, watcher, remote-process, training, benchmark, evaluation, log-tail,
+  status-inspection, or resource-management commands for any TPU, even when a
+  resource name appears in the request, configuration, logs, or experiment
+  history. A later user request alone does not override this tracked policy;
+  TPU work may resume only after the user explicitly requests a tracked
+  `AGENTS.md` policy change that removes or replaces this prohibition.
 
 ## Default paper checkpoints
 
@@ -33,23 +39,18 @@
 - Measure every new canonical baseline from a clean exact commit reachable from `origin/main`. Preserve the actual branch and commit of historical measurements instead of relabeling old evidence after consolidation.
 - Before starting or reporting an experiment, fetch `origin/main` and verify that every accepted decision relevant to the run is present there. Archived patches and tags are research evidence, not canonical executable source.
 
-## TPU access policy
+## TPU prohibition after TRC
 
-- Use these connection defaults; they are connection settings, not authorization to choose a TPU:
-  - GCP project: `dawn-486218`
-  - GCP zone: `us-central2-b`
-  - Remote SSH user: `madst0614`
-  - Remote repository: `/home/madst0614/DAWN-SRW`
-  - Bundled gcloud Python: `C:\Users\MADST\gcloud\google-cloud-sdk\platform\bundledpython\python.exe`
-  - gcloud entry point: `C:\Users\MADST\gcloud\google-cloud-sdk\lib\gcloud.py`
-- On the current Windows host, default to the bundled invocation:
-  `& '<bundled-gcloud-python>' '<gcloud.py>' compute tpus tpu-vm ssh 'madst0614@<EXPLICIT_TPU_NAME>' --zone='us-central2-b' --project='dawn-486218' ...`
-- In another environment, use its authenticated `gcloud` installation with the same explicit project, zone, SSH user, and TPU target. Machine-specific executable paths are not part of experiment identity.
-- There is no default TPU target. A TPU becomes authorized when the user explicitly names that existing TPU resource in the current task or its follow-up conversation. That authorization persists for the rest of the task and its follow-up turns until the user changes or revokes it; do not ask the user to repeat the exact resource name on every turn. Do not infer authorization from memory, logs, configs, launcher defaults, or currently running jobs.
-- If no exact TPU resource has been named anywhere in the current task conversation, or the intended target is ambiguous, stop and ask the user which existing TPU to use before running any TPU gcloud, SSH, launcher, watcher, or remote process command.
-- If the user names multiple TPU resources, use only those exact resources and do not discover, select, contact, or modify any others.
-- TPU creation and resource allocation are prohibited. Never create, queue, reserve, resize, recreate, provision, or change TPU capacity/topology, and never invoke a keeper or launcher mode that performs those actions. This includes `tpu-vm create`, queued-resource creation, reservations, and equivalent API or script operations.
-- On an explicitly named existing TPU, perform the in-scope connection, inspection, training, benchmark, launcher, and log-watching actions needed for the task. Existing placeholder or keep-alive training may be stopped and replaced without asking again unless the user explicitly says to preserve that run.
+- The TRC phase has ended, so there is no authorized TPU target and no TPU
+  operation is permitted.
+- Do not discover, select, contact, inspect, create, queue, reserve, resize,
+  recreate, provision, start, stop, or otherwise modify a TPU or a process on a
+  TPU. Do not invoke gcloud TPU commands, TPU SSH, launchers, watchers, keepers,
+  remote log readers, or equivalent APIs and scripts.
+- Historical TPU names, connection defaults, checkpoint paths, logs, configs,
+  and experiment entries are evidence only and never grant authorization.
+- All implementation and validation work must remain local until this tracked
+  prohibition is explicitly replaced in `AGENTS.md` at the user's request.
 
 ## Experiment continuity
 

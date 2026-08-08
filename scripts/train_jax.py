@@ -121,11 +121,19 @@ from models.dawn_srw_v4171 import (
     _pool_operator_keys as _v4171_pool_operator_keys,
     _query_geometry_diagnostics as _v4171_query_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4171_raw_tau_init_from_cosine_tau,
-    generalized_bilinear_operator_key_diagnostics as _v4172_operator_key_diagnostics,
     symbolic_parameter_count as _v417x_symbolic_parameter_count,
     _tau_init_calibration_scores as _v4171_tau_init_calibration_scores,
 )
-from models.dawn_srw_v4172 import DAWN_SRW_V4172
+from models.dawn_srw_v4172 import (
+    DAWN_SRW_V4172,
+    _pool_operator_keys as _v4172_pool_operator_keys,
+    _query_geometry_diagnostics as _v4172_query_geometry_diagnostics,
+    _raw_tau_init_from_cosine_tau as _v4172_raw_tau_init_from_cosine_tau,
+    _tau_init_calibration_scores as _v4172_tau_init_calibration_scores,
+    generalized_bilinear_operator_key_diagnostics as
+        _v4172_operator_key_diagnostics,
+    symbolic_parameter_count as _v4172_symbolic_parameter_count,
+)
 from models.dawn_srw_v4173 import (
     DAWN_SRW_V4173,
     _pool_operator_keys as _v4173_pool_operator_keys,
@@ -481,12 +489,12 @@ MODEL_REGISTRY = {
     V4172_MODEL_VERSION: {
         'class': DAWN_SRW_V4172,
         'module': 'models.dawn_srw_v4172',
-        'raw_tau_init_from_cosine_tau': _v4171_raw_tau_init_from_cosine_tau,
-        'tau_init_calibration_scores': _v4171_tau_init_calibration_scores,
-        'pool_operator_keys': _v4171_pool_operator_keys,
-        'query_geometry_diagnostics': _v4171_query_geometry_diagnostics,
+        'raw_tau_init_from_cosine_tau': _v4172_raw_tau_init_from_cosine_tau,
+        'tau_init_calibration_scores': _v4172_tau_init_calibration_scores,
+        'pool_operator_keys': _v4172_pool_operator_keys,
+        'query_geometry_diagnostics': _v4172_query_geometry_diagnostics,
         'operator_key_diagnostics': _v4172_operator_key_diagnostics,
-        'symbolic_parameter_count': _v417x_symbolic_parameter_count,
+        'symbolic_parameter_count': _v4172_symbolic_parameter_count,
     },
     V4173_MODEL_VERSION: {
         'class': DAWN_SRW_V4173,

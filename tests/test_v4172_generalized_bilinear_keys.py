@@ -13,9 +13,14 @@ from analysis.operator_interpretability.space import (
     candidate_pool_vectors,
     operator_pool_provenance,
 )
-from models import dawn_srw_v4171 as core
 from models.dawn_srw_v4171 import (
     DAWN_SRW_V4171,
+    symbolic_parameter_count as v4171_symbolic_parameter_count,
+)
+from models import dawn_srw_v4172 as core
+from models.dawn_srw_v4172 import (
+    DAWN_SRW_V4172,
+    MODEL_VERSION as V4172_MODEL_VERSION,
     OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
     OPERATOR_KEY_MODE_LEARNED,
     _composition_den,
@@ -32,10 +37,6 @@ from models.dawn_srw_v4171 import (
     make_sharded_srw_suppression_minimal,
     materialize_generalized_bilinear_operator_keys,
     symbolic_parameter_count,
-)
-from models.dawn_srw_v4172 import (
-    DAWN_SRW_V4172,
-    MODEL_VERSION as V4172_MODEL_VERSION,
 )
 
 
@@ -461,7 +462,12 @@ def test_v4172_400m_parameter_matched_count() -> None:
         with open(path, "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
         loaded[path] = config
-        counts[path] = symbolic_parameter_count(config)["total"]
+        counter = (
+            v4171_symbolic_parameter_count
+            if config["model"]["model_version"] == "spatial-r1-v4.1.7.1"
+            else symbolic_parameter_count
+        )
+        counts[path] = counter(config)["total"]
         operator_counts[path] = sum(
             int(config["model"][key]) for key in ("n_qk", "n_v", "n_rst"))
         assert counts[path] == count
