@@ -54,6 +54,7 @@ htmlcov/
 *.pdf
 !/paper/v9/DAWN-SRW-v9.pdf
 !/paper/v10/DAWN-SRW-v10.pdf
+!/paper/v11/DAWN-SRW-v11.pdf
 logs/
 outputs/
 .generated/

@@ -45,16 +45,18 @@ contain raw per-example vectors.
 
 ### Paper thesis and contribution structure
 
-- Working one-sentence thesis: DAWN-SRW realizes language-model state
-  transitions through input-conditioned read/write operators, enabling
-  operator-level computation to be localized, intervened on, restored, and
-  tested for reuse.
+- Working one-sentence thesis: DAWN-SRW formulates language-model computation
+  as state-conditioned composition of explicit read/write state-transition
+  primitives; each state determines sparse transition support and continuously
+  valued applicability, producing transition fields used for attention and
+  residual-state updates.
 - Evidence order: `(A) language-model performance retention -> (B) causal RW
   operator units -> (C) cross-example circuit reuse -> (D) selected 1.3B
   replication`.
-- The novelty claim is the causal and reusable operator unit, not absolute
-  benchmark leadership. Performance establishes that the analyzed checkpoint
-  is a functioning language model.
+- The novelty claim is the explicit RW transition primitive and its continuous
+  conditional composition, with operator-level causal analysis as evidence;
+  it is not absolute benchmark leadership. Performance establishes that the
+  analyzed checkpoint is a functioning language model.
 - The 400M and 1.3B checkpoints are not a scaling curve: they differ in both
   parameter count and training tokens (`40B` versus `20B`). The 1.3B result is
   a replication at a larger scale.
