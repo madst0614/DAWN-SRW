@@ -14,6 +14,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from analysis.dawn_analysis_common import (
+    V4172_MODEL_VERSION,
     materialize_global_array,
     materialize_global_tree,
 )
@@ -49,6 +50,7 @@ from analysis.operator_interpretability.units import (
 def _runtime_kwargs(
         ctx: Any, *, kernel_profile: str = "production") -> dict[str, Any]:
     cfg = ctx.model_cfg
+    is_v4172 = str(cfg.get("model_version")) == V4172_MODEL_VERSION
     kernel_profile = str(kernel_profile).strip().lower()
     runtime_profiles = {
         "production": "training",
@@ -72,7 +74,9 @@ def _runtime_kwargs(
             # analysis closure instead of a full production context.
             sharded_fns = ctx.sharded_fns
             current_profile = (
-                sharded_fns.get("_v4171_kernel_profile")
+                sharded_fns.get(
+                    "_v4172_kernel_profile"
+                    if is_v4172 else "_v4171_kernel_profile")
                 if isinstance(sharded_fns, Mapping) else None)
             if (current_profile is not None
                     and str(current_profile) != kernel_profile):
@@ -86,9 +90,9 @@ def _runtime_kwargs(
     temperature = float(cfg["soft_gate_temperature"])
     boundary = float(cfg["soft_gate_boundary_power"])
     # QK/V/RST denominator powers are immutable constructor fields on the
-    # restored v417x model. The forward accepts only the legacy scalar and
-    # internally resolves each production pool from those constructor fields.
-    return {
+    # restored model. v4172 exposes its single-gate spelling directly; older
+    # versions retain their original forward contract.
+    kwargs = {
         "deterministic": True,
         "rngs": {"dropout": jax.random.PRNGKey(0)},
         "sharded_fns": sharded_fns,
@@ -102,13 +106,17 @@ def _runtime_kwargs(
         "soft_gate_boundary_power": boundary,
         "soft_gate_boundary_power_final": float(
             cfg.get("soft_gate_boundary_power_final", boundary)),
-        "admission_den_power": float(cfg["admission_den_power"]),
         "srw_composition_mode": str(cfg["srw_composition_mode"]),
         "heat_kernel_beta": float(cfg["heat_kernel_beta"]),
-        "execution_prune_eps": jnp.float32(
-            float(cfg.get("execution_prune_eps", 0.0) or 0.0)),
         "compute_accuracy": False,
     }
+    if is_v4172:
+        kwargs["gate_den_power"] = float(cfg["gate_den_power"])
+    else:
+        kwargs["admission_den_power"] = float(cfg["admission_den_power"])
+        kwargs["execution_prune_eps"] = jnp.float32(
+            float(cfg.get("execution_prune_eps", 0.0) or 0.0))
+    return kwargs
 
 
 def validate_operator_interchange_request(

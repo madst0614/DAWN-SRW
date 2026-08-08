@@ -4,11 +4,11 @@ DAWN-SRW v4.1.7.2 standalone generalized-bilinear SRW implementation
 This module contains the complete v4172 model, SRW kernels, DirectTau path,
 and analysis hooks. The official model fixes operator addressing to live
 generalized coordinate-wise bilinear RW keys; it does not import or delegate
-execution to the v4171 module.
+execution to an earlier model module.
 
-Private ``_v4171_*`` factory metadata names are retained as the established
-v417x runtime protocol consumed by trainer and analysis code. They are
-compatibility labels only and do not delegate execution to the v4171 module.
+Private ``_v4172_*`` factory metadata names are retained as the established
+v4172 runtime protocol consumed by trainer and analysis code. They are
+version-owned labels and do not delegate execution to another model module.
 
 Implemented concepts:
 - cosine-space tau reference with bounded sigmoid min/max mapping
@@ -18,7 +18,7 @@ Implemented concepts:
 - selectable linear-angular, quadratic, or heat-energy composition
 - tau movement controlled by optimizer-side tau_lr_mult
 - train-time effective gate statistics
-- validation-time execution pruning through execution_prune_eps
+- a single canonical composition gate shared by numerator and denominator
 """
 
 
@@ -68,10 +68,10 @@ SELECT_DIAG_COUNT = len(SELECT_DIAG_NAMES)
 ) = range(SELECT_DIAG_COUNT)
 
 
-# v4164 exposure diagnostics are admission based, not hard score>tau based.
+# v4164 exposure diagnostics are gate based, not hard score>tau based.
 # The historical DEAD_EXPOSURE_* constant names are kept as internal slot names
 # so tuple layouts stay stable, but the values below mean:
-#   mean/min/max of max_batch_token(admission_i), and dead fractions at
+#   mean/min/max of max_batch_token(gate_i), and dead fractions at
 #   eps=1e-6, 1e-5, 1e-4.
 DEAD_EXPOSURE_DIAG_NAMES = (
     'soft_exposure_mean',
@@ -123,8 +123,8 @@ ATTN_SPLIT_CORE_NAMES = (
     'k_strong_frac',
     'q_active_n_mean',
     'k_active_n_mean',
-    'qk_drive_mean',
-    'v_drive_mean',
+    'qk_angular_amplitude_mean',
+    'v_angular_amplitude_mean',
 )
 ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
 (
@@ -158,8 +158,8 @@ ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
     ATTN_SPLIT_K_STRONG_FRAC,
     ATTN_SPLIT_Q_ACTIVE_N_MEAN,
     ATTN_SPLIT_K_ACTIVE_N_MEAN,
-    ATTN_SPLIT_QK_DRIVE_MEAN,
-    ATTN_SPLIT_V_DRIVE_MEAN,
+    ATTN_SPLIT_QK_ANGULAR_AMPLITUDE_MEAN,
+    ATTN_SPLIT_V_ANGULAR_AMPLITUDE_MEAN,
 ) = range(ATTN_SPLIT_CORE_COUNT)
 
 
@@ -202,8 +202,8 @@ GATE_SPARSITY_DIAG_NAMES = (
         name
         for suffix in GATE_EPS_NAME_SUFFIXES
         for name in (
-            f'admission_active_eps_{suffix}_frac',
-            f'admission_active_eps_{suffix}_count',
+            f'gate_active_eps_{suffix}_frac',
+            f'gate_active_eps_{suffix}_count',
         ))
     + tuple(
         name
@@ -263,7 +263,7 @@ def _pool_output_scales(d_model, n_layers):
 def _effective_pool_output_scales(pool_params, d_model, n_layers):
     """PureCore uses fixed depth-scaled pool outputs.
 
-    v4171 has no learned pool scale parameters; scale is fixed by d_model/layers.
+    v4172 has no learned pool scale parameters; scale is fixed by d_model/layers.
     """
     return _pool_output_scales(d_model, n_layers)
 
@@ -276,9 +276,8 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers):
 #   tau              = -1 + 2 * sigmoid(raw_tau)
 #   margin           = rho - tau
 #   angular_amplitude = clip(margin / max(1 - tau, 1e-4), 0, 1)
-#   admission_weight  = mode-specific compact-cap composition weight
-#   execution_weight  = admission_weight, optionally eval-pruned
-#   den                = mode-specific function of unpruned admission mass
+#   gate_weight       = mode-specific compact-cap composition weight
+#   den               = mode-specific function of gate mass
 # ================================================================
 
 DEFAULT_D_ROUTE = 64
@@ -289,92 +288,92 @@ OPERATOR_KEY_MODE_LEARNED = "learned_operator_embedding"
 OPERATOR_KEY_MODE_GENERALIZED_BILINEAR = "generalized_bilinear_rw"
 OPERATOR_KEY_MODE = OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
 OPERATOR_QUERY_MODE = "direct_state_projection"
-DEFAULT_ADMISSION_DEN_POWER = 1.0
+DEFAULT_GATE_DEN_POWER = 1.0
 DEFAULT_SRW_COMPOSITION_MODE = "linear_angular"
 DEFAULT_HEAT_KERNEL_BETA = 2.0
 QUADRATIC_DEN_EPS = 1.0e-6
 HEAT_ENERGY_DEN_EPS = 1.0e-6
-_V4171_SRW_COMPOSITION_MODES = frozenset((
+_V4172_SRW_COMPOSITION_MODES = frozenset((
     DEFAULT_SRW_COMPOSITION_MODE,
     "quadratic",
     "heat_energy",
 ))
-_V417X_OPERATOR_KEY_MODES = frozenset((
+_V4172_OPERATOR_KEY_MODES = frozenset((
     OPERATOR_KEY_MODE_LEARNED,
     OPERATOR_KEY_MODE_GENERALIZED_BILINEAR,
 ))
 
 
-def _validate_operator_key_mode(value, *, context="v417x"):
+def _validate_operator_key_mode(value, *, context="v4172"):
     """Validate the static Python-side operator-address selector."""
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
             f"{context} operator_key_mode must be a static Python string")
-    if not isinstance(value, str) or value not in _V417X_OPERATOR_KEY_MODES:
+    if not isinstance(value, str) or value not in _V4172_OPERATOR_KEY_MODES:
         raise ValueError(
             f"{context} unsupported operator_key_mode={value!r}; expected "
-            f"one of {sorted(_V417X_OPERATOR_KEY_MODES)}")
+            f"one of {sorted(_V4172_OPERATOR_KEY_MODES)}")
     return value
 
 
-def _validate_v4171_srw_composition_mode(value, *, context="v4171"):
-    """Validate the static Python-side v4171 SRW composition selector."""
+def _validate_v4172_srw_composition_mode(value, *, context="v4172"):
+    """Validate the static Python-side v4172 SRW composition selector."""
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
             f"{context} srw_composition_mode must be a static Python string; "
-            "v4171 does not support a traced or dynamic composition mode")
+            "v4172 does not support a traced or dynamic composition mode")
     if not isinstance(value, str):
         raise ValueError(
             f"{context} srw_composition_mode must be one of "
-            f"{sorted(_V4171_SRW_COMPOSITION_MODES)}, got {value!r}")
-    if value not in _V4171_SRW_COMPOSITION_MODES:
+            f"{sorted(_V4172_SRW_COMPOSITION_MODES)}, got {value!r}")
+    if value not in _V4172_SRW_COMPOSITION_MODES:
         raise ValueError(
             f"{context} unsupported srw_composition_mode={value!r}; "
-            f"expected one of {sorted(_V4171_SRW_COMPOSITION_MODES)}")
+            f"expected one of {sorted(_V4172_SRW_COMPOSITION_MODES)}")
     return value
 
 
-def _validate_v4171_admission_den_power(value, *, context="v4171"):
+def _validate_v4172_gate_den_power(value, *, context="v4172"):
     """Validate a static, non-negative composition power before tracing."""
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
-            f"{context} admission_den_power must be a static Python scalar; "
-            "v4171 does not support a traced or scheduled denominator power")
+            f"{context} gate_den_power must be a static Python scalar; "
+            "v4172 does not support a traced or scheduled denominator power")
     if isinstance(value, bool):
         raise ValueError(
-            f"{context} admission_den_power must be numeric, not bool")
+            f"{context} gate_den_power must be numeric, not bool")
     if not isinstance(value, numbers.Real):
         raise ValueError(
-            f"{context} admission_den_power must be a static numeric Python "
+            f"{context} gate_den_power must be a static numeric Python "
             f"scalar, got {value!r}")
     value = float(value)
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(
-            f"{context} admission_den_power must be finite and >= 0.0, "
+            f"{context} gate_den_power must be finite and >= 0.0, "
             f"got {value}")
     return value
 
 
-def _resolve_v417x_admission_den_powers(
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_power_qk=None,
-        admission_den_power_v=None,
-        admission_den_power_rst=None, *, context="v417x"):
-    """Resolve validated legacy fallback plus QK/V/RST static powers."""
-    legacy = _validate_v4171_admission_den_power(
-        admission_den_power, context=f"{context}.admission_den_power")
+def _resolve_v4172_gate_den_powers(
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_power_qk=None,
+        gate_den_power_v=None,
+        gate_den_power_rst=None, *, context="v4172"):
+    """Resolve the validated default plus QK/V/RST static powers."""
+    default_power = _validate_v4172_gate_den_power(
+        gate_den_power, context=f"{context}.gate_den_power")
     resolved = []
     for pool, value in (
-            ("qk", admission_den_power_qk),
-            ("v", admission_den_power_v),
-            ("rst", admission_den_power_rst)):
-        resolved.append(_validate_v4171_admission_den_power(
-            legacy if value is None else value,
-            context=f"{context}.admission_den_power_{pool}"))
-    return legacy, *resolved
+            ("qk", gate_den_power_qk),
+            ("v", gate_den_power_v),
+            ("rst", gate_den_power_rst)):
+        resolved.append(_validate_v4172_gate_den_power(
+            default_power if value is None else value,
+            context=f"{context}.gate_den_power_{pool}"))
+    return default_power, *resolved
 
 
-def _validate_v4171_heat_kernel_beta(value, *, context="v4171"):
+def _validate_v4172_heat_kernel_beta(value, *, context="v4172"):
     """Validate compact spherical heat amplitude sharpness before tracing."""
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
@@ -395,50 +394,50 @@ def _validate_v4171_heat_kernel_beta(value, *, context="v4171"):
     return value
 
 
-def _validate_v4171_composition_settings(
-        srw_composition_mode, admission_den_power,
-        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA, *, context="v4171"):
-    mode = _validate_v4171_srw_composition_mode(
+def _validate_v4172_composition_settings(
+        srw_composition_mode, gate_den_power,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA, *, context="v4172"):
+    mode = _validate_v4172_srw_composition_mode(
         srw_composition_mode, context=context)
-    power = _validate_v4171_admission_den_power(
-        admission_den_power, context=context)
-    beta = _validate_v4171_heat_kernel_beta(
+    power = _validate_v4172_gate_den_power(
+        gate_den_power, context=context)
+    beta = _validate_v4172_heat_kernel_beta(
         heat_kernel_beta, context=context)
     return mode, power, beta
 
 
-def _validate_v4171_admission_den_grad_scale(value, *, context="v4171"):
+def _validate_v4172_gate_den_grad_scale(value, *, context="v4172"):
     if isinstance(value, jax.core.Tracer):
         raise ValueError(
-            f"{context} admission_den_grad_scale must be a static Python scalar")
+            f"{context} gate_den_grad_scale must be a static Python scalar")
     try:
         value = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"v417x requires admission_den_grad_scale=1.0, got {value!r}") from exc
+            f"v4172 requires gate_den_grad_scale=1.0, got {value!r}") from exc
     if not math.isfinite(value) or value != 1.0:
         raise ValueError(
-            f"v417x requires admission_den_grad_scale=1.0, got {value}")
+            f"v4172 requires gate_den_grad_scale=1.0, got {value}")
     return value
 
 
-def _mark_v4171_srw_factory_output(
-        fn, admission_den_power,
+def _mark_v4172_srw_factory_output(
+        fn, gate_den_power,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
-            context="v4171 sharded factory metadata"))
-    fn._v4171_srw_composition_mode = srw_composition_mode
-    fn._v4171_admission_den_power = float(admission_den_power)
-    fn._v4171_heat_kernel_beta = float(heat_kernel_beta)
-    fn._v4171_admission_den_grad_scale = 1.0
+            context="v4172 sharded factory metadata"))
+    fn._v4172_srw_composition_mode = srw_composition_mode
+    fn._v4172_gate_den_power = float(gate_den_power)
+    fn._v4172_heat_kernel_beta = float(heat_kernel_beta)
+    fn._v4172_gate_den_grad_scale = 1.0
     return fn
 
 
-def _validate_v4171_sharded_fns(
+def _validate_v4172_sharded_fns(
         sharded_fns, expected_power,
         expected_mode=DEFAULT_SRW_COMPOSITION_MODE,
         expected_heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA, *,
@@ -447,15 +446,15 @@ def _validate_v4171_sharded_fns(
     if sharded_fns is None:
         return
     if not isinstance(sharded_fns, dict):
-        raise ValueError("v417x requires dict-style canonical sharded_fns")
+        raise ValueError("v4172 requires dict-style canonical sharded_fns")
     expected_mode, expected_power, expected_heat_kernel_beta = (
-        _validate_v4171_composition_settings(
+        _validate_v4172_composition_settings(
             expected_mode, expected_power, expected_heat_kernel_beta,
-            context="v4171 model/sharded closure"))
+            context="v4172 model/sharded closure"))
     _, qk_power, v_power, rst_power = (
-        _resolve_v417x_admission_den_powers(
+        _resolve_v4172_gate_den_powers(
             expected_power, expected_power_qk, expected_power_v,
-            expected_power_rst, context="v4171 model/sharded closure"))
+            expected_power_rst, context="v4172 model/sharded closure"))
     wrapper_pools = {
         'single': ('v', v_power),
         'attn_v_single': ('v', v_power),
@@ -485,45 +484,45 @@ def _validate_v4171_sharded_fns(
         fn = sharded_fns.get(name)
         if fn is None:
             continue
-        actual_mode = getattr(fn, '_v4171_srw_composition_mode', None)
+        actual_mode = getattr(fn, '_v4172_srw_composition_mode', None)
         if actual_mode is None:
             raise ValueError(
-                f"v4171 sharded function {name!r} is missing canonical "
+                f"v4172 sharded function {name!r} is missing canonical "
                 "srw_composition_mode metadata")
-        actual_mode = _validate_v4171_srw_composition_mode(
-            actual_mode, context=f"v4171 sharded_fns[{name!r}]")
+        actual_mode = _validate_v4172_srw_composition_mode(
+            actual_mode, context=f"v4172 sharded_fns[{name!r}]")
         if actual_mode != expected_mode:
             raise ValueError(
-                "v4171 model/sharded closure srw_composition_mode mismatch: "
+                "v4172 model/sharded closure srw_composition_mode mismatch: "
                 f"sharded_fns[{name!r}]={actual_mode!r}, "
                 f"model={expected_mode!r}")
-        actual = getattr(fn, '_v4171_admission_den_power', None)
+        actual = getattr(fn, '_v4172_gate_den_power', None)
         if actual is None:
             raise ValueError(
-                f"v4171 sharded function {name!r} is missing canonical "
-                "admission_den_power metadata")
+                f"v4172 sharded function {name!r} is missing canonical "
+                "gate_den_power metadata")
         if float(actual) != float(route_power):
             raise ValueError(
-                "v4171 closure/runtime admission_den_power mismatch for "
+                "v4172 closure/runtime gate_den_power mismatch for "
                 f"{pool} pool: sharded_fns[{name!r}]={actual}, "
                 f"runtime={route_power}")
-        actual_beta = getattr(fn, '_v4171_heat_kernel_beta', None)
+        actual_beta = getattr(fn, '_v4172_heat_kernel_beta', None)
         if actual_beta is None:
             raise ValueError(
-                f"v4171 sharded function {name!r} is missing canonical "
+                f"v4172 sharded function {name!r} is missing canonical "
                 "heat_kernel_beta metadata")
-        actual_beta = _validate_v4171_heat_kernel_beta(
-            actual_beta, context=f"v4171 sharded_fns[{name!r}]")
+        actual_beta = _validate_v4172_heat_kernel_beta(
+            actual_beta, context=f"v4172 sharded_fns[{name!r}]")
         if actual_beta != expected_heat_kernel_beta:
             raise ValueError(
-                "v4171 model/sharded closure heat_kernel_beta mismatch: "
+                "v4172 model/sharded closure heat_kernel_beta mismatch: "
                 f"sharded_fns[{name!r}]={actual_beta}, "
                 f"model={expected_heat_kernel_beta}")
-    profile = sharded_fns.get('_v4171_kernel_profile')
+    profile = sharded_fns.get('_v4172_kernel_profile')
     if profile is not None and profile not in {
             'production', 'production_diagnostics',
             'retention', 'suppression', 'trajectory'}:
-        raise ValueError(f"unknown v4171 minimal kernel profile: {profile!r}")
+        raise ValueError(f"unknown v4172 minimal kernel profile: {profile!r}")
 
 
 # ================================================================
@@ -629,7 +628,7 @@ def generalized_bilinear_operator_key_diagnostics(
 
 
 def symbolic_parameter_count(model_cfg):
-    """Return the exact parameter breakdown for the shared v417x core."""
+    """Return the exact parameter breakdown for the shared v4172 core."""
     if (isinstance(model_cfg, dict) and 'model' in model_cfg
             and isinstance(model_cfg['model'], dict)):
         model_cfg = model_cfg['model']
@@ -686,21 +685,21 @@ _BILINEAR_PROBE_NAMES = ('rw_key_read_probe', 'rw_key_write_probe')
 def _resolve_operator_key_mode(pool_params, operator_key_mode=None):
     if operator_key_mode is not None:
         return _validate_operator_key_mode(
-            operator_key_mode, context="v417x neuron_pool")
+            operator_key_mode, context="v4172 neuron_pool")
     learned_present = tuple(
         name for name in _LEARNED_OPERATOR_KEY_NAMES if name in pool_params)
     probes_present = tuple(
         name for name in _BILINEAR_PROBE_NAMES if name in pool_params)
     if learned_present and probes_present:
         raise ValueError(
-            "v417x neuron_pool mixes learned operator key tables with "
+            "v4172 neuron_pool mixes learned operator key tables with "
             "generalized bilinear probes")
     if learned_present:
         return OPERATOR_KEY_MODE_LEARNED
     if probes_present:
         return OPERATOR_KEY_MODE_GENERALIZED_BILINEAR
     raise ValueError(
-        "v417x neuron_pool has neither learned operator key tables nor "
+        "v4172 neuron_pool has neither learned operator key tables nor "
         "generalized bilinear probes")
 
 
@@ -719,7 +718,7 @@ def _pool_operator_keys(pool_params, operator_key_mode=None):
             key for key in _LEARNED_OPERATOR_KEY_NAMES if key not in pool_params)
         if missing:
             raise ValueError(
-                "v4171 neuron_pool is missing learned operator embeddings: "
+                "v4172 neuron_pool is missing learned operator embeddings: "
                 + ", ".join(missing))
         keys = {
             name: pool_params[name] for name in _LEARNED_OPERATOR_KEY_NAMES
@@ -760,37 +759,37 @@ def _pool_operator_keys(pool_params, operator_key_mode=None):
         operator_keys = keys[f'{prefix}_op_key']
         if operator_keys.ndim != 2:
             raise ValueError(
-                f"v417x {prefix}_op_key must have rank 2 [N, d_route], "
+                f"v4172 {prefix}_op_key must have rank 2 [N, d_route], "
                 f"got {operator_keys.shape}")
         if read_key in pool_params:
             expected_rows = int(pool_params[read_key].shape[0])
             if int(operator_keys.shape[0]) != expected_rows:
                 raise ValueError(
-                    f"v417x {prefix}_op_key shape mismatch: expected "
+                    f"v4172 {prefix}_op_key shape mismatch: expected "
                     f"[{expected_rows}, d_route], got {operator_keys.shape}")
         if d_route is None:
             d_route = int(operator_keys.shape[1])
             if d_route <= 0:
                 raise ValueError(
-                    f"v417x {prefix}_op_key must have d_route > 0, got "
+                    f"v4172 {prefix}_op_key must have d_route > 0, got "
                     f"{operator_keys.shape}")
         elif int(operator_keys.shape[1]) != d_route:
             raise ValueError(
-                f"v417x {prefix}_op_key route width mismatch: expected "
+                f"v4172 {prefix}_op_key route width mismatch: expected "
                 f"d_route={d_route}, got {operator_keys.shape}")
     return keys
 
 
 def _composition_den(
-        admission_mass, admission_den_power,
+        gate_mass, gate_den_power,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
     """Live-gradient canonical SRW composition denominator."""
     # Mode/power compatibility is validated at config, model, and factory
     # boundaries. Keep this numerical helper trace-safe because the already
     # validated power is represented as a scalar JAX value in compiled paths.
-    srw_composition_mode = _validate_v4171_srw_composition_mode(
-        srw_composition_mode, context="v4171 composition denominator")
-    admission_mass = jnp.asarray(admission_mass, dtype=jnp.float32)
+    srw_composition_mode = _validate_v4172_srw_composition_mode(
+        srw_composition_mode, context="v4172 composition denominator")
+    gate_mass = jnp.asarray(gate_mass, dtype=jnp.float32)
     if srw_composition_mode in ("quadratic", "heat_energy"):
         den_eps = (
             HEAT_ENERGY_DEN_EPS
@@ -800,14 +799,14 @@ def _composition_den(
     else:
         den_floor_mass = jnp.float32(1.0)
     return jnp.power(
-        jnp.maximum(admission_mass, den_floor_mass),
-        jnp.asarray(admission_den_power, dtype=jnp.float32))
+        jnp.maximum(gate_mass, den_floor_mass),
+        jnp.asarray(gate_den_power, dtype=jnp.float32))
 
 
 def _composition_den_floor_mass(
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE):
-    mode = _validate_v4171_srw_composition_mode(
-        srw_composition_mode, context="v4171 composition denominator floor")
+    mode = _validate_v4172_srw_composition_mode(
+        srw_composition_mode, context="v4172 composition denominator floor")
     if mode in ("quadratic", "heat_energy"):
         if mode == "heat_energy":
             return HEAT_ENERGY_DEN_EPS ** 2
@@ -860,7 +859,7 @@ def analysis_operator_membership(global_operator_ids, selected_operator_ids):
     The existing single-id shape is ``[B]``.  Group analysis uses one static,
     ``-1`` padded ``[B, M]`` shape for every requested group size. Membership
     uses sorted indexed lookup, not a dense ``B x pool x M`` one-hot tensor.
-    This changes only execution numerators; admission and every production
+    This changes only execution numerators; gate and every production
     denominator/statistic remain untouched.
     """
     global_operator_ids = _analysis_int32_array(
@@ -905,7 +904,7 @@ TRAJECTORY_TRACE_FIELDS = (
     "selected_replay_precast_output",
     "query",
     "tau",
-    "admission_mass",
+    "gate_mass",
     "denominator",
     "numerator_active_count",
     "denominator_active_count",
@@ -913,8 +912,8 @@ TRAJECTORY_TRACE_FIELDS = (
     "operator_valid",
     "read_scalar_bf16_bits",
     "prewrite_amplitude_bf16_bits",
-    "execution_weight",
-    "admission",
+    "gate_weight",
+    "gate",
     "margin",
     "rho",
     "position_valid",
@@ -1402,52 +1401,36 @@ def _compact_heat_kernel_from_amplitude(
 
 
 def _boundary_gate_from_margin(margin, tau, boundary_power=None):
-    """Compatibility hook for diagnostics; v4171 has no projected gate."""
+    """Compatibility hook for diagnostics; v4172 has no projected gate."""
     del boundary_power
     return _linear_angular_depth_from_margin(margin, tau)
 
 
-def _compute_admission_drive(score, tau, boundary_scale,
-                             boundary_power=2.0,
-                             effective_active_eps=1.0e-6,
-                             execution_prune_eps=0.0,
-                             srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-                             heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """v4171 canonical angular selection and mode-specific composition.
-
-    The historical tuple slots are kept for scan compatibility:
-    selection margin, unpruned composition admission, linear angular
-    amplitude, pruned composition execution weight, and active mask.
-    """
-    del boundary_scale, boundary_power, effective_active_eps
-    srw_composition_mode = _validate_v4171_srw_composition_mode(
-        srw_composition_mode, context="v4171 admission drive")
-    execution_prune_eps = jnp.asarray(execution_prune_eps, dtype=jnp.float32)
+def _compute_gate_weight(
+        score, tau, *,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    """Compute the single canonical v4172 composition gate."""
+    srw_composition_mode = _validate_v4172_srw_composition_mode(
+        srw_composition_mode, context="v4172 gate weight")
     score = jnp.clip(jnp.asarray(score, dtype=jnp.float32), -1.0, 1.0)
     tau = jnp.asarray(tau, dtype=jnp.float32)
     selection_margin = score - tau
     angular_amplitude = _linear_angular_depth_from_margin(
         selection_margin, tau)
     if srw_composition_mode == "quadratic":
-        admission_weight = angular_amplitude * angular_amplitude
+        gate_weight = angular_amplitude * angular_amplitude
     elif srw_composition_mode == "heat_energy":
         heat_amplitude = _compact_heat_kernel_from_amplitude(
             angular_amplitude, heat_kernel_beta)
-        admission_weight = heat_amplitude * heat_amplitude
+        gate_weight = heat_amplitude * heat_amplitude
     else:
-        admission_weight = angular_amplitude
-    execution_weight = jnp.where(
-        execution_prune_eps > 0.0,
-        jnp.where(
-            admission_weight >= execution_prune_eps,
-            admission_weight, 0.0),
-        admission_weight)
+        gate_weight = angular_amplitude
     active_mask = selection_margin > jnp.float32(0.0)
     return (
         selection_margin,
-        admission_weight,
+        gate_weight,
         angular_amplitude,
-        execution_weight,
         active_mask,
     )
 
@@ -1458,8 +1441,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                      analysis=False,
                      dead_exposure_target=0.1,
                      soft_gate_effective_active_eps=1.0e-6,
-                     admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                     admission_den_grad_scale=1.0,
+                     gate_den_power=DEFAULT_GATE_DEN_POWER,
+                     gate_den_grad_scale=1.0,
                      srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                      heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create fused shard_map'd angular Select + SRW.
@@ -1467,18 +1450,17 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     Fast train path: one chunked pass computes rho, tau, gate, and SRW.
     Analysis path may compute rho distribution moments for diagnostics.
 
-    v4171 canonical DirectTau execution:
+    v4172 canonical DirectTau execution:
         rho               = cosine(operator_query, operator_keys)
         margin            = rho - tau
         angular_amplitude = clip(margin / max(1 - tau, 1e-4), 0, 1)
-        admission_weight  = mode-specific unpruned composition weight
-        execution_weight  = pruned admission_weight
-        den               = mode-specific unpruned-admission normalization
+        gate_weight       = mode-specific composition weight
+        den               = mode-specific gate-mass normalization
 
 
     `analysis=False` (default, train path): returns the SLIM tuple plus
     four gate-concentration diagnostics, and skips distribution-shape stats
-    (skew/kurt), selection-residency/entropy diagnostics and drive extrema.
+    (skew/kurt), selection-residency/entropy diagnostics and amplitude extrema.
     XLA DCE's the unused work.
     `analysis=True`: returns the SLIM/concentration tuple followed by
     observational scalars/arrays for route shape, gate concentration, and
@@ -1497,14 +1479,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
     _compute_sparsity_mass = True
     _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale, context="make_sharded_srw")
-    _admission_den_power = jnp.float32(admission_den_power)
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale, context="make_sharded_srw")
+    _gate_den_power = jnp.float32(gate_den_power)
     _srw_composition_mode = srw_composition_mode
     _heat_kernel_beta = jnp.float32(heat_kernel_beta)
 
@@ -1572,8 +1554,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        P(),                       # soft_gate_temperature scalar
                        P(),                       # soft_gate_t_final scalar
                        P(),                       # soft_gate_boundary_power scalar
-                       P(),                       # soft_gate_boundary_power_final scalar
-                       P()),                      # execution_prune_eps scalar
+                       P()),                      # soft_gate_boundary_power_final scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw(x, operator_query, operator_keys_local, raw_tau,
@@ -1581,7 +1562,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                        soft_gate_temperature, soft_gate_t_final,
                        soft_gate_boundary_power,
                        soft_gate_boundary_power_final,
-                       execution_prune_eps):
+                       ):
         N_local = operator_keys_local.shape[0]
         cs = min(int(max_chunk_size), int(N_local))
         nc = (int(N_local) + cs - 1) // cs
@@ -1671,7 +1652,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             rho_std = jnp.zeros((B, S, 1), dtype=jnp.float32)
 
         # Load-balance over rho distribution is disabled in the fast path;
-        # v4171 does not require a rho-statistics pass for regular train.
+        # v4172 does not require a rho-statistics pass for regular train.
         rho_lb = jnp.float32(0.0)
 
         def edge_margin_stat_terms(rho):
@@ -1679,29 +1660,23 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_compose_parts(rho, valid_mask):
-            (selection_margin, admission_weight, angular_amplitude,
-             execution_weight,
-             active_mask) = _compute_admission_drive(
-                rho, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            (selection_margin, gate_weight, angular_amplitude,
+             active_mask) = _compute_gate_weight(
+                rho, tau,
                 srw_composition_mode=_srw_composition_mode,
                 heat_kernel_beta=_heat_kernel_beta)
             strong_mask = selection_margin > _angular_strong_margin
             selection_margin = jnp.where(valid_mask, selection_margin, 0.0)
-            admission_weight = jnp.where(
-                valid_mask, admission_weight, 0.0)
+            gate_weight = jnp.where(
+                valid_mask, gate_weight, 0.0)
             angular_amplitude = jnp.where(
                 valid_mask, angular_amplitude, 0.0)
-            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
             active_mask = active_mask & valid_mask
             strong_mask = strong_mask & valid_mask
             return (
                 selection_margin,
-                admission_weight,
+                gate_weight,
                 angular_amplitude,
-                execution_weight,
                 active_mask,
                 strong_mask,
             )
@@ -1753,29 +1728,27 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             jnp.zeros((margin_band_count,), dtype=jnp.float32),
         )
 
-        def gate_sparsity_parts(selection_margin, admission, execution_weight,
-                                valid_mask):
+        def gate_sparsity_parts(selection_margin, gate_weight, valid_mask):
             margin_sg = jax.lax.stop_gradient(selection_margin)
-            admission_sg = jax.lax.stop_gradient(admission)
-            execution_sg = jax.lax.stop_gradient(execution_weight)
+            gate_sg = jax.lax.stop_gradient(gate_weight)
             active_tau = (margin_sg > 0.0) & valid_mask
 
-            admission_active = admission_sg[..., None] > current_eps
-            admission_active_count = admission_active.astype(jnp.float32).sum(
+            gate_active = gate_sg[..., None] > current_eps
+            gate_active_count = gate_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
-            current_active = execution_sg[..., None] > current_eps
+            current_active = gate_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 2))
             if _compute_sparsity_mass:
                 current_mass = (
-                    execution_sg[..., None] * current_active.astype(jnp.float32)
+                    gate_sg[..., None] * current_active.astype(jnp.float32)
                 ).sum(axis=(0, 1, 2))
-                gate_mass = execution_sg.sum()
+                gate_mass = gate_sg.sum()
             else:
                 current_mass = jnp.zeros_like(current_active_count)
                 gate_mass = jnp.float32(0.0)
 
-            projected_gate = jnp.where(valid_mask, execution_sg, 0.0)
+            projected_gate = jnp.where(valid_mask, gate_sg, 0.0)
             projected_active = (
                 (projected_gate[..., None] > projected_eps)
                 & valid_mask[..., None])
@@ -1811,7 +1784,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 )).astype(jnp.float32)
             return (
                 active_tau.astype(jnp.float32).sum(),
-                admission_active_count,
+                gate_active_count,
                 current_active_count,
                 current_mass,
                 gate_mass,
@@ -1825,13 +1798,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             return tuple(x + y for x, y in zip(a, b))
 
         def finalize_sparsity_diag(carry):
-            (active_tau_count, admission_active_count,
+            (active_tau_count, gate_active_count,
              current_active_count, current_mass, gate_mass,
              projected_active_count, projected_mass, projected_gate_mass,
              margin_bands) = carry
             active_tau_count = jax.lax.psum(active_tau_count, 'model')
-            admission_active_count = jax.lax.psum(
-                admission_active_count, 'model')
+            gate_active_count = jax.lax.psum(
+                gate_active_count, 'model')
             current_active_count = jax.lax.psum(
                 current_active_count, 'model')
             current_mass = jax.lax.psum(current_mass, 'model')
@@ -1844,8 +1817,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
 
             token_count = jnp.float32(B * S)
             element_count = token_count * jnp.float32(N_total)
-            admission_frac = admission_active_count / element_count
-            admission_count = admission_active_count / token_count
+            gate_frac = gate_active_count / element_count
+            gate_count = gate_active_count / token_count
             current_frac = current_active_count / element_count
             current_count = current_active_count / token_count
             projected_frac = projected_active_count / element_count
@@ -1858,12 +1831,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             for _i, _suffix in enumerate(_current_suffixes):
                 out = out.at[
                     GATE_SPARSITY_DIAG_INDEX[
-                        f'admission_active_eps_{_suffix}_frac']
-                ].set(admission_frac[_i])
+                        f'gate_active_eps_{_suffix}_frac']
+                ].set(gate_frac[_i])
                 out = out.at[
                     GATE_SPARSITY_DIAG_INDEX[
-                        f'admission_active_eps_{_suffix}_count']
-                ].set(admission_count[_i])
+                        f'gate_active_eps_{_suffix}_count']
+                ].set(gate_count[_i])
                 out = out.at[
                     GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_frac']
                 ].set(current_frac[_i])
@@ -1918,11 +1891,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 ].set(margin_frac[4])
             return jax.lax.stop_gradient(out.astype(jnp.float32))
 
-        def soft_gate_exposure_parts(gate_unpruned, valid_chunk):
-            # v4164 admission exposure diagnostic only.  Do not use the hard
+        def soft_gate_exposure_parts(gate_values, valid_chunk):
+            # v4164 gate exposure diagnostic only.  Do not use the hard
             # score > tau boundary as a dead definition: with high T,
             # score < tau can still produce meaningful boundary gate mass.
-            # A unit is considered soft-dead only if its actual admission
+            # A unit is considered soft-dead only if its actual gate
             # mass is essentially zero across the batch/tokens.
             if not analysis:
                 return (
@@ -1935,7 +1908,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     jnp.float32(0.0),
                 )
             local_soft_exposure = jax.lax.stop_gradient(
-                gate_unpruned).max(axis=(0, 1))  # [cs]
+                gate_values).max(axis=(0, 1))  # [cs]
             local_soft_exposure = jnp.where(
                 valid_chunk, local_soft_exposure, 0.0)
             soft_exposure = jax.lax.all_gather(
@@ -1984,8 +1957,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-                (selection_margin, admission_weight, angular_amplitude,
-                 execution_weight,
+                (selection_margin, gate_weight, angular_amplitude,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsn)
                 select_diag_carry = update_select_diag(
@@ -2000,38 +1972,37 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission_weight, execution_weight,
-                        valid_bsn)
+                        selection_margin, gate_weight, valid_bsn)
                 else:
                     chunk_sparsity = sparsity_carry0
                 chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
-                a = execution_weight * xr_f
+                a = gate_weight * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(execution_weight).sum(
+                chunk_weighted = gate_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(gate_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission_weight.sum(
+                chunk_den_cost = gate_weight.sum(
                     axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 1), dtype=jnp.float32)
                 chunk_margin_band_wide = jnp.zeros((B, S, 1), dtype=jnp.float32)
                 chunk_margin_band_mid = jnp.zeros((B, S, 1), dtype=jnp.float32)
-                g_safe = execution_weight + 1e-8
-                chunk_g_log_g = (execution_weight * jnp.log(g_safe)).sum(
+                g_safe = gate_weight + 1e-8
+                chunk_g_log_g = (gate_weight * jnp.log(g_safe)).sum(
                     axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission_weight, valid_chunk))
+                    soft_gate_exposure_parts(gate_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, gate_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_margin_band + chunk_margin_band,
@@ -2099,8 +2070,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-                (selection_margin, admission_weight, angular_amplitude,
-                 execution_weight,
+                (selection_margin, gate_weight, angular_amplitude,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsn)
                 select_diag_carry = update_select_diag(
@@ -2115,20 +2085,19 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission_weight, execution_weight,
-                        valid_bsn)
+                        selection_margin, gate_weight, valid_bsn)
                 else:
                     chunk_sparsity = sparsity_carry0
                 chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
-                a = execution_weight * xr_f
+                a = gate_weight * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(execution_weight).sum(
+                chunk_weighted = gate_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(gate_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission_weight.sum(
+                chunk_den_cost = gate_weight.sum(
                     axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -2136,11 +2105,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission_weight, valid_chunk))
+                    soft_gate_exposure_parts(gate_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, gate_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_den_cost + chunk_den_cost,
@@ -2184,9 +2153,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 jnp.arange(nc))
 
 
-        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(execution_weight)
+        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(gate_weight)
         global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
-        # Denominator intentionally uses admission only, not execution_weight.
+        # Denominator intentionally uses gate only, not gate_weight.
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_selection_cost = jax.lax.psum(total_selection_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
@@ -2196,7 +2165,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
             / jnp.float32(B * S * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         composition_den = _composition_den(
-            global_den_cost, _admission_den_power,
+            global_den_cost, _gate_den_power,
             _srw_composition_mode)
         out = raw_out / composition_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -2221,7 +2190,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
         tau_direct = tau
         # Measurement path: the copies below are detached for diagnostics only.
         # The forward denominator above intentionally remains live-gradient,
-        # and numerator paths through execution_weight also remain live.
+        # and numerator paths through gate_weight also remain live.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -2350,8 +2319,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 + (sparsity_diag_out,)
                )
 
-    return _mark_v4171_srw_factory_output(
-        fused_gate_srw, admission_den_power, _srw_composition_mode,
+    return _mark_v4172_srw_factory_output(
+        fused_gate_srw, gate_den_power, _srw_composition_mode,
         heat_kernel_beta)
 
 
@@ -2359,8 +2328,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             analysis=False,
                             dead_exposure_target=0.1,
                             soft_gate_effective_active_eps=1.0e-6,
-                            admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                            admission_den_grad_scale=1.0,
+                            gate_den_power=DEFAULT_GATE_DEN_POWER,
+                            gate_den_grad_scale=1.0,
                             srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                             heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Fused attention_q+attention_k shard_map: two routes sharing same pool in one shard_map call.
@@ -2371,8 +2340,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     Scores stats computed independently per route.
     Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
 
-    v4171 canonical execution uses the same statically selected composition
-    kernel and unpruned-mass denominator as the single-route factory. attention_q and attention_k
+    v4172 canonical execution uses the same statically selected composition
+    kernel and gate-mass denominator as the single-route factory. attention_q and attention_k
     accumulate and normalize their kernel masses independently.
     analysis: see make_sharded_srw docstring.
     """
@@ -2388,14 +2357,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
     _compute_sparsity_mass = True
     _compact_margin_bands = False
     _angular_strong_margin = jnp.float32(0.05)
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_paired"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale, context="make_sharded_srw_paired")
-    _admission_den_power = jnp.float32(admission_den_power)
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale, context="make_sharded_srw_paired")
+    _gate_den_power = jnp.float32(gate_den_power)
     _srw_composition_mode = srw_composition_mode
     _heat_kernel_beta = jnp.float32(heat_kernel_beta)
 
@@ -2471,8 +2440,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                        P(),                           # soft_gate_temperature scalar
                        P(),                           # soft_gate_t_final scalar
                        P(),                           # soft_gate_boundary_power scalar
-                       P(),                           # soft_gate_boundary_power_final scalar
-                       P()),                          # execution_prune_eps scalar
+                       P()),                          # soft_gate_boundary_power_final scalar
              out_specs=_out_specs,
              check_rep=False)
     def fused_gate_srw_paired(x, operator_query, operator_keys_local, raw_tau,
@@ -2480,7 +2448,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                               soft_gate_temperature, soft_gate_t_final,
                               soft_gate_boundary_power,
                               soft_gate_boundary_power_final,
-                              execution_prune_eps):
+                              ):
         N_local = operator_keys_local.shape[0]
         cs = min(int(max_chunk_size), int(N_local))
         nc = (int(N_local) + cs - 1) // cs
@@ -2573,7 +2541,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             rho_std = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
 
         # Load-balance over rho distribution is disabled in the fast path;
-        # v4171 does not require a rho-statistics pass for regular train.
+        # v4172 does not require a rho-statistics pass for regular train.
         rho_lb = jnp.float32(0.0)
 
         def edge_margin_stat_terms(rho):
@@ -2581,29 +2549,23 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return jnp.square(positive_selection_margin)
 
         def angular_compose_parts(rho, valid_mask):
-            (selection_margin, admission_weight, angular_amplitude,
-             execution_weight,
-             active_mask) = _compute_admission_drive(
-                rho, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            (selection_margin, gate_weight, angular_amplitude,
+             active_mask) = _compute_gate_weight(
+                rho, tau,
                 srw_composition_mode=_srw_composition_mode,
                 heat_kernel_beta=_heat_kernel_beta)
             strong_mask = selection_margin > _angular_strong_margin
             selection_margin = jnp.where(valid_mask, selection_margin, 0.0)
-            admission_weight = jnp.where(
-                valid_mask, admission_weight, 0.0)
+            gate_weight = jnp.where(
+                valid_mask, gate_weight, 0.0)
             angular_amplitude = jnp.where(
                 valid_mask, angular_amplitude, 0.0)
-            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
             active_mask = active_mask & valid_mask
             strong_mask = strong_mask & valid_mask
             return (
                 selection_margin,
-                admission_weight,
+                gate_weight,
                 angular_amplitude,
-                execution_weight,
                 active_mask,
                 strong_mask,
             )
@@ -2655,29 +2617,27 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             jnp.zeros((2, margin_band_count), dtype=jnp.float32),
         )
 
-        def gate_sparsity_parts(selection_margin, admission, execution_weight,
-                                valid_mask):
+        def gate_sparsity_parts(selection_margin, gate_weight, valid_mask):
             margin_sg = jax.lax.stop_gradient(selection_margin)
-            admission_sg = jax.lax.stop_gradient(admission)
-            execution_sg = jax.lax.stop_gradient(execution_weight)
+            gate_sg = jax.lax.stop_gradient(gate_weight)
             active_tau = (margin_sg > 0.0) & valid_mask
 
-            admission_active = admission_sg[..., None] > current_eps
-            admission_active_count = admission_active.astype(jnp.float32).sum(
+            gate_active = gate_sg[..., None] > current_eps
+            gate_active_count = gate_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
-            current_active = execution_sg[..., None] > current_eps
+            current_active = gate_sg[..., None] > current_eps
             current_active_count = current_active.astype(jnp.float32).sum(
                 axis=(0, 1, 3))
             if _compute_sparsity_mass:
                 current_mass = (
-                    execution_sg[..., None] * current_active.astype(jnp.float32)
+                    gate_sg[..., None] * current_active.astype(jnp.float32)
                 ).sum(axis=(0, 1, 3))
-                gate_mass = execution_sg.sum(axis=(0, 1, 3))
+                gate_mass = gate_sg.sum(axis=(0, 1, 3))
             else:
                 current_mass = jnp.zeros_like(current_active_count)
                 gate_mass = jnp.zeros((2,), dtype=jnp.float32)
 
-            projected_gate = jnp.where(valid_mask, execution_sg, 0.0)
+            projected_gate = jnp.where(valid_mask, gate_sg, 0.0)
             projected_active = (
                 (projected_gate[..., None] > projected_eps)
                 & valid_mask[..., None])
@@ -2715,7 +2675,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 ), axis=1).astype(jnp.float32)
             return (
                 active_tau.astype(jnp.float32).sum(axis=(0, 1, 3)),
-                admission_active_count,
+                gate_active_count,
                 current_active_count,
                 current_mass,
                 gate_mass,
@@ -2729,13 +2689,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             return tuple(x + y for x, y in zip(a, b))
 
         def finalize_sparsity_diag(carry):
-            (active_tau_count, admission_active_count,
+            (active_tau_count, gate_active_count,
              current_active_count, current_mass, gate_mass,
              projected_active_count, projected_mass, projected_gate_mass,
              margin_bands) = carry
             active_tau_count = jax.lax.psum(active_tau_count, 'model')
-            admission_active_count = jax.lax.psum(
-                admission_active_count, 'model')
+            gate_active_count = jax.lax.psum(
+                gate_active_count, 'model')
             current_active_count = jax.lax.psum(
                 current_active_count, 'model')
             current_mass = jax.lax.psum(current_mass, 'model')
@@ -2748,8 +2708,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
             token_count = jnp.float32(B * S)
             element_count = token_count * jnp.float32(N_total)
-            admission_frac = admission_active_count / element_count
-            admission_count = admission_active_count / token_count
+            gate_frac = gate_active_count / element_count
+            gate_count = gate_active_count / token_count
             current_frac = current_active_count / element_count
             current_count = current_active_count / token_count
             projected_frac = projected_active_count / element_count
@@ -2762,12 +2722,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             for _i, _suffix in enumerate(_current_suffixes):
                 out = out.at[
                     :, GATE_SPARSITY_DIAG_INDEX[
-                        f'admission_active_eps_{_suffix}_frac']
-                ].set(admission_frac[:, _i])
+                        f'gate_active_eps_{_suffix}_frac']
+                ].set(gate_frac[:, _i])
                 out = out.at[
                     :, GATE_SPARSITY_DIAG_INDEX[
-                        f'admission_active_eps_{_suffix}_count']
-                ].set(admission_count[:, _i])
+                        f'gate_active_eps_{_suffix}_count']
+                ].set(gate_count[:, _i])
                 out = out.at[
                     :, GATE_SPARSITY_DIAG_INDEX[f'active_eps_{_suffix}_frac']
                 ].set(current_frac[:, _i])
@@ -2822,11 +2782,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 ].set(margin_frac[:, 4])
             return jax.lax.stop_gradient(out.astype(jnp.float32))
 
-        def soft_gate_exposure_parts(gate_unpruned, valid_chunk):
-            # v4164 admission exposure diagnostic only.  Do not use the hard
+        def soft_gate_exposure_parts(gate_values, valid_chunk):
+            # v4164 gate exposure diagnostic only.  Do not use the hard
             # score > tau boundary as a dead definition: with high T,
             # score < tau can still produce meaningful boundary gate mass.
-            # A unit is considered soft-dead only if its actual admission
+            # A unit is considered soft-dead only if its actual gate
             # mass is essentially zero across the batch/tokens/routes.
             if not analysis:
                 return (
@@ -2839,7 +2799,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     jnp.float32(0.0),
                 )
             local_soft_exposure = jax.lax.stop_gradient(
-                gate_unpruned).max(axis=(0, 1, 2))  # [cs]
+                gate_values).max(axis=(0, 1, 2))  # [cs]
             local_soft_exposure = jnp.where(
                 valid_chunk, local_soft_exposure, 0.0)
             soft_exposure = jax.lax.all_gather(
@@ -2888,8 +2848,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsrn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-                (selection_margin, admission_weight, angular_amplitude,
-                 execution_weight,
+                (selection_margin, gate_weight, angular_amplitude,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsrn)
                 select_diag_carry = update_select_diag(
@@ -2904,38 +2863,37 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission_weight, execution_weight,
-                        valid_bsrn)
+                        selection_margin, gate_weight, valid_bsrn)
                 else:
                     chunk_sparsity = sparsity_carry0
                 chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T  # [B,S,N]
                 xr_f = xr.astype(jnp.float32)
-                a = execution_weight * xr_f[:, :, None, :]
+                a = gate_weight * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
-                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(execution_weight).sum(
+                chunk_weighted = gate_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(gate_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission_weight.sum(
+                chunk_den_cost = gate_weight.sum(
                     axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_margin_band = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
                 chunk_margin_band_wide = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
                 chunk_margin_band_mid = jnp.zeros((B, S, 2, 1), dtype=jnp.float32)
-                g_safe = execution_weight + 1e-8
-                chunk_g_log_g = (execution_weight * jnp.log(g_safe)).sum(
+                g_safe = gate_weight + 1e-8
+                chunk_g_log_g = (gate_weight * jnp.log(g_safe)).sum(
                     axis=-1, keepdims=True)
                 (chunk_dead_penalty, chunk_dead_count,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission_weight, valid_chunk))
+                    soft_gate_exposure_parts(gate_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, gate_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_margin_band + chunk_margin_band,
@@ -3004,8 +2962,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 rho_raw, rho_exposure = operator_scores_from_keys(operator_keys)
                 rho = jnp.where(valid_bsrn, rho_raw, diag_neg_inf)
                 rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-                (selection_margin, admission_weight, angular_amplitude,
-                 execution_weight,
+                (selection_margin, gate_weight, angular_amplitude,
                  active_mask, strong_mask) = angular_compose_parts(
                     rho_compute, valid_bsrn)
                 select_diag_carry = update_select_diag(
@@ -3020,20 +2977,19 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                     / jnp.maximum(valid_count, 1.0))
                 if _sparsity_diag_enabled:
                     chunk_sparsity = gate_sparsity_parts(
-                        selection_margin, admission_weight, execution_weight,
-                        valid_bsrn)
+                        selection_margin, gate_weight, valid_bsrn)
                 else:
                     chunk_sparsity = sparsity_carry0
                 chunk_int_max = angular_amplitude.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
-                a = execution_weight * xr_f[:, :, None, :]
+                a = gate_weight * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
-                chunk_weighted = execution_weight.sum(axis=-1, keepdims=True)
-                chunk_gate_sq = jnp.square(execution_weight).sum(
+                chunk_weighted = gate_weight.sum(axis=-1, keepdims=True)
+                chunk_gate_sq = jnp.square(gate_weight).sum(
                     axis=-1, keepdims=True)
-                chunk_den_cost = admission_weight.sum(
+                chunk_den_cost = gate_weight.sum(
                     axis=-1, keepdims=True)
                 chunk_active = active_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = strong_mask.astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -3041,11 +2997,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                  chunk_exposure_sum, chunk_exposure_min,
                  chunk_exposure_max, chunk_weak_exposure_count,
                  chunk_soft_dead_1e4_count) = (
-                    soft_gate_exposure_parts(admission_weight, valid_chunk))
+                    soft_gate_exposure_parts(gate_weight, valid_chunk))
                 return (out + c_out,
                         total_weighted_cost + chunk_weighted,
                         total_gate_sq + chunk_gate_sq,
-                        jnp.maximum(total_gate_max, execution_weight.max(axis=-1, keepdims=True)),
+                        jnp.maximum(total_gate_max, gate_weight.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_den_cost + chunk_den_cost,
@@ -3091,7 +3047,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
 
 
         # Normalize per route independently
-        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')   # sum(execution_weight)
+        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')   # sum(gate_weight)
         global_gate_sq = jax.lax.psum(total_gate_sq, 'model')
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_selection_cost = jax.lax.psum(total_selection_cost, 'model')
@@ -3102,7 +3058,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
             / jnp.float32(B * S * 2 * N_total))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         composition_den = _composition_den(
-            global_den_cost, _admission_den_power,
+            global_den_cost, _gate_den_power,
             _srw_composition_mode)
         out = raw_out / composition_den
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -3127,7 +3083,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
         tau_direct = tau
         # Measurement path: the copies below are detached for diagnostics only.
         # The forward denominator above intentionally remains live-gradient,
-        # and numerator paths through execution_weight also remain live.
+        # and numerator paths through gate_weight also remain live.
         global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
         global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
         global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
@@ -3268,54 +3224,54 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 + (sparsity_diag_out,)
                )
 
-    return _mark_v4171_srw_factory_output(
-        fused_gate_srw_paired, admission_den_power, _srw_composition_mode,
+    return _mark_v4172_srw_factory_output(
+        fused_gate_srw_paired, gate_den_power, _srw_composition_mode,
         heat_kernel_beta)
 
 
-_V4171_MINIMAL_KERNEL_BUNDLES = {}
+_V4172_MINIMAL_KERNEL_BUNDLES = {}
 
 
-def _v4171_minimal_bundle_key(
+def _v4172_minimal_bundle_key(
         route_kind, mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode, heat_kernel_beta,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode, heat_kernel_beta,
         trajectory_capture_width=0):
     return (
         str(route_kind), id(mesh), int(max_chunk_size),
         float(dead_exposure_target), float(soft_gate_effective_active_eps),
-        float(admission_den_power), float(admission_den_grad_scale),
+        float(gate_den_power), float(gate_den_grad_scale),
         str(srw_composition_mode), float(heat_kernel_beta),
         int(trajectory_capture_width),
     )
 
 
-def _cached_v4171_minimal_bundle(route_kind, builder, *factory_args):
-    key = _v4171_minimal_bundle_key(route_kind, *factory_args)
-    bundle = _V4171_MINIMAL_KERNEL_BUNDLES.get(key)
+def _cached_v4172_minimal_bundle(route_kind, builder, *factory_args):
+    key = _v4172_minimal_bundle_key(route_kind, *factory_args)
+    bundle = _V4172_MINIMAL_KERNEL_BUNDLES.get(key)
     if bundle is None:
         bundle = builder(*factory_args)
-        _V4171_MINIMAL_KERNEL_BUNDLES[key] = bundle
+        _V4172_MINIMAL_KERNEL_BUNDLES[key] = bundle
     return bundle
 
 
 def _make_sharded_srw_training_fast_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Build the lean production single-route training executable."""
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_minimal"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale, context="make_sharded_srw_minimal")
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale, context="make_sharded_srw_minimal")
     del dead_exposure_target
-    den_power = jnp.float32(admission_den_power)
+    den_power = jnp.float32(gate_den_power)
     effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
     composition_mode = srw_composition_mode
     beta = jnp.float32(heat_kernel_beta)
@@ -3325,7 +3281,7 @@ def _make_sharded_srw_training_fast_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps):
+            ):
         del soft_gate_t_final, soft_gate_boundary_power_final
         n_local = operator_keys_local.shape[0]
         chunk_size = min(int(max_chunk_size), int(n_local))
@@ -3373,24 +3329,20 @@ def _make_sharded_srw_training_fast_minimal_impl(
                 operator_query_unit_bf @ operator_keys.T
             ).astype(jnp.float32)
             rho_compute = jnp.where(valid_mask, rho_raw, tau)
-            _, admission, _, execution_weight, _ = _compute_admission_drive(
-                rho_compute, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            _, gate_weight, _, _ = _compute_gate_weight(
+                rho_compute, tau,
                 srw_composition_mode=composition_mode,
                 heat_kernel_beta=beta)
-            admission = jnp.where(valid_mask, admission, 0.0)
-            execution_weight = jnp.where(
-                valid_mask, execution_weight, 0.0)
+            gate_weight = jnp.where(
+                valid_mask, gate_weight, 0.0)
             read_value = x_bf @ read_chunk.T
-            amplitude = execution_weight * read_value.astype(jnp.float32)
+            amplitude = gate_weight * read_value.astype(jnp.float32)
             chunk_out = (
                 amplitude.astype(jnp.bfloat16) @ write_chunk
             ).astype(jnp.float32)
             return (
                 raw_out + chunk_out,
-                total_gate_mass + admission.sum(axis=-1, keepdims=True),
+                total_gate_mass + gate_weight.sum(axis=-1, keepdims=True),
             ), None
 
         (raw_out, total_gate_mass), _ = jax.lax.scan(
@@ -3414,34 +3366,34 @@ def _make_sharded_srw_training_fast_minimal_impl(
     common_in_specs = (
         P('data', None, None), P('data', None, None), P('model', None),
         P('data', None, None), P('model', None), P('model', None),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P())
     training_kernel = shard_map(
         training_core, mesh=mesh, in_specs=common_in_specs,
         out_specs=P('data', None, None), check_rep=False)
-    _mark_v4171_srw_factory_output(
-        training_kernel, admission_den_power, composition_mode,
+    _mark_v4172_srw_factory_output(
+        training_kernel, gate_den_power, composition_mode,
         heat_kernel_beta)
-    training_kernel._v4171_kernel_profile = "production"
-    training_kernel._v4171_production_shard_map_kernel = training_kernel
+    training_kernel._v4172_kernel_profile = "production"
+    training_kernel._v4172_production_shard_map_kernel = training_kernel
     return training_kernel
 
 
 def _make_sharded_srw_production_diagnostics_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Build the observational production single-route executable."""
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_minimal"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale, context="make_sharded_srw_minimal")
-    _admission_den_power = jnp.float32(admission_den_power)
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale, context="make_sharded_srw_minimal")
+    _gate_den_power = jnp.float32(gate_den_power)
     _srw_composition_mode = srw_composition_mode
     _heat_kernel_beta = jnp.float32(heat_kernel_beta)
     _composition_floor_mass = jnp.float32(
@@ -3455,7 +3407,7 @@ def _make_sharded_srw_production_diagnostics_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps):
+            ):
         del soft_gate_t_final, soft_gate_boundary_power_final
         n_local = operator_keys_local.shape[0]
         chunk_size = min(int(max_chunk_size), int(n_local))
@@ -3505,36 +3457,31 @@ def _make_sharded_srw_production_diagnostics_minimal_impl(
                 operator_query_unit_bf @ operator_keys.T
             ).astype(jnp.float32)
             rho_compute = jnp.where(valid_mask, rho_raw, tau)
-            (margin, admission, angular_amplitude, execution_weight,
-             _) = _compute_admission_drive(
-                rho_compute, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            (margin, gate_weight, angular_amplitude, _) = _compute_gate_weight(
+                rho_compute, tau,
                 srw_composition_mode=_srw_composition_mode,
                 heat_kernel_beta=_heat_kernel_beta)
-            admission = jnp.where(valid_mask, admission, 0.0)
             angular_amplitude = jnp.where(
                 valid_mask, angular_amplitude, 0.0)
-            execution_weight = jnp.where(
-                valid_mask, execution_weight, 0.0)
+            gate_weight = jnp.where(
+                valid_mask, gate_weight, 0.0)
             active_count = (
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32).sum(axis=-1, keepdims=True))
             read_value = x_bf @ read_chunk.T
-            amplitude = execution_weight * read_value.astype(jnp.float32)
+            amplitude = gate_weight * read_value.astype(jnp.float32)
             chunk_out = (
                 amplitude.astype(jnp.bfloat16) @ write_chunk
             ).astype(jnp.float32)
-            chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
+            chunk_gate_mass = gate_weight.sum(axis=-1, keepdims=True)
             return (
                 raw_out + chunk_out,
                 total_gate_mass + chunk_gate_mass,
-                total_gate_sq + jnp.square(admission).sum(
+                total_gate_sq + jnp.square(gate_weight).sum(
                     axis=-1, keepdims=True),
                 jnp.maximum(
                     total_gate_max,
-                    admission.max(axis=-1, keepdims=True)),
+                    gate_weight.max(axis=-1, keepdims=True)),
                 total_active_count + active_count,
                 total_angular_amplitude + angular_amplitude.sum(
                     axis=-1, keepdims=True),
@@ -3571,7 +3518,7 @@ def _make_sharded_srw_production_diagnostics_minimal_impl(
             jax.lax.psum(
                 valid_padded.astype(jnp.float32).sum(), 'model'))
         gate_den = _composition_den(
-            global_gate_mass, _admission_den_power,
+            global_gate_mass, _gate_den_power,
             _srw_composition_mode)
         active_n_mean = global_active_count.mean()
         active_frac = active_n_mean / jnp.maximum(global_operator_count, 1.0)
@@ -3600,7 +3547,7 @@ def _make_sharded_srw_production_diagnostics_minimal_impl(
         raw_out_global = jax.lax.psum(
             jax.lax.stop_gradient(raw_out).astype(jnp.bfloat16), 'model'
         ).astype(jnp.float32)
-        admission_mass_max = global_gate_mass.max()
+        gate_mass_max = global_gate_mass.max()
         composition_den_min = gate_den.min()
         composition_den_max = gate_den.max()
         raw_srw_out_norm = jnp.linalg.norm(
@@ -3618,7 +3565,7 @@ def _make_sharded_srw_production_diagnostics_minimal_impl(
             jax.lax.stop_gradient(top1_gate_frac_mean.astype(jnp.float32)),
             jax.lax.stop_gradient(den_floor_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(tau_mean.astype(jnp.float32)),
-            jax.lax.stop_gradient(admission_mass_max.astype(jnp.float32)),
+            jax.lax.stop_gradient(gate_mass_max.astype(jnp.float32)),
             jax.lax.stop_gradient(composition_den_min.astype(jnp.float32)),
             jax.lax.stop_gradient(composition_den_max.astype(jnp.float32)),
             jax.lax.stop_gradient(raw_srw_out_norm.astype(jnp.float32)),
@@ -3629,38 +3576,38 @@ def _make_sharded_srw_production_diagnostics_minimal_impl(
     common_in_specs = (
         P('data', None, None), P('data', None, None), P('model', None),
         P('data', None, None), P('model', None), P('model', None),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P())
     out_specs = (
         P('data', None, None), P(), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P())
     production_kernel = shard_map(
         production_core, mesh=mesh, in_specs=common_in_specs,
         out_specs=out_specs, check_rep=False)
-    _mark_v4171_srw_factory_output(
-        production_kernel, admission_den_power, _srw_composition_mode,
+    _mark_v4172_srw_factory_output(
+        production_kernel, gate_den_power, _srw_composition_mode,
         heat_kernel_beta)
-    production_kernel._v4171_kernel_profile = "production_diagnostics"
-    production_kernel._v4171_diagnostics_shard_map_kernel = production_kernel
+    production_kernel._v4172_kernel_profile = "production_diagnostics"
+    production_kernel._v4172_diagnostics_shard_map_kernel = production_kernel
     return production_kernel
 
 
 def _make_sharded_srw_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
         trajectory_capture_width=0):
     """Build analysis-only retention, suppression, and trajectory wrappers."""
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_minimal"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale, context="make_sharded_srw_minimal")
-    _admission_den_power = jnp.float32(admission_den_power)
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale, context="make_sharded_srw_minimal")
+    _gate_den_power = jnp.float32(gate_den_power)
     _srw_composition_mode = srw_composition_mode
     _heat_kernel_beta = jnp.float32(heat_kernel_beta)
     _composition_floor_mass = jnp.float32(
@@ -3676,7 +3623,7 @@ def _make_sharded_srw_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local,
             position_mask, retention_mode, *, capture_trajectory=False,
             trajectory_positions=None, trajectory_position_valid=None,
@@ -3756,23 +3703,18 @@ def _make_sharded_srw_minimal_impl(
             return ec, rc, wc, vc
 
         def angular_compose_parts(rho, valid_mask):
-            (margin, admission, angular_amplitude, execution_weight,
-             _) = _compute_admission_drive(
-                rho, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            (margin, gate_weight, angular_amplitude, _) = _compute_gate_weight(
+                rho, tau,
                 srw_composition_mode=_srw_composition_mode,
                 heat_kernel_beta=_heat_kernel_beta)
-            admission = jnp.where(valid_mask, admission, 0.0)
             angular_amplitude = jnp.where(
                 valid_mask, angular_amplitude, 0.0)
-            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
+            gate_weight = jnp.where(valid_mask, gate_weight, 0.0)
             active_count = (
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32)
                 .sum(axis=-1, keepdims=True))
-            return (margin, admission, angular_amplitude, execution_weight,
+            return (margin, gate_weight, angular_amplitude, gate_weight,
                     active_count)
 
         @jax.checkpoint
@@ -3782,8 +3724,8 @@ def _make_sharded_srw_minimal_impl(
              total_angular_amplitude, selected_raw_out) = carry[:7]
             if capture_trajectory:
                 (trace_score, trace_ids, trace_read_bits,
-                 trace_amplitude_bits, trace_execution_weight,
-                 trace_admission, trace_margin, trace_rho,
+                 trace_amplitude_bits, trace_gate_weight,
+                 trace_gate, trace_margin, trace_rho,
                  trace_numerator_count, trace_denominator_count,
                  trace_selected_raw) = carry[7:]
             s = i * cs
@@ -3791,7 +3733,7 @@ def _make_sharded_srw_minimal_impl(
             valid_bsn = valid_chunk[None, None, :]
             rho_raw = operator_scores_from_keys(operator_keys)
             rho_compute = jnp.where(valid_bsn, rho_raw, tau)
-            (margin, admission, angular_amplitude, execution_weight,
+            (margin, gate_for_denominator, angular_amplitude, gate_weight,
              chunk_active_count) = angular_compose_parts(
                  rho_compute, valid_bsn)
             global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
@@ -3820,19 +3762,19 @@ def _make_sharded_srw_minimal_impl(
             autonomous_retention = (
                 (retention_mode == jnp.int32(2)) & route_has_removal)
             numerator_keep = (~retention_enabled) | effective_keep
-            execution_for_numerator = jnp.where(
+            gate_for_numerator = jnp.where(
                 suppress_mask | ~numerator_keep,
-                jnp.float32(0.0), execution_weight)
+                jnp.float32(0.0), gate_weight)
             restoration_enabled = (
                 (retention_mode == jnp.int32(3)) & route_has_removal)
             restoration_execution = jnp.where(
                 restoration_enabled & ~effective_keep,
-                execution_weight, jnp.float32(0.0))
-            admission_for_den = jnp.where(
+                gate_weight, jnp.float32(0.0))
+            gate_for_den = jnp.where(
                 autonomous_retention & ~effective_keep,
-                jnp.float32(0.0), admission)
+                jnp.float32(0.0), gate_for_denominator)
             xr = x_bf @ rc.T
-            a = execution_for_numerator * xr.astype(jnp.float32)
+            a = gate_for_numerator * xr.astype(jnp.float32)
             c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
 
             def compute_restoration(_):
@@ -3854,14 +3796,14 @@ def _make_sharded_srw_minimal_impl(
             c_out = c_out + restoration_c_out
             selected_execution = jnp.where(
                 token_match & operator_match & valid_bsn,
-                execution_weight, jnp.float32(0.0))
+                gate_weight, jnp.float32(0.0))
             selected_a = selected_execution * xr.astype(jnp.float32)
             selected_c_out = (
                 selected_a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
-            chunk_gate_mass = admission_for_den.sum(axis=-1, keepdims=True)
-            chunk_gate_sq = jnp.square(admission_for_den).sum(
+            chunk_gate_mass = gate_for_den.sum(axis=-1, keepdims=True)
+            chunk_gate_sq = jnp.square(gate_for_den).sum(
                 axis=-1, keepdims=True)
-            chunk_gate_max = admission_for_den.max(axis=-1, keepdims=True)
+            chunk_gate_max = gate_for_den.max(axis=-1, keepdims=True)
             next_carry = (
                 raw_out + c_out,
                 total_gate_mass + chunk_gate_mass,
@@ -3881,18 +3823,18 @@ def _make_sharded_srw_minimal_impl(
 
                 rho_target = gather_target(rho_compute)
                 margin_target = gather_target(margin)
-                admission_target = gather_target(admission)
-                execution_target = gather_target(execution_weight)
+                gate_target = gather_target(gate_for_denominator)
+                gate_target = gather_target(gate_weight)
                 xr_target = gather_target(xr)
                 amplitude_target = (
-                    execution_target * xr_target.astype(jnp.float32))
+                    gate_target * xr_target.astype(jnp.float32))
                 target_valid = trajectory_position_valid[:, :, None]
                 valid_target = valid_chunk[None, None, :] & target_valid
                 numerator_active = (
                     valid_target
-                    & (execution_target != jnp.float32(0.0)))
+                    & (gate_target != jnp.float32(0.0)))
                 denominator_active = (
-                    valid_target & (admission_target != jnp.float32(0.0)))
+                    valid_target & (gate_target != jnp.float32(0.0)))
                 chunk_score = jnp.where(
                     numerator_active, jnp.abs(amplitude_target),
                     -jnp.inf)
@@ -3908,8 +3850,8 @@ def _make_sharded_srw_minimal_impl(
                         (trace_amplitude_bits, jax.lax.bitcast_convert_type(
                             amplitude_target.astype(jnp.bfloat16),
                             jnp.uint16)),
-                        (trace_execution_weight, execution_target),
-                        (trace_admission, admission_target),
+                        (trace_gate_weight, gate_target),
+                        (trace_gate, gate_target),
                         (trace_margin, margin_target),
                         (trace_rho, rho_target),
                     ))
@@ -3925,7 +3867,7 @@ def _make_sharded_srw_minimal_impl(
                 selected_match = _analysis_sorted_operator_membership(
                     global_ids, selected_ids)
                 selected_execution = jnp.where(
-                    selected_match & valid_target, execution_target,
+                    selected_match & valid_target, gate_target,
                     jnp.float32(0.0))
                 selected_amplitude = (
                     selected_execution * xr_target.astype(jnp.float32))
@@ -3985,7 +3927,7 @@ def _make_sharded_srw_minimal_impl(
             jax.lax.psum(
                 valid_padded.astype(jnp.float32).sum(), 'model'))
         gate_den = _composition_den(
-            global_gate_mass, _admission_den_power,
+            global_gate_mass, _gate_den_power,
             _srw_composition_mode)
         active_n_mean = global_active_count.mean()
         active_frac = active_n_mean / jnp.maximum(global_operator_count, 1.0)
@@ -4019,7 +3961,7 @@ def _make_sharded_srw_minimal_impl(
         raw_out_global = jax.lax.psum(
             jax.lax.stop_gradient(raw_out).astype(jnp.bfloat16), 'model'
         ).astype(jnp.float32)
-        admission_mass_max = global_gate_mass.max()
+        gate_mass_max = global_gate_mass.max()
         composition_den_min = gate_den.min()
         composition_den_max = gate_den.max()
         raw_srw_out_norm = jnp.linalg.norm(
@@ -4037,7 +3979,7 @@ def _make_sharded_srw_minimal_impl(
             jax.lax.stop_gradient(top1_gate_frac_mean.astype(jnp.float32)),
             jax.lax.stop_gradient(den_floor_frac.astype(jnp.float32)),
             jax.lax.stop_gradient(tau_mean.astype(jnp.float32)),
-            jax.lax.stop_gradient(admission_mass_max.astype(jnp.float32)),
+            jax.lax.stop_gradient(gate_mass_max.astype(jnp.float32)),
             jax.lax.stop_gradient(composition_den_min.astype(jnp.float32)),
             jax.lax.stop_gradient(composition_den_max.astype(jnp.float32)),
             jax.lax.stop_gradient(raw_srw_out_norm.astype(jnp.float32)),
@@ -4048,8 +3990,8 @@ def _make_sharded_srw_minimal_impl(
             return base_result
 
         (trace_score, trace_ids, trace_read_bits,
-         trace_amplitude_bits, trace_execution_weight,
-         trace_admission, trace_margin, trace_rho,
+         trace_amplitude_bits, trace_gate_weight,
+         trace_gate, trace_margin, trace_rho,
          trace_numerator_count, trace_denominator_count,
          trace_selected_raw) = scan_carry[7:]
 
@@ -4062,10 +4004,10 @@ def _make_sharded_srw_minimal_impl(
             gathered_score, _trajectory_capture_width)
         gathered_fields = tuple(gather_model_axis(value) for value in (
             trace_ids, trace_read_bits, trace_amplitude_bits,
-            trace_execution_weight, trace_admission, trace_margin,
+            trace_gate_weight, trace_gate, trace_margin,
             trace_rho))
         (global_ids, global_read_bits, global_amplitude_bits,
-         global_execution_weight, global_admission, global_margin,
+         global_gate_weight, global_gate, global_margin,
          global_rho) = tuple(jnp.take_along_axis(
              value, global_index, axis=-1) for value in gathered_fields)
         global_valid = (
@@ -4080,7 +4022,7 @@ def _make_sharded_srw_minimal_impl(
         trace_position = jnp.clip(trajectory_positions, 0, S - 1)
         denominator_target = gate_den[
             trace_batch, trace_position, :]
-        admission_mass_target = global_gate_mass[
+        gate_mass_target = global_gate_mass[
             trace_batch, trace_position, :]
         production_target = out[
             trace_batch, trace_position, :].astype(jnp.float32)
@@ -4106,7 +4048,7 @@ def _make_sharded_srw_minimal_impl(
             jnp.where(valid_vector, replay_precast_target, 0.0),
             jnp.where(valid_vector, query_target, 0.0),
             jnp.where(valid_vector, tau_target, 0.0),
-            jnp.where(valid_vector, admission_mass_target, 0.0),
+            jnp.where(valid_vector, gate_mass_target, 0.0),
             jnp.where(valid_vector, denominator_target, 0.0),
             jnp.where(trajectory_position_valid, global_numerator_count, 0),
             jnp.where(trajectory_position_valid, global_denominator_count, 0),
@@ -4114,8 +4056,8 @@ def _make_sharded_srw_minimal_impl(
             global_valid,
             jnp.where(global_valid, global_read_bits, jnp.uint16(0)),
             jnp.where(global_valid, global_amplitude_bits, jnp.uint16(0)),
-            jnp.where(global_valid, global_execution_weight, 0.0),
-            jnp.where(global_valid, global_admission, 0.0),
+            jnp.where(global_valid, global_gate_weight, 0.0),
+            jnp.where(global_valid, global_gate, 0.0),
             jnp.where(global_valid, global_margin, 0.0),
             jnp.where(global_valid, global_rho, 0.0),
             trajectory_position_valid,
@@ -4125,7 +4067,7 @@ def _make_sharded_srw_minimal_impl(
     common_in_specs = (
         P('data', None, None), P('data', None, None), P('model', None),
         P('data', None, None), P('model', None), P('model', None),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P())
     out_specs = (
         P('data', None, None), P(), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P(), P('data', None))
@@ -4138,14 +4080,14 @@ def _make_sharded_srw_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local,
             position_mask, retention_mode):
         return _sharded_srw_minimal_core(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local,
             position_mask, retention_mode)
 
@@ -4173,7 +4115,7 @@ def _make_sharded_srw_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, trajectory_positions,
+            trajectory_positions,
             trajectory_position_valid, trajectory_selected_ids,
             trajectory_selected_valid):
         batch_size = x.shape[0]
@@ -4182,7 +4124,7 @@ def _make_sharded_srw_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps,
+
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.bool_(False),
@@ -4198,13 +4140,13 @@ def _make_sharded_srw_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps):
+            ):
         batch_size = x.shape[0]
         return canonical_single_kernel(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps,
+
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.bool_(False),
@@ -4216,7 +4158,7 @@ def _make_sharded_srw_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local=None,
             position_mask=None, retention_mode=0):
         if retain_mask_local is None:
@@ -4228,7 +4170,7 @@ def _make_sharded_srw_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, retain_mask_local,
             position_mask, retention_mode)
 
@@ -4237,7 +4179,7 @@ def _make_sharded_srw_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, trajectory_positions,
+            trajectory_positions,
             trajectory_position_valid, trajectory_selected_ids,
             trajectory_selected_valid):
         return canonical_single_trajectory_kernel(
@@ -4245,7 +4187,7 @@ def _make_sharded_srw_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, trajectory_positions,
+            trajectory_positions,
             trajectory_position_valid, trajectory_selected_ids,
             trajectory_selected_valid)
 
@@ -4254,20 +4196,20 @@ def _make_sharded_srw_minimal_impl(
             fused_gate_srw_minimal,
             fused_gate_srw_suppression_minimal,
             fused_gate_srw_trajectory_minimal):
-        _mark_v4171_srw_factory_output(
-            wrapper, admission_den_power, _srw_composition_mode,
+        _mark_v4172_srw_factory_output(
+            wrapper, gate_den_power, _srw_composition_mode,
             heat_kernel_beta)
-        wrapper._v4171_canonical_shard_map_kernel = canonical_single_kernel
-        wrapper._v4171_canonical_factory_token = factory_token
-    fused_gate_srw_trajectory_minimal._v4171_trajectory_shard_map_kernel = (
+        wrapper._v4172_canonical_shard_map_kernel = canonical_single_kernel
+        wrapper._v4172_canonical_factory_token = factory_token
+    fused_gate_srw_trajectory_minimal._v4172_trajectory_shard_map_kernel = (
         canonical_single_trajectory_kernel)
-    fused_gate_srw_trajectory_minimal._v4171_trajectory_capture_width = (
+    fused_gate_srw_trajectory_minimal._v4172_trajectory_capture_width = (
         _trajectory_capture_width)
-    fused_gate_srw_minimal._v4171_suppression_wrapper = (
+    fused_gate_srw_minimal._v4172_suppression_wrapper = (
         fused_gate_srw_suppression_minimal)
-    fused_gate_srw_suppression_minimal._v4171_production_wrapper = (
+    fused_gate_srw_suppression_minimal._v4172_production_wrapper = (
         fused_gate_srw_minimal)
-    fused_gate_srw_trajectory_minimal._v4171_production_wrapper = (
+    fused_gate_srw_trajectory_minimal._v4172_production_wrapper = (
         fused_gate_srw_minimal)
     return (fused_gate_srw_minimal, fused_gate_srw_suppression_minimal,
             fused_gate_srw_trajectory_minimal)
@@ -4276,112 +4218,112 @@ def _make_sharded_srw_minimal_impl(
 def make_sharded_srw_minimal(mesh, max_chunk_size=2048,
                              dead_exposure_target=0.1,
                              soft_gate_effective_active_eps=1.0e-6,
-                             admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                             admission_den_grad_scale=1.0,
+                             gate_den_power=DEFAULT_GATE_DEN_POWER,
+                             gate_den_grad_scale=1.0,
                              srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                              heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the lean production single-route training kernel."""
-    return _cached_v4171_minimal_bundle(
+    return _cached_v4172_minimal_bundle(
         "single_production", _make_sharded_srw_training_fast_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)
 
 
 def make_sharded_srw_diagnostics_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the production-equivalent observational single-route kernel."""
-    return _cached_v4171_minimal_bundle(
+    return _cached_v4172_minimal_bundle(
         "single_production_diagnostics",
         _make_sharded_srw_production_diagnostics_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)
 
 
 def make_sharded_srw_retention_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the analysis-only dynamic retention/parity kernel."""
-    kernel = _cached_v4171_minimal_bundle(
+    kernel = _cached_v4172_minimal_bundle(
         "single_retention", _make_sharded_srw_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)[0]
-    kernel._v4171_kernel_profile = "retention"
+    kernel._v4172_kernel_profile = "retention"
     return kernel
 
 
 def make_sharded_srw_suppression_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the analysis-only exact execution-suppression kernel."""
-    kernel = _cached_v4171_minimal_bundle(
+    kernel = _cached_v4172_minimal_bundle(
         "single_suppression", _make_sharded_srw_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)[1]
-    kernel._v4171_kernel_profile = "suppression"
+    kernel._v4172_kernel_profile = "suppression"
     return kernel
 
 
 def make_sharded_srw_trajectory_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
         trajectory_capture_width=1024):
     """Create the analysis-only exact active-operator trace kernel."""
     if int(trajectory_capture_width) <= 0:
         raise ValueError("trajectory_capture_width must be positive")
-    kernel = _cached_v4171_minimal_bundle(
+    kernel = _cached_v4172_minimal_bundle(
         "single_trajectory", _make_sharded_srw_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta, int(trajectory_capture_width))[2]
-    kernel._v4171_kernel_profile = "trajectory"
-    kernel._v4171_production_wrapper._v4171_kernel_profile = "trajectory"
+    kernel._v4172_kernel_profile = "trajectory"
+    kernel._v4172_production_wrapper._v4172_kernel_profile = "trajectory"
     return kernel
 
 
 def _make_sharded_srw_paired_training_fast_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Build the lean production paired Q/K training executable."""
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_paired_minimal"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale,
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale,
         context="make_sharded_srw_paired_minimal")
     del dead_exposure_target
-    den_power = jnp.float32(admission_den_power)
+    den_power = jnp.float32(gate_den_power)
     effective_active_eps = jnp.float32(soft_gate_effective_active_eps)
     composition_mode = srw_composition_mode
     beta = jnp.float32(heat_kernel_beta)
@@ -4391,7 +4333,7 @@ def _make_sharded_srw_paired_training_fast_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps):
+            ):
         del soft_gate_t_final, soft_gate_boundary_power_final
         n_local = operator_keys_local.shape[0]
         chunk_size = min(int(max_chunk_size), int(n_local))
@@ -4440,26 +4382,22 @@ def _make_sharded_srw_paired_training_fast_minimal_impl(
                 'bsrd,nd->bsrn', operator_query_unit_bf,
                 operator_keys).astype(jnp.float32)
             rho_compute = jnp.where(valid_mask, rho_raw, tau)
-            _, admission, _, execution_weight, _ = _compute_admission_drive(
-                rho_compute, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            _, gate_weight, _, _ = _compute_gate_weight(
+                rho_compute, tau,
                 srw_composition_mode=composition_mode,
                 heat_kernel_beta=beta)
-            admission = jnp.where(valid_mask, admission, 0.0)
-            execution_weight = jnp.where(
-                valid_mask, execution_weight, 0.0)
+            gate_weight = jnp.where(
+                valid_mask, gate_weight, 0.0)
             read_value = x_bf @ read_chunk.T
             amplitude = (
-                execution_weight
+                gate_weight
                 * read_value.astype(jnp.float32)[:, :, None, :])
             chunk_out = jnp.einsum(
                 'bsrn,nd->bsrd', amplitude.astype(jnp.bfloat16),
                 write_chunk).astype(jnp.float32)
             return (
                 raw_out + chunk_out,
-                total_gate_mass + admission.sum(axis=-1, keepdims=True),
+                total_gate_mass + gate_weight.sum(axis=-1, keepdims=True),
             ), None
 
         route_shape = (batch_size, sequence_length, 2, 1)
@@ -4482,35 +4420,35 @@ def _make_sharded_srw_paired_training_fast_minimal_impl(
     common_in_specs = (
         P('data', None, None), P('data', None, None, None), P('model', None),
         P('data', None, None, None), P('model', None), P('model', None),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P())
     training_kernel = shard_map(
         training_core, mesh=mesh, in_specs=common_in_specs,
         out_specs=P('data', None, None, None), check_rep=False)
-    _mark_v4171_srw_factory_output(
-        training_kernel, admission_den_power, composition_mode,
+    _mark_v4172_srw_factory_output(
+        training_kernel, gate_den_power, composition_mode,
         heat_kernel_beta)
-    training_kernel._v4171_kernel_profile = "production"
-    training_kernel._v4171_production_shard_map_kernel = training_kernel
+    training_kernel._v4172_kernel_profile = "production"
+    training_kernel._v4172_production_shard_map_kernel = training_kernel
     return training_kernel
 
 
 def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Build the observational production paired Q/K executable."""
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_paired_minimal"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale,
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale,
         context="make_sharded_srw_paired_minimal")
-    _admission_den_power = jnp.float32(admission_den_power)
+    _gate_den_power = jnp.float32(gate_den_power)
     _srw_composition_mode = srw_composition_mode
     _heat_kernel_beta = jnp.float32(heat_kernel_beta)
     _composition_floor_mass = jnp.float32(
@@ -4524,7 +4462,7 @@ def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps):
+            ):
         del soft_gate_t_final, soft_gate_boundary_power_final
         n_local = operator_keys_local.shape[0]
         chunk_size = min(int(max_chunk_size), int(n_local))
@@ -4575,38 +4513,33 @@ def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
                 'bsrd,nd->bsrn', operator_query_unit_bf,
                 operator_keys).astype(jnp.float32)
             rho_compute = jnp.where(valid_mask, rho_raw, tau)
-            (margin, admission, angular_amplitude, execution_weight,
-             _) = _compute_admission_drive(
-                rho_compute, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            (margin, gate_weight, angular_amplitude, _) = _compute_gate_weight(
+                rho_compute, tau,
                 srw_composition_mode=_srw_composition_mode,
                 heat_kernel_beta=_heat_kernel_beta)
-            admission = jnp.where(valid_mask, admission, 0.0)
             angular_amplitude = jnp.where(
                 valid_mask, angular_amplitude, 0.0)
-            execution_weight = jnp.where(
-                valid_mask, execution_weight, 0.0)
+            gate_weight = jnp.where(
+                valid_mask, gate_weight, 0.0)
             active_count = (
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32).sum(axis=-1, keepdims=True))
             read_value = x_bf @ read_chunk.T
             amplitude = (
-                execution_weight
+                gate_weight
                 * read_value.astype(jnp.float32)[:, :, None, :])
             chunk_out = jnp.einsum(
                 'bsrn,nd->bsrd', amplitude.astype(jnp.bfloat16),
                 write_chunk).astype(jnp.float32)
-            chunk_gate_mass = admission.sum(axis=-1, keepdims=True)
+            chunk_gate_mass = gate_weight.sum(axis=-1, keepdims=True)
             return (
                 raw_out + chunk_out,
                 total_gate_mass + chunk_gate_mass,
-                total_gate_sq + jnp.square(admission).sum(
+                total_gate_sq + jnp.square(gate_weight).sum(
                     axis=-1, keepdims=True),
                 jnp.maximum(
                     total_gate_max,
-                    admission.max(axis=-1, keepdims=True)),
+                    gate_weight.max(axis=-1, keepdims=True)),
                 total_active_count + active_count,
                 total_angular_amplitude + angular_amplitude.sum(
                     axis=-1, keepdims=True),
@@ -4644,7 +4577,7 @@ def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
             return value[:, :, route_index, :].mean()
 
         gate_den = _composition_den(
-            global_gate_mass, _admission_den_power,
+            global_gate_mass, _gate_den_power,
             _srw_composition_mode)
         depth_active = jnp.where(
             global_active_count > 0.0,
@@ -4736,7 +4669,7 @@ def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
     common_in_specs = (
         P('data', None, None), P('data', None, None, None), P('model', None),
         P('data', None, None, None), P('model', None), P('model', None),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P())
     out_specs = (
         P('data', None, None, None), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
@@ -4744,31 +4677,31 @@ def _make_sharded_srw_paired_production_diagnostics_minimal_impl(
     production_kernel = shard_map(
         production_core, mesh=mesh, in_specs=common_in_specs,
         out_specs=out_specs, check_rep=False)
-    _mark_v4171_srw_factory_output(
-        production_kernel, admission_den_power, _srw_composition_mode,
+    _mark_v4172_srw_factory_output(
+        production_kernel, gate_den_power, _srw_composition_mode,
         heat_kernel_beta)
-    production_kernel._v4171_kernel_profile = "production_diagnostics"
-    production_kernel._v4171_diagnostics_shard_map_kernel = production_kernel
+    production_kernel._v4172_kernel_profile = "production_diagnostics"
+    production_kernel._v4172_diagnostics_shard_map_kernel = production_kernel
     return production_kernel
 
 
 def _make_sharded_srw_paired_minimal_impl(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
         trajectory_capture_width=0):
     """Build analysis-only paired retention, suppression, and trace wrappers."""
-    srw_composition_mode, admission_den_power, heat_kernel_beta = (
-        _validate_v4171_composition_settings(
-            srw_composition_mode, admission_den_power,
+    srw_composition_mode, gate_den_power, heat_kernel_beta = (
+        _validate_v4172_composition_settings(
+            srw_composition_mode, gate_den_power,
             heat_kernel_beta,
             context="make_sharded_srw_paired_minimal"))
-    _validate_v4171_admission_den_grad_scale(
-        admission_den_grad_scale, context="make_sharded_srw_paired_minimal")
-    _admission_den_power = jnp.float32(admission_den_power)
+    _validate_v4172_gate_den_grad_scale(
+        gate_den_grad_scale, context="make_sharded_srw_paired_minimal")
+    _gate_den_power = jnp.float32(gate_den_power)
     _srw_composition_mode = srw_composition_mode
     _heat_kernel_beta = jnp.float32(heat_kernel_beta)
     _composition_floor_mass = jnp.float32(
@@ -4784,7 +4717,7 @@ def _make_sharded_srw_paired_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
             retain_mask_local, position_mask, retention_mode, *,
             capture_trajectory=False, trajectory_positions=None,
@@ -4868,23 +4801,18 @@ def _make_sharded_srw_paired_minimal_impl(
             return ec, rc, wc, vc
 
         def angular_compose_parts(rho, valid_mask):
-            (margin, admission, angular_amplitude, execution_weight,
-             _) = _compute_admission_drive(
-                rho, tau, soft_gate_temperature,
-                boundary_power=soft_gate_boundary_power,
-                effective_active_eps=_soft_gate_effective_active_eps,
-                execution_prune_eps=execution_prune_eps,
+            (margin, gate_weight, angular_amplitude, _) = _compute_gate_weight(
+                rho, tau,
                 srw_composition_mode=_srw_composition_mode,
                 heat_kernel_beta=_heat_kernel_beta)
-            admission = jnp.where(valid_mask, admission, 0.0)
             angular_amplitude = jnp.where(
                 valid_mask, angular_amplitude, 0.0)
-            execution_weight = jnp.where(valid_mask, execution_weight, 0.0)
+            gate_weight = jnp.where(valid_mask, gate_weight, 0.0)
             active_count = (
                 ((margin > jnp.float32(0.0)) & valid_mask)
                 .astype(jnp.float32)
                 .sum(axis=-1, keepdims=True))
-            return (margin, admission, angular_amplitude, execution_weight,
+            return (margin, gate_weight, angular_amplitude, gate_weight,
                     active_count)
 
         @jax.checkpoint
@@ -4894,8 +4822,8 @@ def _make_sharded_srw_paired_minimal_impl(
              total_angular_amplitude, selected_raw_out) = carry[:7]
             if capture_trajectory:
                 (trace_score, trace_ids, trace_read_bits,
-                 trace_amplitude_bits, trace_execution_weight,
-                 trace_admission, trace_margin, trace_rho,
+                 trace_amplitude_bits, trace_gate_weight,
+                 trace_gate, trace_margin, trace_rho,
                  trace_numerator_count, trace_denominator_count,
                  trace_selected_raw) = carry[7:]
             s = i * cs
@@ -4903,7 +4831,7 @@ def _make_sharded_srw_paired_minimal_impl(
             valid_bsrn = valid_chunk[None, None, None, :]
             rho_raw = operator_scores_from_keys(operator_keys)
             rho_compute = jnp.where(valid_bsrn, rho_raw, tau)
-            (margin, admission, angular_amplitude, execution_weight,
+            (margin, gate_for_denominator, angular_amplitude, gate_weight,
              chunk_active_count) = angular_compose_parts(
                 rho_compute, valid_bsrn)
             global_ids = global_start + s + jnp.arange(cs, dtype=jnp.int32)
@@ -4946,19 +4874,19 @@ def _make_sharded_srw_paired_minimal_impl(
             autonomous_retention = (
                 (retention_mode == jnp.int32(2)) & route_has_removal)
             numerator_keep = (~retention_enabled) | effective_keep
-            execution_for_numerator = jnp.where(
+            gate_for_numerator = jnp.where(
                 suppress_mask | ~numerator_keep,
-                jnp.float32(0.0), execution_weight)
+                jnp.float32(0.0), gate_weight)
             restoration_enabled = (
                 (retention_mode == jnp.int32(3)) & route_has_removal)
             restoration_execution = jnp.where(
                 restoration_enabled & ~effective_keep,
-                execution_weight, jnp.float32(0.0))
-            admission_for_den = jnp.where(
+                gate_weight, jnp.float32(0.0))
+            gate_for_den = jnp.where(
                 autonomous_retention & ~effective_keep,
-                jnp.float32(0.0), admission)
+                jnp.float32(0.0), gate_for_denominator)
             xr = x_bf @ rc.T
-            a = execution_for_numerator * xr.astype(jnp.float32)[:, :, None, :]
+            a = gate_for_numerator * xr.astype(jnp.float32)[:, :, None, :]
             c_out = jnp.einsum(
                 'bsrn,nd->bsrd',
                 a.astype(jnp.bfloat16),
@@ -4985,16 +4913,16 @@ def _make_sharded_srw_paired_minimal_impl(
             c_out = c_out + restoration_c_out
             selected_execution = jnp.where(
                 token_match & operator_match & route_match & valid_bsrn,
-                execution_weight, jnp.float32(0.0))
+                gate_weight, jnp.float32(0.0))
             selected_a = (
                 selected_execution * xr.astype(jnp.float32)[:, :, None, :])
             selected_c_out = jnp.einsum(
                 'bsrn,nd->bsrd', selected_a.astype(jnp.bfloat16),
                 wc).astype(jnp.float32)
-            chunk_gate_mass = admission_for_den.sum(axis=-1, keepdims=True)
-            chunk_gate_sq = jnp.square(admission_for_den).sum(
+            chunk_gate_mass = gate_for_den.sum(axis=-1, keepdims=True)
+            chunk_gate_sq = jnp.square(gate_for_den).sum(
                 axis=-1, keepdims=True)
-            chunk_gate_max = admission_for_den.max(axis=-1, keepdims=True)
+            chunk_gate_max = gate_for_den.max(axis=-1, keepdims=True)
             next_carry = (
                 raw_out + c_out,
                 total_gate_mass + chunk_gate_mass,
@@ -5014,19 +4942,19 @@ def _make_sharded_srw_paired_minimal_impl(
 
                 rho_target = gather_target(rho_compute)
                 margin_target = gather_target(margin)
-                admission_target = gather_target(admission)
-                execution_target = gather_target(execution_weight)
+                gate_target = gather_target(gate_for_denominator)
+                gate_target = gather_target(gate_weight)
                 xr_target = gather_target(xr)[:, :, None, :]
                 amplitude_target = (
-                    execution_target * xr_target.astype(jnp.float32))
+                    gate_target * xr_target.astype(jnp.float32))
                 target_valid = trajectory_position_valid[:, :, None, None]
                 valid_target = (
                     valid_chunk[None, None, None, :] & target_valid)
                 numerator_active = (
                     valid_target
-                    & (execution_target != jnp.float32(0.0)))
+                    & (gate_target != jnp.float32(0.0)))
                 denominator_active = (
-                    valid_target & (admission_target != jnp.float32(0.0)))
+                    valid_target & (gate_target != jnp.float32(0.0)))
                 chunk_score = jnp.where(
                     numerator_active, jnp.abs(amplitude_target), -jnp.inf)
                 chunk_ids = jnp.broadcast_to(
@@ -5043,8 +4971,8 @@ def _make_sharded_srw_paired_minimal_impl(
                         (trace_amplitude_bits, jax.lax.bitcast_convert_type(
                             amplitude_target.astype(jnp.bfloat16),
                             jnp.uint16)),
-                        (trace_execution_weight, execution_target),
-                        (trace_admission, admission_target),
+                        (trace_gate_weight, gate_target),
+                        (trace_gate, gate_target),
                         (trace_margin, margin_target),
                         (trace_rho, rho_target),
                     ))
@@ -5064,7 +4992,7 @@ def _make_sharded_srw_paired_minimal_impl(
                         global_ids, selected_ids[:, :, 1, :]),
                 ), axis=2)
                 selected_execution = jnp.where(
-                    selected_match & valid_target, execution_target,
+                    selected_match & valid_target, gate_target,
                     jnp.float32(0.0))
                 selected_amplitude = (
                     selected_execution * xr_target.astype(jnp.float32))
@@ -5129,7 +5057,7 @@ def _make_sharded_srw_paired_minimal_impl(
             return value[:, :, route_index, :].mean()
 
         gate_den = _composition_den(
-            global_gate_mass, _admission_den_power,
+            global_gate_mass, _gate_den_power,
             _srw_composition_mode)
         depth_active = jnp.where(
             global_active_count > 0.0,
@@ -5225,8 +5153,8 @@ def _make_sharded_srw_paired_minimal_impl(
             return base_result
 
         (trace_score, trace_ids, trace_read_bits,
-         trace_amplitude_bits, trace_execution_weight,
-         trace_admission, trace_margin, trace_rho,
+         trace_amplitude_bits, trace_gate_weight,
+         trace_gate, trace_margin, trace_rho,
          trace_numerator_count, trace_denominator_count,
          trace_selected_raw) = scan_carry[7:]
 
@@ -5239,10 +5167,10 @@ def _make_sharded_srw_paired_minimal_impl(
             gathered_score, _trajectory_capture_width)
         gathered_fields = tuple(gather_model_axis(value) for value in (
             trace_ids, trace_read_bits, trace_amplitude_bits,
-            trace_execution_weight, trace_admission, trace_margin,
+            trace_gate_weight, trace_gate, trace_margin,
             trace_rho))
         (global_ids, global_read_bits, global_amplitude_bits,
-         global_execution_weight, global_admission, global_margin,
+         global_gate_weight, global_gate, global_margin,
          global_rho) = tuple(jnp.take_along_axis(
              value, global_index, axis=-1) for value in gathered_fields)
         global_valid = (
@@ -5257,7 +5185,7 @@ def _make_sharded_srw_paired_minimal_impl(
         trace_position = jnp.clip(trajectory_positions, 0, S - 1)
         denominator_target = gate_den[
             trace_batch, trace_position, :, :]
-        admission_mass_target = global_gate_mass[
+        gate_mass_target = global_gate_mass[
             trace_batch, trace_position, :, :]
         production_target = out[
             trace_batch, trace_position, :, :].astype(jnp.float32)
@@ -5283,7 +5211,7 @@ def _make_sharded_srw_paired_minimal_impl(
             jnp.where(valid_vector, replay_precast_target, 0.0),
             jnp.where(valid_vector, query_target, 0.0),
             jnp.where(valid_vector, tau_target, 0.0),
-            jnp.where(valid_vector, admission_mass_target, 0.0),
+            jnp.where(valid_vector, gate_mass_target, 0.0),
             jnp.where(valid_vector, denominator_target, 0.0),
             jnp.where(
                 trajectory_position_valid[:, :, None],
@@ -5295,8 +5223,8 @@ def _make_sharded_srw_paired_minimal_impl(
             global_valid,
             jnp.where(global_valid, global_read_bits, jnp.uint16(0)),
             jnp.where(global_valid, global_amplitude_bits, jnp.uint16(0)),
-            jnp.where(global_valid, global_execution_weight, 0.0),
-            jnp.where(global_valid, global_admission, 0.0),
+            jnp.where(global_valid, global_gate_weight, 0.0),
+            jnp.where(global_valid, global_gate, 0.0),
             jnp.where(global_valid, global_margin, 0.0),
             jnp.where(global_valid, global_rho, 0.0),
             trajectory_position_valid,
@@ -5306,7 +5234,7 @@ def _make_sharded_srw_paired_minimal_impl(
     common_in_specs = (
         P('data', None, None), P('data', None, None, None), P('model', None),
         P('data', None, None, None), P('model', None), P('model', None),
-        P(), P(), P(), P(), P())
+        P(), P(), P(), P())
     out_specs = (
         P('data', None, None, None), P(), P(), P(), P(), P(), P(), P(), P(),
         P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(), P(),
@@ -5321,14 +5249,14 @@ def _make_sharded_srw_paired_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
             retain_mask_local, position_mask, retention_mode):
         return _sharded_srw_paired_minimal_core(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
             retain_mask_local, position_mask, retention_mode)
 
@@ -5357,7 +5285,7 @@ def _make_sharded_srw_paired_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, trajectory_positions,
+            trajectory_positions,
             trajectory_position_valid, trajectory_selected_ids,
             trajectory_selected_valid):
         batch_size = x.shape[0]
@@ -5366,7 +5294,7 @@ def _make_sharded_srw_paired_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps,
+
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.bool_(False), jnp.int32(-1),
@@ -5383,13 +5311,13 @@ def _make_sharded_srw_paired_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps):
+            ):
         batch_size = x.shape[0]
         return canonical_paired_kernel(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps,
+
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.full((batch_size,), -1, dtype=jnp.int32),
             jnp.bool_(False), jnp.int32(-1),
@@ -5400,7 +5328,7 @@ def _make_sharded_srw_paired_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
             retain_mask_local=None, position_mask=None, retention_mode=0):
         if retain_mask_local is None:
@@ -5412,7 +5340,7 @@ def _make_sharded_srw_paired_minimal_impl(
             x, operator_query, operator_keys_local, raw_tau, read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, selected_global_operator_id,
+            selected_global_operator_id,
             target_positions, apply_suppression, route_selector,
             retain_mask_local, position_mask, retention_mode)
 
@@ -5421,7 +5349,7 @@ def _make_sharded_srw_paired_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, trajectory_positions,
+            trajectory_positions,
             trajectory_position_valid, trajectory_selected_ids,
             trajectory_selected_valid):
         return canonical_paired_trajectory_kernel(
@@ -5429,7 +5357,7 @@ def _make_sharded_srw_paired_minimal_impl(
             read_vectors_local, write_vectors_local,
             soft_gate_temperature, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, trajectory_positions,
+            trajectory_positions,
             trajectory_position_valid, trajectory_selected_ids,
             trajectory_selected_valid)
 
@@ -5438,20 +5366,20 @@ def _make_sharded_srw_paired_minimal_impl(
             fused_gate_srw_paired_minimal,
             fused_gate_srw_paired_suppression_minimal,
             fused_gate_srw_paired_trajectory_minimal):
-        _mark_v4171_srw_factory_output(
-            wrapper, admission_den_power, _srw_composition_mode,
+        _mark_v4172_srw_factory_output(
+            wrapper, gate_den_power, _srw_composition_mode,
             heat_kernel_beta)
-        wrapper._v4171_canonical_shard_map_kernel = canonical_paired_kernel
-        wrapper._v4171_canonical_factory_token = factory_token
-    fused_gate_srw_paired_trajectory_minimal._v4171_trajectory_shard_map_kernel = (
+        wrapper._v4172_canonical_shard_map_kernel = canonical_paired_kernel
+        wrapper._v4172_canonical_factory_token = factory_token
+    fused_gate_srw_paired_trajectory_minimal._v4172_trajectory_shard_map_kernel = (
         canonical_paired_trajectory_kernel)
-    fused_gate_srw_paired_trajectory_minimal._v4171_trajectory_capture_width = (
+    fused_gate_srw_paired_trajectory_minimal._v4172_trajectory_capture_width = (
         _trajectory_capture_width)
-    fused_gate_srw_paired_minimal._v4171_suppression_wrapper = (
+    fused_gate_srw_paired_minimal._v4172_suppression_wrapper = (
         fused_gate_srw_paired_suppression_minimal)
-    fused_gate_srw_paired_suppression_minimal._v4171_production_wrapper = (
+    fused_gate_srw_paired_suppression_minimal._v4172_production_wrapper = (
         fused_gate_srw_paired_minimal)
-    fused_gate_srw_paired_trajectory_minimal._v4171_production_wrapper = (
+    fused_gate_srw_paired_trajectory_minimal._v4172_production_wrapper = (
         fused_gate_srw_paired_minimal)
     return (fused_gate_srw_paired_minimal,
             fused_gate_srw_paired_suppression_minimal,
@@ -5461,92 +5389,92 @@ def _make_sharded_srw_paired_minimal_impl(
 def make_sharded_srw_paired_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the lean production paired attention_q/attention_k kernel."""
-    return _cached_v4171_minimal_bundle(
+    return _cached_v4172_minimal_bundle(
         "paired_production",
         _make_sharded_srw_paired_training_fast_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)
 
 
 def make_sharded_srw_paired_diagnostics_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the production-equivalent observational paired Q/K kernel."""
-    return _cached_v4171_minimal_bundle(
+    return _cached_v4172_minimal_bundle(
         "paired_production_diagnostics",
         _make_sharded_srw_paired_production_diagnostics_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)
 
 
 def make_sharded_srw_paired_retention_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the analysis-only paired Q/K retention/parity kernel."""
-    kernel = _cached_v4171_minimal_bundle(
+    kernel = _cached_v4172_minimal_bundle(
         "paired_retention", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)[0]
-    kernel._v4171_kernel_profile = "retention"
+    kernel._v4172_kernel_profile = "retention"
     return kernel
 
 
 def make_sharded_srw_paired_suppression_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
     """Create the analysis-only route-selective attention_q/attention_k suppression kernel."""
-    kernel = _cached_v4171_minimal_bundle(
+    kernel = _cached_v4172_minimal_bundle(
         "paired_suppression", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta)[1]
-    kernel._v4171_kernel_profile = "suppression"
+    kernel._v4172_kernel_profile = "suppression"
     return kernel
 
 
 def make_sharded_srw_paired_trajectory_minimal(
         mesh, max_chunk_size=2048, dead_exposure_target=0.1,
         soft_gate_effective_active_eps=1.0e-6,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        admission_den_grad_scale=1.0,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        gate_den_grad_scale=1.0,
         srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
         heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA,
         trajectory_capture_width=1024):
     """Create the analysis-only exact Q/K active-operator trace kernel."""
     if int(trajectory_capture_width) <= 0:
         raise ValueError("trajectory_capture_width must be positive")
-    kernel = _cached_v4171_minimal_bundle(
+    kernel = _cached_v4172_minimal_bundle(
         "paired_trajectory", _make_sharded_srw_paired_minimal_impl,
         mesh, max_chunk_size, dead_exposure_target,
-        soft_gate_effective_active_eps, admission_den_power,
-        admission_den_grad_scale, srw_composition_mode,
+        soft_gate_effective_active_eps, gate_den_power,
+        gate_den_grad_scale, srw_composition_mode,
         heat_kernel_beta, int(trajectory_capture_width))[2]
-    kernel._v4171_kernel_profile = "trajectory"
-    kernel._v4171_production_wrapper._v4171_kernel_profile = "trajectory"
+    kernel._v4172_kernel_profile = "trajectory"
+    kernel._v4172_production_wrapper._v4172_kernel_profile = "trajectory"
     return kernel
 
 
@@ -5570,7 +5498,7 @@ class NeuronPool(nn.Module):
             self.operator_key_mode, context="NeuronPool")
         if d_route <= 0:
             raise ValueError(
-                f"v4171 model.d_route must be > 0, got {d_route}")
+                f"v4172 model.d_route must be > 0, got {d_route}")
         n_rst_eff = self.n_rst if self.n_rst is not None else self.n_know
         if n_rst_eff is None:
             raise ValueError("NeuronPool requires n_rst or n_know checkpoint alias.")
@@ -5619,7 +5547,7 @@ class Router(nn.Module):
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Checkpoint/config alias for rst pool size.
     router_dropout: float = 0.1
-    # Constructor receives cosine-space tau values. The train driver may use
+    # Constructor receives cosine-space tau values. The training loop may use
     # safe placeholders before one-time quantile calibration.
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
@@ -5640,7 +5568,7 @@ class Router(nn.Module):
         ]
         if missing_tau:
             raise ValueError(
-                "v417x requires explicit cosine-space tau_init_attn_qk/v/rst; "
+                "v4172 requires explicit cosine-space tau_init_attn_qk/v/rst; "
                 f"missing {', '.join(missing_tau)}.")
         qk_tau_init = float(self.tau_init_attn_qk)
         v_tau_init = float(self.tau_init_attn_v)
@@ -5678,14 +5606,14 @@ class Router(nn.Module):
 # ================================================================
 
 
-def _v4171_minimal_kernel_profile(sharded_fns, route_key):
+def _v4172_minimal_kernel_profile(sharded_fns, route_key):
     if not isinstance(sharded_fns, dict):
         return None
-    profile = sharded_fns.get('_v4171_kernel_profile')
+    profile = sharded_fns.get('_v4172_kernel_profile')
     if profile is not None:
         return str(profile)
     fn = sharded_fns.get(route_key)
-    return getattr(fn, '_v4171_kernel_profile', None)
+    return getattr(fn, '_v4172_kernel_profile', None)
 
 
 def _attn_forward_training_fast(
@@ -5696,10 +5624,10 @@ def _attn_forward_training_fast(
         soft_gate_T_qk=None, soft_gate_T_v=None,
         soft_gate_boundary_power=2.0,
         soft_gate_boundary_power_final=4.0,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        execution_prune_eps=0.0):
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        ):
     """Lean training attention graph returning only the residual update."""
-    del n_qk, n_v, admission_den_power
+    del n_qk, n_v, gate_den_power
     batch_size, sequence_length, d_hidden = x.shape
     soft_gate_T_qk = (
         soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
@@ -5712,7 +5640,7 @@ def _attn_forward_training_fast(
     fused_single_v = sharded_fns.get('attn_v_single_minimal')
     if fused_paired is None or fused_single_v is None:
         raise ValueError("training fast attention requires QK and V kernels")
-    if any(getattr(fn, '_v4171_kernel_profile', None) != 'production'
+    if any(getattr(fn, '_v4172_kernel_profile', None) != 'production'
            for fn in (fused_paired, fused_single_v)):
         raise ValueError("training fast attention received a non-production kernel")
 
@@ -5735,13 +5663,13 @@ def _attn_forward_training_fast(
         pool_params['attn_qk_read'], pool_params['attn_qk_write'],
         soft_gate_T_qk, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps)
+        )
     value_state = fused_single_v(
         x, v_query, pool_params['attn_v_op_key'], raw_tau[:, :, 2:3],
         pool_params['attn_v_read'], pool_params['attn_v_write'],
         soft_gate_T_v, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps)
+        )
     query = qk_state[:, :, 0, :] * qk_scale
     key = qk_state[:, :, 1, :] * qk_scale
     value = value_state * v_scale
@@ -5784,11 +5712,11 @@ def _attn_forward_production_diagnostics(
         soft_gate_T_qk=None, soft_gate_T_v=None,
         soft_gate_boundary_power=2.0,
         soft_gate_boundary_power_final=4.0,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        execution_prune_eps=0.0, parity_debug=False,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        parity_debug=False,
         **unused_analysis_kwargs):
     """Production-equivalent attention graph with observational metrics."""
-    del n_qk, n_v, admission_den_power, unused_analysis_kwargs
+    del n_qk, n_v, gate_den_power, unused_analysis_kwargs
     batch_size, sequence_length, d_hidden = x.shape
     soft_gate_T_qk = (
         soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
@@ -5808,7 +5736,7 @@ def _attn_forward_production_diagnostics(
     if fused_paired is None or fused_single_v is None:
         raise ValueError(
             "production minimal attention requires pure QK and V kernels")
-    if any(getattr(fn, '_v4171_kernel_profile', None)
+    if any(getattr(fn, '_v4172_kernel_profile', None)
            != 'production_diagnostics'
            for fn in (fused_paired, fused_single_v)):
         raise ValueError(
@@ -5836,7 +5764,7 @@ def _attn_forward_production_diagnostics(
         x, qk_operator_queries, qk_operator_keys, raw_tau_qk,
         qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps)
+        )
     (qk_state_transitions,
      q_active_frac, k_active_frac,
      q_active_n_mean, k_active_n_mean,
@@ -5847,7 +5775,7 @@ def _attn_forward_production_diagnostics(
      q_top1_gate_frac_mean, k_top1_gate_frac_mean,
      q_den_floor_frac, k_den_floor_frac,
      q_tau_mean, k_tau_mean,
-     q_admission_mass_max, k_admission_mass_max,
+     q_gate_mass_max, k_gate_mass_max,
      q_composition_den_min, k_composition_den_min,
      q_composition_den_max, k_composition_den_max,
      q_raw_srw_out_norm, k_raw_srw_out_norm,
@@ -5857,11 +5785,11 @@ def _attn_forward_production_diagnostics(
         x, v_operator_query, v_operator_keys, raw_tau_all[:, :, 2:3],
         v_read, v_write, soft_gate_T_v, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps)
+        )
     (attention_v, v_active_frac, v_active_n_mean,
      v_gate_mass_mean, v_gate_den_mean, v_depth_active_mean,
      v_gate_eff_n_mean, v_top1_gate_frac_mean, v_den_floor_frac,
-     v_tau_mean, v_admission_mass_max, v_composition_den_min,
+     v_tau_mean, v_gate_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm) = v_result
 
@@ -5903,8 +5831,8 @@ def _attn_forward_production_diagnostics(
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     attn_out_norm = jnp.linalg.norm(
         out.astype(jnp.float32), axis=-1).mean()
-    qk_admission_mass_max = jnp.maximum(
-        q_admission_mass_max, k_admission_mass_max)
+    qk_gate_mass_max = jnp.maximum(
+        q_gate_mass_max, k_gate_mass_max)
     qk_composition_den_min = jnp.minimum(
         q_composition_den_min, k_composition_den_min)
     qk_composition_den_max = jnp.maximum(
@@ -5928,11 +5856,11 @@ def _attn_forward_production_diagnostics(
         q_den_floor_frac, k_den_floor_frac, v_den_floor_frac,
         q_tau_mean, k_tau_mean, v_tau_mean,
         jax.lax.stop_gradient(attn_out_norm.astype(jnp.float32)),
-        qk_admission_mass_max,
+        qk_gate_mass_max,
         qk_composition_den_min, qk_composition_den_max,
         qk_raw_srw_out_norm, qk_normalized_srw_out_norm,
         qk_normalized_srw_out_norm * qk_scale,
-        v_admission_mass_max,
+        v_gate_mass_max,
         v_composition_den_min, v_composition_den_max,
         v_raw_srw_out_norm, v_normalized_srw_out_norm,
         v_normalized_srw_out_norm * v_scale,
@@ -5960,8 +5888,8 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
                           soft_gate_T_v=None,
                           soft_gate_boundary_power=2.0,
                           soft_gate_boundary_power_final=4.0,
-                          admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                          execution_prune_eps=0.0,
+                          gate_den_power=DEFAULT_GATE_DEN_POWER,
+
                           analysis_selected_operator_id=None,
                           analysis_layer_index=0,
                           analysis_target_layer=-1,
@@ -6000,9 +5928,9 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
                           analysis_trajectory_patch_enabled=None,
                           analysis_trajectory_patch_values=None,
                           parity_debug=False):
-    """Canonical shared v417x minimal attention path."""
+    """Canonical shared v4172 minimal attention path."""
     del n_qk, n_v
-    admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
+    gate_den_power = jnp.asarray(gate_den_power, dtype=jnp.float32)
     B, S, D = x.shape
     soft_gate_T_qk = (
         soft_gate_temperature if soft_gate_T_qk is None else soft_gate_T_qk)
@@ -6065,12 +5993,12 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
     else:
         fused_single_v, fused_paired = sharded_fns
     canonical_paired = getattr(
-        fused_paired, '_v4171_canonical_shard_map_kernel', None)
+        fused_paired, '_v4172_canonical_shard_map_kernel', None)
     canonical_single_v = getattr(
-        fused_single_v, '_v4171_canonical_shard_map_kernel', None)
+        fused_single_v, '_v4172_canonical_shard_map_kernel', None)
     if canonical_paired is None or canonical_single_v is None:
         raise ValueError(
-            "minimal attention requires canonical v4171 shard-map kernels")
+            "minimal attention requires canonical v4172 shard-map kernels")
     if analysis_trajectory_enabled and (
             trajectory_paired is None or trajectory_single_v is None):
         raise ValueError(
@@ -6118,7 +6046,7 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
             x, qk_operator_queries, qk_operator_keys, raw_tau_QK,
             qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, analysis_trajectory_positions,
+            analysis_trajectory_positions,
             analysis_trajectory_position_valid, qk_trajectory_ids,
             qk_trajectory_valid)
     else:
@@ -6126,7 +6054,7 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
             x, qk_operator_queries, qk_operator_keys, raw_tau_QK,
             qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, qk_selected_ids, qk_selected_positions,
+            qk_selected_ids, qk_selected_positions,
             qk_apply_suppression, qk_selected_route, analysis_keep_qk,
             analysis_position_mask, analysis_retention_mode)
     (qk_state_transitions,
@@ -6139,7 +6067,7 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
      q_top1_gate_frac_mean, k_top1_gate_frac_mean,
      q_den_floor_frac, k_den_floor_frac,
      q_tau_mean, k_tau_mean,
-     q_admission_mass_max, k_admission_mass_max,
+     q_gate_mass_max, k_gate_mass_max,
      q_composition_den_min, k_composition_den_min,
      q_composition_den_max, k_composition_den_max,
      q_raw_srw_out_norm, k_raw_srw_out_norm,
@@ -6179,7 +6107,7 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
             x, v_operator_query, v_operator_keys,
             raw_tau_all[:, :, 2:3], v_read, v_write,
             soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps,
+            soft_gate_boundary_power_final,
             analysis_trajectory_positions,
             analysis_trajectory_position_valid,
             analysis_trajectory_ids_v, analysis_trajectory_valid_v)
@@ -6188,14 +6116,14 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
             x, v_operator_query, v_operator_keys,
             raw_tau_all[:, :, 2:3], v_read, v_write,
             soft_gate_T_v, soft_gate_t_final, soft_gate_boundary_power,
-            soft_gate_boundary_power_final, execution_prune_eps,
+            soft_gate_boundary_power_final,
             v_selected_ids, v_selected_positions, v_apply_suppression,
             analysis_keep_v, analysis_position_mask,
             analysis_retention_mode)
     (attention_v, v_active_frac, v_active_n_mean, v_gate_mass_mean, v_gate_den_mean,
      v_depth_active_mean, v_gate_eff_n_mean, v_top1_gate_frac_mean,
      v_den_floor_frac, v_tau_mean,
-     v_admission_mass_max, v_composition_den_min,
+     v_gate_mass_max, v_composition_den_min,
      v_composition_den_max, v_raw_srw_out_norm,
      v_normalized_srw_out_norm, v_selected_target) = v_result
     if analysis_trajectory_enabled:
@@ -6235,7 +6163,7 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
             x, qk_operator_queries, qk_operator_keys, raw_tau_QK,
             qk_read, qk_write, soft_gate_T_qk, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, analysis_selected_operator_id,
+            analysis_selected_operator_id,
             analysis_target_positions, jnp.bool_(True), target_route,
             analysis_keep_qk, analysis_position_mask,
             analysis_retention_mode)[0]
@@ -6252,7 +6180,7 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
             raw_tau_all[:, :, 2:3], v_read, v_write,
             soft_gate_T_v, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, analysis_selected_operator_id,
+            analysis_selected_operator_id,
             analysis_target_positions, jnp.bool_(True), analysis_keep_v,
             analysis_position_mask, analysis_retention_mode)[0]
 
@@ -6430,8 +6358,8 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
     attn_out_norm = jnp.linalg.norm(out.astype(jnp.float32), axis=-1).mean()
-    qk_admission_mass_max = jnp.maximum(
-        q_admission_mass_max, k_admission_mass_max)
+    qk_gate_mass_max = jnp.maximum(
+        q_gate_mass_max, k_gate_mass_max)
     qk_composition_den_min = jnp.minimum(
         q_composition_den_min, k_composition_den_min)
     qk_composition_den_max = jnp.maximum(
@@ -6470,13 +6398,13 @@ def _attn_forward_analysis_minimal(x, pool_params, router_params, expand_O_kerne
         k_tau_mean,
         v_tau_mean,
         jax.lax.stop_gradient(attn_out_norm.astype(jnp.float32)),
-        qk_admission_mass_max,
+        qk_gate_mass_max,
         qk_composition_den_min,
         qk_composition_den_max,
         qk_raw_srw_out_norm,
         qk_normalized_srw_out_norm,
         qk_normalized_srw_out_norm * qk_scale,
-        v_admission_mass_max,
+        v_gate_mass_max,
         v_composition_den_min,
         v_composition_den_max,
         v_raw_srw_out_norm,
@@ -6513,10 +6441,10 @@ def _rst_forward_training_fast(
         soft_gate_temperature=0.07, soft_gate_t_final=0.07,
         soft_gate_T_rst=None, soft_gate_boundary_power=2.0,
         soft_gate_boundary_power_final=4.0,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        execution_prune_eps=0.0):
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        ):
     """Lean training RST graph returning only the residual update."""
-    del admission_den_power
+    del gate_den_power
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
@@ -6528,7 +6456,7 @@ def _rst_forward_training_fast(
     fused_single = sharded_fns.get('rst_single_minimal')
     if fused_single is None:
         raise ValueError("training fast RST requires the production kernel")
-    if getattr(fused_single, '_v4171_kernel_profile', None) != 'production':
+    if getattr(fused_single, '_v4172_kernel_profile', None) != 'production':
         raise ValueError("training fast RST received a non-production kernel")
     rng, rng_drop = jax.random.split(rng)
     operator_query = (
@@ -6545,7 +6473,7 @@ def _rst_forward_training_fast(
         pool_params['rst_read'], pool_params['rst_write'],
         soft_gate_T_rst, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps)
+        )
     out = out * rst_scale
     rng, rng_out = jax.random.split(rng)
     return safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -6558,11 +6486,11 @@ def _rst_forward_production_diagnostics(
         soft_gate_temperature=0.07, soft_gate_t_final=0.07,
         soft_gate_T_rst=None, soft_gate_boundary_power=2.0,
         soft_gate_boundary_power_final=4.0,
-        admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-        execution_prune_eps=0.0, parity_debug=False,
+        gate_den_power=DEFAULT_GATE_DEN_POWER,
+        parity_debug=False,
         **unused_analysis_kwargs):
     """Production-equivalent RST graph with observational metrics."""
-    del admission_den_power, unused_analysis_kwargs
+    del gate_den_power, unused_analysis_kwargs
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
@@ -6577,7 +6505,7 @@ def _rst_forward_production_diagnostics(
     fused_single = sharded_fns.get('rst_single_minimal')
     if fused_single is None:
         raise ValueError("production minimal RST requires the pure RST kernel")
-    if (getattr(fused_single, '_v4171_kernel_profile', None)
+    if (getattr(fused_single, '_v4172_kernel_profile', None)
             != 'production_diagnostics'):
         raise ValueError(
             "production diagnostics RST received the wrong kernel profile")
@@ -6596,11 +6524,11 @@ def _rst_forward_production_diagnostics(
         x, operator_query, rst_operator_keys, raw_tau,
         rst_read, rst_write, soft_gate_T_rst, soft_gate_t_final,
         soft_gate_boundary_power, soft_gate_boundary_power_final,
-        execution_prune_eps)
+        )
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
      rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
-     rst_admission_mass_max, rst_composition_den_min,
+     rst_gate_mass_max, rst_composition_den_min,
      rst_composition_den_max, rst_raw_srw_out_norm,
      rst_normalized_srw_out_norm) = result
     out = out * rst_scale
@@ -6617,7 +6545,7 @@ def _rst_forward_production_diagnostics(
         rst_depth_active_mean, rst_gate_eff_n_mean,
         rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
         jax.lax.stop_gradient(rst_out_norm.astype(jnp.float32)),
-        rst_admission_mass_max,
+        rst_gate_mass_max,
         rst_composition_den_min, rst_composition_den_max,
         rst_raw_srw_out_norm, rst_normalized_srw_out_norm,
         rst_normalized_srw_out_norm * rst_scale,
@@ -6637,8 +6565,8 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
                          soft_gate_T_rst=None,
                          soft_gate_boundary_power=2.0,
                          soft_gate_boundary_power_final=4.0,
-                         admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                         execution_prune_eps=0.0,
+                         gate_den_power=DEFAULT_GATE_DEN_POWER,
+
                          analysis_selected_operator_id=None,
                          analysis_layer_index=0,
                          analysis_target_layer=-1,
@@ -6668,8 +6596,8 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
                          analysis_trajectory_patch_enabled=None,
                          analysis_trajectory_patch_values=None,
                          parity_debug=False):
-    """Canonical shared v417x minimal RST path."""
-    admission_den_power = jnp.asarray(admission_den_power, dtype=jnp.float32)
+    """Canonical shared v4172 minimal RST path."""
+    gate_den_power = jnp.asarray(gate_den_power, dtype=jnp.float32)
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
@@ -6711,10 +6639,10 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
     else:
         fused_single, _ = sharded_fns
     canonical_single = getattr(
-        fused_single, '_v4171_canonical_shard_map_kernel', None)
+        fused_single, '_v4172_canonical_shard_map_kernel', None)
     if canonical_single is None:
         raise ValueError(
-            "minimal RST requires a canonical v4171 shard-map kernel")
+            "minimal RST requires a canonical v4172 shard-map kernel")
     if analysis_trajectory_enabled and trajectory_single is None:
         raise ValueError(
             "trajectory analysis requires a canonical RST trace kernel")
@@ -6737,7 +6665,7 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
             x, operator_query, rst_operator_keys, raw_tau,
             rst_read, rst_write, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, analysis_trajectory_positions,
+            analysis_trajectory_positions,
             analysis_trajectory_position_valid,
             analysis_trajectory_ids_rst, analysis_trajectory_valid_rst)
     else:
@@ -6745,14 +6673,14 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
             x, operator_query, rst_operator_keys, raw_tau,
             rst_read, rst_write, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, rst_selected_ids,
+            rst_selected_ids,
             rst_selected_positions, rst_apply_suppression,
             analysis_keep_rst, analysis_position_mask,
             analysis_retention_mode)
     (out, rst_active_frac, rst_active_n_mean, rst_gate_mass_mean,
      rst_gate_den_mean, rst_depth_active_mean, rst_gate_eff_n_mean,
      rst_top1_gate_frac_mean, rst_den_floor_frac, rst_tau_mean,
-     rst_admission_mass_max, rst_composition_den_min,
+     rst_gate_mass_max, rst_composition_den_min,
      rst_composition_den_max, rst_raw_srw_out_norm,
      rst_normalized_srw_out_norm, rst_selected_target) = rst_result
     if analysis_trajectory_enabled:
@@ -6785,7 +6713,7 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
             x, operator_query, rst_operator_keys, raw_tau, rst_read,
             rst_write, soft_gate_T_rst, soft_gate_t_final,
             soft_gate_boundary_power, soft_gate_boundary_power_final,
-            execution_prune_eps, analysis_selected_operator_id,
+            analysis_selected_operator_id,
             analysis_target_positions, jnp.bool_(True), analysis_keep_rst,
             analysis_position_mask, analysis_retention_mode)[0]
 
@@ -6887,7 +6815,7 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
         rst_den_floor_frac,
         rst_tau_mean,
         jax.lax.stop_gradient(rst_out_norm.astype(jnp.float32)),
-        rst_admission_mass_max,
+        rst_gate_mass_max,
         rst_composition_den_min,
         rst_composition_den_max,
         rst_raw_srw_out_norm,
@@ -6909,7 +6837,7 @@ def _rst_forward_analysis_minimal(x, pool_params, router_params, rng,
 def _attn_forward_minimal(*args, **kwargs):
     sharded_fns = kwargs.get(
         'sharded_fns', args[13] if len(args) > 13 else None)
-    profile = _v4171_minimal_kernel_profile(
+    profile = _v4172_minimal_kernel_profile(
         sharded_fns, 'attn_qk_paired_minimal')
     if profile == 'production':
         return _attn_forward_training_fast(*args, **kwargs)
@@ -6924,7 +6852,7 @@ def _attn_forward_minimal(*args, **kwargs):
 def _rst_forward_minimal(*args, **kwargs):
     sharded_fns = kwargs.get(
         'sharded_fns', args[7] if len(args) > 7 else None)
-    profile = _v4171_minimal_kernel_profile(
+    profile = _v4172_minimal_kernel_profile(
         sharded_fns, 'rst_single_minimal')
     if profile == 'production':
         return _rst_forward_training_fast(*args, **kwargs)
@@ -6947,9 +6875,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   soft_gate_T_v=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
-                  admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                  execution_prune_eps=0.0):
-    """Shared v417x sharded analysis path; canonical fused functions required.
+                  gate_den_power=DEFAULT_GATE_DEN_POWER,
+                  ):
+    """Shared v4172 sharded analysis path; canonical fused functions required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
     returns the SLIM tuple extended with observational ANALYSIS stats
@@ -7021,7 +6949,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                            soft_gate_T_qk, soft_gate_t_final,
                            soft_gate_boundary_power,
                            soft_gate_boundary_power_final,
-                           execution_prune_eps)
+                           )
     (qk_state_transitions, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_positive_margin_active, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
@@ -7051,7 +6979,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                            soft_gate_T_v, soft_gate_t_final,
                            soft_gate_boundary_power,
                            soft_gate_boundary_power_final,
-                           execution_prune_eps)
+                           )
     (attention_v, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_positive_margin_active, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
@@ -7358,9 +7286,9 @@ def _rst_forward(x, pool_params, router_params, rng,
                   soft_gate_T_rst=None,
                   soft_gate_boundary_power=2.0,
                   soft_gate_boundary_power_final=4.0,
-                  admission_den_power=DEFAULT_ADMISSION_DEN_POWER,
-                  execution_prune_eps=0.0):
-    """Shared v417x sharded analysis path; canonical fused functions required.
+                  gate_den_power=DEFAULT_GATE_DEN_POWER,
+                  ):
+    """Shared v4172 sharded analysis path; canonical fused functions required.
 
     `analysis` see _attn_forward docstring.
     """
@@ -7403,7 +7331,7 @@ def _rst_forward(x, pool_params, router_params, rng,
                             soft_gate_T_rst, soft_gate_t_final,
                             soft_gate_boundary_power,
                             soft_gate_boundary_power_final,
-                            execution_prune_eps)
+                            )
     (out, active_frac, raw_gate_max, lb_loss, rho_std_slim, gate_sum, active_n_mean,
      strong_frac, positive_margin_mean_active, rst_tau_abs_mean,
      rst_dead_penalty, rst_dead_count, rst_int_max,
@@ -7547,10 +7475,10 @@ class DAWN_SRW_V4172(nn.Module):
 
     d_route: int = DEFAULT_D_ROUTE
     operator_key_mode: str = OPERATOR_KEY_MODE
-    admission_den_power: float = DEFAULT_ADMISSION_DEN_POWER
-    admission_den_power_qk: Optional[float] = None
-    admission_den_power_v: Optional[float] = None
-    admission_den_power_rst: Optional[float] = None
+    gate_den_power: float = DEFAULT_GATE_DEN_POWER
+    gate_den_power_qk: Optional[float] = None
+    gate_den_power_v: Optional[float] = None
+    gate_den_power_rst: Optional[float] = None
     srw_composition_mode: str = DEFAULT_SRW_COMPOSITION_MODE
     heat_kernel_beta: float = DEFAULT_HEAT_KERNEL_BETA
     n_qk: int = 1580
@@ -7562,7 +7490,7 @@ class DAWN_SRW_V4172(nn.Module):
     n_chunks_know: int = 1    # Config alias; n_chunks_rst is canonical.
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
-    # Constructor receives cosine-space tau values. The train driver may use
+    # Constructor receives cosine-space tau values. The training loop may use
     # safe placeholders before one-time quantile calibration.
     tau_init_attn_qk: Optional[float] = None
     tau_init_attn_v: Optional[float] = None
@@ -7595,15 +7523,15 @@ class DAWN_SRW_V4172(nn.Module):
             raise ValueError(
                 "v4172 requires operator_key_mode="
                 f"{OPERATOR_KEY_MODE!r}, got {operator_key_mode!r}")
-        legacy_power, _, _, _ = _resolve_v417x_admission_den_powers(
-            self.admission_den_power,
-            self.admission_den_power_qk,
-            self.admission_den_power_v,
-            self.admission_den_power_rst,
+        default_power, _, _, _ = _resolve_v4172_gate_den_powers(
+            self.gate_den_power,
+            self.gate_den_power_qk,
+            self.gate_den_power_v,
+            self.gate_den_power_rst,
             context="DAWN_SRW_V4172 constructor")
-        _validate_v4171_composition_settings(
+        _validate_v4172_composition_settings(
             self.srw_composition_mode,
-            legacy_power,
+            default_power,
             self.heat_kernel_beta,
             context="DAWN_SRW_V4172 constructor")
         if int(self.d_route) <= 0:
@@ -7649,10 +7577,10 @@ class DAWN_SRW_V4172(nn.Module):
                  soft_gate_T_rst=None,
                  soft_gate_boundary_power=2.0,
                  soft_gate_boundary_power_final=4.0,
-                 admission_den_power=None,
+                 gate_den_power=None,
                  srw_composition_mode=None,
                  heat_kernel_beta=None,
-                 execution_prune_eps=0.0,
+
                  minimal_train=False,
                  minimal_runtime_profile="training",
                  ce_token_chunk_size=32768,
@@ -7714,56 +7642,56 @@ class DAWN_SRW_V4172(nn.Module):
         """
         operator_key_mode = _validate_operator_key_mode(
             self.operator_key_mode, context="DAWN_SRW_V4172 forward")
-        (model_admission_den_power, model_admission_den_power_qk,
-         model_admission_den_power_v, model_admission_den_power_rst) = (
-            _resolve_v417x_admission_den_powers(
-                self.admission_den_power,
-                self.admission_den_power_qk,
-                self.admission_den_power_v,
-                self.admission_den_power_rst,
+        (model_gate_den_power, model_gate_den_power_qk,
+         model_gate_den_power_v, model_gate_den_power_rst) = (
+            _resolve_v4172_gate_den_powers(
+                self.gate_den_power,
+                self.gate_den_power_qk,
+                self.gate_den_power_v,
+                self.gate_den_power_rst,
                 context="DAWN_SRW_V4172 constructor"))
-        (model_srw_composition_mode, model_admission_den_power,
+        (model_srw_composition_mode, model_gate_den_power,
          model_heat_kernel_beta) = (
-            _validate_v4171_composition_settings(
+            _validate_v4172_composition_settings(
                 self.srw_composition_mode,
-                model_admission_den_power,
+                model_gate_den_power,
                 self.heat_kernel_beta,
                 context="DAWN_SRW_V4172 constructor"))
-        (runtime_srw_composition_mode, runtime_admission_den_power,
+        (runtime_srw_composition_mode, runtime_gate_den_power,
          runtime_heat_kernel_beta) = (
-            _validate_v4171_composition_settings(
+            _validate_v4172_composition_settings(
                 model_srw_composition_mode
                 if srw_composition_mode is None else srw_composition_mode,
-                (model_admission_den_power
-                 if admission_den_power is None else admission_den_power),
+                (model_gate_den_power
+                 if gate_den_power is None else gate_den_power),
                 (model_heat_kernel_beta
                  if heat_kernel_beta is None else heat_kernel_beta),
                 context="DAWN_SRW_V4172 forward"))
         if runtime_srw_composition_mode != model_srw_composition_mode:
             raise ValueError(
-                "v4171 constructor/forward srw_composition_mode mismatch: "
+                "v4172 constructor/forward srw_composition_mode mismatch: "
                 f"model={model_srw_composition_mode!r}, "
                 f"runtime={runtime_srw_composition_mode!r}")
-        if runtime_admission_den_power != model_admission_den_power:
+        if runtime_gate_den_power != model_gate_den_power:
             raise ValueError(
-                "v4171 constructor/forward admission_den_power mismatch: "
-                f"model={model_admission_den_power}, "
-                f"runtime={runtime_admission_den_power}")
+                "v4172 constructor/forward gate_den_power mismatch: "
+                f"model={model_gate_den_power}, "
+                f"runtime={runtime_gate_den_power}")
         if runtime_heat_kernel_beta != model_heat_kernel_beta:
             raise ValueError(
-                "v4171 constructor/forward heat_kernel_beta mismatch: "
+                "v4172 constructor/forward heat_kernel_beta mismatch: "
                 f"model={model_heat_kernel_beta}, "
                 f"runtime={runtime_heat_kernel_beta}")
-        _validate_v4171_sharded_fns(
-            sharded_fns, model_admission_den_power,
+        _validate_v4172_sharded_fns(
+            sharded_fns, model_gate_den_power,
             model_srw_composition_mode, model_heat_kernel_beta,
-            expected_power_qk=model_admission_den_power_qk,
-            expected_power_v=model_admission_den_power_v,
-            expected_power_rst=model_admission_den_power_rst)
-        admission_den_power = model_admission_den_power
-        admission_den_power_qk = model_admission_den_power_qk
-        admission_den_power_v = model_admission_den_power_v
-        admission_den_power_rst = model_admission_den_power_rst
+            expected_power_qk=model_gate_den_power_qk,
+            expected_power_v=model_gate_den_power_v,
+            expected_power_rst=model_gate_den_power_rst)
+        gate_den_power = model_gate_den_power
+        gate_den_power_qk = model_gate_den_power_qk
+        gate_den_power_v = model_gate_den_power_v
+        gate_den_power_rst = model_gate_den_power_rst
         heat_kernel_beta = model_heat_kernel_beta
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
@@ -7813,7 +7741,7 @@ class DAWN_SRW_V4172(nn.Module):
             analysis_trajectory_enabled
             or analysis_trajectory_patch_schedule_enabled)
         minimal_kernel_profile = (
-            _v4171_minimal_kernel_profile(
+            _v4172_minimal_kernel_profile(
                 sharded_fns, 'attn_qk_paired_minimal')
             if minimal_train else None)
         runtime_profiles = {
@@ -8619,8 +8547,8 @@ class DAWN_SRW_V4172(nn.Module):
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=(
                             soft_gate_boundary_power_final),
-                        admission_den_power=admission_den_power_qk,
-                        execution_prune_eps=execution_prune_eps)
+                        gate_den_power=gate_den_power_qk,
+                        )
                     x = x + attn_update
                     normed = _layer_norm(
                         x, bp['norm2']['scale'], bp['norm2']['bias'])
@@ -8636,8 +8564,8 @@ class DAWN_SRW_V4172(nn.Module):
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=(
                             soft_gate_boundary_power_final),
-                        admission_den_power=admission_den_power_rst,
-                        execution_prune_eps=execution_prune_eps)
+                        gate_den_power=gate_den_power_rst,
+                        )
                     return x + rst_update, ()
 
                 if self.gradient_checkpointing:
@@ -8745,8 +8673,8 @@ class DAWN_SRW_V4172(nn.Module):
                         soft_gate_T_v=soft_gate_T_v,
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                        admission_den_power=admission_den_power_qk,
-                        execution_prune_eps=execution_prune_eps,
+                        gate_den_power=gate_den_power_qk,
+
                         analysis_selected_operator_id=analysis_contribution,
                         analysis_layer_index=layer_index,
                         analysis_target_layer=analysis_target_layer,
@@ -8827,11 +8755,11 @@ class DAWN_SRW_V4172(nn.Module):
                      q_den_floor_frac, k_den_floor_frac, v_den_floor_frac,
                      q_tau_mean, k_tau_mean, v_tau_mean,
                      attn_out_norm,
-                     qk_admission_mass_max, qk_composition_den_min,
+                     qk_gate_mass_max, qk_composition_den_min,
                      qk_composition_den_max, qk_raw_srw_out_norm,
                      qk_normalized_srw_out_norm,
                      qk_pool_scaled_srw_out_norm,
-                     v_admission_mass_max, v_composition_den_min,
+                     v_gate_mass_max, v_composition_den_min,
                      v_composition_den_max, v_raw_srw_out_norm,
                      v_normalized_srw_out_norm,
                      v_pool_scaled_srw_out_norm,
@@ -8869,8 +8797,8 @@ class DAWN_SRW_V4172(nn.Module):
                         soft_gate_T_rst=soft_gate_T_rst,
                         soft_gate_boundary_power=soft_gate_boundary_power,
                         soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                        admission_den_power=admission_den_power_rst,
-                        execution_prune_eps=execution_prune_eps,
+                        gate_den_power=gate_den_power_rst,
+
                         analysis_selected_operator_id=analysis_contribution,
                         analysis_layer_index=layer_index,
                         analysis_target_layer=analysis_target_layer,
@@ -8930,7 +8858,7 @@ class DAWN_SRW_V4172(nn.Module):
                      rst_depth_active_mean, rst_gate_eff_n_mean,
                      rst_top1_gate_frac_mean, rst_den_floor_frac,
                      rst_tau_mean, rst_out_norm,
-                     rst_admission_mass_max, rst_composition_den_min,
+                     rst_gate_mass_max, rst_composition_den_min,
                      rst_composition_den_max, rst_raw_srw_out_norm,
                      rst_normalized_srw_out_norm,
                      rst_pool_scaled_srw_out_norm,
@@ -8988,19 +8916,19 @@ class DAWN_SRW_V4172(nn.Module):
                         rst_tau_mean,
                         attn_out_norm,
                         rst_out_norm,
-                        qk_admission_mass_max,
+                        qk_gate_mass_max,
                         qk_composition_den_min,
                         qk_composition_den_max,
                         qk_raw_srw_out_norm,
                         qk_normalized_srw_out_norm,
                         qk_pool_scaled_srw_out_norm,
-                        v_admission_mass_max,
+                        v_gate_mass_max,
                         v_composition_den_min,
                         v_composition_den_max,
                         v_raw_srw_out_norm,
                         v_normalized_srw_out_norm,
                         v_pool_scaled_srw_out_norm,
-                        rst_admission_mass_max,
+                        rst_gate_mass_max,
                         rst_composition_den_min,
                         rst_composition_den_max,
                         rst_raw_srw_out_norm,
@@ -9174,15 +9102,15 @@ class DAWN_SRW_V4172(nn.Module):
                  rst_den_floor_all,
                  q_tau_all, k_tau_all, v_tau_all, rst_tau_all,
                  attn_out_norm_all, rst_out_norm_all,
-                 qk_admission_mass_max_all,
+                 qk_gate_mass_max_all,
                  qk_composition_den_min_all, qk_composition_den_max_all,
                  qk_raw_srw_out_norm_all, qk_normalized_srw_out_norm_all,
                  qk_pool_scaled_srw_out_norm_all,
-                 v_admission_mass_max_all,
+                 v_gate_mass_max_all,
                  v_composition_den_min_all, v_composition_den_max_all,
                  v_raw_srw_out_norm_all, v_normalized_srw_out_norm_all,
                  v_pool_scaled_srw_out_norm_all,
-                 rst_admission_mass_max_all,
+                 rst_gate_mass_max_all,
                  rst_composition_den_min_all, rst_composition_den_max_all,
                  rst_raw_srw_out_norm_all, rst_normalized_srw_out_norm_all,
                  rst_pool_scaled_srw_out_norm_all,
@@ -9501,11 +9429,11 @@ class DAWN_SRW_V4172(nn.Module):
                     'attn_out_norm': _sg_mean(attn_out_norm_all),
                     'rst_out_norm': _sg_mean(rst_out_norm_all),
                     'd_route': jnp.int32(self.d_route),
-                    'admission_den_power': jnp.float32(admission_den_power),
+                    'gate_den_power': jnp.float32(gate_den_power),
                     'heat_kernel_beta': jnp.float32(heat_kernel_beta),
-                    'attn_qk_admission_mass_mean': _sg_mean(qk_gate_mass_all),
-                    'attn_qk_admission_mass_max': jax.lax.stop_gradient(
-                        qk_admission_mass_max_all.max()),
+                    'attn_qk_gate_mass_mean': _sg_mean(qk_gate_mass_all),
+                    'attn_qk_gate_mass_max': jax.lax.stop_gradient(
+                        qk_gate_mass_max_all.max()),
                     'attn_qk_composition_den_mean': _sg_mean(qk_gate_den_all),
                     'attn_qk_composition_den_min': jax.lax.stop_gradient(
                         qk_composition_den_min_all.min()),
@@ -9519,9 +9447,9 @@ class DAWN_SRW_V4172(nn.Module):
                         qk_normalized_srw_out_norm_all),
                     'attn_qk_pool_scaled_srw_out_norm': _sg_mean(
                         qk_pool_scaled_srw_out_norm_all),
-                    'attn_v_admission_mass_mean': _sg_mean(v_gate_mass_all),
-                    'attn_v_admission_mass_max': jax.lax.stop_gradient(
-                        v_admission_mass_max_all.max()),
+                    'attn_v_gate_mass_mean': _sg_mean(v_gate_mass_all),
+                    'attn_v_gate_mass_max': jax.lax.stop_gradient(
+                        v_gate_mass_max_all.max()),
                     'attn_v_composition_den_mean': _sg_mean(v_gate_den_all),
                     'attn_v_composition_den_min': jax.lax.stop_gradient(
                         v_composition_den_min_all.min()),
@@ -9535,9 +9463,9 @@ class DAWN_SRW_V4172(nn.Module):
                         v_normalized_srw_out_norm_all),
                     'attn_v_pool_scaled_srw_out_norm': _sg_mean(
                         v_pool_scaled_srw_out_norm_all),
-                    'rst_admission_mass_mean': _sg_mean(rst_gate_mass_all),
-                    'rst_admission_mass_max': jax.lax.stop_gradient(
-                        rst_admission_mass_max_all.max()),
+                    'rst_gate_mass_mean': _sg_mean(rst_gate_mass_all),
+                    'rst_gate_mass_max': jax.lax.stop_gradient(
+                        rst_gate_mass_max_all.max()),
                     'rst_composition_den_mean': _sg_mean(rst_gate_den_all),
                     'rst_composition_den_min': jax.lax.stop_gradient(
                         rst_composition_den_min_all.min()),
@@ -9611,8 +9539,8 @@ class DAWN_SRW_V4172(nn.Module):
                     soft_gate_T_v=soft_gate_T_v,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                    admission_den_power=admission_den_power_qk,
-                    execution_prune_eps=execution_prune_eps)
+                    gate_den_power=gate_den_power_qk,
+                    )
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -9678,8 +9606,8 @@ class DAWN_SRW_V4172(nn.Module):
                     soft_gate_T_rst=soft_gate_T_rst,
                     soft_gate_boundary_power=soft_gate_boundary_power,
                     soft_gate_boundary_power_final=soft_gate_boundary_power_final,
-                    admission_den_power=admission_den_power_rst,
-                    execution_prune_eps=execution_prune_eps)
+                    gate_den_power=gate_den_power_rst,
+                    )
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_op_key_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_positive_margin_active, k_tau_abs,
@@ -9975,25 +9903,10 @@ class DAWN_SRW_V4172(nn.Module):
                 soft_gate_boundary_power, dtype=jnp.float32),
             'soft_gate_boundary_power_final': jnp.asarray(
                 soft_gate_boundary_power_final, dtype=jnp.float32),
-            'execution_prune_eps': jnp.asarray(execution_prune_eps, dtype=jnp.float32),
-            'execution_gate_mass_retained': (
-                (attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean())
-                / jnp.maximum(attn_current_cost_mean_all.mean()
-                              + rst_current_cost_mean_all.mean(), 1.0e-8)),
             'execution_estimated_compute_frac': (
                 (attn_active_n_mean_all.mean() + rst_active_n_mean_all.mean())
                 / jnp.maximum(jnp.float32(self.n_qk + self.n_v)
                               + jnp.float32(n_rst_eff), 1.0)),
-            'execution_prune_gate_den_mean': (
-                attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean()) / 2.0,
-            'execution_prune_gate_den_min': jnp.minimum(
-                attn_den_cost_mean_all.min(), rst_den_cost_mean_all.min()),
-            'execution_prune_no_active_frac': (
-                (jnp.mean((attn_qk_active_all <= 0.0).astype(jnp.float32))
-                 + jnp.mean((attn_v_active_all <= 0.0).astype(jnp.float32))) / 2.0
-                + jnp.mean((rst_active_all <= 0.0).astype(jnp.float32))) / 2.0,
-            'execution_prune_unpruned_gate_den_mean': (
-                attn_current_cost_mean_all.mean() + rst_current_cost_mean_all.mean()) / 2.0,
             'attn_aux': attn_auxes.mean(),
             'rst_aux': rst_auxes.mean(),
             'edge_margin_stat_qk': (
@@ -10191,8 +10104,8 @@ class DAWN_SRW_V4172(nn.Module):
             'rst_no_active_direct': jax.lax.stop_gradient(
                 rst_no_active_direct_all),
             # v4164 aliases: old gate tuple slots carry paper
-            # execution_weight statistics; denominator slots carry
-            # admission-only sums.
+            # gate_weight statistics; denominator slots carry
+            # gate-only sums.
             'attn_int_max': attn_int_max_all.max(),
             'attn_qk_int_max': _attn_core_max(ATTN_SPLIT_QK_INT_MAX),
             'attn_v_int_max': _attn_core_max(ATTN_SPLIT_V_INT_MAX),
@@ -10243,14 +10156,14 @@ class DAWN_SRW_V4172(nn.Module):
             'rst_gate_eff_ratio': rst_gate_eff_ratio_all.mean(),
             'rst_top1_gate_frac': rst_top1_gate_frac_all.mean(),
             'rst_top1_gate_frac_max': rst_top1_gate_frac_max_all.max(),
-            'admission_den_sum': (
+            'gate_den_sum': (
                 attn_den_cost_mean_all.mean() + rst_den_cost_mean_all.mean()),
-            'attn_admission_den_sum': attn_den_cost_mean_all.mean(),
-            'attn_qk_admission_den_sum': _attn_core_mean(
+            'attn_gate_den_sum': attn_den_cost_mean_all.mean(),
+            'attn_qk_gate_den_sum': _attn_core_mean(
                 ATTN_SPLIT_QK_GATE_DEN_SUM_MEAN),
-            'attn_v_admission_den_sum': _attn_core_mean(
+            'attn_v_gate_den_sum': _attn_core_mean(
                 ATTN_SPLIT_V_GATE_DEN_SUM_MEAN),
-            'rst_admission_den_sum': rst_den_cost_mean_all.mean(),
+            'rst_gate_den_sum': rst_den_cost_mean_all.mean(),
             'execution_mass_sum': attn_gsum_all.mean() + rst_gsum_all.mean(),
             'attn_execution_mass_sum': attn_gsum_all.mean(),
             'attn_qk_execution_mass_sum': _attn_core_mean(
@@ -10258,23 +10171,23 @@ class DAWN_SRW_V4172(nn.Module):
             'attn_v_execution_mass_sum': _attn_core_mean(
                 ATTN_SPLIT_V_GATE_SUM),
             'rst_execution_mass_sum': rst_gsum_all.mean(),
-            'drive_mean': (
+            'angular_amplitude_mean': (
                 attn_current_cost_mean_all.mean()
                 + rst_current_cost_mean_all.mean()) / jnp.float32(2.0),
-            'attn_drive_mean': attn_current_cost_mean_all.mean(),
-            'attn_qk_drive_mean': _attn_core_mean(
-                ATTN_SPLIT_QK_DRIVE_MEAN),
-            'attn_v_drive_mean': _attn_core_mean(
-                ATTN_SPLIT_V_DRIVE_MEAN),
-            'rst_drive_mean': rst_current_cost_mean_all.mean(),
-            'drive_max': jnp.maximum(
+            'attn_angular_amplitude_mean': attn_current_cost_mean_all.mean(),
+            'attn_qk_angular_amplitude_mean': _attn_core_mean(
+                ATTN_SPLIT_QK_ANGULAR_AMPLITUDE_MEAN),
+            'attn_v_angular_amplitude_mean': _attn_core_mean(
+                ATTN_SPLIT_V_ANGULAR_AMPLITUDE_MEAN),
+            'rst_angular_amplitude_mean': rst_current_cost_mean_all.mean(),
+            'angular_amplitude_max': jnp.maximum(
                 attn_int_max_all.max(), rst_int_max_all.max()),
-            'attn_drive_max': attn_int_max_all.max(),
-            'attn_qk_drive_max': _attn_core_max(
+            'attn_angular_amplitude_max': attn_int_max_all.max(),
+            'attn_qk_angular_amplitude_max': _attn_core_max(
                 ATTN_SPLIT_QK_INT_MAX),
-            'attn_v_drive_max': _attn_core_max(
+            'attn_v_angular_amplitude_max': _attn_core_max(
                 ATTN_SPLIT_V_INT_MAX),
-            'rst_drive_max': rst_int_max_all.max(),
+            'rst_angular_amplitude_max': rst_int_max_all.max(),
             'execution_eff_n': (
                 attn_gate_eff_n_all.mean() + rst_gate_eff_n_all.mean()
             ) / jnp.float32(2.0),
@@ -10348,8 +10261,8 @@ class DAWN_SRW_V4172(nn.Module):
             result.update({
                 'per_layer_attn_qk_active_tau_frac': _sparsity_layer(
                     attn_qk_sparsity_diag_all, 'active_tau_frac'),
-                'per_layer_attn_qk_admission_active_eps_1e_2_frac': _sparsity_layer(
-                    attn_qk_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_qk_gate_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_qk_sparsity_diag_all, 'gate_active_eps_1e_2_frac'),
                 'per_layer_attn_qk_active_eps_1e_2_frac': _sparsity_layer(
                     attn_qk_sparsity_diag_all, 'active_eps_1e_2_frac'),
                 'per_layer_attn_qk_mass_eps_1e_2': _sparsity_layer(
@@ -10386,24 +10299,24 @@ class DAWN_SRW_V4172(nn.Module):
                     attn_qk_select_diag_all, SELECT_SELECTED_FRAC),
                 'per_layer_attn_q_active_tau_frac': _sparsity_layer(
                     attn_q_sparsity_diag_all, 'active_tau_frac'),
-                'per_layer_attn_q_admission_active_eps_1e_2_frac': _sparsity_layer(
-                    attn_q_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_q_gate_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_q_sparsity_diag_all, 'gate_active_eps_1e_2_frac'),
                 'per_layer_attn_q_active_eps_1e_2_frac': _sparsity_layer(
                     attn_q_sparsity_diag_all, 'active_eps_1e_2_frac'),
                 'per_layer_attn_q_active_n_mean': attn_split_core_all[
                     :, ATTN_SPLIT_Q_ACTIVE_N_MEAN],
                 'per_layer_attn_k_active_tau_frac': _sparsity_layer(
                     attn_k_sparsity_diag_all, 'active_tau_frac'),
-                'per_layer_attn_k_admission_active_eps_1e_2_frac': _sparsity_layer(
-                    attn_k_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_k_gate_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_k_sparsity_diag_all, 'gate_active_eps_1e_2_frac'),
                 'per_layer_attn_k_active_eps_1e_2_frac': _sparsity_layer(
                     attn_k_sparsity_diag_all, 'active_eps_1e_2_frac'),
                 'per_layer_attn_k_active_n_mean': attn_split_core_all[
                     :, ATTN_SPLIT_K_ACTIVE_N_MEAN],
                 'per_layer_attn_v_active_tau_frac': _sparsity_layer(
                     attn_v_sparsity_diag_all, 'active_tau_frac'),
-                'per_layer_attn_v_admission_active_eps_1e_2_frac': _sparsity_layer(
-                    attn_v_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_attn_v_gate_active_eps_1e_2_frac': _sparsity_layer(
+                    attn_v_sparsity_diag_all, 'gate_active_eps_1e_2_frac'),
                 'per_layer_attn_v_active_eps_1e_2_frac': _sparsity_layer(
                     attn_v_sparsity_diag_all, 'active_eps_1e_2_frac'),
                 'per_layer_attn_v_mass_eps_1e_2': _sparsity_layer(
@@ -10440,8 +10353,8 @@ class DAWN_SRW_V4172(nn.Module):
                     attn_v_select_diag_all, SELECT_SELECTED_FRAC),
                 'per_layer_rst_active_tau_frac': _sparsity_layer(
                     rst_sparsity_diag_all, 'active_tau_frac'),
-                'per_layer_rst_admission_active_eps_1e_2_frac': _sparsity_layer(
-                    rst_sparsity_diag_all, 'admission_active_eps_1e_2_frac'),
+                'per_layer_rst_gate_active_eps_1e_2_frac': _sparsity_layer(
+                    rst_sparsity_diag_all, 'gate_active_eps_1e_2_frac'),
                 'per_layer_rst_active_eps_1e_2_frac': _sparsity_layer(
                     rst_sparsity_diag_all, 'active_eps_1e_2_frac'),
                 'per_layer_rst_mass_eps_1e_2': _sparsity_layer(
@@ -10588,7 +10501,7 @@ class DAWN_SRW_V4172(nn.Module):
             return_residual=True, **production_kwargs):
         """Suppress one execution numerator inside the production SRW core.
 
-        Admission and its denominator remain unmodified.  Operator ids and
+        Gate and its denominator remain unmodified.  Operator ids and
         target positions are per-example arrays; ``route_selector`` is 0=attention_q,
         1=attention_k, 2=attention_v, or 3=RST.
         """
@@ -10617,7 +10530,7 @@ class DAWN_SRW_V4172(nn.Module):
 
         Every group size, including the all-``-1`` size-zero baseline, uses
         the same ``[B, M]`` input shape and therefore the same compiled graph.
-        attention_q/attention_k route selection and all production admission/denominator semantics
+        attention_q/attention_k route selection and all production gate/denominator semantics
         are identical to single-operator suppression.
         """
         selected_global_operator_ids = _analysis_int32_array(
@@ -10650,9 +10563,9 @@ class DAWN_SRW_V4172(nn.Module):
         """Retain a circuit across every layer and route in one forward.
 
         ``conditional_execution_sufficiency`` keeps the selected execution
-        numerator while retaining the production admission denominator.
+        numerator while retaining the production gate denominator.
         ``autonomous_subcircuit_sufficiency`` restricts both numerator and
-        admission denominator to the selected circuit.
+        gate denominator to the selected circuit.
         ``exact_selected_numerator_restore_after_suppression`` removes the
         complement of the keep mask under the production denominator and
         reinserts its exact same-example numerator contribution before the
@@ -10894,12 +10807,12 @@ class DAWN_SRW_V4172(nn.Module):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
         logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
-        (legacy_power, qk_power, v_power, rst_power) = (
-            _resolve_v417x_admission_den_powers(
-                self.admission_den_power,
-                self.admission_den_power_qk,
-                self.admission_den_power_v,
-                self.admission_den_power_rst,
+        (default_power, qk_power, v_power, rst_power) = (
+            _resolve_v4172_gate_den_powers(
+                self.gate_den_power,
+                self.gate_den_power_qk,
+                self.gate_den_power_v,
+                self.gate_den_power_rst,
                 context="DAWN_SRW_V4172 config serialization"))
         cfg = {
             'model_version': self.__version__,
@@ -10911,10 +10824,10 @@ class DAWN_SRW_V4172(nn.Module):
             'd_route': self.d_route,
             'operator_key_mode': self.operator_key_mode,
             'operator_query_mode': OPERATOR_QUERY_MODE,
-            'admission_den_power': legacy_power,
-            'admission_den_power_qk': qk_power,
-            'admission_den_power_v': v_power,
-            'admission_den_power_rst': rst_power,
+            'gate_den_power': default_power,
+            'gate_den_power_qk': qk_power,
+            'gate_den_power_v': v_power,
+            'gate_den_power_rst': rst_power,
             'srw_composition_mode': self.srw_composition_mode,
             'heat_kernel_beta': self.heat_kernel_beta,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
@@ -10928,28 +10841,28 @@ class DAWN_SRW_V4172(nn.Module):
         logical_vocab_size, embedding_vocab_size = self._vocab_sizes()
         qk_scale, v_scale, rst_scale = _pool_output_scales(
             self.d_model, self.n_layers)
-        (admission_den_power, qk_den_power, v_den_power,
-         rst_den_power) = _resolve_v417x_admission_den_powers(
-            self.admission_den_power,
-            self.admission_den_power_qk,
-            self.admission_den_power_v,
-            self.admission_den_power_rst,
+        (gate_den_power, qk_den_power, v_den_power,
+         rst_den_power) = _resolve_v4172_gate_den_powers(
+            self.gate_den_power,
+            self.gate_den_power_qk,
+            self.gate_den_power_v,
+            self.gate_den_power_rst,
             context="DAWN_SRW_V4172 model info")
-        mode, admission_den_power, heat_kernel_beta = (
-            _validate_v4171_composition_settings(
+        mode, gate_den_power, heat_kernel_beta = (
+            _validate_v4172_composition_settings(
             self.srw_composition_mode,
-            self.admission_den_power,
+            self.gate_den_power,
             self.heat_kernel_beta,
             context="DAWN_SRW_V4172 model info"))
         if mode == "quadratic":
             composition_info = [
                 f"  mode={mode}",
                 "  angular_amplitude=linear_cap_depth",
-                "  admission_weight=amplitude^2",
-                "  total_weight=sum(unpruned_admission)",
+                "  gate_weight=amplitude^2",
+                "  total_weight=sum(gate)",
                 ("  den=max(total_weight,1e-12)^"
-                 "admission_den_power"),
-                "  numerator=pruned_execution_weight",
+                 "gate_den_power"),
+                "  numerator=gate_weight",
                 "  live_den_gradient=true",
             ]
         elif mode == "heat_energy":
@@ -10962,10 +10875,10 @@ class DAWN_SRW_V4172(nn.Module):
                  "(exp(beta)-1)"),
                 f"  beta={heat_kernel_beta:g}",
                 "  energy_weight=heat_amplitude^2",
-                "  total_energy=sum(unpruned_energy_weight)",
-                "  numerator=pruned_energy_weight",
+                "  total_energy=sum(energy_weight)",
+                "  numerator=energy_weight",
                 ("  denominator=max(total_energy,1e-12)^"
-                 "admission_den_power"),
+                 "gate_den_power"),
                 ("  beta_to_zero_limit=quadratic"),
                 "  live_den_gradient=true",
             ]
@@ -10973,10 +10886,10 @@ class DAWN_SRW_V4172(nn.Module):
             composition_info = [
                 f"  mode={mode}",
                 "  angular_amplitude=linear_cap_depth",
-                "  admission_weight=amplitude",
-                ("  den=max(sum(unpruned_admission),1)^"
-                 "admission_den_power"),
-                "  numerator=pruned_execution_weight",
+                "  gate_weight=amplitude",
+                ("  den=max(sum(gate),1)^"
+                 "gate_den_power"),
+                "  numerator=gate_weight",
                 "  live_den_gradient=true",
             ]
         return [
@@ -11043,37 +10956,36 @@ def _slice_logits_to_logical_vocab(logits, model_cfg):
     return logits[..., :logical]
 
 
-def _angular_execution_kwargs_from_model_cfg(model_cfg):
-    """Extract v4171 canonical execution settings for inference."""
-    (admission_den_power, admission_den_power_qk,
-     admission_den_power_v, admission_den_power_rst) = (
-        _resolve_v417x_admission_den_powers(
+def _angular_gate_kwargs_from_model_cfg(model_cfg):
+    """Extract v4172 canonical execution settings for inference."""
+    (gate_den_power, gate_den_power_qk,
+     gate_den_power_v, gate_den_power_rst) = (
+        _resolve_v4172_gate_den_powers(
             model_cfg.get(
-                'admission_den_power', DEFAULT_ADMISSION_DEN_POWER),
-            model_cfg.get('admission_den_power_qk'),
-            model_cfg.get('admission_den_power_v'),
-            model_cfg.get('admission_den_power_rst'),
-            context="v417x inference model config"))
-    (srw_composition_mode, admission_den_power,
+                'gate_den_power', DEFAULT_GATE_DEN_POWER),
+            model_cfg.get('gate_den_power_qk'),
+            model_cfg.get('gate_den_power_v'),
+            model_cfg.get('gate_den_power_rst'),
+            context="v4172 inference model config"))
+    (srw_composition_mode, gate_den_power,
      heat_kernel_beta) = (
-        _validate_v4171_composition_settings(
+        _validate_v4172_composition_settings(
             model_cfg.get(
                 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-            admission_den_power,
+            gate_den_power,
             model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-            context="v4171 inference model config"))
+            context="v4172 inference model config"))
     return {
         'soft_gate_temperature': float(
             model_cfg.get('soft_gate_temperature', 0.07)),
         'soft_gate_boundary_power': float(
             model_cfg.get('soft_gate_boundary_power', 4.0)),
-        'admission_den_power': admission_den_power,
-        'admission_den_power_qk': admission_den_power_qk,
-        'admission_den_power_v': admission_den_power_v,
-        'admission_den_power_rst': admission_den_power_rst,
+        'gate_den_power': gate_den_power,
+        'gate_den_power_qk': gate_den_power_qk,
+        'gate_den_power_v': gate_den_power_v,
+        'gate_den_power_rst': gate_den_power_rst,
         'srw_composition_mode': srw_composition_mode,
         'heat_kernel_beta': heat_kernel_beta,
-        'execution_prune_eps': float(model_cfg.get('execution_prune_eps', 0.0)),
         'soft_gate_effective_active_eps': float(
             model_cfg.get('soft_gate_effective_active_eps', 1.0e-6)),
     }
@@ -11102,7 +11014,7 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
     """Sample fresh-init cosine scores without changing forward semantics.
 
     The sample uses the first block's freshly initialized normalized route
-    states and the shared v4171 router/pool parameters. Rho follows the
+    states and the shared v4172 router/pool parameters. Rho follows the
     train path exactly: direct state projections against independent learned
     live-gradient operator-address embeddings.
     """
@@ -11164,7 +11076,7 @@ def _tau_init_calibration_scores(params, input_ids, max_tokens=128):
 
 
 def _query_geometry_diagnostics(params, input_ids, max_tokens=4096):
-    """Heavy v4171 query geometry on deterministic first-block tokens."""
+    """Heavy v4172 query geometry on deterministic first-block tokens."""
     max_tokens = int(max_tokens)
     input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
     if input_ids.ndim != 2 or max_tokens <= 0:
@@ -11212,82 +11124,78 @@ def _angular_relation(operator_query, operator_keys):
         jnp.float32)
 
 
-def _angular_execution(operator_query, operator_keys, raw_tau, raw_scan_offset=None,
-                     soft_gate_temperature=0.07,
-                     soft_gate_boundary_power=4.0,
-                     execution_prune_eps=0.0,
-                     soft_gate_effective_active_eps=1.0e-6,
-                     srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
-                     heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+def _angular_gate(
+        operator_query, operator_keys, raw_tau, raw_scan_offset=None,
+        soft_gate_temperature=0.07, soft_gate_boundary_power=4.0,
+        soft_gate_effective_active_eps=1.0e-6,
+        srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
+        heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
+    del (raw_scan_offset, soft_gate_temperature, soft_gate_boundary_power,
+         soft_gate_effective_active_eps)
     rho = _angular_relation(operator_query, operator_keys)
     tau = _tau_from_param(raw_tau)
-    return _compute_admission_drive(
-        rho, tau, soft_gate_temperature,
-        boundary_power=soft_gate_boundary_power,
-        effective_active_eps=soft_gate_effective_active_eps,
-        execution_prune_eps=execution_prune_eps,
+    return _compute_gate_weight(
+        rho, tau,
         srw_composition_mode=srw_composition_mode,
         heat_kernel_beta=heat_kernel_beta)
 
 
-def _angular_execution_weight(operator_query, operator_keys, raw_tau, raw_scan_offset=None,
+def _angular_gate_weight(operator_query, operator_keys, raw_tau, raw_scan_offset=None,
                   soft_gate_temperature=0.07,
                   soft_gate_boundary_power=4.0,
-                  execution_prune_eps=0.0,
                   soft_gate_effective_active_eps=1.0e-6,
                   srw_composition_mode=DEFAULT_SRW_COMPOSITION_MODE,
                   heat_kernel_beta=DEFAULT_HEAT_KERNEL_BETA):
-    """Canonical v4166 execution_weight for non-sharded inference helpers."""
-    _, _, _, execution_weight, _ = _angular_execution(
+    """Canonical v4172 gate weight for non-sharded inference helpers."""
+    _, gate_weight, _, _ = _angular_gate(
         operator_query, operator_keys, raw_tau, raw_scan_offset,
         soft_gate_temperature=soft_gate_temperature,
         soft_gate_boundary_power=soft_gate_boundary_power,
-        execution_prune_eps=execution_prune_eps,
         soft_gate_effective_active_eps=soft_gate_effective_active_eps,
         srw_composition_mode=srw_composition_mode,
         heat_kernel_beta=heat_kernel_beta)
-    return execution_weight.astype(jnp.float32)
+    return gate_weight.astype(jnp.float32)
 
 
-def _split_admission_den_kwargs(
-        angular_execution_kwargs, admission_den_pool=None):
-    execution_kwargs = dict(angular_execution_kwargs)
-    legacy_power = execution_kwargs.pop(
-        'admission_den_power', DEFAULT_ADMISSION_DEN_POWER)
+def _split_gate_den_kwargs(
+        angular_gate_kwargs, gate_den_pool=None):
+    gate_kwargs = dict(angular_gate_kwargs)
+    default_power = gate_kwargs.pop(
+        'gate_den_power', DEFAULT_GATE_DEN_POWER)
     pool_powers = {
-        pool: execution_kwargs.pop(f'admission_den_power_{pool}', legacy_power)
+        pool: gate_kwargs.pop(f'gate_den_power_{pool}', default_power)
         for pool in ('qk', 'v', 'rst')
     }
-    if admission_den_pool is not None and admission_den_pool not in pool_powers:
+    if gate_den_pool is not None and gate_den_pool not in pool_powers:
         raise ValueError(
-            f"unsupported admission denominator pool {admission_den_pool!r}")
-    admission_den_power = jnp.float32(
-        legacy_power if admission_den_pool is None
-        else pool_powers[admission_den_pool])
-    return execution_kwargs, admission_den_power
+            f"unsupported gate denominator pool {gate_den_pool!r}")
+    gate_den_power = jnp.float32(
+        default_power if gate_den_pool is None
+        else pool_powers[gate_den_pool])
+    return gate_kwargs, gate_den_power
 
 
 def _srw_inference(
         state, operator_query, operator_keys, raw_tau, raw_scan_offset,
-        read_vectors, write_vectors, admission_den_pool=None,
-        **angular_execution_kwargs):
+        read_vectors, write_vectors, gate_den_pool=None,
+        **angular_gate_kwargs):
     """Non-chunked SRW for inference."""
     # Selection uses d_route operator keys; execution uses d_model RW dirs.
     read_directions = _forward_unit_direction(
         read_vectors.astype(jnp.float32))
     write_directions = _forward_unit_direction(
         write_vectors.astype(jnp.float32))
-    execution_kwargs, admission_den_power = _split_admission_den_kwargs(
-        angular_execution_kwargs, admission_den_pool)
-    _, admission, _, execution_weight, _ = _angular_execution(
-        operator_query, operator_keys, raw_tau, raw_scan_offset, **execution_kwargs)
+    gate_kwargs, gate_den_power = _split_gate_den_kwargs(
+        angular_gate_kwargs, gate_den_pool)
+    _, gate_weight, _, _ = _angular_gate(
+        operator_query, operator_keys, raw_tau, raw_scan_offset, **gate_kwargs)
 
     read_activations = state.astype(jnp.float32) @ read_directions.T
-    weighted_read_activations = execution_weight * read_activations
+    weighted_read_activations = gate_weight * read_activations
     raw_state_transition = weighted_read_activations @ write_directions
     composition_den = _composition_den(
-        admission.sum(axis=-1, keepdims=True), admission_den_power,
-        execution_kwargs.get(
+        gate_weight.sum(axis=-1, keepdims=True), gate_den_power,
+        gate_kwargs.get(
             'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
     state_transition = raw_state_transition.astype(jnp.float32) / composition_den
     return state_transition.astype(jnp.float32)
@@ -11295,44 +11203,44 @@ def _srw_inference(
 
 def _srw_inference_with_gates(
         state, operator_query, operator_keys, raw_tau, raw_scan_offset,
-        read_vectors, write_vectors, admission_den_pool=None,
-        **angular_execution_kwargs):
+        read_vectors, write_vectors, gate_den_pool=None,
+        **angular_gate_kwargs):
     """Like _srw_inference but also returns gate and normalized gate."""
     # Selection uses d_route operator keys; execution uses d_model RW dirs.
     read_directions = _forward_unit_direction(
         read_vectors.astype(jnp.float32))
     write_directions = _forward_unit_direction(
         write_vectors.astype(jnp.float32))
-    execution_kwargs, admission_den_power = _split_admission_den_kwargs(
-        angular_execution_kwargs, admission_den_pool)
-    _, admission, _, execution_weight, _ = _angular_execution(
-        operator_query, operator_keys, raw_tau, raw_scan_offset, **execution_kwargs)
+    gate_kwargs, gate_den_power = _split_gate_den_kwargs(
+        angular_gate_kwargs, gate_den_pool)
+    _, gate_weight, _, _ = _angular_gate(
+        operator_query, operator_keys, raw_tau, raw_scan_offset, **gate_kwargs)
     composition_den = _composition_den(
-        admission.sum(axis=-1, keepdims=True), admission_den_power,
-        execution_kwargs.get(
+        gate_weight.sum(axis=-1, keepdims=True), gate_den_power,
+        gate_kwargs.get(
             'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
-    execution_weight_norm = execution_weight / jnp.maximum(
+    gate_weight_norm = gate_weight / jnp.maximum(
         composition_den, 1e-8)
 
     read_activations = state.astype(jnp.float32) @ read_directions.T
-    weighted_read_activations = execution_weight * read_activations
+    weighted_read_activations = gate_weight * read_activations
     raw_state_transition = weighted_read_activations @ write_directions
     state_transition = raw_state_transition.astype(jnp.float32) / composition_den
-    return (state_transition.astype(jnp.float32), execution_weight,
-            execution_weight_norm)
+    return (state_transition.astype(jnp.float32), gate_weight,
+            gate_weight_norm)
 
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                          n_heads, d_model, n_layers,
                          cache_K, cache_V, cache_len,
-                         angular_execution_kwargs=None):
+                         angular_gate_kwargs=None):
     """Cached attention decode step. x: [B, 1, D]."""
     B = x.shape[0]
     d_head = d_model // n_heads
 
-    if angular_execution_kwargs is None:
-        angular_execution_kwargs = {}
+    if angular_gate_kwargs is None:
+        angular_gate_kwargs = {}
     pool_params = _ensure_pool_operator_keys(pool_params)
     qk_operator_keys = pool_params['attn_qk_op_key']
     v_operator_keys = pool_params['attn_v_op_key']
@@ -11343,16 +11251,16 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
     attention_q = _srw_inference(x, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                        pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                       admission_den_pool='qk',
-                       **angular_execution_kwargs)
+                       gate_den_pool='qk',
+                       **angular_gate_kwargs)
     attention_k_new = _srw_inference(x, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                           admission_den_pool='qk',
-                           **angular_execution_kwargs)
+                           gate_den_pool='qk',
+                           **angular_gate_kwargs)
     attention_v_new = _srw_inference(x, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                            pool_params['attn_v_read'], pool_params['attn_v_write'],
-                           admission_den_pool='v',
-                           **angular_execution_kwargs)
+                           gate_den_pool='v',
+                           **angular_gate_kwargs)
     _qk_s, _v_s, _ = _effective_pool_output_scales(
         pool_params, d_model, n_layers)
     attention_q = attention_q * _qk_s
@@ -11381,10 +11289,10 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _rst_forward_inference(x, pool_params, router_params,
                            d_model=None, n_layers=None,
-                           angular_execution_kwargs=None):
+                           angular_gate_kwargs=None):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
-    if angular_execution_kwargs is None:
-        angular_execution_kwargs = {}
+    if angular_gate_kwargs is None:
+        angular_gate_kwargs = {}
     pool_params = _ensure_pool_operator_keys(pool_params)
     rst_operator_keys = pool_params['rst_op_key']
     operator_query = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
@@ -11392,8 +11300,8 @@ def _rst_forward_inference(x, pool_params, router_params,
     raw_scan_offset = jnp.zeros_like(tau)
     out = _srw_inference(x, operator_query, rst_operator_keys, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'],
-                         admission_den_pool='rst',
-                         **angular_execution_kwargs)
+                         gate_den_pool='rst',
+                         **angular_gate_kwargs)
     if d_model is None or n_layers is None:
         raise ValueError(
             "depth-scaled pool outputs require d_model and n_layers.")
@@ -11413,7 +11321,7 @@ def prefill(params, model_cfg, input_ids):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
     max_seq = model_cfg['max_seq_len']
     d_head = d_model // n_heads
 
@@ -11447,16 +11355,16 @@ def prefill(params, model_cfg, input_ids):
 
         attention_q = _srw_inference(normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                           admission_den_pool='qk',
-                           **angular_execution_kwargs)
+                           gate_den_pool='qk',
+                           **angular_gate_kwargs)
         attention_k = _srw_inference(normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                      pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                                     admission_den_pool='qk',
-                                     **angular_execution_kwargs)
+                                     gate_den_pool='qk',
+                                     **angular_gate_kwargs)
         attention_v = _srw_inference(normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                      pool_params['attn_v_read'], pool_params['attn_v_write'],
-                                     admission_den_pool='v',
-                                     **angular_execution_kwargs)
+                                     gate_den_pool='v',
+                                     **angular_gate_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
         attention_q = attention_q * _qk_s
@@ -11490,7 +11398,7 @@ def prefill(params, model_cfg, input_ids):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            angular_execution_kwargs=angular_execution_kwargs)
+            angular_gate_kwargs=angular_gate_kwargs)
         x = x + rst_out
         return (x, cK, cV), None
 
@@ -11512,7 +11420,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
 
     pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
     router_params = params['router']
@@ -11534,7 +11442,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
             bp['attn']['expand_O']['kernel'],
             n_heads, d_model, n_layers,
             cK[layer_idx], cV[layer_idx], pos,
-            angular_execution_kwargs=angular_execution_kwargs)
+            angular_gate_kwargs=angular_gate_kwargs)
         cK = cK.at[layer_idx].set(new_cK)
         cV = cV.at[layer_idx].set(new_cV)
         x = x + attn_out
@@ -11543,7 +11451,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            angular_execution_kwargs=angular_execution_kwargs)
+            angular_gate_kwargs=angular_gate_kwargs)
         x = x + rst_out
         return (x, cK, cV, pos), None
 
@@ -11577,7 +11485,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     max_seq = model_cfg['max_seq_len']
-    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
 
     pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
     router_params = params['router']
@@ -11608,16 +11516,16 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             attention_q = _srw_inference(normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                               admission_den_pool='qk',
-                               **angular_execution_kwargs)
+                               gate_den_pool='qk',
+                               **angular_gate_kwargs)
             attention_k = _srw_inference(normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-                               admission_den_pool='qk',
-                               **angular_execution_kwargs)
+                               gate_den_pool='qk',
+                               **angular_gate_kwargs)
             attention_v = _srw_inference(normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'],
-                               admission_den_pool='v',
-                               **angular_execution_kwargs)
+                               gate_den_pool='v',
+                               **angular_gate_kwargs)
             _qk_s = qk_scale_eff
             _v_s = v_scale_eff
             attention_q = attention_q * _qk_s
@@ -11651,8 +11559,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             raw_scan_offset_k = jnp.zeros_like(tau_k)
             rst_out = _srw_inference(normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
                                      pool_params['rst_read'], pool_params['rst_write'],
-                                     admission_den_pool='rst',
-                                     **angular_execution_kwargs)
+                                     gate_den_pool='rst',
+                                     **angular_gate_kwargs)
             x = x + rst_out * rst_scale_eff
             return x, None
 
@@ -11763,8 +11671,8 @@ def vectorized_weight_analysis(params, max_sample=2048):
 def analysis_forward(params, model_cfg, input_ids, mode='full'):
     """Forward returning per-layer gate distributions + output norms.
 
-    mode='full': returns gate + execution_weight_norm (R.1, P2, P3 etc.)
-    mode='light': returns execution_weight_norm only.
+    mode='full': returns gate + gate_weight_norm (R.1, P2, P3 etc.)
+    mode='light': returns gate_weight_norm only.
 
     Returns:
         logits: [B, S, vocab]
@@ -11782,7 +11690,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
 
     pool_params = _pool_params_with_operator_keys(params['neuron_pool'])
     router_params = params['router']
@@ -11814,18 +11722,18 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         attention_q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
             normed, q_operator_query, qk_operator_keys, tau_all[:, :, 0:1], raw_scan_offset_all[:, :, 0:1],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-            admission_den_pool='qk',
-            **angular_execution_kwargs)
+            gate_den_pool='qk',
+            **angular_gate_kwargs)
         attention_k, gate_K_raw, gate_K = _srw_inference_with_gates(
             normed, k_operator_query, qk_operator_keys, tau_all[:, :, 1:2], raw_scan_offset_all[:, :, 1:2],
             pool_params['attn_qk_read'], pool_params['attn_qk_write'],
-            admission_den_pool='qk',
-            **angular_execution_kwargs)
+            gate_den_pool='qk',
+            **angular_gate_kwargs)
         attention_v, gate_V_raw, gate_V = _srw_inference_with_gates(
             normed, v_operator_query, v_operator_keys, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
             pool_params['attn_v_read'], pool_params['attn_v_write'],
-            admission_den_pool='v',
-            **angular_execution_kwargs)
+            gate_den_pool='v',
+            **angular_gate_kwargs)
         _qk_s = qk_scale_eff
         _v_s = v_scale_eff
         attention_q = attention_q * _qk_s
@@ -11860,8 +11768,8 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
             normed, rst_operator_query, rst_operator_keys, tau_k, raw_scan_offset_k,
             pool_params['rst_read'], pool_params['rst_write'],
-            admission_den_pool='rst',
-            **angular_execution_kwargs)
+            gate_den_pool='rst',
+            **angular_gate_kwargs)
         rst_out = rst_out * rst_scale_eff
         rst_out_norm = jnp.linalg.norm(rst_out, axis=-1).mean()
         x = x + rst_out
@@ -11907,7 +11815,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     """
     params = _squeeze_params(params)
     params = jax.tree.map(jnp.asarray, params)
-    angular_execution_kwargs = _angular_execution_kwargs_from_model_cfg(model_cfg)
+    angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
     qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
         if 'qk' in suppress_masks else None
     v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
@@ -11917,26 +11825,25 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
     def _srw_sup(
             state, operator_query, operator_keys, tau_off, raw_scan_offset,
-            read_vectors, write_vectors, mult, admission_den_pool):
+            read_vectors, write_vectors, mult, gate_den_pool):
         """SRW with optional gate suppression."""
         # Suppressed forward selects by d_route keys and executes d_model RW.
         read_directions = _forward_unit_direction(
             read_vectors.astype(jnp.float32))
         write_directions = _forward_unit_direction(
             write_vectors.astype(jnp.float32))
-        execution_kwargs, admission_den_power = _split_admission_den_kwargs(
-            angular_execution_kwargs, admission_den_pool)
-        _, admission, _, execution_weight, _ = _angular_execution(
-            operator_query, operator_keys, tau_off, raw_scan_offset, **execution_kwargs)
+        gate_kwargs, gate_den_power = _split_gate_den_kwargs(
+            angular_gate_kwargs, gate_den_pool)
+        _, gate_weight, _, _ = _angular_gate(
+            operator_query, operator_keys, tau_off, raw_scan_offset, **gate_kwargs)
         if mult is not None:
-            execution_weight = execution_weight * mult[None, None, :]
-            admission = admission * mult[None, None, :]
+            gate_weight = gate_weight * mult[None, None, :]
         read_activations = state.astype(jnp.float32) @ read_directions.T
-        weighted_read_activations = execution_weight * read_activations
+        weighted_read_activations = gate_weight * read_activations
         state_transition = weighted_read_activations @ write_directions
         composition_den = _composition_den(
-            admission.sum(axis=-1, keepdims=True), admission_den_power,
-            execution_kwargs.get(
+            gate_weight.sum(axis=-1, keepdims=True), gate_den_power,
+            gate_kwargs.get(
                 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE))
         return (state_transition.astype(jnp.float32) / composition_den).astype(
             jnp.float32)

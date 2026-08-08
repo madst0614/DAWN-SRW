@@ -20,10 +20,10 @@ model:
 
   d_route: 256
   srw_composition_mode: linear_angular
-  admission_den_power: 1.0
-  admission_den_power_qk: 0.5
-  admission_den_power_v: 1.0
-  admission_den_power_rst: 1.2
+  gate_den_power: 1.0
+  gate_den_power_qk: 0.5
+  gate_den_power_v: 1.0
+  gate_den_power_rst: 1.2
 
   # Total-parameter matched to the official v4171 1.3B config.
   # v4172 source ratio: 4600:14500:29300 (QK:V:RST).

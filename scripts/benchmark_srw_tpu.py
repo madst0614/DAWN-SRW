@@ -1749,12 +1749,16 @@ def build_sharded_fns(cfg, mesh):
 
 def benchmark_apply_kwargs(cfg, version, sharded_fns, attention_mask, rng, step):
     t = cfg["training"]
+    m = cfg["model"]
     soft_gate_t = float(t.get("soft_gate_temperature", 0.07))
     boundary_power = float(t.get(
         "soft_gate_boundary_power_final",
         t.get("soft_gate_boundary_power_mid",
               t.get("soft_gate_boundary_power_start", 4.0))))
-    admission_den_power = float(t.get("admission_den_power", 1.0))
+    is_v4172 = version == V4172_MODEL_VERSION
+    den_power_key = "gate_den_power" if is_v4172 else "admission_den_power"
+    den_power = float(
+        m.get(den_power_key, t.get(den_power_key, 1.0)))
     tokens_per_step = (
         int(t["batch_size"])
         * int(cfg["model"].get("max_seq_len", 512)))
@@ -1771,9 +1775,10 @@ def benchmark_apply_kwargs(cfg, version, sharded_fns, attention_mask, rng, step)
         "soft_gate_T_rst": soft_gate_t,
         "soft_gate_boundary_power": boundary_power,
         "soft_gate_boundary_power_final": boundary_power,
-        "admission_den_power": admission_den_power,
-        "execution_prune_eps": 0.0,
+        den_power_key: den_power,
     }
+    if not is_v4172:
+        out["execution_prune_eps"] = 0.0
     if version in V417X_MODEL_VERSIONS:
         out.update({
             "minimal_runtime_profile": "training",
@@ -2133,7 +2138,16 @@ def create_module_profile_fns(cfg, sharded_fns):
         "soft_gate_boundary_power_final",
         t.get("soft_gate_boundary_power_mid",
               t.get("soft_gate_boundary_power_start", 4.0))))
-    admission_den_power = float(t.get("admission_den_power", 1.0))
+    is_v4172 = version == V4172_MODEL_VERSION
+    den_power_key = "gate_den_power" if is_v4172 else "admission_den_power"
+    den_power = float(
+        m.get(den_power_key, t.get(den_power_key, 1.0)))
+
+    def execution_kwargs():
+        kwargs = {den_power_key: den_power}
+        if not is_v4172:
+            kwargs["execution_prune_eps"] = 0.0
+        return kwargs
     tokens_per_step = (
         int(t["batch_size"])
         * int(m.get("max_seq_len", 512)))
@@ -2166,8 +2180,7 @@ def create_module_profile_fns(cfg, sharded_fns):
                     soft_gate_T_v=soft_gate_t,
                     soft_gate_boundary_power=boundary_power,
                     soft_gate_boundary_power_final=boundary_power,
-                    admission_den_power=admission_den_power,
-                    execution_prune_eps=0.0,
+                    **execution_kwargs(),
                     training_tokens=training_tokens(step)))
             diag_guard = (
                 jnp.sum(sector_diag)
@@ -2186,8 +2199,7 @@ def create_module_profile_fns(cfg, sharded_fns):
                 soft_gate_T_v=soft_gate_t,
                 soft_gate_boundary_power=boundary_power,
                 soft_gate_boundary_power_final=boundary_power,
-                admission_den_power=admission_den_power,
-                execution_prune_eps=0.0)
+                **execution_kwargs())
             diag_guard = jnp.mean(attn_out)
         return x + attn_out, diag_guard
 
@@ -2208,8 +2220,7 @@ def create_module_profile_fns(cfg, sharded_fns):
                     soft_gate_T_rst=soft_gate_t,
                     soft_gate_boundary_power=boundary_power,
                     soft_gate_boundary_power_final=boundary_power,
-                    admission_den_power=admission_den_power,
-                    execution_prune_eps=0.0,
+                    **execution_kwargs(),
                     training_tokens=training_tokens(step)))
             diag_guard = (
                 jnp.sum(sector_diag)
@@ -2227,8 +2238,7 @@ def create_module_profile_fns(cfg, sharded_fns):
                 soft_gate_T_rst=soft_gate_t,
                 soft_gate_boundary_power=boundary_power,
                 soft_gate_boundary_power_final=boundary_power,
-                admission_den_power=admission_den_power,
-                execution_prune_eps=0.0)
+                **execution_kwargs())
             diag_guard = jnp.mean(rst_out)
         return x + rst_out, diag_guard
 

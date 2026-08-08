@@ -2,7 +2,7 @@
 
 The runtime profiler advances the checkpoint with the canonical production
 minimal kernels.  It only observes address-stage selection margins and
-admission weights, before the high-dimensional read/write application.  This
+gate weights, before the high-dimensional read/write application.  This
 keeps the measured support definition aligned with the exact conditional
 execution boundary without claiming that the current dense kernel skips work.
 """
@@ -27,7 +27,7 @@ DEFAULT_EPSILON_THRESHOLDS = (1.0e-6, 1.0e-5, 1.0e-4, 1.0e-3)
 def threshold_id(index: int, epsilon_thresholds: Sequence[float]) -> str:
     if int(index) == 0:
         return "exact_margin_gt_0"
-    return f"admission_weight_gt_{float(epsilon_thresholds[index - 1]):.0e}"
+    return f"gate_weight_gt_{float(epsilon_thresholds[index - 1]):.0e}"
 
 
 def threshold_record(
@@ -44,9 +44,9 @@ def threshold_record(
     return {
         "threshold_id": threshold_id(index, epsilon_thresholds),
         "kind": "approximate",
-        "criterion": f"admission_weight > {epsilon:.0e}",
+        "criterion": f"gate_weight > {epsilon:.0e}",
         "epsilon": epsilon,
-        "output_equivalence": "not asserted; approximate pruning threshold",
+        "output_equivalence": "not asserted; approximate support threshold",
     }
 
 
@@ -62,9 +62,11 @@ def _transition_output(result: Any, *, name: str, expected_ndim: int):
 def _address_support(
         operator_query, operator_keys, raw_tau, *, model_module,
         execution_kwargs: Mapping[str, Any]):
-    """Return production-precision selection margin and admission weight."""
+    """Return production-precision selection margin and gate weight."""
     kwargs = dict(execution_kwargs)
     for key in (
+            "gate_den_power", "gate_den_power_qk",
+            "gate_den_power_v", "gate_den_power_rst",
             "admission_den_power", "admission_den_power_qk",
             "admission_den_power_v", "admission_den_power_rst"):
         kwargs.pop(key, None)
@@ -79,31 +81,46 @@ def _address_support(
     temperature = kwargs.pop("soft_gate_temperature")
     boundary_power = kwargs.pop("soft_gate_boundary_power")
     effective_active_eps = kwargs.pop("soft_gate_effective_active_eps")
-    selection_margin, admission, _, _, _ = (
-        model_module._compute_admission_drive(
-            score,
-            tau,
-            temperature,
-            boundary_power=boundary_power,
-            effective_active_eps=effective_active_eps,
-            **kwargs,
-        ))
-    return selection_margin, admission
+    if hasattr(model_module, "_compute_gate_weight"):
+        selection_margin, gate_weight, _, _ = (
+            model_module._compute_gate_weight(
+                score,
+                tau,
+                **kwargs,
+            ))
+    else:
+        selection_margin, gate_weight, _, _, _ = (
+            model_module._compute_admission_drive(
+                score,
+                tau,
+                temperature,
+                boundary_power=boundary_power,
+                effective_active_eps=effective_active_eps,
+                **kwargs,
+            ))
+    return selection_margin, gate_weight
+
+
+def _legacy_kernel_tail(model_module, gate_kwargs):
+    """Supply the retired prune scalar only to older module signatures."""
+    if hasattr(model_module, "_compute_gate_weight"):
+        return ()
+    return (gate_kwargs.get("execution_prune_eps", 0.0),)
 
 
 def _support_counts(
-        selection_margin, admission, epsilon_thresholds):
+        selection_margin, gate_weight, epsilon_thresholds):
     exact = (selection_margin > jnp.float32(0.0)).sum(
         axis=-1, dtype=jnp.int32)
     eps = jnp.asarray(epsilon_thresholds, dtype=jnp.float32)
     approximate = jax.vmap(
-        lambda value: (admission > value).sum(axis=-1, dtype=jnp.int32)
+        lambda value: (gate_weight > value).sum(axis=-1, dtype=jnp.int32)
     )(eps)
     return jnp.concatenate((exact[jnp.newaxis, ...], approximate), axis=0)
 
 
 def _union_support_counts(
-        q_margin, q_admission, k_margin, k_admission,
+        q_margin, q_gate_weight, k_margin, k_gate_weight,
         epsilon_thresholds):
     exact = jnp.logical_or(
         q_margin > jnp.float32(0.0),
@@ -112,7 +129,7 @@ def _union_support_counts(
     eps = jnp.asarray(epsilon_thresholds, dtype=jnp.float32)
     approximate = jax.vmap(
         lambda value: jnp.logical_or(
-            q_admission > value, k_admission > value
+            q_gate_weight > value, k_gate_weight > value
         ).sum(axis=-1, dtype=jnp.int32)
     )(eps)
     return jnp.concatenate((exact[jnp.newaxis, ...], approximate), axis=0)
@@ -165,12 +182,19 @@ def support_profile_forward(
     n_v = int(model_cfg["n_v"])
     n_rst = int(model_cfg.get("n_rst", model_cfg.get("n_know")))
 
-    execution_kwargs = (
-        model_module._angular_execution_kwargs_from_model_cfg(model_cfg))
-    default_power = float(execution_kwargs.get("admission_den_power", 1.0))
+    gate_kwargs_builder = getattr(
+        model_module, "_angular_gate_kwargs_from_model_cfg", None)
+    if gate_kwargs_builder is None:
+        gate_kwargs_builder = getattr(
+            model_module, "_angular_execution_kwargs_from_model_cfg")
+    execution_kwargs = gate_kwargs_builder(model_cfg)
+    den_prefix = (
+        "gate_den_power"
+        if "gate_den_power" in execution_kwargs else "admission_den_power")
+    default_power = float(execution_kwargs.get(den_prefix, 1.0))
     powers = {
         route: float(execution_kwargs.get(
-            f"admission_den_power_{route}", default_power))
+            f"{den_prefix}_{route}", default_power))
         for route in ("qk", "v", "rst")
     }
 
@@ -218,29 +242,29 @@ def support_profile_forward(
             normed @ router["raw_tau_attn"]["kernel"]
             + router["raw_tau_attn"]["bias"])
 
-        q_margin, q_admission = _address_support(
+        q_margin, q_gate_weight = _address_support(
             query_q, pool["attn_qk_op_key"], tau_all[:, :, 0:1],
             model_module=model_module, execution_kwargs=execution_qk)
-        k_margin, k_admission = _address_support(
+        k_margin, k_gate_weight = _address_support(
             query_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
             model_module=model_module, execution_kwargs=execution_qk)
-        v_margin, v_admission = _address_support(
+        v_margin, v_gate_weight = _address_support(
             query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
             model_module=model_module, execution_kwargs=execution_v)
         histograms["q"].append(_count_histograms(
             _support_counts(
-                q_margin, q_admission, epsilon_thresholds), n_qk))
+                q_margin, q_gate_weight, epsilon_thresholds), n_qk))
         histograms["k"].append(_count_histograms(
             _support_counts(
-                k_margin, k_admission, epsilon_thresholds), n_qk))
+                k_margin, k_gate_weight, epsilon_thresholds), n_qk))
         histograms["qk_union"].append(_count_histograms(
             _union_support_counts(
-                q_margin, q_admission, k_margin, k_admission,
+                q_margin, q_gate_weight, k_margin, k_gate_weight,
                 epsilon_thresholds),
             n_qk))
         histograms["v"].append(_count_histograms(
             _support_counts(
-                v_margin, v_admission, epsilon_thresholds), n_v))
+                v_margin, v_gate_weight, epsilon_thresholds), n_v))
 
         paired_queries = jnp.stack((query_q, query_k), axis=2)
         paired_tau = jnp.stack(
@@ -261,7 +285,7 @@ def support_profile_forward(
                 model_cfg.get(
                     "soft_gate_boundary_power_final",
                     execution_qk["soft_gate_boundary_power"]),
-                execution_qk.get("execution_prune_eps", 0.0),
+                *_legacy_kernel_tail(model_module, execution_qk),
             ),
             name="attn_qk_paired_minimal",
             expected_ndim=4,
@@ -282,7 +306,7 @@ def support_profile_forward(
                 model_cfg.get(
                     "soft_gate_boundary_power_final",
                     execution_v["soft_gate_boundary_power"]),
-                execution_v.get("execution_prune_eps", 0.0),
+                *_legacy_kernel_tail(model_module, execution_v),
             ),
             name="attn_v_single_minimal",
             expected_ndim=3,
@@ -327,12 +351,12 @@ def support_profile_forward(
         tau_rst = (
             normed @ router["raw_tau_rst"]["kernel"]
             + router["raw_tau_rst"]["bias"])
-        rst_margin, rst_admission = _address_support(
+        rst_margin, rst_gate_weight = _address_support(
             query_rst, pool["rst_op_key"], tau_rst,
             model_module=model_module, execution_kwargs=execution_rst)
         histograms["rst"].append(_count_histograms(
             _support_counts(
-                rst_margin, rst_admission, epsilon_thresholds), n_rst))
+                rst_margin, rst_gate_weight, epsilon_thresholds), n_rst))
         rst_transition = _transition_output(
             production_srw_fns["rst_single_minimal"](
                 normed,
@@ -349,7 +373,7 @@ def support_profile_forward(
                 model_cfg.get(
                     "soft_gate_boundary_power_final",
                     execution_rst["soft_gate_boundary_power"]),
-                execution_rst.get("execution_prune_eps", 0.0),
+                *_legacy_kernel_tail(model_module, execution_rst),
             ),
             name="rst_single_minimal",
             expected_ndim=3,
@@ -444,7 +468,7 @@ def summarize_support_histograms(
         "schema_version": 1,
         "support_definition": {
             "exact": "selection_margin > 0",
-            "approximate": "admission_weight > epsilon",
+            "approximate": "gate_weight > epsilon",
             "epsilon_thresholds": [
                 float(value) for value in epsilon_thresholds],
             "qk_union": (

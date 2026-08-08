@@ -429,8 +429,18 @@ def create_or_reuse_sharded_fns(
     def srw_pool_kwargs(pool):
         kwargs = dict(base_kwargs_for_analysis)
         if train._is_v417x_version(version):
-            kwargs["admission_den_power"] = float(
-                cfg["model"][f"admission_den_power_{pool}"])
+            _, qk_power, v_power, rst_power = gate_den_powers_from_config(cfg)
+            pool_power = {
+                "qk": qk_power,
+                "v": v_power,
+                "rst": rst_power,
+            }[pool]
+            den_power_key = (
+                "gate_den_power"
+                if version == V4172_MODEL_VERSION
+                else "admission_den_power"
+            )
+            kwargs[den_power_key] = float(pool_power)
         if version == v4168_version:
             m_cfg = cfg.get("model", {})
             kwargs.update({
@@ -754,11 +764,11 @@ def model_cfg_from_config(
         total_training_steps: Optional[int] = None) -> Dict[str, Any]:
     m = cfg.get("model", {})
     t = cfg.get("training", {})
-    legacy_den_power = float(m.get(
-        "admission_den_power", t.get("admission_den_power", 1.0)))
     model_version = m.get("model_version")
     if model_version is None:
         raise ValueError("analysis config requires model.model_version")
+    (gate_den_power, gate_den_power_qk,
+     gate_den_power_v, gate_den_power_rst) = gate_den_powers_from_config(cfg)
     model_cfg = {
         "model_version": model_version,
         "vocab_size": int(m.get("vocab_size", 30522)),
@@ -773,19 +783,26 @@ def model_cfg_from_config(
         "n_know": int(m.get("n_know", m.get("n_rst", 25200))),
         "soft_gate_temperature": float(t.get("soft_gate_t_final", 0.07)),
         "soft_gate_boundary_power": float(t.get("soft_gate_boundary_power_final", 4.0)),
-        "admission_den_power": legacy_den_power,
-        "admission_den_power_qk": float(m.get(
-            "admission_den_power_qk", legacy_den_power)),
-        "admission_den_power_v": float(m.get(
-            "admission_den_power_v", legacy_den_power)),
-        "admission_den_power_rst": float(m.get(
-            "admission_den_power_rst", legacy_den_power)),
         "srw_composition_mode": str(m.get(
             "srw_composition_mode", "linear_angular")),
         "heat_kernel_beta": float(m.get("heat_kernel_beta", 2.0)),
         "soft_gate_effective_active_eps": float(t.get("soft_gate_effective_active_eps", 1e-6)),
-        "execution_prune_eps": float(m.get("execution_prune_eps", 0.0)),
     }
+    if model_version == V4172_MODEL_VERSION:
+        model_cfg.update({
+            "gate_den_power": gate_den_power,
+            "gate_den_power_qk": gate_den_power_qk,
+            "gate_den_power_v": gate_den_power_v,
+            "gate_den_power_rst": gate_den_power_rst,
+        })
+    else:
+        model_cfg.update({
+            "admission_den_power": gate_den_power,
+            "admission_den_power_qk": gate_den_power_qk,
+            "admission_den_power_v": gate_den_power_v,
+            "admission_den_power_rst": gate_den_power_rst,
+            "execution_prune_eps": float(m.get("execution_prune_eps", 0.0)),
+        })
     for key in (
         "logical_vocab_size",
         "vocab_size_padded",
@@ -802,25 +819,63 @@ def model_cfg_from_config(
     return model_cfg
 
 
-def admission_den_power_from_config(cfg: Dict[str, Any]) -> float:
-    """Resolve the model-owned v417x value with legacy training fallback."""
+def gate_den_power_from_config(cfg: Dict[str, Any]) -> float:
+    """Resolve the version-owned denominator power.
+
+    Old ``admission_den_power`` metadata remains readable for saved v4172
+    checkpoints, but a current v4172 analysis model config is always emitted
+    with the canonical ``gate_den_power`` key.
+    """
     model_cfg = cfg.get("model", {})
     training_cfg = cfg.get("training", {})
+    if model_cfg.get("model_version") == V4172_MODEL_VERSION:
+        return float(model_cfg.get(
+            "gate_den_power",
+            model_cfg.get(
+                "admission_den_power",
+                training_cfg.get(
+                    "gate_den_power",
+                    training_cfg.get("admission_den_power", 1.0))),
+        ))
     return float(model_cfg.get(
         "admission_den_power", training_cfg.get("admission_den_power", 1.0)))
 
 
+def gate_den_powers_from_config(
+        cfg: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """Return default, QK, V, and RST powers for the selected version."""
+    model_cfg = cfg.get("model", {})
+    default_power = gate_den_power_from_config(cfg)
+    if model_cfg.get("model_version") == V4172_MODEL_VERSION:
+        def pool_power(pool):
+            return float(model_cfg.get(
+                f"gate_den_power_{pool}",
+                model_cfg.get(f"admission_den_power_{pool}", default_power),
+            ))
+
+        return (
+            default_power,
+            pool_power("qk"),
+            pool_power("v"),
+            pool_power("rst"),
+        )
+    return (
+        default_power,
+        float(model_cfg.get("admission_den_power_qk", default_power)),
+        float(model_cfg.get("admission_den_power_v", default_power)),
+        float(model_cfg.get("admission_den_power_rst", default_power)),
+    )
+
+
+def admission_den_power_from_config(cfg: Dict[str, Any]) -> float:
+    """Compatibility alias for analysis callers shared with older versions."""
+    return gate_den_power_from_config(cfg)
+
+
 def admission_den_powers_from_config(
         cfg: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    """Return legacy, QK, V, and RST powers with legacy fallback."""
-    model_cfg = cfg.get("model", {})
-    legacy = admission_den_power_from_config(cfg)
-    return (
-        legacy,
-        float(model_cfg.get("admission_den_power_qk", legacy)),
-        float(model_cfg.get("admission_den_power_v", legacy)),
-        float(model_cfg.get("admission_den_power_rst", legacy)),
-    )
+    """Compatibility alias for analysis callers shared with older versions."""
+    return gate_den_powers_from_config(cfg)
 
 
 def count_params(params: Any) -> int:
@@ -933,6 +988,13 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
                         cfg: Optional[Dict[str, Any]] = None):
     """Trainer-matched CE eval step used by eval/prune stages."""
     cfg = cfg or {}
+    version = cfg.get("model", {}).get("model_version")
+    if version == V4172_MODEL_VERSION and (
+            return_prune_stats or return_pool_prune_stats
+            or float(execution_prune_eps) != 0.0):
+        raise ValueError(
+            "v4172 exposes one canonical gate and has no execution-pruning "
+            "evaluation contract")
     t = cfg.get("training", {})
     train = get_train()
     soft_gate_t_start = float(t.get("soft_gate_t_start", 1.5))
@@ -979,7 +1041,7 @@ def create_ce_eval_step(model, sharded_fns=None, *, minimal_train: bool = True,
         soft_gate_boundary_power_start_frac=float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
         soft_gate_boundary_power_mid_frac=float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
         soft_gate_boundary_power_final_frac=float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
-        admission_den_power=admission_den_power_from_config(cfg),
+        admission_den_power=gate_den_power_from_config(cfg),
     )
 
     def step(params, input_ids, attention_mask, current_step):
@@ -1067,7 +1129,7 @@ def create_active_analysis_step(model, sharded_fns=None, *,
         soft_gate_boundary_power_start_frac=float(t.get("soft_gate_boundary_power_start_frac", 0.0)),
         soft_gate_boundary_power_mid_frac=float(t.get("soft_gate_boundary_power_mid_frac", 0.800)),
         soft_gate_boundary_power_final_frac=float(t.get("soft_gate_boundary_power_final_frac", 0.950)),
-        admission_den_power=admission_den_power_from_config(cfg),
+        admission_den_power=gate_den_power_from_config(cfg),
         ce_token_chunk_size=int(t.get("ce_token_chunk_size", 32768)),
     )
 
@@ -1077,8 +1139,8 @@ def create_composition_analysis_step(
     """Return the v417x minimal-path composition diagnostics step.
 
     The trainer's full ``analysis=True`` path owns per-layer diagnostics, while
-    v417x's exact admission-mass/composition-denominator scalars are emitted by
-    its production minimal path. Run this only when the composition item is
+    v417x's exact gate-mass/composition-denominator scalars are emitted by its
+    production minimal path. Run this only when the composition item is
     selected so other analysis presets do not pay for a second forward.
     """
     cfg = cfg or {}
@@ -1088,11 +1150,43 @@ def create_composition_analysis_step(
             "Composition analysis is only defined for "
             f"{V417X_MODEL_VERSIONS}, got {version!r}")
     t = cfg.get("training", {})
-    admission_den_power = admission_den_power_from_config(cfg)
+    gate_den_power = gate_den_power_from_config(cfg)
     ce_token_chunk_size = int(t.get("ce_token_chunk_size", 32768))
     soft_gate_temperature = float(t.get("soft_gate_t_final", 0.07))
     soft_gate_boundary_power = float(
         t.get("soft_gate_boundary_power_final", 4.0))
+    if version == V4172_MODEL_VERSION:
+        kernel_profile = (
+            sharded_fns.get("_v4172_kernel_profile")
+            if isinstance(sharded_fns, Mapping) else None)
+        if kernel_profile != "production_diagnostics":
+            raise ValueError(
+                "v4172 composition analysis requires "
+                "production_diagnostics sharded functions, got "
+                f"{kernel_profile!r}")
+        denominator_kwargs = {"gate_den_power": gate_den_power}
+        denominator_kwargs["minimal_runtime_profile"] = "diagnostics"
+        denominator_key = "gate_den_power"
+        mass_metric = "gate_mass"
+    else:
+        denominator_kwargs = {
+            "admission_den_power": gate_den_power,
+            "execution_prune_eps": jnp.float32(0.0),
+        }
+        denominator_key = "admission_den_power"
+        mass_metric = "admission_mass"
+    keys = (
+        denominator_key,
+        *(
+            f"{pool}_{name}"
+            for pool in ("attn_qk", "attn_v", "rst")
+            for name in (
+                f"{mass_metric}_mean", f"{mass_metric}_max",
+                "composition_den_mean", "composition_den_min",
+                "composition_den_max", "composition_den_floor_frac",
+            )
+        ),
+    )
 
     @jax.jit
     def step(params, input_ids, attention_mask):
@@ -1107,25 +1201,12 @@ def create_composition_analysis_step(
             sharded_fns=sharded_fns,
             analysis=False,
             minimal_train=True,
-            admission_den_power=admission_den_power,
             soft_gate_temperature=soft_gate_temperature,
             soft_gate_boundary_power=soft_gate_boundary_power,
             soft_gate_boundary_power_final=soft_gate_boundary_power,
-            execution_prune_eps=jnp.float32(0.0),
             ce_token_chunk_size=ce_token_chunk_size,
             compute_accuracy=False,
-        )
-        keys = (
-            "admission_den_power",
-            *(
-                f"{pool}_{name}"
-                for pool in ("attn_qk", "attn_v", "rst")
-                for name in (
-                    "admission_mass_mean", "admission_mass_max",
-                    "composition_den_mean", "composition_den_min",
-                    "composition_den_max", "composition_den_floor_frac",
-                )
-            ),
+            **denominator_kwargs,
         )
         return {key: result[key] for key in keys}
 
@@ -1242,23 +1323,27 @@ def write_run_metadata(store: AnalysisStore, cfg: Dict[str, Any],
         return
     store.ensure_layout()
     selected_stages = getattr(args, "stages", None)
+    model_version = cfg.get("model", {}).get("model_version")
+    per_stage_config = {
+        "eval_max_tokens": getattr(args, "eval_max_tokens", None),
+        "usage_max_sequences": getattr(args, "usage_max_sequences", None),
+        "trace_max_prompts": getattr(args, "trace_max_prompts", None),
+        "ablation_max_sequences": getattr(
+            args, "ablation_max_sequences", None),
+    }
+    if model_version != V4172_MODEL_VERSION:
+        per_stage_config["prune_eps"] = getattr(args, "prune_eps", None)
     manifest_fields = {
         "source_config_path": getattr(args, "config", None),
         "checkpoint_path": getattr(args, "checkpoint", None),
         "checkpoint_step": checkpoint_metadata.get("global_step", getattr(args, "checkpoint_step", None)),
         "checkpoint_metadata": json_safe(checkpoint_metadata),
-        "model_version": cfg.get("model", {}).get("model_version"),
+        "model_version": model_version,
         "data_source": cfg.get("data", {}).get("bin_val"),
         "tokenizer": "bert-base-uncased",
         "vocab_size": cfg.get("model", {}).get("vocab_size"),
         "selected_stages": selected_stages,
-        "per_stage_config": {
-            "eval_max_tokens": getattr(args, "eval_max_tokens", None),
-            "prune_eps": getattr(args, "prune_eps", None),
-            "usage_max_sequences": getattr(args, "usage_max_sequences", None),
-            "trace_max_prompts": getattr(args, "trace_max_prompts", None),
-            "ablation_max_sequences": getattr(args, "ablation_max_sequences", None),
-        },
+        "per_stage_config": per_stage_config,
         **git_info(),
         **host_info(),
     }

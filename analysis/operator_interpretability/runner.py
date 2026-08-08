@@ -12,6 +12,7 @@ import numpy as np
 from transformers import AutoTokenizer
 
 from analysis.dawn_analysis_common import (
+    V4172_MODEL_VERSION,
     analysis_model_module,
     git_info,
     materialize_global_array,
@@ -3291,6 +3292,28 @@ class OperatorInterpretabilityRunner:
                     "Trajectory graph JSON exceeded the advisory size "
                     "threshold; artifact writing continued."),
             })
+        if self.model_version == V4172_MODEL_VERSION:
+            production_active_definition = {
+                "numerator_active": "canonical production gate_weight_nonzero",
+                "denominator_active": (
+                    "the same canonical gate contribution_nonzero"),
+                "gate_den_power": float(
+                    self.ctx.model_cfg["gate_den_power"]),
+                "mass_prefix_or_compactness_selection_used": False,
+                "production_kernel_is_authoritative": True,
+            }
+        else:
+            production_active_definition = {
+                "numerator_active": (
+                    "canonical production valid mask after "
+                    "execution_prune_eps with execution_weight_nonzero"),
+                "denominator_active": (
+                    "canonical production admission contribution_nonzero"),
+                "execution_prune_eps": float(
+                    self.ctx.model_cfg.get("execution_prune_eps", 0.0)),
+                "mass_prefix_or_compactness_selection_used": False,
+                "production_kernel_is_authoritative": True,
+            }
         return {
             "status": (
                 "ready" if causal_path_supported else "no_causal_path"),
@@ -3344,17 +3367,7 @@ class OperatorInterpretabilityRunner:
                 "deep_cohort_hash": canonical_hash([
                     example.example_id for example in deep]),
             },
-            "production_active_definition": {
-                "numerator_active": (
-                    "canonical production valid mask after "
-                    "execution_prune_eps with execution_weight_nonzero"),
-                "denominator_active": (
-                    "canonical production admission contribution_nonzero"),
-                "execution_prune_eps": float(
-                    self.ctx.model_cfg.get("execution_prune_eps", 0.0)),
-                "mass_prefix_or_compactness_selection_used": False,
-                "production_kernel_is_authoritative": True,
-            },
+            "production_active_definition": production_active_definition,
             "production_atlas": {
                 "discovery": compact_discovery_atlas,
                 "validation": compact_validation_atlas,

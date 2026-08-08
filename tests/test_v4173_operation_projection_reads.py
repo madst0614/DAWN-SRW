@@ -97,7 +97,11 @@ def test_v4171_v4172_remain_full_state_read_architectures() -> None:
     common.pop("admission_den_power_v")
     common.pop("admission_den_power_rst")
     for model_type in (DAWN_SRW_V4171, DAWN_SRW_V4172):
-        params = model_type(**common).init(
+        model_kwargs = dict(common)
+        if model_type is DAWN_SRW_V4172:
+            model_kwargs["gate_den_power"] = model_kwargs.pop(
+                "admission_den_power")
+        params = model_type(**model_kwargs).init(
             {"params": jax.random.PRNGKey(1),
              "dropout": jax.random.PRNGKey(2)},
             input_ids, deterministic=True)["params"]

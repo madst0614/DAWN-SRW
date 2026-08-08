@@ -126,6 +126,14 @@ from models.dawn_srw_v4171 import (
 )
 from models.dawn_srw_v4172 import (
     DAWN_SRW_V4172,
+    DEFAULT_GATE_DEN_POWER as V4172_DEFAULT_GATE_DEN_POWER,
+    _resolve_v4172_gate_den_powers,
+    _validate_v4172_composition_settings,
+    _validate_v4172_gate_den_grad_scale,
+    _validate_v4172_gate_den_power,
+    _validate_v4172_heat_kernel_beta,
+    _validate_v4172_sharded_fns,
+    _validate_v4172_srw_composition_mode,
     _pool_operator_keys as _v4172_pool_operator_keys,
     _query_geometry_diagnostics as _v4172_query_geometry_diagnostics,
     _raw_tau_init_from_cosine_tau as _v4172_raw_tau_init_from_cosine_tau,
@@ -607,8 +615,10 @@ def _v417x_kernel_profile_key(version):
             '_v4174_kernel_profile'
             if str(version) == V4174_MODEL_VERSION else (
             '_v4173_kernel_profile'
-            if str(version) == V4173_MODEL_VERSION
-            else '_v4171_kernel_profile')))
+            if str(version) == V4173_MODEL_VERSION else (
+            '_v4172_kernel_profile'
+            if str(version) == V4172_MODEL_VERSION
+            else '_v4171_kernel_profile'))))
 
 
 def _is_fixed_tau_srw_version(version):
@@ -852,6 +862,19 @@ V4171_COMPOSITION_METRIC_NAMES = (
             'pool_scaled_srw_out_norm')),
 )
 
+V4172_COMPOSITION_METRIC_NAMES = (
+    'heat_kernel_beta',
+    *tuple(
+        f'{pool}_{name}'
+        for pool in ('attn_qk', 'attn_v', 'rst')
+        for name in (
+            'gate_mass_mean', 'gate_mass_max',
+            'composition_den_mean', 'composition_den_min',
+            'composition_den_max', 'composition_den_floor_frac',
+            'raw_srw_out_norm', 'normalized_srw_out_norm',
+            'pool_scaled_srw_out_norm')),
+)
+
 V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES = (
     'grad_pool_shared_key_probe',
     'grad_pool_shared_read_probe',
@@ -932,7 +955,9 @@ V4171_COMPACT_REGULAR_JSONL_KEYS = (
     'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
 )
 V4172_COMPACT_REGULAR_JSONL_REC_KEYS = (
-    *V4171_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4170_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4172_COMPOSITION_METRIC_NAMES,
+    *V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES,
     *V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES,
 )
 V4172_COMPACT_REGULAR_JSONL_KEYS = (
@@ -940,8 +965,16 @@ V4172_COMPACT_REGULAR_JSONL_KEYS = (
     'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
 )
 
+V4173_GENERALIZED_COMPACT_REGULAR_JSONL_REC_KEYS = (
+    *V4171_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4172_LEGACY_OPERATOR_KEY_ALIAS_METRIC_NAMES,
+)
+V4173_GENERALIZED_COMPACT_REGULAR_JSONL_KEYS = (
+    *V4173_GENERALIZED_COMPACT_REGULAR_JSONL_REC_KEYS,
+    'progress', 'epoch_elapsed', 'eta', 's_per_it', 'metric_scope',
+)
 V4173_COMPACT_REGULAR_JSONL_REC_KEYS = (
-    *V4172_COMPACT_REGULAR_JSONL_REC_KEYS,
+    *V4173_GENERALIZED_COMPACT_REGULAR_JSONL_REC_KEYS,
     *V4173_OPERATION_SPACE_METRIC_NAMES,
 )
 V4173_COMPACT_REGULAR_JSONL_KEYS = (
@@ -1350,6 +1383,13 @@ V4171_RESUME_REQUIRED_FIELDS = (
     ('model', 'admission_den_power'),
 )
 
+V4172_RESUME_REQUIRED_FIELDS = (
+    *V4169_RESUME_REQUIRED_FIELDS,
+    ('training', 'tau_lr_mult'),
+    ('model', 'operator_key_mode'),
+    ('model', 'operator_query_mode'),
+)
+
 V4173_LOCAL_WRITE_GRADIENT_METRIC_NAMES = (
     'up_proj_grad',
     'local_write_grad',
@@ -1728,18 +1768,18 @@ def _validate_v4171_resume_compatibility(
                 f"{requested_version} checkpoint operation-space schema mismatch: "
                 f"requested={requested_spaces}, checkpoint={checkpoint_spaces}. "
                 "Automatic space replication or migration is disabled.")
-    requested_den_powers = _v4171_checkpoint_den_powers(
+    requested_den_powers = _v417x_checkpoint_den_powers(
         requested_model_cfg,
         missing_message=(
             f"{requested_version} requested full_config.model is missing "
-            "admission_den_power"),
+            "gate denominator power"),
         context=f"{requested_version} requested full_config.model",
     )
-    checkpoint_den_powers = _v4171_checkpoint_den_powers(
+    checkpoint_den_powers = _v417x_checkpoint_den_powers(
         checkpoint_model_cfg,
         missing_message=(
             f"{requested_version} checkpoint full_config.model is missing "
-            "admission_den_power"),
+            "gate denominator power"),
         context=f"{requested_version} checkpoint full_config.model",
     )
     requested_den_power = requested_den_powers[0]
@@ -1747,7 +1787,7 @@ def _validate_v4171_resume_compatibility(
     if requested_den_power != checkpoint_den_power:
         raise RuntimeError(
             f"{requested_version} checkpoint model schema mismatch: "
-            "model.admission_den_power "
+            "model gate denominator power "
             f"requested={requested_den_power}, checkpoint={checkpoint_den_power}. "
             "Automatic migration/fallback is disabled.")
     for pool, requested_pool_power, checkpoint_pool_power in zip(
@@ -1756,7 +1796,7 @@ def _validate_v4171_resume_compatibility(
         if requested_pool_power != checkpoint_pool_power:
             raise RuntimeError(
                 f"{requested_version} checkpoint model schema mismatch: "
-                f"model.admission_den_power_{pool} "
+                f"model gate denominator power for {pool} "
                 f"requested={requested_pool_power}, "
                 f"checkpoint={checkpoint_pool_power}. Automatic "
                 "resume-time denominator changes are disabled; use "
@@ -1836,6 +1876,37 @@ def _v4171_checkpoint_den_powers(model_cfg, *, missing_message, context):
         raise RuntimeError(str(exc)) from exc
 
 
+def _v417x_checkpoint_den_powers(model_cfg, *, missing_message, context):
+    """Resolve denominator powers, including old v4172 checkpoint metadata.
+
+    v4172 source/config uses gate_den_power. Checkpoints created before the
+    standalone cleanup may embed admission_den_power in their saved config;
+    that spelling is accepted only at this checkpoint-metadata boundary.
+    The restored parameter tree is unchanged.
+    """
+    version = str(model_cfg.get('model_version', ''))
+    if version != V4172_MODEL_VERSION:
+        return _v4171_checkpoint_den_powers(
+            model_cfg, missing_message=missing_message, context=context)
+    if not isinstance(model_cfg, dict):
+        raise RuntimeError(missing_message)
+    canonical = 'gate_den_power' in model_cfg
+    compatibility = 'admission_den_power' in model_cfg
+    if not canonical and not compatibility:
+        raise RuntimeError(missing_message)
+    prefix = 'gate_den_power' if canonical else 'admission_den_power'
+    try:
+        return _resolve_v4172_gate_den_powers(
+            _validate_v4172_gate_den_power(
+                model_cfg[prefix], context=context),
+            model_cfg.get(f'{prefix}_qk'),
+            model_cfg.get(f'{prefix}_v'),
+            model_cfg.get(f'{prefix}_rst'),
+            context=context)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def _v4171_checkpoint_heat_kernel_beta(model_cfg, *, context):
     value = (
         model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)
@@ -1847,29 +1918,58 @@ def _v4171_checkpoint_heat_kernel_beta(model_cfg, *, context):
         raise RuntimeError(str(exc)) from exc
 
 
-def _v4171_static_runtime_den_power(model, value, *, context,
-                                    sharded_fns=None):
-    (model_value, model_qk_power, model_v_power, model_rst_power) = (
-        _resolve_v417x_admission_den_powers(
-            getattr(model, 'admission_den_power', None),
-            getattr(model, 'admission_den_power_qk', None),
-            getattr(model, 'admission_den_power_v', None),
-            getattr(model, 'admission_den_power_rst', None),
-            context="v4171 model constructor"))
-    model_mode, model_value, model_beta = _validate_v4171_composition_settings(
+def _canonicalize_v4172_checkpoint_full_config(full_config):
+    """Translate old saved v4172 denominator metadata into the active schema."""
+    canonical = deepcopy(full_config)
+    model_cfg = canonical.get('model')
+    if (not isinstance(model_cfg, dict)
+            or str(model_cfg.get('model_version')) != V4172_MODEL_VERSION):
+        return canonical
+    powers = _v417x_checkpoint_den_powers(
+        model_cfg,
+        missing_message=(
+            "v4172 checkpoint full_config.model is missing its "
+            "denominator-power metadata"),
+        context="v4172 checkpoint full_config.model",
+    )
+    for suffix in ('', '_qk', '_v', '_rst'):
+        model_cfg.pop(f'admission_den_power{suffix}', None)
+    for suffix, value in zip(('', '_qk', '_v', '_rst'), powers):
+        model_cfg[f'gate_den_power{suffix}'] = value
+    return canonical
+
+
+def _v417x_model_composition_state(model):
+    """Return canonical constructor composition state for one v417x model."""
+    model_version = str(getattr(model, '__version__', ''))
+    if model_version == V4172_MODEL_VERSION:
+        powers = _resolve_v4172_gate_den_powers(
+            getattr(model, 'gate_den_power', None),
+            getattr(model, 'gate_den_power_qk', None),
+            getattr(model, 'gate_den_power_v', None),
+            getattr(model, 'gate_den_power_rst', None),
+            context="v4172 model constructor")
+        mode, base_power, beta = _validate_v4172_composition_settings(
+            getattr(
+                model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+            getattr(model, 'gate_den_power', None),
+            getattr(model, 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
+            context="v4172 model constructor")
+        return (*powers[1:], mode, base_power, beta,
+                _validate_v4172_sharded_fns, 'gate_den_power')
+    powers = _resolve_v417x_admission_den_powers(
+        getattr(model, 'admission_den_power', None),
+        getattr(model, 'admission_den_power_qk', None),
+        getattr(model, 'admission_den_power_v', None),
+        getattr(model, 'admission_den_power_rst', None),
+        context="v417x model constructor")
+    mode, base_power, beta = _validate_v4171_composition_settings(
         getattr(
             model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
         getattr(model, 'admission_den_power', None),
         getattr(model, 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-        context="v4171 model constructor")
-    _, runtime_value, _ = _validate_v4171_composition_settings(
-        model_mode, value, model_beta, context=context)
-    if runtime_value != model_value:
-        raise ValueError(
-            f"{context} admission_den_power={runtime_value} does not match "
-            f"v4171 model constructor admission_den_power={model_value}")
-    model_version = str(getattr(model, '__version__', ''))
-    sharded_validator = (
+        context="v417x model constructor")
+    validator = (
         _validate_v4175_sharded_fns
         if model_version == V4175_MODEL_VERSION else (
             _validate_v4174_sharded_fns
@@ -1877,6 +1977,25 @@ def _v4171_static_runtime_den_power(model, value, *, context,
                 _validate_v4173_sharded_fns
                 if model_version == V4173_MODEL_VERSION
                 else _validate_v4171_sharded_fns)))
+    return (*powers[1:], mode, base_power, beta, validator,
+            'admission_den_power')
+
+
+def _v4171_static_runtime_den_power(model, value, *, context,
+                                    sharded_fns=None):
+    (model_qk_power, model_v_power, model_rst_power, model_mode,
+     model_value, model_beta, sharded_validator,
+     den_name) = _v417x_model_composition_state(model)
+    composition_validator = (
+        _validate_v4172_composition_settings
+        if den_name == 'gate_den_power'
+        else _validate_v4171_composition_settings)
+    _, runtime_value, _ = composition_validator(
+        model_mode, value, model_beta, context=context)
+    if runtime_value != model_value:
+        raise ValueError(
+            f"{context} {den_name}={runtime_value} does not match "
+            f"model constructor {den_name}={model_value}")
     sharded_validator(
         sharded_fns, model_value, model_mode, model_beta,
         expected_power_qk=model_qk_power,
@@ -1887,35 +2006,20 @@ def _v4171_static_runtime_den_power(model, value, *, context,
 
 def _v4171_static_runtime_composition_mode(
         model, value=None, *, context, sharded_fns=None):
-    (model_power, model_qk_power, model_v_power, model_rst_power) = (
-        _resolve_v417x_admission_den_powers(
-            getattr(model, 'admission_den_power', None),
-            getattr(model, 'admission_den_power_qk', None),
-            getattr(model, 'admission_den_power_v', None),
-            getattr(model, 'admission_den_power_rst', None),
-            context="v4171 model constructor"))
-    model_mode, model_power, model_beta = _validate_v4171_composition_settings(
-        getattr(
-            model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-        getattr(model, 'admission_den_power', None),
-        getattr(model, 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-        context="v4171 model constructor")
-    runtime_mode = _validate_v4171_srw_composition_mode(
+    (model_qk_power, model_v_power, model_rst_power, model_mode,
+     model_power, model_beta, sharded_validator,
+     den_name) = _v417x_model_composition_state(model)
+    mode_validator = (
+        _validate_v4172_srw_composition_mode
+        if den_name == 'gate_den_power'
+        else _validate_v4171_srw_composition_mode)
+    runtime_mode = mode_validator(
         model_mode if value is None else value, context=context)
     if runtime_mode != model_mode:
         raise ValueError(
             f"{context} srw_composition_mode={runtime_mode!r} does not match "
-            "v4171 model constructor "
+            "model constructor "
             f"srw_composition_mode={model_mode!r}")
-    model_version = str(getattr(model, '__version__', ''))
-    sharded_validator = (
-        _validate_v4175_sharded_fns
-        if model_version == V4175_MODEL_VERSION else (
-            _validate_v4174_sharded_fns
-            if model_version == V4174_MODEL_VERSION else (
-                _validate_v4173_sharded_fns
-                if model_version == V4173_MODEL_VERSION
-                else _validate_v4171_sharded_fns)))
     sharded_validator(
         sharded_fns, model_power, model_mode, model_beta,
         expected_power_qk=model_qk_power,
@@ -1926,34 +2030,19 @@ def _v4171_static_runtime_composition_mode(
 
 def _v4171_static_runtime_heat_kernel_beta(
         model, value=None, *, context, sharded_fns=None):
-    (model_power, model_qk_power, model_v_power, model_rst_power) = (
-        _resolve_v417x_admission_den_powers(
-            getattr(model, 'admission_den_power', None),
-            getattr(model, 'admission_den_power_qk', None),
-            getattr(model, 'admission_den_power_v', None),
-            getattr(model, 'admission_den_power_rst', None),
-            context="v4171 model constructor"))
-    model_mode, model_power, model_beta = _validate_v4171_composition_settings(
-        getattr(
-            model, 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-        getattr(model, 'admission_den_power', None),
-        getattr(model, 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-        context="v4171 model constructor")
-    runtime_beta = _validate_v4171_heat_kernel_beta(
+    (model_qk_power, model_v_power, model_rst_power, model_mode,
+     model_power, model_beta, sharded_validator,
+     den_name) = _v417x_model_composition_state(model)
+    beta_validator = (
+        _validate_v4172_heat_kernel_beta
+        if den_name == 'gate_den_power'
+        else _validate_v4171_heat_kernel_beta)
+    runtime_beta = beta_validator(
         model_beta if value is None else value, context=context)
     if runtime_beta != model_beta:
         raise ValueError(
             f"{context} heat_kernel_beta={runtime_beta} does not match "
-            f"v4171 model constructor heat_kernel_beta={model_beta}")
-    model_version = str(getattr(model, '__version__', ''))
-    sharded_validator = (
-        _validate_v4175_sharded_fns
-        if model_version == V4175_MODEL_VERSION else (
-            _validate_v4174_sharded_fns
-            if model_version == V4174_MODEL_VERSION else (
-                _validate_v4173_sharded_fns
-                if model_version == V4173_MODEL_VERSION
-                else _validate_v4171_sharded_fns)))
+            f"model constructor heat_kernel_beta={model_beta}")
     sharded_validator(
         sharded_fns, model_power, model_mode, model_beta,
         expected_power_qk=model_qk_power,
@@ -1992,12 +2081,12 @@ def _require_resume_materialized_fields(full_config):
     if not _is_active_srw_version(model_version):
         return
     if _is_v417x_version(model_version):
-        _v4171_checkpoint_den_power(
+        _v417x_checkpoint_den_powers(
             full_config.get('model'),
             missing_message=(
                 f"{model_version} checkpoint full_config.model is missing "
-                "admission_den_power"),
-            context="v4171 checkpoint full_config.model",
+                "its denominator-power metadata"),
+            context=f"{model_version} checkpoint full_config.model",
         )
     training_cfg = (
         full_config.get('training', {})
@@ -2045,7 +2134,9 @@ def _require_resume_materialized_fields(full_config):
              if _is_explicit_space_version(model_version) else (
                  V4173_RESUME_REQUIRED_FIELDS
                  if str(model_version) == V4173_MODEL_VERSION
-                 else V4171_RESUME_REQUIRED_FIELDS))
+                 else (V4172_RESUME_REQUIRED_FIELDS
+                       if str(model_version) == V4172_MODEL_VERSION
+                       else V4171_RESUME_REQUIRED_FIELDS)))
             if _is_v417x_version(model_version)
             else (V4170_RESUME_REQUIRED_FIELDS
                   if str(model_version) == V4170_MODEL_VERSION
@@ -3211,6 +3302,18 @@ def _validate_v4170_model_config(model_cfg):
             f"model.d_route={d_route}, product={product}")
 
 
+def _v417x_model_cfg_den_power(model_cfg, pool=None):
+    """Read a v417x denominator value using its versioned config spelling."""
+    version = str(model_cfg.get('model_version', ''))
+    if version == V4172_MODEL_VERSION and 'gate_den_power' in model_cfg:
+        prefix = 'gate_den_power'
+    else:
+        # This path also reads pre-cleanup v4172 checkpoint metadata.
+        prefix = 'admission_den_power'
+    key = prefix if pool is None else f'{prefix}_{pool}'
+    return float(model_cfg[key])
+
+
 def _validate_v4171_model_config(model_cfg):
     version = str(model_cfg.get('model_version', V4171_MODEL_VERSION))
     if version not in V417X_MODEL_VERSIONS:
@@ -3223,14 +3326,34 @@ def _validate_v4171_model_config(model_cfg):
     elif version == V4175_MODEL_VERSION:
         _materialize_v4175_operation_space_config(model_cfg)
     d_route = model_cfg.get('d_route')
-    (den_power, den_power_qk, den_power_v, den_power_rst) = (
-        _resolve_v417x_admission_den_powers(
-            model_cfg.get(
-                'admission_den_power', DEFAULT_ADMISSION_DEN_POWER),
-            model_cfg.get('admission_den_power_qk'),
-            model_cfg.get('admission_den_power_v'),
-            model_cfg.get('admission_den_power_rst'),
-            context=f"{version} model config"))
+    if version == V4172_MODEL_VERSION:
+        stale_den_fields = tuple(
+            key for key in (
+                'admission_den_power', 'admission_den_power_qk',
+                'admission_den_power_v', 'admission_den_power_rst')
+            if key in model_cfg)
+        if stale_den_fields:
+            raise ValueError(
+                "v4172 current config uses gate_den_power fields; old "
+                "checkpoint metadata is converted only during restore: "
+                + ", ".join(stale_den_fields))
+        (den_power, den_power_qk, den_power_v, den_power_rst) = (
+            _resolve_v4172_gate_den_powers(
+                model_cfg.get(
+                    'gate_den_power', V4172_DEFAULT_GATE_DEN_POWER),
+                model_cfg.get('gate_den_power_qk'),
+                model_cfg.get('gate_den_power_v'),
+                model_cfg.get('gate_den_power_rst'),
+                context=f"{version} model config"))
+    else:
+        (den_power, den_power_qk, den_power_v, den_power_rst) = (
+            _resolve_v417x_admission_den_powers(
+                model_cfg.get(
+                    'admission_den_power', DEFAULT_ADMISSION_DEN_POWER),
+                model_cfg.get('admission_den_power_qk'),
+                model_cfg.get('admission_den_power_v'),
+                model_cfg.get('admission_den_power_rst'),
+                context=f"{version} model config"))
     if (not isinstance(d_route, int) or isinstance(d_route, bool)
             or d_route <= 0):
         raise ValueError(
@@ -3245,14 +3368,17 @@ def _validate_v4171_model_config(model_cfg):
         raise ValueError(
             f"{version} does not accept obsolete model "
             "fields: " + ", ".join(obsolete))
+    composition_validator = (
+        _validate_v4172_composition_settings
+        if version == V4172_MODEL_VERSION
+        else _validate_v4171_composition_settings)
     (composition_mode, den_power_value,
-     heat_kernel_beta) = (
-        _validate_v4171_composition_settings(
-            model_cfg.get(
-                'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-            den_power,
-            model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-            context=f"{version} model config"))
+     heat_kernel_beta) = composition_validator(
+        model_cfg.get(
+            'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
+        den_power,
+        model_cfg.get('heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
+        context=f"{version} model config")
     if not _is_explicit_space_version(version):
         expected_mode = (
             OPERATOR_KEY_MODE_LEARNED
@@ -3271,10 +3397,13 @@ def _validate_v4171_model_config(model_cfg):
                 f"direct_state_projection, got {query_mode!r}")
         model_cfg['operator_key_mode'] = mode
         model_cfg['operator_query_mode'] = query_mode
-    model_cfg['admission_den_power'] = den_power_value
-    model_cfg['admission_den_power_qk'] = den_power_qk
-    model_cfg['admission_den_power_v'] = den_power_v
-    model_cfg['admission_den_power_rst'] = den_power_rst
+    den_prefix = (
+        'gate_den_power'
+        if version == V4172_MODEL_VERSION else 'admission_den_power')
+    model_cfg[den_prefix] = den_power_value
+    model_cfg[f'{den_prefix}_qk'] = den_power_qk
+    model_cfg[f'{den_prefix}_v'] = den_power_v
+    model_cfg[f'{den_prefix}_rst'] = den_power_rst
     model_cfg['srw_composition_mode'] = composition_mode
     model_cfg['heat_kernel_beta'] = heat_kernel_beta
 
@@ -3523,11 +3652,15 @@ def _v4170_compact_train_metrics(
         'tau_update_v_max_abs': tau_update_v_max_abs,
         'tau_update_rst_max_abs': tau_update_rst_max_abs,
     })
-    is_v4171 = all(
-        key in result for key in V4171_COMPOSITION_METRIC_NAMES)
-    if is_v4171:
+    composition_metric_names = (
+        V4172_COMPOSITION_METRIC_NAMES
+        if str(model_version) == V4172_MODEL_VERSION
+        else V4171_COMPOSITION_METRIC_NAMES)
+    has_v417x_composition = all(
+        key in result for key in composition_metric_names)
+    if has_v417x_composition:
         metrics.update({
-            key: result[key] for key in V4171_COMPOSITION_METRIC_NAMES})
+            key: result[key] for key in composition_metric_names})
         if operator_key_gradient_metrics is None:
             raise RuntimeError(
                 "v417x compact train metrics require operator-key gradient "
@@ -3552,11 +3685,11 @@ def _v4170_compact_train_metrics(
         if str(model_version) == V4173_MODEL_VERSION else ())
     expected = (
         V4170_COMPACT_TRAIN_METRIC_NAMES
-        + V4171_COMPOSITION_METRIC_NAMES
+        + composition_metric_names
         + V417X_SHARED_PROBE_GRADIENT_METRIC_NAMES
         + v4172_alias_names
         + v4173_local_write_names
-        if is_v4171 else V4170_COMPACT_TRAIN_METRIC_NAMES)
+        if has_v417x_composition else V4170_COMPACT_TRAIN_METRIC_NAMES)
     if tuple(metrics.keys()) != expected:
         raise RuntimeError(
             "v4170 compact train metric schema drift: "
@@ -3665,11 +3798,15 @@ def _dawn_srw_kwargs(cfg):
             'rw_role_write_dim': m['rw_role_write_dim'],
         })
     if _is_v417x_version(version):
+        den_prefix = (
+            'gate_den_power'
+            if str(version) == V4172_MODEL_VERSION
+            else 'admission_den_power')
         kw.update({
-            'admission_den_power': m['admission_den_power'],
-            'admission_den_power_qk': m['admission_den_power_qk'],
-            'admission_den_power_v': m['admission_den_power_v'],
-            'admission_den_power_rst': m['admission_den_power_rst'],
+            den_prefix: m[den_prefix],
+            f'{den_prefix}_qk': m[f'{den_prefix}_qk'],
+            f'{den_prefix}_v': m[f'{den_prefix}_v'],
+            f'{den_prefix}_rst': m[f'{den_prefix}_rst'],
             'srw_composition_mode': m['srw_composition_mode'],
             'heat_kernel_beta': m.get(
                 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
@@ -3723,15 +3860,22 @@ def _v4164_sharded_kwargs(cfg):
     version = str(cfg.get('model', {}).get('model_version', ''))
     if _is_v417x_version(version):
         _validate_v4171_model_config(cfg['model'])
-        return dict(
+        den_prefix = (
+            'gate_den_power'
+            if version == V4172_MODEL_VERSION else 'admission_den_power')
+        result = dict(
             dead_exposure_target=0.0,
             soft_gate_effective_active_eps=1.0e-6,
-            admission_den_power=float(cfg['model']['admission_den_power']),
-            admission_den_grad_scale=1.0,
             srw_composition_mode=cfg['model']['srw_composition_mode'],
             heat_kernel_beta=float(cfg['model'].get(
                 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA)),
         )
+        result[den_prefix] = float(cfg['model'][den_prefix])
+        result[
+            'gate_den_grad_scale'
+            if version == V4172_MODEL_VERSION
+            else 'admission_den_grad_scale'] = 1.0
+        return result
     if version in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS:
         return dict(
             dead_exposure_target=0.0,
@@ -5846,13 +5990,23 @@ def _model_accepts_soft_gate_boundary_power(model):
         return False
 
 
-def _model_accepts_admission_den_power(model):
-    """Return True if model.__call__ accepts runtime admission_den_power."""
+def _model_den_power_kw(model):
+    """Return the version-owned denominator keyword accepted by __call__."""
     import inspect as _inspect
     try:
-        return 'admission_den_power' in _inspect.signature(model.__call__).parameters
+        parameters = _inspect.signature(model.__call__).parameters
     except (TypeError, ValueError):
-        return False
+        return None
+    if 'gate_den_power' in parameters:
+        return 'gate_den_power'
+    if 'admission_den_power' in parameters:
+        return 'admission_den_power'
+    return None
+
+
+def _model_accepts_admission_den_power(model):
+    """Compatibility predicate used by the archived minimal trainer."""
+    return _model_den_power_kw(model) == 'admission_den_power'
 
 
 def _model_accepts_srw_composition_mode(model):
@@ -6973,20 +7127,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v417x_model = _is_v417x_version(_model_version)
+    _den_power_runtime_key = (
+        'gate_den_power'
+        if str(_model_version) == V4172_MODEL_VERSION
+        else 'admission_den_power')
+    _den_power_kw = _model_den_power_kw(model)
     _srw_composition_mode = None
     _heat_kernel_beta = None
     if _is_v417x_model:
         admission_den_power = _v4171_static_runtime_den_power(
             model, admission_den_power,
-            context="v4171 train runtime",
+            context=f"{_model_version} train runtime",
             sharded_fns=sharded_fns,
         )
         _srw_composition_mode = _v4171_static_runtime_composition_mode(
             model,
-            context="v4171 train runtime",
+            context=f"{_model_version} train runtime",
             sharded_fns=sharded_fns)
         _heat_kernel_beta = _v4171_static_runtime_heat_kernel_beta(
-            model, context="v4171 train runtime", sharded_fns=sharded_fns)
+            model, context=f"{_model_version} train runtime",
+            sharded_fns=sharded_fns)
     _fixed_runtime = None
     if runtime_state is not None:
         if not isinstance(runtime_state, dict):
@@ -6995,7 +7155,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
             'soft_gate_temperature', 'soft_gate_t_final',
             'soft_gate_boundary_power',
-            'soft_gate_boundary_power_final', 'admission_den_power',
+            'soft_gate_boundary_power_final', _den_power_runtime_key,
         )
         missing_runtime = [
             key for key in required_runtime if key not in runtime_state
@@ -7007,16 +7167,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _fixed_runtime = {
             key: jnp.float32(runtime_state[key])
             for key in required_runtime
-            if key != 'admission_den_power'
+            if key != _den_power_runtime_key
         }
-        _fixed_runtime['admission_den_power'] = (
+        _fixed_runtime[_den_power_runtime_key] = (
             _v4171_static_runtime_den_power(
-                model, runtime_state['admission_den_power'],
-                context="v4171 source-final train runtime",
+                model, runtime_state[_den_power_runtime_key],
+                context=f"{_model_version} source-final train runtime",
                 sharded_fns=sharded_fns,
             )
             if _is_v417x_model
-            else jnp.float32(runtime_state['admission_den_power'])
+            else jnp.float32(runtime_state[_den_power_runtime_key])
         )
         if _is_v417x_model:
             _fixed_runtime['srw_composition_mode'] = (
@@ -7025,14 +7185,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     runtime_state.get(
                         'srw_composition_mode',
                         DEFAULT_SRW_COMPOSITION_MODE),
-                    context="v4171 source-final train runtime",
+                    context=f"{_model_version} source-final train runtime",
                     sharded_fns=sharded_fns))
             _fixed_runtime['heat_kernel_beta'] = (
                 _v4171_static_runtime_heat_kernel_beta(
                     model,
                     runtime_state.get(
                         'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-                    context="v4171 source-final train runtime",
+                    context=f"{_model_version} source-final train runtime",
                     sharded_fns=sharded_fns))
         if 'training_tokens' in runtime_state:
             _fixed_runtime['training_tokens'] = jnp.float32(
@@ -7042,7 +7202,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _pass_den_power_kw = _den_power_kw is not None
     _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_heat_kernel_beta_kw = _model_accepts_heat_kernel_beta(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
@@ -7167,7 +7327,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _admission_den_power = (
+    _runtime_den_power = (
         admission_den_power
         if _is_v417x_model else jnp.float32(admission_den_power))
     _tokens_per_step = jnp.float32(max(0, int(tokens_per_step or 0)))
@@ -7275,9 +7435,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     _fixed_runtime['soft_gate_t_final']
                     if _fixed_runtime is not None else _soft_gate_t_final)
             if _pass_den_power_kw:
-                extra_kw['admission_den_power'] = (
-                    _fixed_runtime['admission_den_power']
-                    if _fixed_runtime is not None else _admission_den_power)
+                extra_kw[_den_power_kw] = (
+                    _fixed_runtime[_den_power_runtime_key]
+                    if _fixed_runtime is not None else _runtime_den_power)
             if _pass_composition_mode_kw and _is_v417x_model:
                 extra_kw['srw_composition_mode'] = (
                     _fixed_runtime['srw_composition_mode']
@@ -9851,7 +10011,12 @@ def create_production_diagnostic_step(
     pass_schedule = _model_accepts_soft_gate_schedule(model)
     pass_t_final = _model_accepts_soft_gate_t_final(model)
     pass_boundary = _model_accepts_soft_gate_boundary_power(model)
-    pass_den = _model_accepts_admission_den_power(model)
+    den_power_kw = _model_den_power_kw(model)
+    pass_den = den_power_kw is not None
+    den_power_runtime_key = (
+        'gate_den_power'
+        if str(model_version) == V4172_MODEL_VERSION
+        else 'admission_den_power')
     pass_composition = _model_accepts_srw_composition_mode(model)
     pass_beta = _model_accepts_heat_kernel_beta(model)
     pass_execution_prune = _model_accepts_execution_prune_eps(model)
@@ -9902,13 +10067,13 @@ def create_production_diagnostic_step(
     t_final = jnp.float32(soft_gate_t_final)
     runtime_den_power = _v4171_static_runtime_den_power(
         model, admission_den_power,
-        context="v4171 production diagnostics runtime",
+        context=f"{model_version} production diagnostics runtime",
         sharded_fns=sharded_fns)
     runtime_composition = _v4171_static_runtime_composition_mode(
-        model, context="v4171 production diagnostics runtime",
+        model, context=f"{model_version} production diagnostics runtime",
         sharded_fns=sharded_fns)
     runtime_beta = _v4171_static_runtime_heat_kernel_beta(
-        model, context="v4171 production diagnostics runtime",
+        model, context=f"{model_version} production diagnostics runtime",
         sharded_fns=sharded_fns)
 
     fixed_runtime = None
@@ -9917,7 +10082,7 @@ def create_production_diagnostic_step(
             'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
             'soft_gate_temperature', 'soft_gate_t_final',
             'soft_gate_boundary_power',
-            'soft_gate_boundary_power_final', 'admission_den_power')
+            'soft_gate_boundary_power_final', den_power_runtime_key)
         missing = [key for key in required if key not in runtime_state]
         if missing:
             raise RuntimeError(
@@ -9925,25 +10090,25 @@ def create_production_diagnostic_step(
                 + ", ".join(missing))
         fixed_runtime = {
             key: jnp.float32(runtime_state[key])
-            for key in required if key != 'admission_den_power'}
-        fixed_runtime['admission_den_power'] = (
+            for key in required if key != den_power_runtime_key}
+        fixed_runtime[den_power_runtime_key] = (
             _v4171_static_runtime_den_power(
-                model, runtime_state['admission_den_power'],
-                context="v4171 source-final diagnostics runtime",
+                model, runtime_state[den_power_runtime_key],
+                context=f"{model_version} source-final diagnostics runtime",
                 sharded_fns=sharded_fns))
         fixed_runtime['srw_composition_mode'] = (
             _v4171_static_runtime_composition_mode(
                 model,
                 runtime_state.get(
                     'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-                context="v4171 source-final diagnostics runtime",
+                context=f"{model_version} source-final diagnostics runtime",
                 sharded_fns=sharded_fns))
         fixed_runtime['heat_kernel_beta'] = (
             _v4171_static_runtime_heat_kernel_beta(
                 model,
                 runtime_state.get(
                     'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-                context="v4171 source-final diagnostics runtime",
+                context=f"{model_version} source-final diagnostics runtime",
                 sharded_fns=sharded_fns))
 
     @jax.jit
@@ -9997,8 +10162,8 @@ def create_production_diagnostic_step(
                 fixed_runtime['soft_gate_t_final']
                 if fixed_runtime is not None else t_final)
         if pass_den:
-            extra_kw['admission_den_power'] = (
-                fixed_runtime['admission_den_power']
+            extra_kw[den_power_kw] = (
+                fixed_runtime[den_power_runtime_key]
                 if fixed_runtime is not None else runtime_den_power)
         if pass_composition:
             extra_kw['srw_composition_mode'] = (
@@ -10061,7 +10226,8 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _den_power_kw = _model_den_power_kw(model)
+    _pass_den_power_kw = _den_power_kw is not None
     _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_heat_kernel_beta_kw = _model_accepts_heat_kernel_beta(model)
     _pass_minimal_train_kw = _model_accepts_minimal_train(model)
@@ -10079,20 +10245,25 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
     _model_version = getattr(
         model, '__version__', getattr(type(model), '__version__', ''))
     _is_v417x_model = _is_v417x_version(_model_version)
+    _den_power_runtime_key = (
+        'gate_den_power'
+        if str(_model_version) == V4172_MODEL_VERSION
+        else 'admission_den_power')
     _srw_composition_mode = None
     _heat_kernel_beta = None
     if _is_v417x_model:
         admission_den_power = _v4171_static_runtime_den_power(
             model, admission_den_power,
-            context="v4171 eval runtime",
+            context=f"{_model_version} eval runtime",
             sharded_fns=sharded_fns,
         )
         _srw_composition_mode = _v4171_static_runtime_composition_mode(
             model,
-            context="v4171 eval runtime",
+            context=f"{_model_version} eval runtime",
             sharded_fns=sharded_fns)
         _heat_kernel_beta = _v4171_static_runtime_heat_kernel_beta(
-            model, context="v4171 eval runtime", sharded_fns=sharded_fns)
+            model, context=f"{_model_version} eval runtime",
+            sharded_fns=sharded_fns)
     _is_linear_direct_tau_model = (
         str(_model_version) in V4169_LINEAR_DIRECT_TAU_MODEL_VERSIONS)
     _use_minimal_train_path = (
@@ -10161,7 +10332,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _admission_den_power = (
+    _runtime_den_power = (
         admission_den_power
         if _is_v417x_model else jnp.float32(admission_den_power))
     _fixed_runtime = None
@@ -10170,7 +10341,7 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
             'soft_gate_T_qk', 'soft_gate_T_v', 'soft_gate_T_rst',
             'soft_gate_temperature', 'soft_gate_t_final',
             'soft_gate_boundary_power',
-            'soft_gate_boundary_power_final', 'admission_den_power',
+            'soft_gate_boundary_power_final', _den_power_runtime_key,
         )
         missing_runtime = [
             key for key in required_runtime if key not in runtime_state
@@ -10182,16 +10353,16 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
         _fixed_runtime = {
             key: jnp.float32(runtime_state[key])
             for key in required_runtime
-            if key != 'admission_den_power'
+            if key != _den_power_runtime_key
         }
-        _fixed_runtime['admission_den_power'] = (
+        _fixed_runtime[_den_power_runtime_key] = (
             _v4171_static_runtime_den_power(
-                model, runtime_state['admission_den_power'],
-                context="v4171 source-final eval runtime",
+                model, runtime_state[_den_power_runtime_key],
+                context=f"{_model_version} source-final eval runtime",
                 sharded_fns=sharded_fns,
             )
             if _is_v417x_model
-            else jnp.float32(runtime_state['admission_den_power'])
+            else jnp.float32(runtime_state[_den_power_runtime_key])
         )
         if _is_v417x_model:
             _fixed_runtime['srw_composition_mode'] = (
@@ -10200,14 +10371,14 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                     runtime_state.get(
                         'srw_composition_mode',
                         DEFAULT_SRW_COMPOSITION_MODE),
-                    context="v4171 source-final eval runtime",
+                    context=f"{_model_version} source-final eval runtime",
                     sharded_fns=sharded_fns))
             _fixed_runtime['heat_kernel_beta'] = (
                 _v4171_static_runtime_heat_kernel_beta(
                     model,
                     runtime_state.get(
                         'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-                    context="v4171 source-final eval runtime",
+                    context=f"{_model_version} source-final eval runtime",
                     sharded_fns=sharded_fns))
 
     @jax.jit
@@ -10271,9 +10442,9 @@ def create_eval_step(model, sharded_fns=None, return_dead_stats=False,
                 _fixed_runtime['soft_gate_t_final']
                 if _fixed_runtime is not None else _soft_gate_t_final)
         if _pass_den_power_kw:
-            extra_kw['admission_den_power'] = (
-                _fixed_runtime['admission_den_power']
-                if _fixed_runtime is not None else _admission_den_power)
+            extra_kw[_den_power_kw] = (
+                _fixed_runtime[_den_power_runtime_key]
+                if _fixed_runtime is not None else _runtime_den_power)
         if _pass_composition_mode_kw and _is_v417x_model:
             extra_kw['srw_composition_mode'] = (
                 _fixed_runtime['srw_composition_mode']
@@ -10366,7 +10537,8 @@ def create_analysis_step(model, sharded_fns=None,
     _pass_soft_gate_t_final_kw = _model_accepts_soft_gate_t_final(model)
     _pass_execution_prune_kw = _model_accepts_execution_prune_eps(model)
     _pass_boundary_power_kw = _model_accepts_soft_gate_boundary_power(model)
-    _pass_den_power_kw = _model_accepts_admission_den_power(model)
+    _den_power_kw = _model_den_power_kw(model)
+    _pass_den_power_kw = _den_power_kw is not None
     _pass_composition_mode_kw = _model_accepts_srw_composition_mode(model)
     _pass_heat_kernel_beta_kw = _model_accepts_heat_kernel_beta(model)
     _pass_ce_token_chunk_size_kw = _model_accepts_ce_token_chunk_size(model)
@@ -10392,15 +10564,15 @@ def create_analysis_step(model, sharded_fns=None,
     if _is_v417x_model:
         admission_den_power = _v4171_static_runtime_den_power(
             model, admission_den_power,
-            context="v4171 analysis runtime",
+            context=f"{_model_version} analysis runtime",
             sharded_fns=sharded_fns,
         )
         _srw_composition_mode = _v4171_static_runtime_composition_mode(
             model,
-            context="v4171 analysis runtime",
+            context=f"{_model_version} analysis runtime",
             sharded_fns=sharded_fns)
         _heat_kernel_beta = _v4171_static_runtime_heat_kernel_beta(
-            model, context="v4171 analysis runtime",
+            model, context=f"{_model_version} analysis runtime",
             sharded_fns=sharded_fns)
     _ce_token_chunk_size = int(ce_token_chunk_size)
     if _ce_token_chunk_size <= 0:
@@ -10456,7 +10628,7 @@ def create_analysis_step(model, sharded_fns=None,
         soft_gate_boundary_power_mid_frac)
     _soft_gate_boundary_power_final_frac = jnp.float32(
         soft_gate_boundary_power_final_frac)
-    _admission_den_power = (
+    _runtime_den_power = (
         admission_den_power
         if _is_v417x_model else jnp.float32(admission_den_power))
 
@@ -10494,7 +10666,7 @@ def create_analysis_step(model, sharded_fns=None,
         if _pass_soft_gate_t_final_kw:
             extra_kw['soft_gate_t_final'] = _soft_gate_t_final
         if _pass_den_power_kw:
-            extra_kw['admission_den_power'] = _admission_den_power
+            extra_kw[_den_power_kw] = _runtime_den_power
         if _pass_composition_mode_kw and _is_v417x_model:
             extra_kw['srw_composition_mode'] = _srw_composition_mode
         if _pass_heat_kernel_beta_kw and _is_v417x_model:
@@ -14182,7 +14354,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     for _key in LINEAR_DIRECT_TAU_REGULAR_REQUIRED_METRIC_NAMES:
         if _key in m:
             rec[_key] = float(m[_key])
-    for _key in V4171_COMPOSITION_METRIC_NAMES:
+    _composition_metric_names = (
+        V4172_COMPOSITION_METRIC_NAMES
+        if str(ctx.get('model_version')) == V4172_MODEL_VERSION
+        else V4171_COMPOSITION_METRIC_NAMES)
+    for _key in _composition_metric_names:
         if _key in m:
             rec[_key] = float(m[_key])
     for _key in V4173_OPERATION_SPACE_METRIC_NAMES:
@@ -14317,9 +14493,12 @@ def _v4170_compact_regular_jsonl_record(rec, ctx):
                     V4173_OPERATION_SPACE_METRIC_NAMES)):
         rec_keys = V4173_COMPACT_REGULAR_JSONL_REC_KEYS
         output_keys = V4173_COMPACT_REGULAR_JSONL_KEYS
-    elif model_version in GENERALIZED_BILINEAR_V417X_MODEL_VERSIONS:
+    elif model_version == V4172_MODEL_VERSION:
         rec_keys = V4172_COMPACT_REGULAR_JSONL_REC_KEYS
         output_keys = V4172_COMPACT_REGULAR_JSONL_KEYS
+    elif model_version == V4173_MODEL_VERSION:
+        rec_keys = V4173_GENERALIZED_COMPACT_REGULAR_JSONL_REC_KEYS
+        output_keys = V4173_GENERALIZED_COMPACT_REGULAR_JSONL_KEYS
     elif _is_v417x_version(model_version):
         rec_keys = V4171_COMPACT_REGULAR_JSONL_REC_KEYS
         output_keys = V4171_COMPACT_REGULAR_JSONL_KEYS
@@ -16158,33 +16337,46 @@ def _checkpoint_final_runtime(full_config, checkpoint_path):
                 'soft_gate_boundary_power_final': 4.0,
                 'soft_gate_effective_active_eps': 1.0e-6,
             })
-            den_powers = _v4171_checkpoint_den_powers(
+            den_powers = _v417x_checkpoint_den_powers(
                 model,
                 missing_message=(
-                    "v4171 checkpoint full_config.model is missing "
-                    "admission_den_power"),
-                context="v4171 checkpoint full_config.model",
+                    f"{version} checkpoint full_config.model is missing "
+                    "its denominator-power metadata"),
+                context=f"{version} checkpoint full_config.model",
             )
-            (runtime['admission_den_power'],
-             runtime['admission_den_power_qk'],
-             runtime['admission_den_power_v'],
-             runtime['admission_den_power_rst']) = den_powers
+            den_prefix = (
+                'gate_den_power'
+                if version == V4172_MODEL_VERSION
+                else 'admission_den_power')
+            for suffix, value in zip(('', '_qk', '_v', '_rst'), den_powers):
+                runtime[f'{den_prefix}{suffix}'] = value
+            composition_validator = (
+                _validate_v4172_composition_settings
+                if version == V4172_MODEL_VERSION
+                else _validate_v4171_composition_settings)
             (runtime['srw_composition_mode'],
-             runtime['admission_den_power'],
+             runtime[den_prefix],
              runtime['heat_kernel_beta']) = (
-                _validate_v4171_composition_settings(
+                composition_validator(
                     model.get(
                         'srw_composition_mode',
                         DEFAULT_SRW_COMPOSITION_MODE),
-                    runtime['admission_den_power'],
+                    runtime[den_prefix],
                     model.get(
                         'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-                    context="v4171 checkpoint full_config.model"))
-            runtime['admission_den_grad_scale'] = (
-                _validate_v4171_admission_den_grad_scale(
-                    1.0, context="v4171 source-final runtime"))
-            runtime['admission_den_runtime_source'] = (
-                'full_config.model.admission_den_power')
+                    context=f"{version} checkpoint full_config.model"))
+            den_grad_key = (
+                'gate_den_grad_scale'
+                if version == V4172_MODEL_VERSION
+                else 'admission_den_grad_scale')
+            grad_validator = (
+                _validate_v4172_gate_den_grad_scale
+                if version == V4172_MODEL_VERSION
+                else _validate_v4171_admission_den_grad_scale)
+            runtime[den_grad_key] = grad_validator(
+                1.0, context=f"{version} source-final runtime")
+            runtime[f'{den_prefix}_runtime_source'] = (
+                f'full_config.model.{den_prefix}')
             runtime['heat_kernel_beta_runtime_source'] = (
                 'full_config.model.heat_kernel_beta_or_default')
         else:
@@ -16239,24 +16431,34 @@ def _materialize_transfer_checkpoint(source, run_folder, step,
     metadata = _restore_orbax_metadata(checkpoint_dir, int(step))
     full_config = metadata.get('full_config')
     _require_resume_full_config(full_config)
+    full_config = _canonicalize_v4172_checkpoint_full_config(full_config)
     _require_resume_materialized_fields(full_config)
     runtime_state = _checkpoint_final_runtime(full_config, checkpoint_path)
-    if (_is_v417x_version(
-            full_config.get('model', {}).get('model_version', ''))
+    checkpoint_version = str(
+        full_config.get('model', {}).get('model_version', ''))
+    if (_is_v417x_version(checkpoint_version)
             and jax.process_index() == 0):
+        den_prefix = (
+            'gate_den_power'
+            if checkpoint_version == V4172_MODEL_VERSION
+            else 'admission_den_power')
+        den_grad_key = (
+            'gate_den_grad_scale'
+            if checkpoint_version == V4172_MODEL_VERSION
+            else 'admission_den_grad_scale')
         print("Source checkpoint runtime:", flush=True)
         print(
             "  den_power["
-            f"qk={runtime_state['admission_den_power_qk']} "
-            f"v={runtime_state['admission_den_power_v']} "
-            f"rst={runtime_state['admission_den_power_rst']}]", flush=True)
+            f"qk={runtime_state[f'{den_prefix}_qk']} "
+            f"v={runtime_state[f'{den_prefix}_v']} "
+            f"rst={runtime_state[f'{den_prefix}_rst']}]", flush=True)
         print(
             "  srw_composition_mode="
             f"{runtime_state['srw_composition_mode']}", flush=True)
         print(
             "  heat_kernel_beta="
             f"{runtime_state['heat_kernel_beta']}", flush=True)
-        print("  admission_den_grad_scale=1.0", flush=True)
+        print(f"  {den_grad_key}={runtime_state[den_grad_key]}", flush=True)
         print("  source=full_config.model", flush=True)
     return TransferCheckpoint(
         source=str(source),
@@ -16311,7 +16513,9 @@ def resolve_transfer_checkpoint(source):
 
 def build_effective_transfer_config(source_checkpoint, downstream_config):
     """Overlay only fields owned by the transfer phase."""
-    cfg = deepcopy(source_checkpoint.full_config)
+    source_full_config = _canonicalize_v4172_checkpoint_full_config(
+        source_checkpoint.full_config)
+    cfg = deepcopy(source_full_config)
     requested = deepcopy(downstream_config)
     requested_training = requested.get('training', {})
     if requested_training is None:
@@ -16329,7 +16533,7 @@ def build_effective_transfer_config(source_checkpoint, downstream_config):
         if key in requested:
             cfg[key] = deepcopy(requested[key])
 
-    source_tokenizer = source_checkpoint.full_config.get('tokenizer')
+    source_tokenizer = source_full_config.get('tokenizer')
     requested_tokenizer = requested.get('tokenizer')
     if source_tokenizer is not None:
         cfg['tokenizer'] = deepcopy(source_tokenizer)
@@ -16339,7 +16543,7 @@ def build_effective_transfer_config(source_checkpoint, downstream_config):
         raise RuntimeError(
             "Transfer checkpoint has no tokenizer metadata and downstream "
             "config does not explicitly provide tokenizer")
-    cfg['model'] = deepcopy(source_checkpoint.full_config['model'])
+    cfg['model'] = deepcopy(source_full_config['model'])
     # Pretraining materializes logical/padded vocab fields before model init.
     # Older checkpoints may contain the pre-materialized model config, so the
     # transfer frontend must perform the same canonical step before it builds
@@ -16568,8 +16772,12 @@ def build_canonical_sharded_fns(cfg, mesh, *, for_eval=False,
     def pool_kwargs(pool):
         kwargs = dict(base_kwargs)
         if _is_v417x_version(version):
-            kwargs['admission_den_power'] = float(
-                model_cfg[f'admission_den_power_{pool}'])
+            den_prefix = (
+                'gate_den_power'
+                if version == V4172_MODEL_VERSION
+                else 'admission_den_power')
+            kwargs[den_prefix] = float(
+                model_cfg[f'{den_prefix}_{pool}'])
         return kwargs
 
     if training_cfg.get('max_chunk_size') is not None:
@@ -17081,10 +17289,7 @@ def create_canonical_train_step(model, optimizer, cfg, sharded_fns, mesh,
         'soft_gate_boundary_power_final_frac': float(t.get(
             'soft_gate_boundary_power_final_frac', 0.95)),
         'admission_den_power': (
-            _validate_v4171_admission_den_power(
-                m.get('admission_den_power'),
-                context="v4171 canonical train config",
-            )
+            _v417x_model_cfg_den_power(m)
             if _is_v417x_version(version)
             else float(m.get(
                 'admission_den_power', t.get('admission_den_power', 1.0)))),
@@ -17132,27 +17337,38 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
     model_version = str(getattr(
         model, '__version__', getattr(type(model), '__version__', '')))
     if _is_v417x_version(model_version):
+        den_runtime_key = (
+            'gate_den_power'
+            if model_version == V4172_MODEL_VERSION
+            else 'admission_den_power')
         den_power = _v4171_static_runtime_den_power(
-            model, runtime_state.get('admission_den_power'),
-            context="v4171 source-final forward runtime",
+            model, runtime_state.get(den_runtime_key),
+            context=f"{model_version} source-final forward runtime",
             sharded_fns=sharded_fns,
         )
         composition_mode = _v4171_static_runtime_composition_mode(
             model,
             runtime_state.get(
                 'srw_composition_mode', DEFAULT_SRW_COMPOSITION_MODE),
-            context="v4171 source-final forward runtime",
+            context=f"{model_version} source-final forward runtime",
             sharded_fns=sharded_fns)
         heat_kernel_beta = _v4171_static_runtime_heat_kernel_beta(
             model,
             runtime_state.get(
                 'heat_kernel_beta', DEFAULT_HEAT_KERNEL_BETA),
-            context="v4171 source-final forward runtime",
+            context=f"{model_version} source-final forward runtime",
             sharded_fns=sharded_fns)
-        _validate_v4171_admission_den_grad_scale(
-            runtime_state.get('admission_den_grad_scale'),
-            context="v4171 source-final forward runtime",
-        )
+        grad_validator = (
+            _validate_v4172_gate_den_grad_scale
+            if model_version == V4172_MODEL_VERSION
+            else _validate_v4171_admission_den_grad_scale)
+        grad_validator(
+            runtime_state.get(
+                'gate_den_grad_scale'
+                if model_version == V4172_MODEL_VERSION
+                else 'admission_den_grad_scale',
+                1.0),
+            context=f"{model_version} source-final forward runtime")
     else:
         den_power = runtime_state.get('admission_den_power')
         composition_mode = None
@@ -17179,7 +17395,7 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
             'soft_gate_temperature', 'soft_gate_T_qk', 'soft_gate_T_v',
             'soft_gate_T_rst', 'soft_gate_t_final',
             'soft_gate_boundary_power', 'soft_gate_boundary_power_final',
-            'admission_den_power', 'srw_composition_mode',
+            'admission_den_power', 'gate_den_power', 'srw_composition_mode',
             'heat_kernel_beta',
             'training_tokens'):
         if key in signature:
@@ -17187,7 +17403,7 @@ def _fixed_runtime_forward_kwargs(model, sharded_fns, runtime_state,
                 raise RuntimeError(
                     f"source_final_constant runtime is missing {key}")
             kwargs[key] = (
-                den_power if key == 'admission_den_power'
+                den_power if key in ('admission_den_power', 'gate_den_power')
                 else (composition_mode if key == 'srw_composition_mode'
                       else (heat_kernel_beta if key == 'heat_kernel_beta'
                             else runtime_state[key])))
@@ -17481,7 +17697,7 @@ def main():
     elif is_v417x_cfg:
         _validate_v4171_model_config(cfg['model'])
         soft_gate_effective_active_eps = 1.0e-6
-        admission_den_power = float(cfg['model']['admission_den_power'])
+        admission_den_power = _v417x_model_cfg_den_power(cfg['model'])
         admission_den_grad_scale = 1.0
         admission_den_config_keys = ()
     else:
@@ -17585,7 +17801,7 @@ def main():
         boundary_power_schedule_active = False
         pool_specific_gate_t = False
         admission_den_power = (
-            float(cfg['model']['admission_den_power'])
+            _v417x_model_cfg_den_power(cfg['model'])
             if is_v417x_cfg else 1.0)
         admission_den_grad_scale = 1.0
         soft_gate_effective_active_eps = 1.0e-6
@@ -17823,7 +18039,7 @@ def main():
             requested_model_cfg, checkpoint_model_cfg)
         _validate_v4171_resume_compatibility(
             requested_model_cfg, checkpoint_model_cfg)
-        saved_full_config = (
+        saved_full_config = _canonicalize_v4172_checkpoint_full_config(
             _migrate_v4168_operation_space_full_config_for_clean_schema(
                 checkpoint_full_config))
         saved_raw_config = (
@@ -18051,7 +18267,7 @@ def main():
             if not current_admission_den_config_override:
                 if is_linear_direct_tau_cfg:
                     admission_den_power = (
-                        float(saved_model_config['admission_den_power'])
+                        _v417x_model_cfg_den_power(saved_model_config)
                         if is_v417x_cfg else 1.0)
                     admission_den_grad_scale = 1.0
                     soft_gate_effective_active_eps = 1.0e-6
@@ -18146,7 +18362,7 @@ def main():
                 boundary_power_schedule_active = False
                 pool_specific_gate_t = False
                 admission_den_power = (
-                    float(cfg['model']['admission_den_power'])
+                    _v417x_model_cfg_den_power(cfg['model'])
                     if is_v417x_cfg else 1.0)
                 admission_den_grad_scale = 1.0
                 soft_gate_effective_active_eps = 1.0e-6
@@ -18368,7 +18584,7 @@ def main():
         pool_specific_gate_t = False
         boundary_power_schedule_active = False
         admission_den_power = (
-            float(cfg['model']['admission_den_power'])
+            _v417x_model_cfg_den_power(cfg['model'])
             if is_v417x_cfg else 1.0)
         admission_den_grad_scale = 1.0
         soft_gate_effective_active_eps = 1.0e-6
@@ -19514,37 +19730,66 @@ def main():
                 _composition_mode = cfg['model']['srw_composition_mode']
                 print(f"  mode={_composition_mode}")
                 print("  angular_amplitude=linear_cap_depth")
-                if _composition_mode == 'quadratic':
-                    print("  admission_weight=amplitude^2")
-                    print("  total_weight=sum(unpruned_admission)")
-                    print("  den=max(total_weight,1e-12)"
-                          "^admission_den_power")
-                    print("  numerator=pruned_execution_weight")
-                elif _composition_mode == 'heat_energy':
-                    print("  support=rho>tau")
-                    print("  cap_amplitude=clip((rho-tau)/"
-                          "max(1-tau,1e-4),0,1)")
-                    print("  heat_amplitude=(exp(beta*cap_amplitude)-1)/"
-                          "(exp(beta)-1)")
-                    print(
-                        f"  beta={cfg['model']['heat_kernel_beta']:g}")
-                    print("  energy_weight=heat_amplitude^2")
-                    print("  total_energy=sum(unpruned_energy_weight)")
-                    print("  numerator=pruned_energy_weight")
-                    print("  denominator=max(total_energy,1e-12)"
-                          "^admission_den_power")
-                    print("  beta_to_zero_limit=quadratic")
+                _v4172_single_gate = (
+                    str(model_version_cfg) == V4172_MODEL_VERSION)
+                if _v4172_single_gate:
+                    if _composition_mode == 'quadratic':
+                        print("  gate_weight=amplitude^2")
+                        print("  total_weight=sum(gate_weight)")
+                        print("  den=max(total_weight,1e-12)"
+                              "^gate_den_power")
+                        print("  numerator=gate_weight")
+                    elif _composition_mode == 'heat_energy':
+                        print("  support=rho>tau")
+                        print("  cap_amplitude=clip((rho-tau)/"
+                              "max(1-tau,1e-4),0,1)")
+                        print("  heat_amplitude=(exp(beta*cap_amplitude)-1)/"
+                              "(exp(beta)-1)")
+                        print(
+                            f"  beta={cfg['model']['heat_kernel_beta']:g}")
+                        print("  gate_weight=heat_amplitude^2")
+                        print("  total_energy=sum(gate_weight)")
+                        print("  numerator=gate_weight")
+                        print("  denominator=max(total_energy,1e-12)"
+                              "^gate_den_power")
+                        print("  beta_to_zero_limit=quadratic")
+                    else:
+                        print("  gate_weight=amplitude")
+                        print("  den=max(sum(gate_weight),1)"
+                              "^gate_den_power")
+                        print("  numerator=gate_weight")
                 else:
-                    print("  admission_weight=amplitude")
-                    print("  den=max(sum(unpruned_admission),1)"
-                          "^admission_den_power")
-                    print("  numerator=pruned_execution_weight")
+                    if _composition_mode == 'quadratic':
+                        print("  admission_weight=amplitude^2")
+                        print("  total_weight=sum(unpruned_admission)")
+                        print("  den=max(total_weight,1e-12)"
+                              "^admission_den_power")
+                        print("  numerator=pruned_execution_weight")
+                    elif _composition_mode == 'heat_energy':
+                        print("  support=rho>tau")
+                        print("  cap_amplitude=clip((rho-tau)/"
+                              "max(1-tau,1e-4),0,1)")
+                        print("  heat_amplitude=(exp(beta*cap_amplitude)-1)/"
+                              "(exp(beta)-1)")
+                        print(
+                            f"  beta={cfg['model']['heat_kernel_beta']:g}")
+                        print("  energy_weight=heat_amplitude^2")
+                        print("  total_energy=sum(unpruned_energy_weight)")
+                        print("  numerator=pruned_energy_weight")
+                        print("  denominator=max(total_energy,1e-12)"
+                              "^admission_den_power")
+                        print("  beta_to_zero_limit=quadratic")
+                    else:
+                        print("  admission_weight=amplitude")
+                        print("  den=max(sum(unpruned_admission),1)"
+                              "^admission_den_power")
+                        print("  numerator=pruned_execution_weight")
                 print("  live_den_gradient=true")
                 print(
                     "  den_power["
-                    f"qk={cfg['model']['admission_den_power_qk']:g} "
-                    f"v={cfg['model']['admission_den_power_v']:g} "
-                    f"rst={cfg['model']['admission_den_power_rst']:g}]")
+                    f"qk={_v417x_model_cfg_den_power(cfg['model'], 'qk'):g} "
+                    f"v={_v417x_model_cfg_den_power(cfg['model'], 'v'):g} "
+                    f"rst={_v417x_model_cfg_den_power(cfg['model'], 'rst'):g}]")
                 print(
                     "  heat_kernel_beta="
                     f"{cfg['model']['heat_kernel_beta']:g}")
@@ -19556,7 +19801,10 @@ def main():
                         else (
                             "v4174.direct_read"
                             if str(model_version_cfg) == V4174_MODEL_VERSION
-                            else "model.pool_specific_with_legacy_fallback")))
+                            else (
+                                "v4172.single_gate"
+                                if _v4172_single_gate
+                                else "model.pool_specific_with_legacy_fallback"))))
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 _read_role_dim = int(cfg['model']['rw_role_read_dim'])
                 _write_role_dim = int(cfg['model']['rw_role_write_dim'])
@@ -19665,12 +19913,20 @@ def main():
                 print(f"  Gate: linear angular-depth from {_margin_label}")
                 print("  gate = clip((rho - tau) / max(1 - tau, 1e-4), 0, 1)")
                 if is_v417x_cfg:
+                    _den_weight_label = (
+                        "gate_weight"
+                        if str(model_version_cfg) == V4172_MODEL_VERSION
+                        else "unpruned_admission")
+                    _den_field_label = (
+                        "gate_den_power"
+                        if str(model_version_cfg) == V4172_MODEL_VERSION
+                        else "pool_den_power")
                     print(
-                        "  denominator: max(sum(unpruned_admission), 1.0) "
-                        "** pool_den_power with live gradient; den_power["
-                        f"qk={cfg['model']['admission_den_power_qk']:g} "
-                        f"v={cfg['model']['admission_den_power_v']:g} "
-                        f"rst={cfg['model']['admission_den_power_rst']:g}]")
+                        f"  denominator: max(sum({_den_weight_label}), 1.0) "
+                        f"** {_den_field_label} with live gradient; den_power["
+                        f"qk={_v417x_model_cfg_den_power(cfg['model'], 'qk'):g} "
+                        f"v={_v417x_model_cfg_den_power(cfg['model'], 'v'):g} "
+                        f"rst={_v417x_model_cfg_den_power(cfg['model'], 'rst'):g}]")
                 else:
                     print(
                         "  denominator: max(sum(unpruned_admission), 1.0) "
@@ -20622,8 +20878,12 @@ def main():
         def _srw_pool_kwargs(pool):
             kwargs = dict(_srw_base_kwargs)
             if _is_v417x_version(model_version_cfg):
-                kwargs['admission_den_power'] = float(
-                    cfg['model'][f'admission_den_power_{pool}'])
+                _den_prefix = (
+                    'gate_den_power'
+                    if str(model_version_cfg) == V4172_MODEL_VERSION
+                    else 'admission_den_power')
+                kwargs[_den_prefix] = float(
+                    cfg['model'][f'{_den_prefix}_{pool}'])
             if str(model_version_cfg) == V4168_MODEL_VERSION:
                 kwargs.update(_opspace_pool_kwargs(pool))
             return kwargs
@@ -22092,56 +22352,100 @@ def main():
                         "with direct state-to-operation queries; "
                         "execution remains full rank-1 RW")
                 _composition_mode = cfg['model']['srw_composition_mode']
+                _v4172_single_gate = (
+                    str(model_version_cfg) == V4172_MODEL_VERSION)
                 _composition_runtime_source = (
                     "v4175.direct_read"
                     if str(model_version_cfg) == V4175_MODEL_VERSION
-                    else "model.pool_specific_with_legacy_fallback")
+                    else (
+                        "v4172.single_gate"
+                        if _v4172_single_gate
+                        else "model.pool_specific_with_legacy_fallback"))
                 _den_power_summary = (
                     "den_power["
-                    f"qk={cfg['model']['admission_den_power_qk']:g} "
-                    f"v={cfg['model']['admission_den_power_v']:g} "
-                    f"rst={cfg['model']['admission_den_power_rst']:g}]")
-                if _composition_mode == 'quadratic':
-                    log_message(
-                        "Composition: mode=quadratic; "
-                        "angular_amplitude=linear_cap_depth; "
-                        "admission_weight=amplitude^2; "
-                        "total_weight=sum(unpruned_admission); "
-                        "den=max(total_weight,1e-12)"
-                        "^pool_den_power; "
-                        f"{_den_power_summary}; "
-                        "numerator=pruned_execution_weight; "
-                        "live_den_gradient=true; runtime_source="
-                        f"{_composition_runtime_source}")
-                elif _composition_mode == 'heat_energy':
-                    log_message(
-                        "SRW composition: mode=heat_energy; "
-                        "support=rho>tau; "
-                        "cap_amplitude=clip((rho-tau)/"
-                        "max(1-tau,1e-4),0,1); "
-                        "heat_amplitude=(exp(beta*cap_amplitude)-1)/"
-                        "(exp(beta)-1); "
-                        f"beta={cfg['model']['heat_kernel_beta']:g}; "
-                        "energy_weight=heat_amplitude^2; "
-                        "total_energy=sum(unpruned_energy_weight); "
-                        "numerator=pruned_energy_weight; "
-                        "denominator=max(total_energy,1e-12)"
-                        "^pool_den_power; "
-                        f"{_den_power_summary}; "
-                        "beta_to_zero_limit=quadratic; "
-                        "live_den_gradient=true; runtime_source="
-                        f"{_composition_runtime_source}")
+                    f"qk={_v417x_model_cfg_den_power(cfg['model'], 'qk'):g} "
+                    f"v={_v417x_model_cfg_den_power(cfg['model'], 'v'):g} "
+                    f"rst={_v417x_model_cfg_den_power(cfg['model'], 'rst'):g}]")
+                if _v4172_single_gate:
+                    if _composition_mode == 'quadratic':
+                        log_message(
+                            "Composition: mode=quadratic; "
+                            "angular_amplitude=linear_cap_depth; "
+                            "gate_weight=amplitude^2; "
+                            "total_weight=sum(gate_weight); "
+                            "den=max(total_weight,1e-12)^gate_den_power; "
+                            f"{_den_power_summary}; numerator=gate_weight; "
+                            "live_den_gradient=true; runtime_source="
+                            f"{_composition_runtime_source}")
+                    elif _composition_mode == 'heat_energy':
+                        log_message(
+                            "SRW composition: mode=heat_energy; "
+                            "support=rho>tau; "
+                            "cap_amplitude=clip((rho-tau)/"
+                            "max(1-tau,1e-4),0,1); "
+                            "heat_amplitude=(exp(beta*cap_amplitude)-1)/"
+                            "(exp(beta)-1); "
+                            f"beta={cfg['model']['heat_kernel_beta']:g}; "
+                            "gate_weight=heat_amplitude^2; "
+                            "total_energy=sum(gate_weight); "
+                            "numerator=gate_weight; "
+                            "denominator=max(total_energy,1e-12)"
+                            "^gate_den_power; "
+                            f"{_den_power_summary}; "
+                            "beta_to_zero_limit=quadratic; "
+                            "live_den_gradient=true; runtime_source="
+                            f"{_composition_runtime_source}")
+                    else:
+                        log_message(
+                            "Composition: mode=linear_angular; "
+                            "angular_amplitude=linear_cap_depth; "
+                            "gate_weight=amplitude; "
+                            "den=max(sum(gate_weight),1)^gate_den_power; "
+                            f"{_den_power_summary}; numerator=gate_weight; "
+                            "live_den_gradient=true; runtime_source="
+                            f"{_composition_runtime_source}")
                 else:
-                    log_message(
-                        "Composition: mode=linear_angular; "
-                        "angular_amplitude=linear_cap_depth; "
-                        "admission_weight=amplitude; "
-                        "den=max(sum(unpruned_admission),1)"
-                        "^pool_den_power; "
-                        f"{_den_power_summary}; "
-                        "numerator=pruned_execution_weight; "
-                        "live_den_gradient=true; runtime_source="
-                        f"{_composition_runtime_source}")
+                    if _composition_mode == 'quadratic':
+                        log_message(
+                            "Composition: mode=quadratic; "
+                            "angular_amplitude=linear_cap_depth; "
+                            "admission_weight=amplitude^2; "
+                            "total_weight=sum(unpruned_admission); "
+                            "den=max(total_weight,1e-12)"
+                            "^pool_den_power; "
+                            f"{_den_power_summary}; "
+                            "numerator=pruned_execution_weight; "
+                            "live_den_gradient=true; runtime_source="
+                            f"{_composition_runtime_source}")
+                    elif _composition_mode == 'heat_energy':
+                        log_message(
+                            "SRW composition: mode=heat_energy; "
+                            "support=rho>tau; "
+                            "cap_amplitude=clip((rho-tau)/"
+                            "max(1-tau,1e-4),0,1); "
+                            "heat_amplitude=(exp(beta*cap_amplitude)-1)/"
+                            "(exp(beta)-1); "
+                            f"beta={cfg['model']['heat_kernel_beta']:g}; "
+                            "energy_weight=heat_amplitude^2; "
+                            "total_energy=sum(unpruned_energy_weight); "
+                            "numerator=pruned_energy_weight; "
+                            "denominator=max(total_energy,1e-12)"
+                            "^pool_den_power; "
+                            f"{_den_power_summary}; "
+                            "beta_to_zero_limit=quadratic; "
+                            "live_den_gradient=true; runtime_source="
+                            f"{_composition_runtime_source}")
+                    else:
+                        log_message(
+                            "Composition: mode=linear_angular; "
+                            "angular_amplitude=linear_cap_depth; "
+                            "admission_weight=amplitude; "
+                            "den=max(sum(unpruned_admission),1)"
+                            "^pool_den_power; "
+                            f"{_den_power_summary}; "
+                            "numerator=pruned_execution_weight; "
+                            "live_den_gradient=true; runtime_source="
+                            f"{_composition_runtime_source}")
             elif str(model_version_cfg) == V4170_MODEL_VERSION:
                 log_message(
                     "RW-key operator path: live-gradient compressed RW "

@@ -21,10 +21,10 @@ model:
   gradient_checkpointing: true
 
   d_route: 256
-  admission_den_power: 1.0
-  admission_den_power_qk: 0.5
-  admission_den_power_v: 1.0
-  admission_den_power_rst: 1.2
+  gate_den_power: 1.0
+  gate_den_power_qk: 0.5
+  gate_den_power_v: 1.0
+  gate_den_power_rst: 1.2
   srw_composition_mode: linear_angular
 
   n_qk: 4600

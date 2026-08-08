@@ -720,11 +720,16 @@ def main() -> None:
         'tau_lr_mult': runtime_state['tau_lr_mult'],
     }
     if tj._is_v417x_version(model_cfg['model_version']):
-        header.update({
+        composition_header = {
             'srw_composition_mode': runtime_state['srw_composition_mode'],
-            'admission_den_power': runtime_state['admission_den_power'],
             'heat_kernel_beta': runtime_state['heat_kernel_beta'],
-        })
+        }
+        den_power_key = (
+            'gate_den_power'
+            if str(model_cfg['model_version']) == tj.V4172_MODEL_VERSION
+            else 'admission_den_power')
+        composition_header[den_power_key] = runtime_state[den_power_key]
+        header.update(composition_header)
     else:
         header.update({
             'soft_gate_T_qk': runtime_state['soft_gate_T_qk'],

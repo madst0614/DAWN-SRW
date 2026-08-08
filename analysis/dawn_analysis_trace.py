@@ -28,14 +28,22 @@ def _transition_output(result, *, name: str, expected_ndim: int):
     return output
 
 
+def _legacy_kernel_tail(model_module, gate_kwargs):
+    if hasattr(model_module, "_compute_gate_weight"):
+        return ()
+    return (gate_kwargs.get("execution_prune_eps", 0.0),)
+
+
 def _operator_contribution_topk(
         state, operator_query, operator_keys, raw_tau,
         read_vectors, write_vectors, *, model_module, topk: int,
-        execution_kwargs: Dict[str, Any], admission_den_power: float,
+        execution_kwargs: Dict[str, Any], gate_den_power: float,
         target_positions=None) -> dict[str, jax.Array]:
     """Rank pre-cancellation production-precision contribution norms."""
     kwargs = dict(execution_kwargs)
     for key in (
+            "gate_den_power", "gate_den_power_qk",
+            "gate_den_power_v", "gate_den_power_rst",
             "admission_den_power", "admission_den_power_qk",
             "admission_den_power_v", "admission_den_power_rst"):
         kwargs.pop(key, None)
@@ -47,18 +55,20 @@ def _operator_contribution_topk(
             jnp.bfloat16)
     rho = (query_direction @ key_directions.T).astype(jnp.float32)
     tau = model_module._tau_from_param(raw_tau).astype(jnp.float32)
-    drive_kwargs = dict(kwargs)
-    temperature = drive_kwargs.pop("soft_gate_temperature")
-    boundary_power = drive_kwargs.pop("soft_gate_boundary_power")
-    effective_active_eps = drive_kwargs.pop(
+    gate_kwargs = dict(kwargs)
+    temperature = gate_kwargs.pop("soft_gate_temperature")
+    boundary_power = gate_kwargs.pop("soft_gate_boundary_power")
+    effective_active_eps = gate_kwargs.pop(
         "soft_gate_effective_active_eps")
-    _, admission, _, execution_weight, _ = (
-        model_module._compute_admission_drive(
+    if hasattr(model_module, "_compute_gate_weight"):
+        _, gate_weight, _, _ = model_module._compute_gate_weight(
+            rho, tau, **gate_kwargs)
+    else:
+        _, gate_weight, _, _, _ = model_module._compute_admission_drive(
             rho, tau, temperature,
             boundary_power=boundary_power,
             effective_active_eps=effective_active_eps,
-            **drive_kwargs,
-        ))
+            **gate_kwargs)
     read_directions = model_module._forward_unit_direction(
         read_vectors.astype(jnp.bfloat16).astype(jnp.float32)).astype(
             jnp.bfloat16)
@@ -66,24 +76,24 @@ def _operator_contribution_topk(
         write_vectors.astype(jnp.bfloat16).astype(jnp.float32)).astype(
             jnp.bfloat16)
     read_activations = state.astype(jnp.bfloat16) @ read_directions.T
-    coefficient = execution_weight * read_activations
-    admission_mass = admission.sum(axis=-1, keepdims=True)
+    coefficient = gate_weight * read_activations
+    gate_mass = gate_weight.sum(axis=-1, keepdims=True)
     composition_den = getattr(model_module, "_composition_den", None)
     if composition_den is None:
         denominator = jnp.power(
-            jnp.maximum(admission_mass, 1.0),
-            jnp.asarray(admission_den_power, dtype=jnp.float32),
+            jnp.maximum(gate_mass, 1.0),
+            jnp.asarray(gate_den_power, dtype=jnp.float32),
         )
     elif hasattr(model_module, "DEFAULT_SRW_COMPOSITION_MODE"):
         denominator = composition_den(
-            admission_mass,
-            admission_den_power,
+            gate_mass,
+            gate_den_power,
             kwargs.get(
                 "srw_composition_mode",
                 model_module.DEFAULT_SRW_COMPOSITION_MODE),
         )
     else:
-        denominator = composition_den(admission_mass, admission_den_power)
+        denominator = composition_den(gate_mass, gate_den_power)
     production_coefficient = (
         coefficient.astype(jnp.bfloat16).astype(jnp.float32)
         / jnp.maximum(denominator, jnp.float32(1.0e-8)))
@@ -143,14 +153,27 @@ def topk_trace_forward(
     n_layers = int(model_cfg["n_layers"])
     n_heads = int(model_cfg["n_heads"])
     d_head = d_model // n_heads
-    execution_kwargs = (
-        model_module._angular_execution_kwargs_from_model_cfg(model_cfg))
+    gate_kwargs_builder = getattr(
+        model_module, "_angular_gate_kwargs_from_model_cfg", None)
+    if gate_kwargs_builder is None:
+        gate_kwargs_builder = getattr(
+            model_module, "_angular_execution_kwargs_from_model_cfg")
+    execution_kwargs = gate_kwargs_builder(model_cfg)
     if execution_prune_eps is not None:
-        execution_kwargs["execution_prune_eps"] = float(execution_prune_eps)
-    default_power = float(execution_kwargs.get("admission_den_power", 1.0))
+        if hasattr(model_module, "_compute_gate_weight"):
+            if float(execution_prune_eps) != 0.0:
+                raise ValueError(
+                    "v4172 has no execution pruning control")
+        else:
+            execution_kwargs["execution_prune_eps"] = float(
+                execution_prune_eps)
+    den_prefix = (
+        "gate_den_power"
+        if "gate_den_power" in execution_kwargs else "admission_den_power")
+    default_power = float(execution_kwargs.get(den_prefix, 1.0))
     powers = {
         route: float(execution_kwargs.get(
-            f"admission_den_power_{route}", default_power))
+            f"{den_prefix}_{route}", default_power))
         for route in ("qk", "v", "rst")
     }
 
@@ -204,21 +227,21 @@ def topk_trace_forward(
             pool["attn_qk_read"], pool["attn_qk_write"],
             model_module=model_module, topk=topk_qk,
             execution_kwargs=execution_qk,
-            admission_den_power=powers["qk"],
+            gate_den_power=powers["qk"],
             target_positions=target_positions)
         k_stats = _operator_contribution_topk(
             normed, query_k, pool["attn_qk_op_key"], tau_all[:, :, 1:2],
             pool["attn_qk_read"], pool["attn_qk_write"],
             model_module=model_module, topk=topk_qk,
             execution_kwargs=execution_qk,
-            admission_den_power=powers["qk"],
+            gate_den_power=powers["qk"],
             target_positions=target_positions)
         v_stats = _operator_contribution_topk(
             normed, query_v, pool["attn_v_op_key"], tau_all[:, :, 2:3],
             pool["attn_v_read"], pool["attn_v_write"],
             model_module=model_module, topk=topk_v,
             execution_kwargs=execution_v,
-            admission_den_power=powers["v"],
+            gate_den_power=powers["v"],
             target_positions=target_positions)
 
         paired_queries = jnp.stack((query_q, query_k), axis=2)
@@ -236,7 +259,7 @@ def topk_trace_forward(
                 model_cfg.get(
                     "soft_gate_boundary_power_final",
                     execution_qk["soft_gate_boundary_power"]),
-                execution_qk.get("execution_prune_eps", 0.0),
+                *_legacy_kernel_tail(model_module, execution_qk),
             ),
             name="attn_qk_paired_minimal",
             expected_ndim=4,
@@ -257,7 +280,7 @@ def topk_trace_forward(
                 model_cfg.get(
                     "soft_gate_boundary_power_final",
                     execution_v["soft_gate_boundary_power"]),
-                execution_v.get("execution_prune_eps", 0.0),
+                *_legacy_kernel_tail(model_module, execution_v),
             ),
             name="attn_v_single_minimal",
             expected_ndim=3,
@@ -307,7 +330,7 @@ def topk_trace_forward(
             pool["rst_read"], pool["rst_write"],
             model_module=model_module, topk=topk_rst,
             execution_kwargs=execution_rst,
-            admission_den_power=powers["rst"],
+            gate_den_power=powers["rst"],
             target_positions=target_positions)
         rst_transition = _transition_output(
             production_srw_fns["rst_single_minimal"](
@@ -321,7 +344,7 @@ def topk_trace_forward(
                 model_cfg.get(
                     "soft_gate_boundary_power_final",
                     execution_rst["soft_gate_boundary_power"]),
-                execution_rst.get("execution_prune_eps", 0.0),
+                *_legacy_kernel_tail(model_module, execution_rst),
             ),
             name="rst_single_minimal",
             expected_ndim=3,
