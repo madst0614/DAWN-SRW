@@ -235,6 +235,20 @@ function of the current state after the primitive is selected.
 \subsection{Continuous Conditional Applicability}
 \label{sec:applicability}
 
+Rather than assigning a representation state to a single discrete branch,
+\DAWN{} resolves it simultaneously against many learned transition conditions
+within each route. The resulting route-level applicability profile over the
+\(N_a\) primitives in route \(a\),
+\begin{equation}
+C_a(x)=\big(c_{a,1}(x),\ldots,c_{a,N_a}(x)\big),
+\label{eq:applicability_profile}
+\end{equation}
+interprets \(x\) in terms of which transition conditions it satisfies and to
+what degree. This is not an algebraic decomposition of the representation
+vector: exact zeros exclude transitions outside learned boundaries, while
+positive coordinates continuously weight the corresponding RW transitions
+composed below.
+
 For each route, normalized coordinates \(q_a(x)\) and \(k_{a,i}\) compare the
 current state with transition \(i\); Section~\ref{sec:operation-space} gives
 their learned construction. A separate direct projection produces the
