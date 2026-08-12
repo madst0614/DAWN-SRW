@@ -18,11 +18,14 @@
 \newcommand{\od}{\mathbin{\odot}}
 \newcommand{\DAWN}{DAWN-SRW}
 \newcommand{\op}{\mathcal{O}}
-\newcommand{\route}{a}
 \newcommand{\smallhead}[1]{\vspace{0.25em}\noindent\textbf{#1}}
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
 
 \usepackage[preprint]{icml2026}
+\makeatletter
+\renewcommand{\Notice@String}{}
+\makeatother
+\hypersetup{pdfsubject={}}
 
 \icmltitlerunning{\smash{DAWN-SRW: Learned State Transitions}}
 
@@ -45,7 +48,7 @@
 \printAffiliationsAndNotice{}
 
 \begin{abstract}
-Language-model blocks evolve representation states through relational interaction and subsequent transformation. DAWN-SRW asks whether these otherwise implicit mechanisms can instead be constructed explicitly from reusable, state-conditioned read-write (RW) transition primitives. It tests this reverse architectural hypothesis by composing rank-1 RW primitives under explicit continuous conditional control. Each residual state determines exactly which RW primitives apply and to what continuous degree. Their normalized composition constructs the query, key, and value representations used by attention, or directly produces the post-attention residual update. The goal is not to assume that learned operators are semantically human-readable, but to make transition-producing computation architecturally explicit enough to identify and causally intervene on its constituent operations. Learned operation-address spaces implement control by comparing state-derived queries with bilinear addresses of primitive read/write directions. At 393.8M parameters and 39.999B tokens, DAWN-SRW retains performance against a matched dense Transformer: C4 cross-entropies are 2.9402 versus 2.9359, and six-task zero-shot means are 0.4629 versus 0.4597. A descriptive 1.272B evaluation reaches 2.8359 cross-entropy and a 0.4858 zero-shot mean. A discovery-frozen 4,096-site Q/K-centered operator circuit passes suppression, four matched-control families, and exact restoration on independent validation and held-out indirect-object-identification inputs. The model also exhibits exact input-conditioned functional support, although execution remains dense. These results support explicit state-conditioned RW composition as viable and causally analyzable, without claiming benchmark superiority or hardware efficiency.
+Language-model blocks evolve representation states through relational interaction and subsequent transformation. DAWN-SRW asks whether these otherwise implicit mechanisms can instead be constructed explicitly from reusable read-write (RW) primitives under state-conditioned control. It tests this architectural hypothesis by composing rank-1 RW primitives according to explicit state-conditioned applicability. Each current representation state determines which primitives participate and to what continuous degree. Their normalized composition constructs the query, key, and value representations used by attention, or directly produces the post-attention residual update. The goal is not to assume that learned operators are semantically human-readable, but to make transition-producing computation architecturally explicit enough to identify and causally intervene on its constituent operations. In the evaluated v4172 realization, learned operation-address mappings implement this control by comparing state-derived queries with bilinear addresses of primitive read/write directions. At 393.8M parameters and 39.999B tokens, DAWN-SRW retains performance against a matched dense Transformer: C4 cross-entropies are 2.9402 versus 2.9359, and six-task zero-shot means are 0.4629 versus 0.4597. A descriptive 1.272B evaluation reaches 2.8359 cross-entropy and a 0.4858 zero-shot mean. A discovery-frozen 4,096-site Q/K-centered operator circuit passes suppression, four matched-control families, and exact restoration on independent validation and held-out indirect-object-identification inputs. The model also exhibits exact input-conditioned functional support, although execution remains dense. These results support explicit state-conditioned RW composition as viable and causally analyzable, without claiming benchmark superiority or hardware efficiency.
 \end{abstract}
 
 \section{Introduction}
@@ -77,15 +80,20 @@ This does not require individual primitives to correspond to human-readable
 concepts; it requires the transition-producing computation itself to be
 architecturally identifiable.
 
-This motivates the reverse architectural question:
+This motivates the following architectural question:
 \begin{quote}
 \emph{Can the mechanisms producing language-model state evolution be
-constructed explicitly from reusable, state-conditioned transition
-primitives?}
+constructed explicitly from reusable RW primitives under state-conditioned
+control?}
 \end{quote}
 
+We call this a reverse architectural hypothesis: instead of recovering
+transition structure from an already-trained dense computation, we make that
+structure explicit in the architecture and test whether it can support
+end-to-end language modeling.
+
 \DAWN{} investigates this question by taking a rank-1 read-write transformation
-as its basic state-transition primitive. For a token state \(x\),
+as its basic RW computational primitive. For a token state \(x\),
 \begin{align}
 \op_i(x)&=\langle x,r_i\rangle w_i,
 \label{eq:intro_operator}\\
@@ -94,32 +102,39 @@ F(x)&=\frac{1}{Z(x)}\sum_i c_i(x)\op_i(x),
 \label{eq:intro_field}
 \end{align}
 The read direction \(r_i\) determines what is extracted from the current
-representation, the write direction \(w_i\) determines a candidate state-change
-direction, and \(c_i(x)\) determines whether and to what degree that primitive
-applies. Thus, \DAWN{} parameterizes transition-producing computation as
-explicit conditional composition of reusable RW primitives.
+representation, the write direction \(w_i\) determines the direction of the
+primitive's output contribution, and \(c_i(x)\) determines whether and to what
+degree that primitive applies. Thus, \DAWN{} parameterizes transition-producing
+computation as explicit conditional composition of reusable RW primitives.
 
-The control decision is also explicit:
+The control abstraction is also explicit:
 \begin{equation}
-x\longmapsto\big(q_a(x),\tau_a(x)\big)
-\longmapsto c_{a,i}(x).
+x\longmapsto C_a(x)
+=\big(c_{a,1}(x),\ldots,c_{a,N_a}(x)\big).
 \label{eq:intro_control}
 \end{equation}
-The operation-address space implements this applicability control; it is not
-itself the transition mechanism. RW primitives determine the candidate state
-changes, while their state-conditioned applicability determines which of those
-changes participate in the realized route output.
+In v4172, this profile is realized through
+\[
+x\longmapsto\big(q_a(x),\tau_a(x)\big)
+\longmapsto c_{a,i}(x),
+\]
+using primitive addresses \(k_{a,i}\). The operation-address space implements
+this applicability control; it does not execute RW computation. Each RW
+primitive defines a candidate computational contribution, while
+state-conditioned applicability determines whether and to what degree that
+contribution participates in the composed output.
 
 This construction builds on the read-write view of dense feed-forward
 computation, where first-layer directions detect input patterns and second-layer
 directions contribute outputs \cite{geva2021transformer}. That analysis reveals
 functional directions inside an existing dense layer. \DAWN{} instead turns RW
 factorization into an architectural constraint: reusable RW units are
-executable transition primitives whose state-dependent contributions are
+executable RW primitives whose state-dependent contributions are
 directly controlled and observable.
 
 The same formulation produces the query, key, and value states used by causal
-self-attention and the transition applied to the post-attention residual state.
+self-attention and the direct update applied to the post-attention residual
+state.
 Q and K produce separate outputs from one shared QK pool; V and the
 post-attention residual transition (RST) use separate pools. Operator pools and
 applicability projections are reused across depth, while normalization and
@@ -143,15 +158,15 @@ Our contributions are:
     the view of language-model computation as representation-state evolution,
     we test whether its transition-producing transformations can be
     parameterized as compositions of explicit reusable RW primitives.
-    \item \textbf{State-conditioned continuous control.} We introduce an
-    explicit control mechanism that determines both the exact support and
-    continuous applicability of transition primitives from the current
-    representation state. Learned operation-address mappings implement this
-    control.
+    \item \textbf{State-conditioned applicability.} We explicitly parameterize
+    which RW primitives participate in the current computation and to what
+    continuous degree. In the evaluated v4172 realization, this control
+    additionally yields exact state-dependent support and is implemented
+    through learned operation-address mappings.
     \item \textbf{End-to-end language modeling and causal analysis.} We show
     that this formulation can train language models at 400M and 1.3B scale while
-    exposing exact operator support and causally intervenable transition
-    trajectories, including a discovery-frozen IOI circuit confirmed on
+    exposing exact operator support and causally intervenable operator
+    contributions, including a discovery-frozen IOI circuit confirmed on
     independent validation and held-out inputs.
 \end{enumerate}
 
@@ -165,8 +180,8 @@ networks \cite{shazeer2017outrageously}, and Switch Transformers scale this
 pattern with simple routing \cite{fedus2022switch}. PEER uses product-key
 retrieval over more than a million small experts \cite{he2024mixture}. These
 methods formulate conditional computation as expert retrieval; \DAWN{} instead
-organizes the base language-model computation explicitly around read-write
-state-transition primitives and their state-dependent applicability. Its
+organizes the base language-model computation explicitly around RW primitives
+and their state-dependent applicability. Its
 current implementation still uses a dense address scan and dense, chunked RW
 application; functional sparsity is not an indexed sparse kernel.
 
@@ -193,9 +208,9 @@ circuit and evaluates faithfulness, completeness, and minimality
 approximations localize behavior to components \cite{kramar2024atp}. RAVEL
 emphasizes that neuron-level representations may be entangled and evaluates
 methods against causal criteria \cite{huang2024ravel}. Our analysis treats a
-layer, route, and transition-primitive identity as a site, freezes localization
-before confirmatory evaluation, and uses direct numerator suppression, matched
-random circuits, and exact same-example restoration. Explicit transition units
+site as a layer, computation type, and RW-operator identity; freezes
+localization before confirmation; and uses direct numerator suppression,
+matched random circuits, and exact same-example restoration. Explicit RW units
 make the intervention target precise, but do not guarantee a human-readable
 interpretation.
 
@@ -226,18 +241,16 @@ parameterized.
 \label{sec:transition-hypothesis}
 
 \DAWN{} tests the reverse hypothesis that transition-producing computation can
-be constructed from explicit reusable state-transition primitives under
-explicit state-dependent control. For a token state
-\(x\in\mathcal{S}=\R^D\), each route produces a state-conditioned computation
-vector:
+be constructed from explicit reusable RW primitives under explicit
+state-dependent control. For a token state \(x\in\mathcal{S}=\R^D\), let
+\(a\in\{Q,K,V,\mathrm{RST}\}\) index the computation type and define
 \begin{equation}
-F_a:\mathcal{S}\rightarrow\R^D,
-\qquad a\in\{Q,K,V,\mathrm{RST}\}.
-\label{eq:route_output}
+F_a:\mathcal{S}\rightarrow\R^D.
+\label{eq:composed_output}
 \end{equation}
 The Q, K, and V outputs form the state-conditioned interfaces through which
 relational interaction is computed, whereas \(F_{\mathrm{RST}}\) directly
-specifies a residual-state update. In every route, the output is explicitly
+specifies a residual-state update. Each composed output is explicitly
 decomposed into contributions from reusable RW primitives under state-dependent
 control. The construction therefore separates the primitives, their
 applicability profile, and their normalized composition. The operation-address
@@ -257,7 +270,7 @@ paper's core hypothesis.
 \fbox{\parbox[c][0.92cm][c]{0.10\textwidth}{\centering
 \textbf{Contextual state}\\\(Y_\ell\)}} &
 \fbox{\parbox[c][0.92cm][c]{0.16\textwidth}{\centering
-\textbf{State refinement}\\residual transition \(F_{\mathrm{RST}}\)}} &
+\textbf{Residual-state transition}\\via \(F_{\mathrm{RST}}\)}} &
 \fbox{\parbox[c][0.92cm][c]{0.10\textwidth}{\centering
 \textbf{Next state}\\\(X_{\ell+1}\)}}
 \end{tabular}\\[-0.05em]
@@ -265,31 +278,32 @@ paper's core hypothesis.
 \parbox{0.34\textwidth}{\centering
 \(F_Q,F_K,F_V\) parameterize relational interaction\\\(\Downarrow\)} &
 \parbox{0.34\textwidth}{\centering
-\(F_{\mathrm{RST}}\) instantiates state refinement\\\(\Downarrow\)}
+\(F_{\mathrm{RST}}\) directly updates the residual state\\\(\Downarrow\)}
 \end{tabular}\\[0.15em]
 \textbf{\DAWN{}: explicit construction of state-conditioned computation}\\[0.35em]
-\begin{tabular}{c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c}
+\begin{tabular}{c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c}
 \fbox{\parbox[c][0.92cm][c]{0.09\textwidth}{\centering
 \textbf{Token state}\\\(x\)}} &
-\fbox{\parbox[c][0.92cm][c]{0.15\textwidth}{\centering
-\textbf{Conditional control}\\\(q_a(x),\tau_a(x)\)}} &
-\fbox{\parbox[c][0.92cm][c]{0.13\textwidth}{\centering
-\textbf{Applicability}\\\(c_{a,i}(x)\)}} &
+\fbox{\parbox[c][0.92cm][c]{0.20\textwidth}{\centering
+\textbf{State-conditioned}\\\textbf{applicability}\\\(C_a(x)\)}} &
 \fbox{\parbox[c][0.92cm][c]{0.18\textwidth}{\centering
 \textbf{RW primitive}\\\(\op_{a,i}(x)=\langle x,\bar r_{a,i}\rangle\bar w_{a,i}\)}} &
 \fbox{\parbox[c][0.92cm][c]{0.13\textwidth}{\centering
 \textbf{Composed output}\\\(F_a(x)\)}}
-\end{tabular}
+\end{tabular}\\[0.18em]
+\parbox{0.82\textwidth}{\centering\footnotesize
+\(C_a(x)=(c_{a,1}(x),\ldots,c_{a,N_a}(x))\); v4172:
+\(q_a(x),\tau_a(x),k_{a,i}\) determine \(c_{a,i}(x)\)}
 \caption{The two-level construction. Top: a language-model block evolves a
-sequence representation through relational interaction and subsequent state
-refinement. Bottom: \DAWN{} constructs each route output from explicit RW
-transition primitives under state-conditioned continuous control. The
-operation-address space implements the control step; RW execution remains in
-the full \(D\)-dimensional representation space.}
+sequence representation through relational interaction and a subsequent
+residual-state transition. Bottom: \DAWN{} constructs each composed output from
+explicit RW primitives under state-conditioned applicability. In v4172, the
+operation-address mapping implements the applicability step; RW execution
+remains in the full \(D\)-dimensional representation space.}
 \label{fig:architecture}
 \end{figure*}
 
-\subsection{Read-Write Transition Primitives}
+\subsection{Read-Write Computational Primitives}
 \label{sec:rw}
 
 Each primitive owns learned read and write parameters. With
@@ -301,42 +315,46 @@ directions \(\bar r_{a,i}=\operatorname{unit}(r_{a,i})\) and
 =\bar w_{a,i}\bar r_{a,i}^{\top}x.
 \label{eq:rw_operator}
 \end{equation}
-This is an explicit rank-1 state-transition primitive: it maps the current
-state to a candidate state-change vector. The read direction specifies the
-scalar extracted from the current state, and the write direction specifies the
-direction of that candidate change. Unlike a retrieved static value, the output
-remains a function of the current state after the primitive is selected. The
-state-to-state transition is completed only when the composed output
-participates in the attention-mediated or residual update.
+This is an explicit rank-1 RW primitive. It reads a scalar from the current
+state and produces a directed output contribution. The read direction
+specifies the extracted scalar, while the write direction specifies the
+direction of that contribution. For Q, K, and V, these contributions compose
+the interfaces used by attention; for RST, they compose a direct residual-state
+update. Unlike a static retrieved value, an RW primitive remains an
+input-dependent transformation, with its output varying with the current state
+through the read response. The state-to-state transition
+is completed only when the composed output participates in the
+attention-mediated or residual update.
 
-\subsection{Continuous Conditional Applicability}
+\subsection{State-Conditioned Applicability}
 \label{sec:applicability}
 
-Rather than assigning a representation state to a single discrete branch,
-\DAWN{} resolves it simultaneously against many learned transition conditions
-within each route. The resulting route-level applicability profile over the
-\(N_a\) primitives in route \(a\),
+At the abstract level, control is represented by an applicability profile over
+reusable RW primitives. For each computation type
+\(a\in\{Q,K,V,\mathrm{RST}\}\), the current state induces a profile over all
+\(N_a\) primitives,
 \begin{equation}
 C_a(x)=\big(c_{a,1}(x),\ldots,c_{a,N_a}(x)\big),
 \label{eq:applicability_profile}
 \end{equation}
-interprets \(x\) in terms of which transition conditions it satisfies and to
-what degree. This is not an algebraic decomposition of the representation
-vector: exact zeros exclude transitions outside learned boundaries, while
-positive coordinates continuously weight the corresponding RW transitions
-composed below.
+whose coordinates specify which primitives participate and to what degree,
+rather than assigning the state to a single discrete branch. The evaluated
+v4172 realization has exact zero support outside learned boundaries and
+continuously positive applicability inside them. This is not an algebraic
+decomposition of the representation vector; its coordinates control the
+contributions of the corresponding RW primitives composed below.
 
-For each route, normalized coordinates \(q_a(x)\) and \(k_{a,i}\) compare the
-current state with transition \(i\); Section~\ref{sec:operation-space} gives
-their learned construction. A separate direct projection produces the
-state-dependent DirectTau boundary:
+In v4172, normalized coordinates \(q_a(x)\) and \(k_{a,i}\) compare the current
+state with primitive \(i\)'s learned address;
+Section~\ref{sec:operation-space} gives their construction. A separate direct
+projection produces the state-dependent DirectTau boundary:
 \begin{align}
 \tau_a(x)&=-1+2\sigma(xu_a+\beta_a),\\
 \rho_{a,i}(x)&=q_a(x)^\top k_{a,i},\\
 m_{a,i}(x)&=\rho_{a,i}(x)-\tau_a(x).
 \label{eq:directtau}
 \end{align}
-The evaluated \texttt{linear\_angular} rule defines transition applicability as
+The evaluated \texttt{linear\_angular} rule defines primitive applicability as
 \begin{equation}
 c_{a,i}(x)=
 \operatorname{clip}\!\left(
@@ -345,7 +363,7 @@ c_{a,i}(x)=
 \label{eq:angular_gate}
 \end{equation}
 We call \(c_{a,i}(x)\in[0,1]\) the \emph{continuous conditional
-applicability} of transition \(i\) at state \(x\). Its exact state-dependent
+applicability} of primitive \(i\) at state \(x\). Its exact state-dependent
 support is
 \begin{equation}
 \mathcal{I}_a(x)=\{i:\rho_{a,i}(x)>\tau_a(x)\}
@@ -353,15 +371,15 @@ support is
 \label{eq:applicable_support}
 \end{equation}
 Outside this set, a primitive contributes exactly zero; inside it,
-\(0<c_{a,i}(x)\leq1\). A transition therefore enters continuously from zero at
-the learned boundary. This combines state-dependent sparse support with a
-continuous-valued degree of applicability rather than merely assigning a dense
-soft mixture over every primitive.
+\(0<c_{a,i}(x)\leq1\). A primitive's contribution therefore enters
+continuously from zero at the learned boundary. This combines state-dependent
+sparse support with a continuous-valued degree of applicability rather than
+merely assigning a dense soft mixture over every primitive.
 
 \subsection{State-Conditioned Operator Composition}
 \label{sec:operator-composition}
 
-Applicable primitives compose into the route output
+Applicable primitives compose into the output \(F_a(x)\):
 \begin{align}
 Z_a(x)&=\left[\max\!\left(\sum_i c_{a,i}(x),1\right)\right]^{p_a},\\
 s_a&=\sqrt{D/L},\nonumber\\
@@ -391,22 +409,26 @@ discrete. The scalar mapping from normalized margin to applicability is
 continuous and piecewise linear, with nondifferentiable support boundaries.
 
 The denominator powers are \(p_Q=p_K=0.5\), \(p_V=1.0\), and
-\(p_{\mathrm{RST}}=1.2\). The fixed route scale is \(s_a=\sqrt{D/L}\), with no
+\(p_{\mathrm{RST}}=1.2\). The fixed composition scale is
+\(s_a=\sqrt{D/L}\), with no
 learned pool-strength parameter.
 
 \subsection{Operation-Address Space}
 \label{sec:operation-space}
 
-The operation-address space \(\mathcal{A}=\R^R\) is where transition
-applicability is evaluated, not where the transition itself executes. In the
-evaluated v4172 realization, \(R=256\), and a normalized query is a direct
-projection of the route input:
+The operation-address space \(\mathcal{A}=\R^R\) is where primitive
+applicability is evaluated, not where RW computation itself is executed. This
+addressing construction is one evaluated realization of the state-conditioned
+applicability abstraction above. The present experiments do not establish that
+this particular realization is necessary or preferable to alternative
+state-conditioned control mechanisms. In v4172, \(R=256\), and a normalized
+query is a direct projection of the current input state:
 \begin{equation}
 q_a(x)=\operatorname{unit}(xP_a+b_a)\in\mathcal{A}.
 \label{eq:query}
 \end{equation}
-One shared pair of learned probes \(P_r,P_w\in\R^{D\times R}\) maps every
-route's functional read and write directions into address features. The
+A shared probe pair \(P_r,P_w\in\R^{D\times R}\) maps all operator pools'
+functional read and write directions into address features. The
 operator address is
 \begin{align}
 u_{a,i}&=\operatorname{unit}(\bar r_{a,i}^{\top}P_r),&
@@ -418,9 +440,9 @@ This generalized coordinate-wise bilinear mapping makes address identity a
 learned function of what a primitive reads and where it writes, rather than an
 independent expert ID. It is the addressing realization used to compute the
 applicability coefficients in Equation~\ref{eq:angular_gate}, not the paper's
-definition of a transition. Shared probes align QK, V, and RST addresses to one
-coordinate convention, while their operator rows remain in route-specific
-pools.
+definition of a state transition. Shared probes align QK, V, and RST addresses
+to one coordinate convention, while their operator rows remain in QK-, V-, and
+RST-specific pools.
 
 Because both \(q_a(x)\) and \(k_{a,i}\) are unit-normalized, they lie on the
 address sphere \(\mathbb{S}^{R-1}\). Let
@@ -431,9 +453,10 @@ address sphere \(\mathbb{S}^{R-1}\). Let
 =\{i:\theta_{a,i}(x)<\theta_a(x)\},
 \]
 a spherical cap centered at the query \(q_a(x)\) with state-dependent angular
-radius \(\theta_a(x)\). Geometrically, \(q_a(x)\) specifies \emph{where} to
-operate, \(\tau_a(x)\) specifies \emph{how broadly} to operate, and
-\(c_{a,i}(x)\) specifies \emph{how strongly} primitive \(i\) applies. When the
+radius \(\theta_a(x)\). Geometrically, \(q_a(x)\) specifies the center of the
+applicability query, \(\tau_a(x)\) specifies its angular support boundary, and
+\(c_{a,i}(x)\) specifies the continuous degree to which primitive \(i\)
+applies. When the
 numerical guard in Equation~\ref{eq:angular_gate} is inactive, an active
 primitive has
 \[
@@ -465,7 +488,7 @@ Y_\ell&=X_\ell+\Delta X_{\mathrm{attn},\ell}.
 Q and K produce separate outputs from the same 4,600-row QK pool; V produces an
 output from a separate 14,500-row pool. After attention, a second layer-specific
 normalization \(\widetilde Y_\ell=\operatorname{LN}^{(2)}_\ell(Y_\ell)\) is
-evaluated anew by the RST route and its 29,300-row pool:
+evaluated anew using the 29,300-row RST operator pool:
 \begin{equation}
 X_{\ell+1}=Y_\ell+F_{\mathrm{RST}}(\widetilde Y_\ell).
 \label{eq:rst}
@@ -484,7 +507,7 @@ separate query slices, tau values, applicability coefficients, and outputs. The
 layer-specific parameters are two LayerNorms and the attention output
 projection \(W^O_\ell\). Positional and token embeddings and the final
 normalization are model-level parameters. Consequently, \DAWN{} reuses
-transition primitives across depth without claiming complete block sharing.
+RW primitives across depth without claiming complete block sharing.
 
 \subsection{Implemented Addressing and Compute Boundary}
 \label{sec:implemented-boundary}
@@ -508,10 +531,10 @@ implemented or timed here.
 \subsection{Models and training}
 
 Table~\ref{tab:model-spec} summarizes the evaluated checkpoints. The primary
-\DAWN{} model has 393,800,708 measured parameters, width 2,304, 18 layers, 36
-heads of width 64, route width 256, and 48,400 operator rows across QK, V, and
-RST. It was trained for 39,999,504,384 packed C4 tokens with sequence length
-512 and global training batch 1,024. Model and router dropout are zero.
+\DAWN{} model has 393,800,708 measured parameters, operation-address dimension
+\(R=256\), and 48,400 operator rows across QK, V, and RST. It was trained for
+39,999,504,384 packed C4 tokens with sequence length 512 and global training
+batch 1,024. Both dropout rates are zero.
 
 \begin{table*}[t]
 \centering
@@ -559,20 +582,21 @@ an unweighted mean of these six metrics.
 \subsection{Mechanistic localization and frozen intervention protocol}
 \label{sec:protocol}
 
-We define a site by layer, route, token position, and global operator identity.
+We define a site by layer, computation type, token position, and global operator
+identity.
 IOI discovery uses 119 independent paired-correct units. Sites are ranked by
 absolute discovery mean contribution importance. We choose the smallest
 audited prefix that reaches at least 0.70 cumulative absolute importance and
-0.95 split top-\(k\) overlap. The resulting 4,096-site identity, route/layer
-composition, score, and intervention specification are frozen before
-validation.
+0.95 split top-\(k\) overlap. The resulting 4,096-site Q/K/V/RST/layer
+composition and intervention specification are frozen before validation.
 
 The primary causal score is the summed-log-probability margin between the
 correct indirect object and the source name. Circuit-wide suppression zeros
 only the selected operators' execution numerator at target positions while
 retaining the full production denominator. Four control families each contain
 100 frozen-size circuits that exclude circuit sites: equal-count random,
-same-layer random, activation-matched, and route-frequency-matched. Exact
+same-layer random, activation-matched, and route-frequency-matched across
+Q/K/V/RST. Exact
 restoration reinserts the same-example selected numerator after suppression,
 again under the production denominator. Validation uses 123 independent
 paired-correct units; the held-out test accessor is opened only after the
@@ -651,8 +675,8 @@ controlled scaling curve nor a dense-model comparison.
 \subsection{Input-conditioned RW operator support}
 \label{sec:support}
 
-Across 9,994,240 packed-C4 positions, every route has a strict subset of its
-pool at positive selection margin (Table~\ref{tab:support}). Mean exact support
+At all 9,994,240 packed-C4 positions, Q, K, V, and RST each have strict-subset
+operator support at positive selection margin (Table~\ref{tab:support}). Mean exact support
 is 487.896 Q operators, 386.722 K operators, 812.388 in the shared-pool Q/K
 union, 1,649.994 V operators, and 2,017.703 RST operators. This is exact
 input-conditioned functional support under Equation~\ref{eq:angular_gate}.
@@ -665,7 +689,7 @@ an operator active for Q or K at the same layer and token.}
 \small
 \begin{tabular}{lrrr}
 \toprule
-Route & Pool & Mean active & Pool fraction\\
+Computation & Pool & Mean active & Pool fraction\\
 \midrule
 Q & 4,600 & 487.896 & 10.6064\%\\
 K & 4,600 & 386.722 & 8.4070\%\\
@@ -687,7 +711,7 @@ not measured latency, energy, or hardware speedup.
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{../../../assets/paper/v4172_400m_compute_support_step76293/flops_stacked.pdf}
+\includegraphics[width=\linewidth]{figures/flops_stacked.pdf}
 \caption{Static backbone accounting at batch 1 and sequence length 512.
 Address scoring remains dense in the exact-support estimate. Current execution
 also applies all full-dimensional RW rows. No production latency claim is made.}
@@ -798,10 +822,10 @@ No frozen circuit; validation and test closed\\
 
 The evaluated model shows that a language model can construct attention and
 post-attention residual updates by state-conditioned composition of explicit
-RW transition primitives. The matched 400M comparison shows performance
+RW primitives. The matched 400M comparison shows performance
 retention under the measured protocols. The support profile shows that
 applicability has exact input-conditioned zeros, and the IOI study shows that
-transition sites can form a discovery-frozen circuit whose suppression and
+operator sites can form a discovery-frozen circuit whose suppression and
 restoration causally control behavior on held-out data.
 
 These claims are deliberately narrower than a theory of language reasoning as
@@ -829,14 +853,14 @@ these objects is a subsequent empirical question rather than a prerequisite of
 the architecture.
 
 The central abstraction is a state-dependent map from the current
-representation to its applicable RW transitions, their continuously weighted
+representation to its applicable RW primitives, their continuously weighted
 composition, the resulting composed computation vector, and the state update it
 parameterizes:
 \[
 \begin{array}{c}
 \text{current state}\\[-0.15em]
 \downarrow\\[-0.15em]
-\text{transition applicability}\\[-0.15em]
+\text{state-conditioned applicability}\\[-0.15em]
 \downarrow\\[-0.15em]
 \text{RW operator composition}\\[-0.15em]
 \downarrow\\[-0.15em]
@@ -855,7 +879,7 @@ The operation-address space implements one step inside this abstraction. A
 query represents the current applicability condition, an address identifies a
 reusable primitive for that test, and the RW directions define the primitive's
 executed function. Because the address is derived from read/write parameters,
-applicability geometry and transition function are coupled rather than assigned
+applicability geometry and RW function are coupled rather than assigned
 independent labels. This coupling is an architectural constraint, not proof of
 semantic interpretability. A primitive may be explicit, observable, and
 causally testable while participating in distributed or polysemantic
@@ -909,13 +933,12 @@ reasoning as universally discrete operator programs.
 \section{Conclusion}
 
 \DAWN{} formulates language-model computation as state-conditioned composition
-of explicit read-write state-transition primitives. A representation state determines
-which transitions are applicable and to what continuous degree; their
-composition produces the interfaces used by attention or a direct
-residual-state update. The
+of explicit reusable RW primitives. A representation state determines which RW
+primitives are applicable and to what continuous degree; their composition
+produces the interfaces used by attention or a direct residual-state update. The
 evaluated v4172 realization computes applicability through learned
-operation-address mappings derived from RW function and reuses route-specific
-primitive pools across depth. It retains measured language-model performance
+operation-address mappings derived from RW function and reuses QK-, V-, and
+RST-specific primitive pools across depth. It retains measured language-model performance
 relative to a matched 400M dense control. A discovery-frozen Q/K-centered
 operator circuit is causally necessary under suppression and recoverable under
 exact restoration on independent validation and fully held-out IOI inputs. The
@@ -963,7 +986,7 @@ c_i=
 \]
 and padding rows are masked to zero. This is the single applicability
 coefficient used in RW composition. Let \(M_a=\sum_i c_i\). The production
-route output before causal attention or residual addition is
+composed output before causal attention or residual addition is
 \[
 F_a(x)=
 \sqrt{\frac{D}{L}}\,
@@ -993,7 +1016,7 @@ Layers & 18 & 18 & 24\\
 Heads / head width & 36 / 64 & 20 / 64 & 32 / 128\\
 Maximum sequence length & 512 & 512 & 512\\
 Feed-forward width & -- & 5,120 & --\\
-Operation-route width & 256 & -- & 256\\
+Operation-address width & 256 & -- & 256\\
 QK / V / RST pool & 4,600 / 14,500 / 29,300 & -- &
 8,534 / 26,904 / 54,352\\
 QK / V / RST chunks & 1 / 1 / 4 & -- & 1 / 2 / 8\\
@@ -1007,7 +1030,7 @@ Learning rate & \(3\times10^{-4}\) & \(3\times10^{-4}\) & \(2\times10^{-4}\)\\
 Warmup ratio & 0.08 & 0.08 & 0.06\\
 Weight decay & 0.1 & 0.1 & 0.1\\
 Tau learning-rate multiplier & 0.001 & -- & 0.001\\
-Dropout / router dropout & 0 / 0 & 0 / -- & 0 / 0\\
+Dropout / \texttt{router\_dropout} & 0 / 0 & 0 / -- & 0 / 0\\
 Gradient checkpointing & yes & yes & yes\\
 Seed & 1 & 1 & 1\\
 \bottomrule
@@ -1050,26 +1073,12 @@ split top-\(k\) overlap at least 0.95. The selected \(k=4096\) prefix has:
     \item cumulative absolute importance 0.719248713;
     \item 3,993 shared split sites, overlap 0.974853516, and Jaccard
     0.950940700;
-    \item route counts Q/K/V/RST \(=1744/2350/2/0\);
+    \item Q/K/V/RST counts \(=1744/2350/2/0\);
     \item coverage of every layer from 0 through 17.
 \end{itemize}
 Validation and test do not recompute or alter this selection.
 
-\subsection{Suppression, controls, and restoration}
-
-For a correct candidate \(c\) and source candidate \(s\), the primary score is
-\[
-\mathcal{M}=\sum_{t\in c}\log p(t)-\sum_{t\in s}\log p(t).
-\]
-Suppression zeros the frozen sites' execution numerator at specified token
-positions. It leaves admission mass and the production denominator unchanged.
-Controls use the same 4,096-site count and exclude all circuit sites.
-Activation matching conditions on layer, route, and the discovery mean
-pre-scale operator-output-norm quantile. Restoration executes a distinct
-intervention: after suppression, it adds back the exact selected same-example
-numerator under the unchanged denominator.
-
-\begin{table*}[h]
+\begin{table*}[!t]
 \centering
 \caption{Control effects and frozen-minus-control separation. Each control
 family contains 100 replicates. All paired permutation \(p\)-values are
@@ -1092,6 +1101,20 @@ Route-frequency & 0.219162 & 7.645626 [7.289512, 8.031625] &
 \bottomrule
 \end{tabular}
 \end{table*}
+
+\subsection{Suppression, controls, and restoration}
+
+For a correct candidate \(c\) and source candidate \(s\), the primary score is
+\[
+\mathcal{M}=\sum_{t\in c}\log p(t)-\sum_{t\in s}\log p(t).
+\]
+Suppression zeros the frozen sites' execution numerator at specified token
+positions. It leaves admission mass and the production denominator unchanged.
+Controls use the same 4,096-site count and exclude all circuit sites.
+Activation matching conditions on layer, computation type, and the discovery mean
+pre-scale operator-output-norm quantile. Restoration executes a distinct
+intervention: after suppression, it adds back the exact selected same-example
+numerator under the unchanged denominator.
 
 On validation, restoration returns the margin to 3.462791, leaving residual
 drop 0.002665. On held-out test, it returns the margin to 3.242905, leaving
@@ -1134,7 +1157,7 @@ matmul/einsum operations and omits softmax, normalization, gate elementwise
 arithmetic, embedding lookup, residual additions, and communication
 collectives.
 
-\begin{table*}[h]
+\begin{table*}[!t]
 \centering
 \caption{Backbone static accounting. ``Exact support'' retains full dense
 address scoring and replaces only full-pool RW application with the measured
@@ -1144,7 +1167,7 @@ positive-margin support.}
 \toprule
 Component & Current dense \DAWN{} & Dense address + exact RW & Dense Transformer\\
 \midrule
-Address / route / tau projections & 0.293742 & 0.293742 & --\\
+Address scoring + query/tau projections & 0.293742 & 0.293742 & --\\
 RW application & 4.306187 & 0.383157 & --\\
 Causal attention & 0.043487 & 0.043487 & 0.024159\\
 Dense output / QKV / FFN maps & 0.097845 & 0.097845 & 0.362388\\
@@ -1165,10 +1188,9 @@ part of the measured path.
 
 The low-dimensional extension uses one shared atlas of \(M=8\) operation-space
 addresses, shared \(D\!\to\!R\) read interfaces \(P_m\), and shared
-\(R\!\to\!D\) write interfaces \(B_m\). Q, K, V, and RST have independent
-query projections and select two atlas entries independently. Route-specific
-tau maps and operator banks remain separate. For local operator \(i\) in space
-\(m\),
+\(R\!\to\!D\) write interfaces \(B_m\). Q, K, V, and RST have separate query
+projections, tau maps, and operator banks, and independently select two atlas
+entries. For local operator \(i\) in space \(m\),
 \[
 \begin{aligned}
 \op^{\mathrm{global}}_{a,m,i}(x)
@@ -1181,7 +1203,7 @@ so the induced global transformation remains rank-1.
 The 40M reference has 40,341,088 parameters, \(D=432\), \(R=128\), 12
 layers, six heads, and top-2 space selection. Repository-local compilation,
 abstract-tree and symbolic parameter counting, shared-key and independent
-route selection, legacy-checkpoint rejection, reduced JIT
+Q/K/V/RST space selection, legacy-checkpoint rejection, reduced JIT
 forward/backward, selector metrics, and gradient contracts have passed.
 Some early-training observations are recorded, but the exact deployment and
 complete controlled language-model evaluation are absent. No latency,
@@ -1192,7 +1214,7 @@ dispatch and an accelerator-native execution kernel.
 \section{Reproducibility Identities}
 \label{app:repro}
 
-\begin{table*}[h]
+\begin{table*}[!t]
 \centering
 \caption{Primary immutable identities. Branch names are omitted because they
 move; exact checkpoint steps, hashes, and artifact locations are the binding
@@ -1247,7 +1269,11 @@ interpretations, and final claims remain the responsibility of the author.
 This research was supported by the Google TPU Research Cloud (TRC) program,
 which provided computational resources for training and analysis.
 
+\begingroup
+\small
+\setlength{\bibsep}{0pt}
 \bibliography{references}
 \bibliographystyle{icml2026}
+\endgroup
 
 \end{document}

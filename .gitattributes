@@ -1,2 +1,5 @@
 # Preserve generated research patch mail exactly as archived.
 research/branch_archive/patches/** -text -whitespace
+
+# Treat generated paper artifacts as binary outputs.
+*.pdf binary

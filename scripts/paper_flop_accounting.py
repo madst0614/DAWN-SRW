@@ -132,7 +132,7 @@ def _figure_bytes(accounting: Mapping[str, Any], suffix: str) -> bytes:
     labels = {
         "qkv_and_output_projections": "QKV/O projections",
         "ffn": "FFN",
-        "route_and_tau_projections": "Route/tau projections",
+        "route_and_tau_projections": "Query/tau projections",
         "full_pool_address_scoring": "Full-pool address scoring",
         "full_pool_rw_application": "Full-pool RW application",
         "exact_support_rw_application": "Exact-support RW application",
