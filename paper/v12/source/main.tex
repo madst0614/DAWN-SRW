@@ -11,6 +11,7 @@
 \usepackage{multirow}
 \usepackage{array}
 \usepackage{xcolor}
+\usepackage{balance}
 
 \newcommand{\theHalgorithm}{\arabic{algorithm}}
 \newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
@@ -48,7 +49,7 @@
 \printAffiliationsAndNotice{}
 
 \begin{abstract}
-Language-model blocks evolve representation states through relational interaction and subsequent transformation. DAWN-SRW asks whether these otherwise implicit mechanisms can instead be constructed explicitly from reusable read-write (RW) primitives under state-conditioned control. It tests this architectural hypothesis by composing rank-1 RW primitives according to explicit state-conditioned applicability. Each current representation state determines which primitives participate and to what continuous degree. Their normalized composition constructs the query, key, and value representations used by attention, or directly produces the post-attention residual update. The goal is not to assume that learned operators are semantically human-readable, but to make transition-producing computation architecturally explicit enough to identify and causally intervene on its constituent operations. In the evaluated v4172 realization, learned operation-address mappings implement this control by comparing state-derived queries with bilinear addresses of primitive read/write directions. At 393.8M parameters and 39.999B tokens, DAWN-SRW retains performance against a matched dense Transformer: C4 cross-entropies are 2.9402 versus 2.9359, and six-task zero-shot means are 0.4629 versus 0.4597. A descriptive 1.272B evaluation reaches 2.8359 cross-entropy and a 0.4858 zero-shot mean. A discovery-frozen 4,096-site Q/K-centered operator circuit passes suppression, four matched-control families, and exact restoration on independent validation and held-out indirect-object-identification inputs. The model also exhibits exact input-conditioned functional support, although execution remains dense. These results support explicit state-conditioned RW composition as viable and causally analyzable, without claiming benchmark superiority or hardware efficiency.
+Language-model blocks evolve representation states through relational interaction and subsequent transformation. DAWN-SRW asks whether these otherwise implicit mechanisms can instead be organized explicitly around reusable learned operations, continuous state-conditioned applicability, and their composition. It realizes this organization with rank-1 read-write (RW) primitives. Each current representation state determines which primitives participate and to what continuous degree. Their normalized composition constructs the query, key, and value representations used by attention, or directly produces the post-attention residual update. This organization admits a program-like interpretation as continuous conditional execution over learned operators controlled by the current representation. The goal is not to assume that those operations are semantically human-readable, but to make transition-producing computation architecturally explicit enough to identify and causally intervene on its constituent operations. In the evaluated v4172 realization, learned operation-address mappings implement this control by comparing state-derived queries with bilinear addresses of primitive read/write directions. At 393.8M parameters and 39.999B tokens, DAWN-SRW retains performance against a matched dense Transformer: C4 cross-entropies are 2.9402 versus 2.9359, and six-task zero-shot means are 0.4629 versus 0.4597. A descriptive 1.272B evaluation reaches 2.8359 cross-entropy and a 0.4858 zero-shot mean. A discovery-frozen 4,096-site Q/K-centered operator circuit passes suppression, four matched-control families, and exact restoration on independent validation and held-out indirect-object-identification inputs. The model also exhibits exact input-conditioned functional support, although execution remains dense. These results support explicit state-conditioned RW composition as viable and causally analyzable, without claiming benchmark superiority or hardware efficiency.
 \end{abstract}
 
 \section{Introduction}
@@ -65,34 +66,32 @@ contribution.
 
 In conventional Transformers, the mechanisms producing these state changes
 remain largely implicit in dense parameterized transformations. Attention and
-feed-forward layers expose module boundaries, but the architecture does not
-directly represent which reusable elementary transformations apply to the
-current state, under what conditions they apply, or which state-change
-directions they produce.
+feed-forward layers expose module boundaries, but they do not natively factor
+transition-producing computation into reusable operations, explicit
+state-dependent applicability, and the direct composition of those applicable
+contributions.
 
-Before asking whether learned neural computation is semantically interpretable,
-we ask a more structural question: can the mechanism that transforms one
-representation state into the next first be made explicit? Ideally, such a
-representation would expose which reusable computational primitives apply to
-the current state, to what degree they apply, how their contributions compose,
-and how the resulting computation participates in the subsequent state update.
-This does not require individual primitives to correspond to human-readable
-concepts; it requires the transition-producing computation itself to be
-architecturally identifiable.
+We therefore ask whether transition-producing computation can be decomposed
+architecturally into three explicit parts: reusable learned operations,
+state-dependent applicability, and composition. Such a representation should
+expose which operations exist, which apply to the current state and to what
+degree, and how their contributions form the computation used in the next
+update. This decomposition does not require individual operations to correspond
+to human-readable concepts; semantic interpretation remains a subsequent
+empirical question.
 
 This motivates the following architectural question:
 \begin{quote}
-\emph{Can the mechanisms producing language-model state evolution be
-constructed explicitly from reusable RW primitives under state-conditioned
-control?}
+\emph{Can transition-producing language-model computation be explicitly
+organized around reusable learned operations, continuous state-dependent
+applicability, and their composition?}
 \end{quote}
 
-We call this a reverse architectural hypothesis: instead of recovering
-transition structure from an already-trained dense computation, we make that
-structure explicit in the architecture and test whether it can support
-end-to-end language modeling.
+Rather than recovering such structure post hoc from an already-trained dense
+model, \DAWN{} makes it explicit by construction and tests whether it can
+support end-to-end language modeling.
 
-\DAWN{} investigates this question by taking a rank-1 read-write transformation
+\DAWN{} realizes this organization by taking a rank-1 read-write transformation
 as its basic RW computational primitive. For a token state \(x\),
 \begin{align}
 \op_i(x)&=\langle x,r_i\rangle w_i,
@@ -113,7 +112,21 @@ x\longmapsto C_a(x)
 =\big(c_{a,1}(x),\ldots,c_{a,N_a}(x)\big).
 \label{eq:intro_control}
 \end{equation}
-In v4172, this profile is realized through
+Together, these components admit an operational, program-like interpretation:
+the representation supplies the evolving computational state, \(C_a(x)\)
+controls explicit learned operations, and composition produces the computation
+used in the next update. Classical operational accounts describe computation
+through transitions between configurations \cite{plotkin1981structural}; we use
+this perspective as a conceptual reference. Compared with familiar binary
+predicate-controlled execution, \DAWN{} represents operator applicability
+continuously and composes the contributions of applicable operations.
+
+In the evaluated v4172 realization, the QK-, V-, and RST-specific RW banks
+persist across depth and share an address coordinate convention, while each
+successive representation state recomputes applicability over the corresponding
+bank. The model therefore conditionally reuses persistent type-specific
+operation repertoires rather than selecting unrelated layer-local units. This
+profile is realized through
 \[
 x\longmapsto\big(q_a(x),\tau_a(x)\big)
 \longmapsto c_{a,i}(x),
@@ -154,20 +167,20 @@ operator pools densely.
 
 Our contributions are:
 \begin{enumerate}
-    \item \textbf{Explicit state-transition parameterization.} Starting from
-    the view of language-model computation as representation-state evolution,
-    we test whether its transition-producing transformations can be
-    parameterized as compositions of explicit reusable RW primitives.
-    \item \textbf{State-conditioned applicability.} We explicitly parameterize
-    which RW primitives participate in the current computation and to what
-    continuous degree. In the evaluated v4172 realization, this control
-    additionally yields exact state-dependent support and is implemented
-    through learned operation-address mappings.
-    \item \textbf{End-to-end language modeling and causal analysis.} We show
-    that this formulation can train language models at 400M and 1.3B scale while
-    exposing exact operator support and causally intervenable operator
-    contributions, including a discovery-frozen IOI circuit confirmed on
-    independent validation and held-out inputs.
+    \item \textbf{Explicit operation-control organization.} We organize
+    transition-producing computation around reusable rank-1 RW operations,
+    continuous state-conditioned applicability, and normalized composition into
+    the interfaces used by attention or a direct residual-state update. In the
+    evaluated v4172 realization, applicability is implemented through learned
+    spherical operation-address mappings, yielding exact state-dependent
+    support.
+    \item \textbf{End-to-end viability and operator-level causal intervention.} We show that
+    this organization supports language modeling at 400M and 1.3B scale,
+    characterize its exact input-conditioned operator support, and show on IOI
+    that exposed operator contributions can serve as causal intervention
+    targets. A discovery-frozen IOI circuit is confirmed by suppression, matched
+    controls, and exact restoration on independent validation and fully held-out
+    inputs.
 \end{enumerate}
 
 \section{Related Work}
@@ -178,12 +191,26 @@ Our contributions are:
 Sparsely-gated mixtures of experts activate a small subset of large expert
 networks \cite{shazeer2017outrageously}, and Switch Transformers scale this
 pattern with simple routing \cite{fedus2022switch}. PEER uses product-key
-retrieval over more than a million small experts \cite{he2024mixture}. These
-methods formulate conditional computation as expert retrieval; \DAWN{} instead
-organizes the base language-model computation explicitly around RW primitives
-and their state-dependent applicability. Its
-current implementation still uses a dense address scan and dense, chunked RW
-application; functional sparsity is not an indexed sparse kernel.
+retrieval over more than a million tiny experts \cite{he2024mixture}; OmniMoE
+extends fine-grained conditional computation to vector-level Atomic Experts
+\cite{shi2026omnimoe}. Thus fine-grained reusable units and state-dependent
+retrieval predate \DAWN{}. \DAWN{} instead uses an explicit operation-control
+organization as the base parameterization of transition-producing language-model
+computation and evaluates the resulting operator contributions as causal
+intervention targets. Current execution remains a dense address scan and dense,
+chunked RW application rather than an indexed sparse kernel.
+
+\subsection{Neural programming and programming interpretations}
+
+Neural Programmer-Interpreters represent and execute programs from supervised
+traces \cite{reed2016npi}, while Neural Programmer differentiably selects
+operations and data \cite{neelakantan2016neuralprogrammer}. Fast Weight
+Programmers show an algebraic connection: linearized self-attention is
+equivalent to fast-weight programming, with additive outer products interpreted
+as elementary instructions \cite{schlag2021linear}. \DAWN{} neither induces a
+symbolic program nor defines a formal semantics; its program-like interpretation
+concerns explicit learned RW operations, continuous applicability, and
+composition inside a language-model block.
 
 \subsection{Read-write primitives and memory views}
 
@@ -237,12 +264,12 @@ This decomposition only fixes the computational abstraction and notation.
 \DAWN{} concerns how the transformations producing these updates are
 parameterized.
 
-\subsection{Explicit State-Transition Hypothesis}
+\subsection{Explicit Operation-Control Parameterization}
 \label{sec:transition-hypothesis}
 
-\DAWN{} tests the reverse hypothesis that transition-producing computation can
-be constructed from explicit reusable RW primitives under explicit
-state-dependent control. For a token state \(x\in\mathcal{S}=\R^D\), let
+\DAWN{} parameterizes transition-producing computation using explicit reusable
+RW primitives under explicit state-dependent control. For a token state
+\(x\in\mathcal{S}=\R^D\), let
 \(a\in\{Q,K,V,\mathrm{RST}\}\) index the computation type and define
 \begin{equation}
 F_a:\mathcal{S}\rightarrow\R^D.
@@ -281,25 +308,26 @@ paper's core hypothesis.
 \(F_{\mathrm{RST}}\) directly updates the residual state\\\(\Downarrow\)}
 \end{tabular}\\[0.15em]
 \textbf{\DAWN{}: explicit construction of state-conditioned computation}\\[0.35em]
-\begin{tabular}{c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c@{\hspace{0.12em}\(\longrightarrow\)\hspace{0.12em}}c}
-\fbox{\parbox[c][0.92cm][c]{0.09\textwidth}{\centering
-\textbf{Token state}\\\(x\)}} &
-\fbox{\parbox[c][0.92cm][c]{0.20\textwidth}{\centering
-\textbf{State-conditioned}\\\textbf{applicability}\\\(C_a(x)\)}} &
-\fbox{\parbox[c][0.92cm][c]{0.18\textwidth}{\centering
-\textbf{RW primitive}\\\(\op_{a,i}(x)=\langle x,\bar r_{a,i}\rangle\bar w_{a,i}\)}} &
-\fbox{\parbox[c][0.92cm][c]{0.13\textwidth}{\centering
-\textbf{Composed output}\\\(F_a(x)\)}}
-\end{tabular}\\[0.18em]
-\parbox{0.82\textwidth}{\centering\footnotesize
-\(C_a(x)=(c_{a,1}(x),\ldots,c_{a,N_a}(x))\); v4172:
-\(q_a(x),\tau_a(x),k_{a,i}\) determine \(c_{a,i}(x)\)}
+\begin{tabular}{c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c}
+&& \fbox{\parbox[c][0.68cm][c]{0.23\textwidth}{\centering
+\textbf{Applicability control}\\\(C_a(x)=(c_{a,1}(x),\ldots,c_{a,N_a}(x))\)}} && \\[-0.28em]
+\fbox{\parbox[c][0.68cm][c]{0.10\textwidth}{\centering
+\textbf{Token state}\\\(x\)}} & \(\nearrow\) && \(\searrow\) &
+\fbox{\parbox[c][0.68cm][c]{0.18\textwidth}{\centering
+\textbf{Normalized composition}\\\(F_a(x)\)}} \\[-0.28em]
+& \(\searrow\) && \(\nearrow\) & \\[-0.28em]
+&& \fbox{\parbox[c][0.86cm][c]{0.23\textwidth}{\centering
+\textbf{Persistent RW bank}\\\(\{\op_{a,i}(x)\}_{i=1}^{N_a}\)\\[-0.12em]
+\scriptsize type-specific; shared across depth}} &&
+\end{tabular}\\[0.15em]
 \caption{The two-level construction. Top: a language-model block evolves a
 sequence representation through relational interaction and a subsequent
-residual-state transition. Bottom: \DAWN{} constructs each composed output from
-explicit RW primitives under state-conditioned applicability. In v4172, the
-operation-address mapping implements the applicability step; RW execution
-remains in the full \(D\)-dimensional representation space.}
+residual-state transition. Bottom: \(x\) separately determines the applicability
+profile and input-dependent responses of a persistent, type-specific RW bank
+shared across depth; the two meet in normalized composition \(F_a(x)\). In
+v4172, \(q_a(x),\tau_a(x),k_{a,i}\)
+implement applicability in address space; RW execution remains in the full
+\(D\)-dimensional representation space.}
 \label{fig:architecture}
 \end{figure*}
 
@@ -815,6 +843,7 @@ No frozen circuit; validation and test closed\\
 \end{tabularx}
 \end{table*}
 
+\balance
 \section{Discussion}
 \label{sec:discussion}
 
@@ -833,16 +862,29 @@ discrete programs. The causal result is strong for the specified IOI task and
 intervention, not universal across tasks or scales. RAVEL, ARC, and 1.3B IOI
 demonstrate that explicit units do not make successful localization automatic.
 
-\subsection{Explicit Transition Construction as a Computational Interface}
+\subsection{Operational Interpretation and Computational Interface}
 
-The purpose of this decomposition is architectural observability rather than an
-assumption of semantic interpretability. A learned primitive may remain
-polysemantic, and a transition may depend on a large distributed set of
-primitives. \DAWN{} does not claim that such computation is therefore easy for
-a human to understand or manipulate. Instead, it asks whether the computation
-producing state evolution can first be represented in a form that exposes its
-constituent operations, their state-dependent applicability, their executed
-contributions, and their composition.
+This organization admits a program-like interpretation as continuous
+conditional execution over learned operators. The representation supplies the
+current computational state,
+the applicability profile controls explicit learned operations, and normalized
+composition produces the computation used by the subsequent attention or
+residual update. This is an architectural interpretation of exposed
+computation, not a formal operational semantics or an assumption of semantic
+interpretability. A learned primitive may remain polysemantic, and a transition
+may depend on a large distributed set of primitives. \DAWN{} does not claim that
+such computation is therefore easy for a human to understand or manipulate;
+it exposes the constituent operations, their state-dependent applicability,
+their executed contributions, and their composition.
+
+Cross-depth sharing makes this computational interface persistent: the same
+QK-, V-, or RST-specific primitive can be revisited at different depths as the
+evolving representation changes its applicability. An analysis can therefore
+trace when the same identified operation participates and how strongly it
+contributes across depth, rather than compare unrelated layer-local units. In
+v4172, the type-specific pools remain separate, but their addresses share a
+learned coordinate convention; this does not imply a single pool in which all
+operator types compete.
 
 This provides an analysis interface that is absent when the same computation is
 represented only as an implicit dense transformation. One may inspect which
@@ -936,6 +978,10 @@ reasoning as universally discrete operator programs.
 of explicit reusable RW primitives. A representation state determines which RW
 primitives are applicable and to what continuous degree; their composition
 produces the interfaces used by attention or a direct residual-state update. The
+explicit separation of learned operations, continuous applicability, and
+composition supports the operational interpretation developed in this paper:
+language-model computation as continuously controlled execution over reusable
+learned operators. The
 evaluated v4172 realization computes applicability through learned
 operation-address mappings derived from RW function and reuses QK-, V-, and
 RST-specific primitive pools across depth. It retains measured language-model performance
@@ -1001,11 +1047,12 @@ the equation.
 \section{Complete Model and Training Settings}
 \label{app:settings}
 
-\begin{table*}[h]
+\begin{table*}[!t]
 \centering
 \caption{Detailed settings from the registered training configurations and
 restored checkpoint manifests.}
-\small
+\scriptsize
+\renewcommand{\arraystretch}{0.94}
 \begin{tabular}{lrrr}
 \toprule
 Setting & \DAWN{} 400M & Dense 400M & \DAWN{} 1.3B\\
@@ -1084,7 +1131,8 @@ Validation and test do not recompute or alter this selection.
 family contains 100 replicates. All paired permutation \(p\)-values are
 0.0004997501 with 2,000 permutations.}
 \label{tab:controls}
-\small
+\scriptsize
+\renewcommand{\arraystretch}{0.96}
 \begin{tabular}{lrrrr}
 \toprule
 Control & Validation drop & Frozen minus control (95\% CI) &
@@ -1162,7 +1210,8 @@ collectives.
 \caption{Backbone static accounting. ``Exact support'' retains full dense
 address scoring and replaces only full-pool RW application with the measured
 positive-margin support.}
-\small
+\scriptsize
+\renewcommand{\arraystretch}{0.96}
 \begin{tabular}{lrrr}
 \toprule
 Component & Current dense \DAWN{} & Dense address + exact RW & Dense Transformer\\
@@ -1182,34 +1231,6 @@ can skip all and only zero-weight RW terms. It does not include indexed
 address retrieval and does not demonstrate kernel parity. Instrumented
 profiling time is excluded from latency claims because histogram collection is
 part of the measured path.
-
-\section{Low-Dimensional Operation-Space Extension}
-\label{app:lowd}
-
-The low-dimensional extension uses one shared atlas of \(M=8\) operation-space
-addresses, shared \(D\!\to\!R\) read interfaces \(P_m\), and shared
-\(R\!\to\!D\) write interfaces \(B_m\). Q, K, V, and RST have separate query
-projections, tau maps, and operator banks, and independently select two atlas
-entries. For local operator \(i\) in space \(m\),
-\[
-\begin{aligned}
-\op^{\mathrm{global}}_{a,m,i}(x)
-&=B_m w_{a,m,i}r_{a,m,i}^{\top}P_m^\top x\\
-&=(B_mw_{a,m,i})(P_mr_{a,m,i})^\top x,
-\end{aligned}
-\]
-so the induced global transformation remains rank-1.
-
-The 40M reference has 40,341,088 parameters, \(D=432\), \(R=128\), 12
-layers, six heads, and top-2 space selection. Repository-local compilation,
-abstract-tree and symbolic parameter counting, shared-key and independent
-Q/K/V/RST space selection, legacy-checkpoint rejection, reduced JIT
-forward/backward, selector metrics, and gradient contracts have passed.
-Some early-training observations are recorded, but the exact deployment and
-complete controlled language-model evaluation are absent. No latency,
-throughput, energy, or hardware-efficiency result exists. The reference path
-executes every space densely; future work requires candidate-restricted
-dispatch and an accelerator-native execution kernel.
 
 \section{Reproducibility Identities}
 \label{app:repro}
@@ -1254,6 +1275,34 @@ recorded in the repository experiment ledger. Historical experiment branches
 are evidence identities only; this source is maintained on the canonical main
 branch.
 
+\section{Low-Dimensional Operation-Space Extension}
+\label{app:lowd}
+
+The low-dimensional extension uses one shared atlas of \(M=8\) operation-space
+addresses, shared \(D\!\to\!R\) read interfaces \(P_m\), and shared
+\(R\!\to\!D\) write interfaces \(B_m\). Q, K, V, and RST have separate query
+projections, tau maps, and operator banks, and independently select two atlas
+entries. For local operator \(i\) in space \(m\),
+\[
+\begin{aligned}
+\op^{\mathrm{global}}_{a,m,i}(x)
+&=B_m w_{a,m,i}r_{a,m,i}^{\top}P_m^\top x\\
+&=(B_mw_{a,m,i})(P_mr_{a,m,i})^\top x,
+\end{aligned}
+\]
+so the induced global transformation remains rank-1.
+
+The 40M reference has 40,341,088 parameters, \(D=432\), \(R=128\), 12
+layers, six heads, and top-2 space selection. Repository-local compilation,
+abstract-tree and symbolic parameter counting, shared-key and independent
+Q/K/V/RST space selection, legacy-checkpoint rejection, reduced JIT
+forward/backward, selector metrics, and gradient contracts have passed.
+Some early-training observations are recorded, but the exact deployment and
+complete controlled language-model evaluation are absent. No latency,
+throughput, energy, or hardware-efficiency result exists. The reference path
+executes every space densely; future work requires candidate-restricted
+dispatch and an accelerator-native execution kernel.
+
 \section*{Acknowledgments}
 
 The author thanks Anthropic Claude, Claude Code, OpenAI ChatGPT, and OpenAI
@@ -1270,7 +1319,7 @@ This research was supported by the Google TPU Research Cloud (TRC) program,
 which provided computational resources for training and analysis.
 
 \begingroup
-\small
+\footnotesize
 \setlength{\bibsep}{0pt}
 \bibliography{references}
 \bibliographystyle{icml2026}
