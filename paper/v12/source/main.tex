@@ -71,6 +71,13 @@ transition-producing computation into reusable operations, explicit
 state-dependent applicability, and the direct composition of those applicable
 contributions.
 
+From this perspective, transition-producing computation can be studied as a
+learned conditional-operator problem: the model learns reusable transformations,
+the representation-dependent conditions under which they participate, and how
+their contributions compose. We use this as a research perspective for exposing
+and organizing learned computation, rather than as an equivalent characterization
+of all language-model computation.
+
 We therefore ask whether transition-producing computation can be decomposed
 architecturally into three explicit parts: reusable learned operations,
 state-dependent applicability, and composition. Such a representation should
@@ -125,7 +132,7 @@ In the evaluated v4172 realization, the QK-, V-, and RST-specific RW banks
 persist across depth and share an address coordinate convention, while each
 successive representation state recomputes applicability over the corresponding
 bank. The model therefore conditionally reuses persistent type-specific
-operation repertoires rather than selecting unrelated layer-local units. This
+RW banks rather than selecting unrelated layer-local units. This
 profile is realized through
 \[
 x\longmapsto\big(q_a(x),\tau_a(x)\big)
@@ -167,20 +174,20 @@ operator pools densely.
 
 Our contributions are:
 \begin{enumerate}
-    \item \textbf{Explicit operation-control organization.} We organize
+    \item \textbf{Explicit state-conditioned operator organization.} We organize
     transition-producing computation around reusable rank-1 RW operations,
     continuous state-conditioned applicability, and normalized composition into
     the interfaces used by attention or a direct residual-state update. In the
     evaluated v4172 realization, applicability is implemented through learned
     spherical operation-address mappings, yielding exact state-dependent
     support.
-    \item \textbf{End-to-end viability and operator-level causal intervention.} We show that
-    this organization supports language modeling at 400M and 1.3B scale,
-    characterize its exact input-conditioned operator support, and show on IOI
-    that exposed operator contributions can serve as causal intervention
-    targets. A discovery-frozen IOI circuit is confirmed by suppression, matched
-    controls, and exact restoration on independent validation and fully held-out
-    inputs.
+    \item \textbf{End-to-end viability and operator-level causal intervention.} We show
+    end-to-end language-model viability at 400M scale, report a descriptive
+    1.3B evaluation, characterize exact input-conditioned operator support in
+    the primary 400M model, and show on IOI that exposed operator contributions
+    can serve as causal intervention targets. A discovery-frozen IOI circuit is
+    confirmed by suppression, matched controls, and exact restoration on
+    independent validation and fully held-out inputs.
 \end{enumerate}
 
 \section{Related Work}
@@ -194,11 +201,11 @@ pattern with simple routing \cite{fedus2022switch}. PEER uses product-key
 retrieval over more than a million tiny experts \cite{he2024mixture}; OmniMoE
 extends fine-grained conditional computation to vector-level Atomic Experts
 \cite{shi2026omnimoe}. Thus fine-grained reusable units and state-dependent
-retrieval predate \DAWN{}. \DAWN{} instead uses an explicit operation-control
-organization as the base parameterization of transition-producing language-model
-computation and evaluates the resulting operator contributions as causal
-intervention targets. Current execution remains a dense address scan and dense,
-chunked RW application rather than an indexed sparse kernel.
+retrieval predate \DAWN{}. \DAWN{} instead uses an explicit state-conditioned
+operator organization as the base parameterization of transition-producing
+language-model computation and evaluates the resulting operator contributions
+as causal intervention targets. Current execution remains a dense address scan
+and dense, chunked RW application rather than an indexed sparse kernel.
 
 \subsection{Neural programming and programming interpretations}
 
@@ -264,12 +271,14 @@ This decomposition only fixes the computational abstraction and notation.
 \DAWN{} concerns how the transformations producing these updates are
 parameterized.
 
-\subsection{Explicit Operation-Control Parameterization}
+\subsection{Explicit State-Conditioned Operator Parameterization}
 \label{sec:transition-hypothesis}
 
-\DAWN{} parameterizes transition-producing computation using explicit reusable
-RW primitives under explicit state-dependent control. For a token state
-\(x\in\mathcal{S}=\R^D\), let
+\DAWN{} parameterizes transition-producing computation as state-conditioned
+operator composition. This higher-level construction separates three
+components: reusable RW primitives, a state-dependent applicability profile
+that supplies control, and normalized composition of their contributions. For
+a token state \(x\in\mathcal{S}=\R^D\), let
 \(a\in\{Q,K,V,\mathrm{RST}\}\) index the computation type and define
 \begin{equation}
 F_a:\mathcal{S}\rightarrow\R^D.
@@ -279,10 +288,10 @@ The Q, K, and V outputs form the state-conditioned interfaces through which
 relational interaction is computed, whereas \(F_{\mathrm{RST}}\) directly
 specifies a residual-state update. Each composed output is explicitly
 decomposed into contributions from reusable RW primitives under state-dependent
-control. The construction therefore separates the primitives, their
-applicability profile, and their normalized composition. The operation-address
-space is the evaluated implementation of this control mechanism rather than the
-paper's core hypothesis.
+control. Control is therefore one component of state-conditioned operator
+composition rather than the whole abstraction. The operation-address space is
+the evaluated implementation of this control mechanism rather than the paper's
+core hypothesis.
 
 \begin{figure*}[t]
 \centering
@@ -307,7 +316,7 @@ paper's core hypothesis.
 \parbox{0.34\textwidth}{\centering
 \(F_{\mathrm{RST}}\) directly updates the residual state\\\(\Downarrow\)}
 \end{tabular}\\[0.15em]
-\textbf{\DAWN{}: explicit construction of state-conditioned computation}\\[0.35em]
+\textbf{\DAWN{}: state-conditioned operator composition}\\[0.35em]
 \begin{tabular}{c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c}
 && \fbox{\parbox[c][0.68cm][c]{0.23\textwidth}{\centering
 \textbf{Applicability control}\\\(C_a(x)=(c_{a,1}(x),\ldots,c_{a,N_a}(x))\)}} && \\[-0.28em]
@@ -865,8 +874,11 @@ demonstrate that explicit units do not make successful localization automatic.
 \subsection{Operational Interpretation and Computational Interface}
 
 This organization admits a program-like interpretation as continuous
-conditional execution over learned operators. The representation supplies the
-current computational state,
+conditional execution over learned operators. Under this view, learning
+transition-producing computation includes learning not only operator functions,
+but also the representation-dependent conditions under which those operators
+participate and how their contributions compose. The representation supplies
+the current computational state,
 the applicability profile controls explicit learned operations, and normalized
 composition produces the computation used by the subsequent attention or
 residual update. This is an architectural interpretation of exposed
@@ -930,12 +942,43 @@ this distributed view. Its suppression and exact-restoration results show that
 the exposed contributions can serve as causal intervention targets; they do not
 show that the circuit is a human-readable algorithm.
 
-\subsection{Toward Low-Dimensional Operation-Space Execution}
+Viewed as a research interface, this perspective decomposes a broader question
+about learned computation into several more explicit problems: how operations
+relevant to a representation state should be organized, how the current state
+should identify them, how multiple applicable operations should compose, and how
+the resulting conditional computation should be executed. These are not claims
+that a trained language model implements a discrete symbolic program. Rather,
+they define axes along which learned transition-producing computation can be
+made more explicit, structured, and experimentally testable. Making these
+objects explicit also provides computational handles for analysis and causal
+intervention, and motivates the longer-term question of whether learned
+computation can become reliably editable and composable rather than merely
+observable.
+
+\subsection{From Functional Conditionality to Structured Conditional Execution}
 \label{sec:future-low-d}
 
-The evaluated model uses low-dimensional addresses but full-\(D\) RW
-execution. A separate repository implementation is an \emph{implemented but
-not yet fully evaluated low-dimensional extension}. It associates each
+The present results establish functional conditionality: for a given
+representation state, many operators have exactly zero applicability. They do
+not yet establish structural conditionality. Each state still evaluates
+globally visible type-specific operator pools before those zero contributions
+are known. A stronger form of conditional computation would organize operators
+so that the current state need only identify a substantially smaller candidate
+region before composition and execution.
+
+This distinction opens several coupled questions. Operator organization may be
+flat or hierarchical, globally shared or locally partitioned; identification
+may use exact addressing or approximate retrieval; composition need not be
+restricted to the present normalized additive form; and physical execution
+requires dispatch mechanisms that avoid evaluating inactive candidates. The
+relevant empirical question is whether such restrictions can reduce
+computational visibility and executed computation while preserving
+language-model quality.
+
+One preliminary direction toward this goal is the \emph{implemented but not yet
+fully evaluated low-dimensional operation-space extension}. The separate
+repository implementation uses low-dimensional addresses but full-\(D\) RW
+execution. It associates each
 operation-space address with \(D\!\leftrightarrow\!R\) interfaces, selects
 spaces independently for Q, K, V, and RST, and performs local RW composition
 before writing back:
@@ -957,6 +1000,24 @@ future work. Appendix~\ref{app:lowd} records the boundary in more detail.
 
 \subsection{Limitations}
 
+The present results do not establish that transition-producing computation has
+been factorized into an efficient conditional computational structure. Although
+each state has strict-subset functional operator support, applicability is still
+evaluated against large globally visible type-specific pools. Performance
+retention may therefore depend partly on the representational capacity provided
+by a large distributed operator bank and global condition evaluation, rather
+than on a compact or intrinsically efficient decomposition of language-model
+computation.
+
+Relatedly, the learned spherical address geometry is not shown to reflect an
+intrinsic or compressible organization of language operations. It may instead
+serve as a high-capacity substrate in which useful operators are distributed
+broadly enough for global state-conditioned access to recover the required
+transformations. The present study therefore does not establish whether
+comparable language-model expressivity can be retained when operator visibility,
+candidate evaluation, and executed computation are restricted substantially
+further.
+
 The current implementation evaluates full address and operator pools densely.
 Exact functional support does not imply current sparse execution, and even the
 exact-support accounting remains 2.1168 times the matched dense Transformer's
@@ -974,13 +1035,14 @@ reasoning as universally discrete operator programs.
 
 \section{Conclusion}
 
-\DAWN{} formulates language-model computation as state-conditioned composition
-of explicit reusable RW primitives. A representation state determines which RW
-primitives are applicable and to what continuous degree; their composition
-produces the interfaces used by attention or a direct residual-state update. The
+\DAWN{} offers a view of language-model computation in which a central part of
+state evolution is formulated as state-conditioned composition of explicit
+reusable RW primitives. A representation state determines which RW primitives
+are applicable and to what continuous degree; their composition produces the
+interfaces used by attention or a direct residual-state update. The
 explicit separation of learned operations, continuous applicability, and
 composition supports the operational interpretation developed in this paper:
-language-model computation as continuously controlled execution over reusable
+transition-producing computation as continuous conditional execution over reusable
 learned operators. The
 evaluated v4172 realization computes applicability through learned
 operation-address mappings derived from RW function and reuses QK-, V-, and
@@ -994,7 +1056,11 @@ intervention targets. These findings support explicit state-conditioned RW
 operator composition as a viable and causally analyzable model of
 language-model computation; they do not establish human-readable primitive
 semantics, freely editable or transferable computation, benchmark superiority,
-or current hardware efficiency.
+or current hardware efficiency. More broadly, these results motivate studying
+learned transition-producing computation through how state-relevant operations
+are organized, identified, composed, and executed. Whether this perspective can
+preserve language-model expressivity while substantially reducing global
+operator visibility and executed computation remains an open question.
 
 \appendix
 
