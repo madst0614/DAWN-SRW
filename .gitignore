@@ -57,6 +57,8 @@ htmlcov/
 !/paper/v11/DAWN-SRW-v11.pdf
 !/paper/v12/DAWN-SRW-v12.pdf
 !/paper/v12/source/figures/flops_stacked.pdf
+!/paper/v13/DAWN-SRW-v13.pdf
+!/paper/v13/source/figures/flops_stacked.pdf
 logs/
 outputs/
 .generated/
