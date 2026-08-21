@@ -49,21 +49,23 @@
 \printAffiliationsAndNotice{}
 
 \begin{abstract}
-Dense language models learn effective state transitions, but the operations that
-produce those transitions and the conditions governing their use remain largely
-implicit. This motivates a broad question: \emph{Can learned language-model
-computation be organized as an explicit state-conditioned operational system?}
-\DAWN{} studies a narrower architectural hypothesis: transition-producing
-computation can be factorized into identifiable learned operations and explicit
-state-conditioned control that determines how those operations contribute to
-the subsequent state transition. Here, identifiable means
+Dense language models operate over learned high-dimensional states, but the
+operations producing their transitions and the conditions governing their use
+remain largely implicit. This motivates a broader computational question:
+\emph{Can computation over learned high-dimensional states be organized as an
+explicit, learnable system of state-conditioned control over operations?}
+\DAWN{} tests this question in language modeling through a narrower architectural
+hypothesis: transition-producing language-model computation can be factorized
+into identifiable learned operations and explicit state-conditioned control that
+determines how those operations contribute to the subsequent state transition.
+Here, identifiable means
 referable as a stable architectural object and available for measurement or
 intervention, not necessarily human-interpretable. The evaluated v4172 model is
 one concrete realization. It
 uses persistent rank-1 read-write (RW) banks, learned operation-address control,
 continuous-valued applicability coefficients with exact support, and normalized
 additive composition to construct Q/K/V attention interfaces and direct RST
-updates; operator visibility and RW execution remain global and dense. At
+updates; operator visibility remains global and RW execution remains dense. At
 393.8M parameters and 39.999B tokens, \DAWN{} retains performance against a
 matched dense Transformer: C4 cross-entropies are 2.9402 versus 2.9359, and
 six-task zero-shot means are 0.4629 versus 0.4597. A descriptive 1.272B
@@ -73,31 +75,42 @@ exhibits exact input-conditioned applicability support, and a discovery-frozen
 matched-control families, and exact restoration on independent validation and
 held-out indirect-object-identification inputs. Fail-closed results delimit where
 localization did not succeed. Together, these results provide a constructive
-test of the hypothesis under the evaluated conditions, without establishing
-human-readable semantics, general editability, benchmark superiority, or
-hardware efficiency.
+test of the narrower architectural hypothesis under the evaluated conditions
+and evidence relevant to the broader computational question, without
+establishing human-readable semantics, general editability, benchmark
+superiority, or hardware efficiency.
 \end{abstract}
 
 \section{Introduction}
 \label{sec:introduction}
 
-Modern language models achieve strong performance through repeated dense
-transformations, but those transformations do not expose the constituent
-operations or the conditions under which a state uses them. The long-term
-motivation is to make learned computation available as explicit computational
-objects that can be identified, analyzed, and causally intervened on. Such an
-interface could eventually support semantic interpretation, reliable editing,
-or more programmable learned systems. Those outcomes are motivations, not
-claims established by this paper.
+Modern language models achieve strong performance by repeatedly transforming
+learned high-dimensional representations, but those transformations do not
+expose the constituent operations or the conditions under which a state uses
+them. The long-term motivation is to make learned computation available as
+explicit computational objects that can be identified, analyzed, and causally
+intervened on. Such an interface could eventually support semantic
+interpretation, reliable editing, or more programmable learned systems. Those
+outcomes are motivations, not claims established by this paper.
 
-We begin from a broad question:
+We begin from a broader computational question:
 \begin{quote}
-\emph{Can learned language-model computation be organized as an explicit
-state-conditioned operational system?}
+\emph{Can computation over learned high-dimensional states be organized as an
+explicit, learnable system of state-conditioned control over operations?}
 \end{quote}
-One decomposition of that question is: \emph{How should a language model
-organize, identify, and apply the operations relevant to its current
-representation state?}
+At this level, a learned representation \(x\) is the current computational state,
+the state determines an applicability profile
+\(C(x)=(c_1(x),\ldots,c_N(x))\) that represents state-conditioned control, and
+controlled operation contributions construct the computation that produces the
+subsequent state transition:
+\[
+x\longrightarrow C(x)\longrightarrow
+\text{controlled operations}\longrightarrow x'.
+\]
+Control answers, at the architectural level, which learned operations are
+applicable to the current state and to what degree; the operations determine
+what computation is performed on that state. \DAWN{} studies this broad question
+in the concrete domain of language modeling.
 
 At a high level, conventional programming makes computation explicit through
 states, operations, and rules governing their execution. Operational accounts
@@ -115,9 +128,11 @@ describe execution through transitions between configurations
 \end{gathered}
 \]
 Such explicit structure supplies objects through which computation can be
-referred to and analyzed. We use this programming perspective only as an
-organizational reference, not to claim that language models implement symbolic
-programs or that \DAWN{} defines a formal operational semantics.
+referred to and analyzed. We use this program-like organization only in the
+limited sense shown above---state, conditions and applicable operations,
+execution, and next state. It does not imply symbolic programs, discrete or
+human-readable instructions or predicates, or a formal operational semantics
+for \DAWN{}.
 
 Language models likewise evolve computational states by repeatedly transforming
 representations across depth. Let \(X_\ell\) denote the sequence representation
@@ -365,10 +380,10 @@ generalize the IOI result beyond the specified task, model, and intervention.
 Across these lines, state dependence, conditional routing, depth sharing,
 attention-side experts, rank-1 RW structure, and programming interpretations all
 have clear precedents. The contribution here is a constructive architectural
-test of organizing transition-producing computation into identifiable learned
-operations and explicit state-conditioned control, instantiated consistently
-across Q/K/V/RST and evaluated for viability, conditional organization, and
-causal accessibility.
+test of whether such an organization can be explicitly instantiated in language
+modeling. The narrower tested factorization is instantiated consistently across
+Q/K/V/RST and evaluated for viability, conditional organization, and causal
+accessibility.
 
 \section{DAWN-SRW}
 \label{sec:method}
@@ -416,6 +431,15 @@ control. This RW factorization, its rank-1 granularity, the operation-address
 coupling, spherical geometry, and normalized additive composition are design
 choices of v4172. They provide one concrete test of the hypothesis rather than
 defining it.
+
+At the computational level, this view separates two questions for a state
+\(x\): which learned operations are applicable, and what transformations those
+operations perform. \DAWN{} makes both sides architecturally explicit:
+\(C_a(x)\) represents state-conditioned control over primitive application,
+whereas the RW primitives represent the transformations whose contributions are
+controlled. Spherical operation-address geometry realizes this applicability
+profile in v4172; it does not define the abstract control representation or the
+broader hypothesis.
 
 \begin{figure*}[t]
 \centering
@@ -515,7 +539,8 @@ projection produces the state-dependent DirectTau boundary:
 m_{a,i}(x)&=\rho_{a,i}(x)-\tau_a(x).
 \label{eq:directtau}
 \end{align}
-The evaluated \texttt{linear\_angular} rule defines primitive applicability as
+Here \(m_{a,i}(x)\) is the applicability margin. The evaluated
+\texttt{linear\_angular} rule defines primitive applicability as
 \begin{equation}
 c_{a,i}(x)=
 \operatorname{clip}\!\left(
@@ -566,8 +591,9 @@ decomposed into identifiable operator contributions.
 
 ``Continuous-valued'' refers to the applicability coefficient, not to
 continuous-time dynamics or a continuous-depth model; layer evolution remains
-discrete. The scalar mapping from normalized margin to applicability is
-continuous and piecewise linear, with nondifferentiable support boundaries.
+discrete. The scalar mapping from normalized applicability margin to
+applicability is continuous and piecewise linear, with nondifferentiable support
+boundaries.
 
 The denominator powers are \(p_Q=p_K=0.5\), \(p_V=1.0\), and
 \(p_{\mathrm{RST}}=1.2\). The fixed composition scale is
@@ -618,7 +644,7 @@ radius \(\theta_a(x)\). Geometrically, \(q_a(x)\) specifies the center of the
 applicability query, \(\tau_a(x)\) specifies its angular support boundary, and
 \(c_{a,i}(x)\) specifies the continuous-valued coefficient with which primitive \(i\)
 applies. When the
-numerical guard in Equation~\ref{eq:angular_gate} is inactive, an active
+numerical guard in Equation~\ref{eq:angular_gate} is inactive, an applicable
 primitive has
 \[
 c_{a,i}(x)=
@@ -849,7 +875,7 @@ controlled scaling curve nor a dense-model comparison.
 \label{sec:support}
 
 At all 9,994,240 packed-C4 positions, Q, K, V, and RST each have strict-subset
-applicability support at positive selection margin (Table~\ref{tab:support}).
+applicability support at positive applicability margin (Table~\ref{tab:support}).
 Mean exact applicability support
 is 487.896 Q operators, 386.722 K operators, 812.388 in the shared-pool Q/K
 union, 1,649.994 V operators, and 2,017.703 RST operators. This is exact
@@ -857,13 +883,14 @@ input-conditioned applicability support under Equation~\ref{eq:angular_gate}.
 
 \begin{table}[t]
 \centering
-\caption{Exact applicability support at selection margin \(>0\). Q/K union counts
-an operator active for Q or K at the same layer and token.}
+\caption{Exact applicability support at applicability margin \(>0\). Q/K union
+counts an operator in the applicability support for Q or K at the same layer and
+token.}
 \label{tab:support}
 \small
 \begin{tabular}{lrrr}
 \toprule
-Computation & Pool & Mean active & Pool fraction\\
+Computation & Pool & Mean support & Pool fraction\\
 \midrule
 Q & 4,600 & 487.896 & 10.6064\%\\
 K & 4,600 & 386.722 & 8.4070\%\\
@@ -998,10 +1025,11 @@ No frozen circuit; validation and test closed\\
 The constructive test supports three ordered claims. First, the matched 400M
 comparison establishes viability under the measured protocols. Second, exact
 input-conditioned applicability support establishes that control is
-state-dependent in the evaluated model, even though visibility and execution
-remain dense. Third, the discovery-frozen IOI result establishes causal
-accessibility for the specified circuit: suppressing its operator contributions
-changes behavior, matched controls do not reproduce that effect, and exact
+state-dependent in the evaluated model, even though operator visibility remains
+global and RW execution remains dense. Third, the discovery-frozen IOI result
+establishes causal accessibility for the specified circuit: suppressing its
+operator contributions changes behavior, matched controls do not reproduce that
+effect, and exact
 same-example restoration recovers it on independent validation and held-out
 data. RAVEL, ARC, and 1.3B IOI are fail-closed boundaries showing that successful
 localization is not automatic across tasks or scales.
@@ -1012,58 +1040,89 @@ have human-readable semantics. They show that one explicit factorization can
 support language modeling, exhibit state-conditioned organization, and provide
 causal intervention targets under the evaluated conditions.
 
-\subsection{From Architectural Hypothesis to an Open Design Space}
+\subsection{From a Computational Principle to an Open Design Space}
 
-Returning to the broad question posed at the outset, the architectural
-hypothesis separates identifiable learned operations from explicit
-state-conditioned control that determines how those operations contribute to
+If learned high-dimensional computation can be organized as state-conditioned
+control over operations, what properties should the conditions, operations,
+their coupling, and their execution have? The present results provide one
+constructive test in language modeling, not a universal answer. Within this open
+design space, the narrower architectural hypothesis separates identifiable
+learned operations from explicit state-conditioned control that determines how
+those operations contribute to
 the subsequent state transition. ``Identifiable'' is
 an architectural property: an operation is referable as a stable object that
 can be measured and intervened on. It does not prescribe the scope or duration
 of that identity and is not a claim of semantic purity. Operations may remain
 distributed or polysemantic, and a behavior may depend on many operation sites.
 
-v4172 occupies one point in this design space. It represents operations as
-rank-1 RW primitives; keeps type-specific QK, V, and RST banks persistent across
-depth; couples operation identity and control through read/write-derived
-addresses in a learned spherical geometry; uses state-derived queries and
-thresholds to produce exact support with continuous-valued coefficients; and
-applies normalized additive composition across Q/K/V/RST. These choices make
-the objects and their contributions explicit, but none is required by the
-higher-level hypothesis. The programming analogy and the view of depth as state
-evolution likewise organize the investigation; they do not supply a formal
-semantics for the model.
+v4172 is one explicit realization: its rank-1 granularity, address-based control,
+cross-depth persistence, and normalized additive composition are design choices
+rather than definitions of the broader computational principle.
 
-The hypothesis therefore opens several independent design questions. Operation
-representation and granularity may differ from rank-1 RW units. Control may
-couple or separate functional parameters and identity, and operation
-organization may be flat or hierarchical and persistent over different scopes.
-Application semantics need not be normalized addition: alternative systems
-could order, sequence, or otherwise combine controlled operations. Finally,
-operator visibility may be restricted before applicability is evaluated, while
-physical execution may separately exploit the resulting conditional structure.
-The present analysis interface supports tracing,
-suppression, and restoration of explicit contributions, but reliable semantic
-editing, transfer, and human-readable programming remain open goals rather than
-established capabilities.
+\paragraph{What constitutes a learned condition?}
+v4172 represents \(C_a(x)\) through an explicit applicability profile derived in
+a learned operation-address geometry. Other systems could couple applicability
+directly to functional parameters, use intrinsic read-side activation as in
+associative-memory-style systems, or use separate control representations. The
+present evidence does not establish that one organization is preferable.
 
-\subsection{From Global Operator Visibility to Candidate-Restricted Execution}
+\paragraph{What constitutes an operation?}
+Rank-1 RW primitives are one granularity. Operations could be finer, coarser,
+structured, or hierarchical, and their identities could persist over different
+scopes. Identifiability requires only a referable architectural object available
+for measurement or intervention; it does not imply semantic purity, and
+operations may remain distributed or polysemantic.
+
+\paragraph{How should control and operation be coupled?}
+v4172 derives operation addresses from read/write parameters, coupling
+functional identity and applicability control without making them identical.
+Other designs could separate the two more strongly or couple applicability more
+directly to the transformation parameters.
+
+\paragraph{How should applicable operations compose?}
+v4172 uses simultaneous normalized additive composition. Other computational
+systems could use sequential, ordered, hierarchical, recurrent, or otherwise
+structured composition; none of these alternatives is evaluated here.
+
+\paragraph{How much global operator visibility is necessary?}
+The current model exposes the full type-specific operator pool to applicability
+evaluation. Whether expressive learned control requires global operator
+visibility or can preserve its conditional structure when operator visibility is
+candidate-restricted remains an empirical question.
+
+\paragraph{How does logical conditional structure map to physical execution?}
+Applicability support, operator visibility, and physical execution are distinct.
+The execution implications of this separation are developed below.
+
+\subsection{From Logical Conditional Structure to Physical Execution}
 \label{sec:future-visibility}
 
 The present results establish state-conditioned applicability support: for a
 given representation state, many operators have exactly zero applicability.
-They do not establish candidate-restricted operator visibility. In v4172,
-\(\mathcal{V}_a(x)\) remains the full type-specific pool, so applicability is evaluated
-before zero-contribution operators are excluded. A stronger execution path
-would first identify a substantially smaller visible candidate set, then
-evaluate applicability and compose within that set.
+They do not establish candidate-restricted operator visibility or sparse physical
+execution. In v4172,
+\[
+\mathcal{I}_a(x)\subseteq\mathcal{V}_a(x)=\{1,\ldots,N_a\},
+\]
+so applicability is evaluated over the full type-specific pool before
+zero-contribution operators are excluded, and RW application remains dense.
 
-This is the most immediate execution question raised by v4172. Identification
-or retrieval would first restrict operator visibility; applicability would still
-determine applicability support within the visible set; accelerator-aware
-dispatch would then need to avoid evaluating inactive candidates. The central
-empirical question is how far operator visibility and executed computation can
-be reduced while preserving language-model quality and expressivity.
+The execution problem separates three levels: applicability support, operator
+visibility, and physical execution. Applicability support specifies which
+operations contribute; operator visibility specifies which operator identities
+the control mechanism can consider when determining applicability; physical
+execution asks whether the resulting computation can be organized into
+accelerator-efficient execution units. \textbf{Sparse applicability support does
+not by itself imply hardware-exploitable sparse computation.} Fine-grained
+state-conditioned control may conflict with hardware-efficient execution
+granularity, memory locality, dispatch, or communication.
+
+The immediate empirical question is how much operator visibility and executed
+computation can be reduced, and at what physical execution granularity, while
+preserving language-model quality and the learned conditional structure. More
+generally, it remains open whether high-dimensional learned control can retain
+broad conditional expressivity while acquiring coarse physical locality suitable
+for efficient execution.
 
 \subsection{Limitations}
 
@@ -1072,9 +1131,15 @@ been factorized into an efficient conditional computational structure. Although
 each state has strict-subset applicability support, applicability is still
 evaluated with global operator visibility over large type-specific pools.
 Performance retention may therefore depend partly on the representational
-capacity provided by a large distributed operator bank and full-pool condition
+capacity provided by a large distributed operator bank and full-pool applicability
 evaluation, rather than on a compact or intrinsically efficient decomposition
 of language-model computation.
+
+More fundamentally, the present results do not establish that
+condition--operation factorization is a necessary, intrinsic, privileged, or
+optimal organization of learned high-dimensional computation. They establish
+only that one explicit realization is viable under the evaluated language-model
+conditions.
 
 Relatedly, the learned spherical address geometry is not shown to reflect an
 intrinsic or compressible organization of language operations. It may instead
@@ -1102,12 +1167,13 @@ reasoning as universally discrete operator programs.
 
 \section{Conclusion}
 
-This paper asks whether learned language-model computation can be organized as
-an explicit state-conditioned operational system. It tests a narrower
-architectural hypothesis: transition-producing computation can be factorized
-into identifiable learned operations and explicit state-conditioned control
-that determines how those operations contribute to the subsequent state
-transition.
+This paper begins from a broader computational question: whether computation
+over learned high-dimensional states can be organized as an explicit, learnable
+system of state-conditioned control over operations. It tests this question in
+language modeling through a narrower architectural hypothesis:
+transition-producing computation can be factorized into identifiable learned
+operations and explicit state-conditioned control that determines how those
+operations contribute to the subsequent state transition.
 
 v4172 is one concrete realization, using persistent rank-1 RW banks,
 read/write-derived spherical addresses, exact applicability support with
@@ -1120,12 +1186,13 @@ where the same localization program did not succeed.
 
 These findings do not establish an intrinsic factorization, human-readable
 operator semantics, general editability, benchmark superiority, or current
-hardware efficiency. They instead motivate an open research program spanning
-operation representation and granularity, control and identity, application
-semantics and persistence, and the separation of operator visibility from
-physical execution. The immediate question is how much global visibility and
-executed computation can be reduced while preserving language-model quality and
-expressivity.
+hardware efficiency. They instead motivate an open research program on how
+learned conditions are represented, how operations are defined and identified,
+how control and operation should be coupled, how applicable operations compose,
+how persistence and hierarchy should be structured, and how logical conditional
+structure can be mapped to efficient physical execution. Candidate-restricted
+operator visibility and execution are one immediate instance of this broader
+program.
 
 \appendix
 
@@ -1200,7 +1267,7 @@ QK / V / RST pool & 4,600 / 14,500 / 29,300 & -- &
 QK / V / RST chunks & 1 / 1 / 4 & -- & 1 / 2 / 8\\
 QK / V / RST denominator power & 0.5 / 1.0 / 1.2 & -- &
 0.5 / 1.0 / 1.2\\
-Initial active targets & 0.05 / 0.03 / 0.01 & -- &
+Initial support-fraction targets & 0.05 / 0.03 / 0.01 & -- &
 0.05 / 0.03 / 0.01\\
 Training batch & 1,024 & 1,024 & 448\\
 Mesh (data \(\times\) model) & \(16\times2\) & \(16\times2\) & \(16\times2\)\\
@@ -1341,7 +1408,7 @@ collectives.
 \centering
 \caption{Backbone static accounting. ``Exact applicability support'' retains full dense
 address scoring and replaces only full-pool RW application with the measured
-positive-margin applicability support.}
+applicability support at positive applicability margin.}
 \scriptsize
 \renewcommand{\arraystretch}{0.96}
 \begin{tabular}{lrrr}
