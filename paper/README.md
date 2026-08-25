@@ -16,9 +16,12 @@ paper/
 ├── v12/
 │   ├── source/
 │   └── DAWN-SRW-v12.pdf
-└── v13/
+├── v13/
+│   ├── source/
+│   └── DAWN-SRW-v13.pdf
+└── v14/
     ├── source/
-    └── DAWN-SRW-v13.pdf
+    └── DAWN-SRW-v14.pdf
 ```
 
 - `v9` is the Zenodo-published snapshot and is preserved by the `paper-v9`
@@ -26,24 +29,25 @@ paper/
 - `v10` is the preserved prior working draft.
 - `v11` is the preserved prior working draft.
 - `v12` is the preserved prior working draft.
-- `v13` is the active working draft. It is not tagged until release.
+- `v13` is the preserved prior working draft.
+- `v14` is the active working draft. It is not tagged until release.
 - Version numbers are repository metadata only; they are not printed on the
   paper's first page.
 
 ## Edit and build
 
-Open `paper/v13/source/main.tex` in VS Code. With the recommended LaTeX
+Open `paper/v14/source/main.tex` in VS Code. With the recommended LaTeX
 Workshop extension installed, saving a TeX file runs `build.ps1` automatically.
 The script builds inside `source/` and refreshes the PDF directly at:
 
 ```text
-paper/v13/DAWN-SRW-v13.pdf
+paper/v14/DAWN-SRW-v14.pdf
 ```
 
 To build manually from PowerShell:
 
 ```powershell
-cd paper\v13\source
+cd paper\v14\source
 .\build.ps1
 ```
 
