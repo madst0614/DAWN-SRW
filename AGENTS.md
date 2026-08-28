@@ -13,6 +13,19 @@
   TPU work may resume only after the user explicitly requests a tracked
   `AGENTS.md` policy change that removes or replaces this prohibition.
 
+## Manuscript PDF synchronization
+
+- `paper/v14/source/main.tex` is the manuscript source, and
+  `paper/v14/DAWN-SRW-v14.pdf` is its canonical synchronized distribution PDF.
+- After every successful compilation of `paper/v14/source/main.tex`, immediately
+  copy `paper/v14/source/main.pdf` to `paper/v14/DAWN-SRW-v14.pdf`.
+- Do not report a manuscript edit as complete until both PDF files exist, have
+  identical SHA-256 hashes, and have matching page counts. If compilation or
+  synchronization fails, report the failure explicitly and do not present the
+  distribution PDF as current.
+- Perform final page-count and visual-layout verification on the synchronized
+  `paper/v14/DAWN-SRW-v14.pdf`, not only on the build-directory PDF.
+
 ## Default paper checkpoints
 
 - The machine-readable registry is `configs/paper_checkpoint_registry.yaml`.
