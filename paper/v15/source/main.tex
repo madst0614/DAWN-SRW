@@ -49,19 +49,21 @@
 
 \begin{abstract}
 Learned state-transition computation is often organizationally implicit. We ask
-whether it can be organized so that the conditions, operations, and transition
-effects constituting its execution are explicit objects of measurement and
+whether it can instead be organized around explicit learned operations and
+state-conditioned applicability, with their controlled contributions composed
+into transition-producing computation and exposed for measurement and causal
 intervention. We study this question constructively in autoregressive language
 models. We use \((\mathcal O,C,\Gamma)\) as minimal organizational coordinates
 for one family of explicit learned transition organizations. Within these coordinates,
 a \emph{State-Conditioned Program} is one program-oriented formulation in which
 controlled operation contributions are constituents of actual forward
 execution. It is not a claim of symbolic program text, formal operational
-semantics, or an intrinsic or privileged neural decomposition. \DAWN{} provides one constructive
-realization using rank-1 read-write (RW) operators that read a scalar from the
-current representation and write along a learned transition direction, together
-with an operation-address space, normalized additive composition, full candidate
-scope, and dense RW execution. At 393.8M parameters and 39.999B tokens, \DAWN{} supports
+semantics, or an intrinsic or privileged neural decomposition. \DAWN{} provides
+one constructive realization: continuous geometric applicability over persistent
+rank-1 read-write (RW) operators controls which full-dimensional RW responses
+contribute and by how much, while normalized additive composition forms the
+transition-producing output. The evaluated model retains full candidate scope
+and dense RW execution. At 393.8M parameters and 39.999B tokens, \DAWN{} supports
 viability relative to the matched dense control: C4 cross-entropy is 2.9402
 versus 2.9359 and the six-task zero-shot mean is 0.4629 versus 0.4597.
 State-conditioned exact applicability support provides evidence of conditional
@@ -79,8 +81,9 @@ hardware efficiency, or an intrinsic or unique decomposition.
 Learned systems compute through state transitions, but their transition-producing
 organization is often implicit. State dependence and conditional structure are
 established; the broader problem is whether learned computation can be
-architecturally organized around explicit conditions, operations, and transition
-effects. Autoregressive language models provide a concrete test setting in which
+architecturally organized around explicit learned operations and state-conditioned
+applicability, with controlled contributions composed into transition-producing
+computation. Autoregressive language models provide a concrete test setting in which
 high-dimensional representations undergo repeated transitions. If
 \(X_\ell\) denotes the sequence
 representation at layer \(\ell\), a block implements, at a coarse level,
@@ -88,9 +91,10 @@ representation at layer \(\ell\), a block implements, at a coarse level,
 
 We therefore ask:
 \begin{quote}
-\emph{Can learned state-transition computation be organized so that the
-conditions, operations, and transition effects constituting its execution are
-explicit objects of measurement and intervention?}
+\emph{Can learned state-transition computation be organized around explicit
+learned operations and state-conditioned applicability, with their controlled
+contributions composed into the transition as measurable and intervenable
+constituents of actual forward execution?}
 \end{quote}
 
 Autoregressive language modeling is the present constructive test domain, not a
@@ -121,27 +125,25 @@ C(x,O_i)=c_i(x),\qquad
 F_{\mathcal P}(x)=\Gamma\!\left(\{c_i(x)O_i(x)\}_i\right).
 \label{eq:general_composition}
 \end{equation}
-These minimal coordinates describe one family of explicit learned transition
-organizations, not a universal ontology or necessary decomposition of learned
-dynamics. The form does not itself state the architectural hypothesis.
-Program and execution traditions motivate identifying conditioned operations;
-dynamics and control provide the richer mathematical precedent for continuously
-valued validity and composition of overlapping component effects. The
-coordinates distinguish what transformations exist, when and how much they
-apply, and how their controlled contributions form a transition-producing
-result. Within them, the \emph{control--operation factorization} separates
-\(C\) from \(\mathcal O\); \(\Gamma\) is a separate composition role, not a
-third factor of that factorization. Normalized additive composition is one
-\DAWN{} realization of \(\Gamma\), not part of the coordinates' definition.
+These coordinates describe one family of explicit learned transition
+organizations, not a universal ontology or necessary decomposition. Here
+\(\mathcal O\) specifies what transformations can act; \(C\) specifies when and
+to what degree each is applicable; and \(\Gamma\) specifies how the controlled
+contributions \(z_i(x)=c_i(x)O_i(x)\) form transition-producing computation.
+Thus operation identity, applicability, operation response, controlled
+contribution, and composition are distinct roles. Program/execution motivates
+conditioned operations, while dynamics/control provides mathematical precedent
+for continuously valued validity and composition of component effects. The
+\emph{control--operation factorization} separates \(C\) from \(\mathcal O\);
+\(\Gamma\) is a separate composition role, and normalized addition is only one
+\DAWN{} realization of it.
 
 The coordinates alone are not the scientific claim. An arbitrary mapping
-\(T(x)\) is vacuously compatible by taking one operation \(O_1=T\) and
-\(c_1(x)=1\). Such post-hoc functional decomposability is weaker than a learned
-system whose forward execution is actually organized through operation
-identities, state-conditioned applicability, and controlled contributions; a
-further architectural step exposes those constituents as explicit variables or
-objects. Our interest is in this computational organization and architectural
-exposure, not in algebraic decomposability by itself.
+\(T(x)\) is vacuously compatible with \(O_1=T\) and \(c_1(x)=1\). Such post-hoc
+decomposability is weaker than actual forward execution in which indexed
+operations, applicability variables, responses, controlled contributions, and
+specified composition semantics are architectural objects. This exposure, not
+the algebraic form alone, is the scientific target.
 
 Within this broader problem, we call one program-oriented organizational
 formulation a \emph{State-Conditioned Program}: the current state determines
@@ -152,17 +154,13 @@ nor additive composition. The term \emph{program} generalizes the analogy beyond
 symbolic source, discrete instructions, named human-readable primitives,
 call/return control flow, or formal operational semantics.
 
-The same learned computation admits complementary descriptions. A neural-network
-view asks what tensor map \(x\mapsto F_{\mathcal P}(x)\mapsto x'\) is implemented;
-a dynamics view asks what evolution \(x\mapsto x'\), or residual update
-\(x\mapsto x+\Delta x\), occurs. The State-Conditioned Program view asks which
-operations contribute at a state, under what conditions, by how much, and what
-happens when selected contributions are changed. It is therefore a computational
-view grounded in actual execution, not an ontological claim that this is the only
-true, intrinsic, necessary, or privileged neural decomposition. Operational
-accounts of transitions between configurations provide an operation-oriented
-conceptual lineage \cite{plotkin1981structural}, but no formal semantics for
-\DAWN{} is claimed.
+The same computation admits neural-map, dynamics, and State-Conditioned Program
+descriptions. The last asks which operations contribute, under what conditions
+and by how much, and what happens when contributions are changed. It is an
+actual-execution lens, not an ontological or privileged decomposition.
+Operational accounts of transitions between configurations provide its
+operation-oriented lineage \cite{plotkin1981structural}, but no formal semantics
+for \DAWN{} is claimed.
 
 The resulting hierarchy is conceptual, not chronological. Its convergence point
 is explicitly organized learned state-transition computation, not the
@@ -175,31 +173,32 @@ rugh2000research}. Learned conditional and modular systems then make both
 \cite{shazeer2017outrageously,rosenbaum2018routing,goyal2021rim,
 rahaman2021dynamic}; stable operation identity is an architectural property,
 whereas reuse is an empirical possibility. Read--write and fast-weight work
-supplies an elementary transformation structure \cite{schlag2021linear,
-lu2026little}. The architectural hypothesis studied here is that learned
-transition-producing computation can organize its actual forward execution
-through stable learned operations under explicit state-conditioned control over
-their contributions. We test that proposition constructively in autoregressive
-language modeling, not the novelty of any constituent ingredient.
+supplies an elementary transformation structure
+\cite{schlag2021linear,lu2026little}. The architectural hypothesis studied here
+is that learned state-transition computation can organize its actual forward
+execution as explicit, state-conditioned compositions of persistent learned
+operations. We use \emph{state-conditioned operator composition} for the
+computational organization by which controlled operation contributions form a
+transition, not as a competing named formulation. We test that proposition
+constructively in autoregressive language modeling, not the novelty of any
+constituent ingredient.
 
-Architectural exposure gives operation identities, applicability coefficients,
-operation responses, and controlled contributions direct measurement and
-intervention targets. In the tested protocol, selected contributions are
-causally accessible through suppression and exact restoration. This does not
-establish semantic purity, universal cross-context meaning, arbitrary operation
-replacement, control transplant, or program synthesis.
+Architectural exposure makes operation identities, applicability coefficients,
+responses, and controlled contributions direct measurement targets. Whether
+exposure supports useful causal manipulation is an empirical question, not an
+automatic consequence.
 
-\DAWN{} is one constructive realization. It uses persistent rank-1 RW operators,
-continuous-valued applicability in a \(d_c=256\) operation-address space, and
-normalized additive composition across Q/K/V and the residual-state transition
-(RST). Applicability is controlled through this low-dimensional representation,
-whereas each applicable RW operation still reads the original
-\(D\)-dimensional representation and writes in \(\R^D\). Thus low-dimensional
-applicability control is not a low-dimensional content read. The evaluated
-implementation considers the full type-specific operator pool and executes RW
-contractions densely. Its spherical operation-address geometry is a control
-inductive bias. Neither geometry nor rank-1 structure, persistence, global
-candidate visibility, or additive composition is required by the formulation.
+\DAWN{} is one concrete geometric RW realization of this hypothesis. It turns
+state-conditioned control into a geometric applicability problem: a state-derived
+query defines a state-dependent neighborhood over persistent operator addresses,
+and continuously weighted RW effects within that neighborhood compose the
+transition. Applicability is controlled in a \(d_c=256\) space, while each RW
+operation reads the original \(D\)-dimensional representation and writes in
+\(\R^D\); low-dimensional applicability control is therefore not a
+low-dimensional content read. Normalized addition composes Q/K/V and residual-state
+transition (RST) outputs. The implementation retains full candidate scope and
+dense RW execution. Geometry, rank-1 structure, persistence, candidate scope,
+and additive composition are realization choices, not formulation requirements.
 
 The empirical study tests this realization through three ordered claims:
 viability, conditional organization, and causal accessibility. Fail-closed
@@ -216,8 +215,9 @@ Our contributions are:
     the State-Conditioned Program as one operation-oriented organization of these
     roles in actual forward execution; and test the resulting architectural
     hypothesis through \DAWN{} in autoregressive language modeling. \DAWN{}
-    provides one concrete realization using persistent rank-1 RW operations and
-    low-dimensional continuous geometric applicability.
+    realizes continuous geometric applicability over persistent rank-1 RW
+    operations whose controlled responses are explicitly composed into
+    transition-producing computation.
     \item \textbf{A constructive empirical test with bounded evidence.} We test
     viability at 400M scale, report descriptive results for the 1.3B \DAWN{}
     checkpoint (1.272B parameters), provide evidence of conditional organization
@@ -242,94 +242,52 @@ substrate \(x\mapsto x'\), not at a claimed formal equivalence.
 
 \subsection{Continuous state-conditioned dynamics and local-model composition}
 
-Dynamical modeling supplies the primary mathematical lineage for conditional
-transition organization. Fuzzy sets formalized continuously graded membership
-rather than Boolean set inclusion \cite{zadeh1965fuzzy}. Takagi--Sugeno models
-couple graded premise validity to local consequent models and aggregate their
-effects \cite{takagi1985fuzzy}. Local model networks likewise interpolate simple
-component models, each with a limited operating regime, into a global nonlinear
-model \cite{johansen1995identification}. Gain scheduling and linear
-parameter-varying formulations organize families of local laws or controllers by
-measured scheduling variables, while also making clear that properties of local
-designs do not automatically transfer to the varying global system
-\cite{rugh2000research}.
-
-Learned-dynamics research also makes transition structure an explicit learned
-object. Decomposed Linear Dynamical Systems learn dynamics components whose
-sparse combinations represent overlapping nonstationary dynamics
-\cite{mudrik2024decomposed}; Neural Hybrid Automata learn discrete modes and
-events with multi-mode continuous dynamics \cite{poli2021neural}. Neither is a
-State-Conditioned Program or equivalent to \DAWN{}; both provide precedent for
-explicit learned transition structure.
-
-Together these traditions establish precedent for continuous state- or
-regime-dependent validity, overlapping component transition laws, and weighted
-effect composition. They are not mathematically identical to one another or to
-\DAWN{}, and they need not expose persistent learned operations or causal
-intervention interfaces. State-conditioned dynamics, continuous membership, and
-weighted combinations of local models are therefore not novelty claims here.
+Fuzzy membership, Takagi--Sugeno consequents, local model networks, and
+gain-scheduled or linear parameter-varying systems provide precedent for graded
+validity or scheduling and weighted component dynamics
+\cite{zadeh1965fuzzy,takagi1985fuzzy,johansen1995identification,
+rugh2000research}. Control-affine systems provide a complementary algebraic
+precedent: scalar controls multiply component vector fields and, under state
+feedback, become state-dependent coefficients \cite{sontag1998mathematical}.
+\DAWN{} instead uses learned internal applicability variables to organize
+forward-computation contributions; it is not a conventional control-affine
+system. Learned-dynamics work also exposes transition structure: dLDS learns
+overlapping dynamics components \cite{mudrik2024decomposed}, Neural Hybrid
+Automata learn multi-mode dynamics and events \cite{poli2021neural}, and
+concurrent LEON work realizes latent world-model transitions through
+context-modulated operator propagation and additive forcing
+\cite{lu2026making}. These traditions supply mathematical precedent for
+state-dependent validity and weighted composition of component transition laws;
+the operation interpretation and actual-forward-execution exposure are the
+computational questions studied here. None of these ingredients is a novelty
+claim.
 
 \subsection{Learned conditional and modular computation}
 
-Mixture-of-experts (MoE) computation already has the generic form
-\begin{equation}
-F(x)=\sum_i G_i(x)E_i(x),
-\label{eq:moe_precedent}
-\end{equation}
-with input-dependent control over learned transformations. Sparsely-gated MoE
-\cite{shazeer2017outrageously}, Switch Transformer \cite{fedus2022switch},
-ModuleFormer \cite{shen2023moduleformer}, and CondConv
-\cite{yang2019condconv} establish conditional routing and weighted expert
-combination. PEER retrieves million-scale tiny experts \cite{he2024mixture},
-while OmniMoE uses vector-level Atomic Experts and structured routing
-\cite{shi2026omnimoe}. Continuous or differentiable control over learned
-transformations is therefore precedent; MoE-style conditional computation and
-continuous applicability are not claimed as novel.
+Input- or state-dependent routing and weighted learned transformations are
+established across MoE, convolutional, retrieval, and structured-routing systems
+\cite{shazeer2017outrageously,fedus2022switch,shen2023moduleformer,
+yang2019condconv,he2024mixture,shi2026omnimoe}. Thus differentiable control over
+learned components is precedent; MoE-style conditional computation and
+continuous applicability are not novelty claims.
 
-Shared parameter identity across depth is likewise established: Universal
-Transformers recur over shared layers \cite{dehghani2019universal}, MoEUT shares
-expertized feed-forward and attention computation \cite{csordas2024moeut}, MoUE
-uses a layer-agnostic expert pool \cite{chen2026mixture}, and UniPool exposes a
-global pool through per-layer routers \cite{huang2026unipool}. SwitchHead routes
-attention-side experts \cite{csordas2024switchhead}, UMoE shares experts across
-attention and FFN computation \cite{yang2025umoe}, and Compositional Attention
-separates query--key search from value retrieval
-\cite{mittal2022compositional}. These architectures make reuse possible and
-measurable; stable or shared identity does not by itself establish broad
-functional reuse.
+Stable or shared component identity across depth and context is likewise
+established in recurrent shared layers, global expert pools, routed attention,
+and compositional attention
+\cite{dehghani2019universal,csordas2024moeut,chen2026mixture,
+huang2026unipool,csordas2024switchhead,yang2025umoe,
+mittal2022compositional}. Such identity makes reuse measurable but does not by
+itself establish broad empirical reuse.
 
-Routing Networks combine a router with learned function blocks and recursively
-choose functions from the current activation, producing input-specific dynamic
-function composition \cite{rosenbaum2018routing}. Recursive Routing Networks
-apply the same organizing principle to language understanding through a shared
-set of learned functions and a meta-learner router
-\cite{cases2019recursive}. These are direct precedents for
-state/input-conditioned selection and composition of learned functions. Recurrent
-Independent Mechanisms use groups with independent transition dynamics that
-compete to update when relevant and communicate through attention
-\cite{goyal2021rim}. The declarative/procedural factorization associated with the
-SCOFF line separates object-state files from reusable schemata that prescribe
-updates \cite{goyal2021factorizing}. Neural Production Systems learn
-condition--action rules whose state- and entity-dependent matches update entity
-state \cite{didolkar2021neural}, and Reusable Slotwise Mechanisms dynamically
-select reusable mechanisms to predict future object-slot states
-\cite{nguyen2023reusable}.
-
-These works expose learned mechanism identity and conditional use: RIM, SCOFF,
-Neural Production Systems, and Reusable Slotwise Mechanisms emphasize world or
-object-state dynamics, while Routing Networks and related executors emphasize
-neural-computation functions. This is emphasis, not a strict taxonomy or a claim
-that they solve the same problem.
-
-Neural Interpreters use learned types and signatures to control access to
-reusable functions in a hyperspherical type space \cite{rahaman2021dynamic}, and
-Neural Attentive Circuits separate a circuit generator from a modular executor
-\cite{weiss2022neural}. These works establish conditional function access and
-dynamic learned configurations. In this layer, both \(C_\theta\) and
-\(O_{\theta,i}\) are learned objects: a local or component transition model can
-be interpreted architecturally as a persistent learned computational operation.
-Persistence supplies identity; whether that identity supports cross-context
-reuse is an empirical question, not part of the definition.
+Routing and modular-mechanism work conditionally selects or composes learned
+functions, transition mechanisms, rules, and executors
+\cite{rosenbaum2018routing,cases2019recursive,goyal2021rim,
+goyal2021factorizing,didolkar2021neural,nguyen2023reusable,
+rahaman2021dynamic,weiss2022neural}. These precedents motivate a bridge from
+learned component-transition structure to persistent learned computational
+operations without identifying the two interpretations. Both \(C_\theta\) and
+\(O_{\theta,i}\) may be learned objects; persistence supplies identity, while
+cross-context reuse remains an empirical question.
 
 \subsection{Read--write and low-rank operation structure}
 
@@ -355,65 +313,29 @@ imply shared conceptual ancestry, interpretation, or research program.
 
 \subsection{Neural programming as adjacent precedent}
 
-Neural Programmer-Interpreters execute programs from supervised traces
-\cite{reed2016npi}, Neural Programmer differentiably selects operations and data
-\cite{neelakantan2016neuralprogrammer}, and Fast Weight Programmers connect
-outer-product computation to instructions \cite{schlag2021linear}. RASP gives a
-programming-language-level model of Transformer computation and realizability
-\cite{weiss2021thinking}. Neural programs, differentiable operation selection,
-and program-level descriptions of Transformer computation therefore have
-precedent. The State-Conditioned Program analogy is deliberately weaker and
-different: it concerns the organization of conditional learned state-transition
-operations, with no requirement for symbolic source, discrete instruction
-traces, human-readable predicates, named primitive semantics, or formal
-structural operational semantics.
+Neural Programmer-Interpreters, Neural Programmer, Fast Weight Programmers, and
+RASP provide adjacent precedents for neural programs, differentiable operation
+selection, instruction-linked computation, and program-level Transformer
+descriptions \cite{reed2016npi,neelakantan2016neuralprogrammer,
+schlag2021linear,weiss2021thinking}. A State-Conditioned Program requires none of
+symbolic source, instruction traces, human-readable predicates, named primitive
+semantics, or formal operational semantics.
 
 \subsection{Causal intervention as evaluation methodology}
 
-Mechanistic interpretability localizes components through causal intervention.
-IOI work isolates an attention-head circuit \cite{wang2023interpretability},
-AtP* approximates activation patching at scale \cite{kramar2024atp}, and RAVEL
-evaluates localization against multiple causal criteria
-\cite{huang2024ravel}. This literature distinguishes candidate localization from
-causal confirmation. \DAWN{} supplies controlled RW-operation contributions as
-intervention targets; its discovery freeze, suppression, matched controls, and
-exact restoration test the specified IOI circuit without implying general
-semantic interpretability. This work supplies a validation methodology, not a
-constructive ingredient of the architecture.
+IOI, AtP*, and RAVEL provide causal-intervention and localization precedent
+\cite{wang2023interpretability,kramar2024atp,huang2024ravel}. Here intervention
+validates a discovery-frozen RW circuit through suppression, controls, and exact
+restoration; it is evaluation methodology, not a constructive architectural
+ingredient or a claim of general semantic interpretability.
 
-The traditions above are neither historically linear nor mathematically
-identical. Program and execution accounts contribute an operation-oriented view
-of conditioned computation. Dynamics and control provide the mathematical
-precedent for continuously state-dependent validity and composition of transition
-effects. Learned modular systems show that control and computational components
-can themselves be learned and assigned persistent identities. RW/fast-weight
-work supplies elementary transformation structures, while causal-intervention
-work provides methodology for testing whether exposed constituents matter to
-behavior. We connect these precedents at the level of learned state-transition
-computation itself: whether execution can be organized so that conditions,
-operations, and transition effects become explicit computational objects.
-
-At the coordinate level, one family of such organizations can be expressed as
-\[
-F_\theta(x)=
-\Gamma\!\left(\{c_{\theta,i}(x)O_{\theta,i}(x)\}_i\right),
-\]
-using \((\mathcal O,C,\Gamma)\) as minimal organizational coordinates. This is an
-organizational form, not the architectural hypothesis and not a universal theory
-of learned dynamics. A State-Conditioned Program is one program-oriented
-formulation in which these roles participate in actual forward execution. The
-architectural hypothesis is the proposition that learned transition-producing
-computation can realize that organization through stable learned operations under
-explicit state-conditioned control over their contributions. \DAWN{} is one
-concrete realization, at the granularity of a controlled RW contribution,
-\[
-c_i(x)O_i(x)=c_i(x)\,\bar w_i\big(\bar r_i^{\top}x\big).
-\]
-Applicability determines when and how much the operation contributes, the read
-direction extracts a state-dependent scalar from the current representation,
-and the write direction determines the resulting transition effect. The present
-constructive test domain is autoregressive language modeling; the broader problem
-is not limited to that domain.
+These traditions are neither historically linear nor mathematically identical:
+program/execution contributes operation-oriented organization; dynamics/control,
+state-dependent component effects and composition; learned modular computation,
+learned control and persistent components; and RW work, elementary read--write
+transformations. \DAWN{} tests one intersection using continuous geometric
+applicability, persistent RW operations, and explicit composition; causal
+intervention supplies validation methodology.
 
 \section{DAWN-SRW}
 \label{sec:method}
@@ -436,11 +358,11 @@ X_{\ell+1}&=Y_\ell+R_\ell(Y_\ell).
 Equations~\ref{eq:organizational_coordinates}--\ref{eq:general_composition}
 provide a coordinate-level organizational form, not a sufficient condition for
 computational organization or the architectural hypothesis itself. That
-hypothesis is that learned transition-producing computation can organize its
-actual forward execution through stable learned operations under explicit
-state-conditioned control over their contributions. \DAWN{} exposes one
-realization through persistent RW operators, an explicit applicability profile,
-and normalized additive composition. For a token state \(x\in\R^D\) and
+hypothesis is that learned state-transition computation can organize its actual
+forward execution as explicit, state-conditioned compositions of persistent
+learned operations. In \DAWN{}, this state-conditioned operator composition uses
+continuous geometric applicability over persistent RW operators and normalized
+additive composition. For a token state \(x\in\R^D\) and
 computation type \(a\in\{Q,K,V,\mathrm{RST}\}\), define
 \begin{equation}
 F_a:\R^D\rightarrow\R^D.
@@ -495,16 +417,13 @@ realization, and geometry implementation are distinct levels of claim.
 \(x\!\to\!\bar r_{a,i}^{\top}x\!\to\!O_{a,i}(x)\)\\[-0.12em]
 persistent pool; shared across depth}} &&
 \end{tabular}\\[0.15em]
-\caption{The two-level construction. Top: a language-model block produces state
-transitions through relational interaction and a subsequent residual-state
-transition. Bottom: the current state follows two distinct paths. The
-applicability path uses the low-dimensional operation-address representation to
-produce \(c_{a,i}(x)\); the RW response path reads a scalar
-\(\bar r_{a,i}^{\top}x\) from the full \(D\)-dimensional representation and
-writes \(O_{a,i}(x)\) along \(\bar w_{a,i}\). Their product is a controlled
-operation contribution, and normalized additive composition produces
-\(F_a(x)\). The type-specific operator pool is persistent across depth, candidate
-scope is full, and physical RW execution is dense.}
+\caption{The two-level construction. Top: relational interaction and a
+residual-state transition update the representation state. Bottom: a low-D
+geometric condition produces applicability \(c_{a,i}(x)\), while the full-D RW
+path reads \(\bar r_{a,i}^{\top}x\) and writes along \(\bar w_{a,i}\). Their
+product is a controlled operation contribution; normalized additive composition
+forms the transition-producing output \(F_a(x)\). Operator pools persist across
+depth, candidate scope is full, and physical RW execution is dense.}
 \label{fig:architecture}
 \end{figure*}
 
@@ -520,6 +439,9 @@ O_{a,i}(x)=\langle x,\bar r_{a,i}\rangle\bar w_{a,i}
 =\bar w_{a,i}\bar r_{a,i}^{\top}x.
 \label{eq:rw_operator}
 \end{equation}
+When nonzero, this is an elementary rank-1 read--write transformation, not a
+claim that rank-1 maps are universal causal atoms or the uniquely correct
+operation granularity.
 One controlled RW contribution can therefore be read as
 \begin{equation}
 \begin{aligned}
@@ -530,11 +452,11 @@ c_{a,i}(x)O_{a,i}(x)
 \end{aligned}
 \label{eq:rw_semantic_roles}
 \end{equation}
-Applicability and the read response are both state-dependent but serve different
-roles. Applicability determines whether and to what degree the operation
-contributes; the read direction extracts an operation-specific scalar operand
-from the current representation; and the write direction determines how that
-operand changes the state. Q/K/V RW operators compose attention interfaces; RST
+Equation~\ref{eq:rw_semantic_roles} reads as applicability \(\times\) state read
+\(\times\) write direction. Geometry controls when, where, and how much an
+operation contributes; it does not supply the operand. The read direction extracts
+an operation-specific scalar from the full representation, and the write direction
+determines its state change. Q/K/V RW operators compose attention interfaces; RST
 RW operators compose a direct residual-state update.
 
 \subsection{State-Conditioned Applicability}
@@ -591,35 +513,42 @@ F_a(x)&=\frac{\sqrt{D/L}}{Z_a(x)}
 \sum_i c_{a,i}(x)\bar w_{a,i}\bar r_{a,i}^{\top}x.
 \label{eq:implemented_composition}
 \end{align}
-In each term, \(c_{a,i}(x)\) specifies state-conditioned applicability and
-\(\bar w_{a,i}\bar r_{a,i}^{\top}x\) is the operation response; their product is
-a controlled operation contribution. This additive form is a deliberate
-realization choice: at a fixed state, it preserves an explicit operator-wise
-decomposition of the transition-producing output, making individual controlled
-contributions directly measurable and available as intervention targets; the
-reported interventions suppress or restore selected numerator terms while
-leaving the normalization factor unchanged. A nonlinear mixer would generally
-introduce cross-operation interactions that obscure this exact decomposition;
-because both \(c_{a,i}(x)\) and \(Z_a(x)\) are state-dependent, the overall mapping
-\(x\mapsto F_a(x)\) remains generally nonlinear. Exact composition parameters
-are listed in Appendix~\ref{app:equations}.
+Let \(A_{a,i}=\bar w_{a,i}\bar r_{a,i}^{\top}\). Each term
+\(c_{a,i}(x)A_{a,i}x\) is a controlled operation contribution. For
+\(S_a(x)=\sum_i c_{a,i}(x)>0\), define relative composition weights
+\(\pi_{a,i}(x)=c_{a,i}(x)/S_a(x)\) and transition gain
+\(g_a(x)=\sqrt{D/L}\,S_a(x)/Z_a(x)\). Then
+\begin{equation*}
+\begin{aligned}
+A_{a,\mathrm{eff}}(x)&=g_a(x)\sum_i\pi_{a,i}(x)A_{a,i},\\
+F_a(x)&=A_{a,\mathrm{eff}}(x)x.
+\end{aligned}
+\end{equation*}
+Here \(\pi_{a,i}(x)\geq0\) and \(\sum_i\pi_{a,i}(x)=1\), separating relative
+operator composition from transition gain. If \(S_a(x)=0\), the effective
+operator and output are zero, and \(\pi_{a,i}(x)\) need not be defined. This is
+an exact interpretation of the implementation, not a new architecture.
+At a fixed state, \DAWN{} composes an effective transition operator from
+persistent RW operators; because \(A_{a,\mathrm{eff}}(x)\) depends on \(x\),
+the map \(x\mapsto F_a(x)\) is generally nonlinear, not globally linear.
+Normalized addition keeps controlled numerator terms separately measurable and
+intervenable. The experiments modify selected realized terms with \(Z_a(x)\)
+fixed; Appendix~\ref{app:equations} gives exact consequences.
 
 \subsection{Operation-Address Space}
 \label{sec:operation-space}
 
-In this realization, evaluating the condition under which an operation
-contributes becomes a learned geometric relation between the current state and
-that operator. The operation-address space is an experimentally controllable
-inductive bias for state--operation applicability, not part of the
-State-Conditioned Program definition. Representation and RW computation remain
-in \(\R^D\), while the query and operator addresses
-\(q_a(x),k_{a,i}\in\R^{d_c}\) are control variables. The control projection need
-only preserve distinctions useful for applicability; once an operation is
-applicable, Equation~\ref{eq:rw_operator} still reads the original
-\(D\)-dimensional representation state. Two states can therefore have similar
-applicability profiles yet different full-dimensional RW read responses and
-transition contributions. This is an architectural consequence of the equations,
-not an experimentally established equivalence relation. Here, \(d_c=256\) and
+\DAWN{} turns state-conditioned control into a geometric applicability problem: a
+state-derived query defines a state-dependent neighborhood over persistent
+operator addresses, and continuously weighted RW effects within that neighborhood
+compose the transition. This operation-address space is a controllable inductive
+bias, not part of the State-Conditioned Program definition. Representation and
+RW computation remain in \(\R^D\), while \(q_a(x),k_{a,i}\in\R^{d_c}\) are
+applicability-control variables. Once applicable, an operation still reads the
+original \(D\)-dimensional state through Equation~\ref{eq:rw_operator}. Thus
+similar applicability profiles can coexist with different full-D reads and
+transition contributions; this is an architectural possibility, not an
+established functional equivalence. Here, \(d_c=256\) and
 \begin{equation}
 q_a(x)=\operatorname{unit}(xP_a+b_a)\in\R^{d_c}.
 \label{eq:query}
@@ -847,176 +776,104 @@ Appendix~\ref{app:negative} and Table~\ref{tab:negative}.
 
 \subsection{What the results establish}
 
-The constructive test supports three ordered claims. First, the matched 400M
-comparison establishes viability under the measured protocols. Second,
-state-conditioned exact applicability support provides evidence of conditional
-organization in the evaluated model; candidate scope is the full type-specific
-operator pool and physical RW execution is dense. Third, the discovery-frozen
-IOI circuit establishes causal accessibility: suppression changes behavior,
-matched controls do not reproduce the effect, and exact same-example restoration
-recovers it on independent validation and held-out data. Fail-closed results on
-RAVEL, ARC, and 1.3B IOI delimit where this localization procedure did not
-succeed.
+The narrow \DAWN{} hypothesis is that useful learned transitions can arise by
+continuously composing persistent RW operations under learned geometric
+applicability. The experiments support only the three bounded claims:
+matched-400M viability, conditional organization, and causal accessibility in a
+discovery-frozen IOI circuit. Fail-closed studies delimit unsuccessful
+localization; causal access implies neither semantics nor reusable programs.
 
-These findings support one explicit realization under the evaluated conditions,
-not an intrinsic or unique decomposition. Architectural exposure makes operator
-identities, applicability coefficients, RW responses, and controlled
-contributions direct measurement and intervention targets. The specified
-suppression/restoration result establishes causal accessibility for the selected
-IOI contributions; it does not establish human-readable operator semantics,
-global modularity, a complete or unique causal decomposition, or transferable
-program fragments.
+\paragraph{Architectural exposure.}
+The present construction highlights five architectural properties that support
+direct measurement and localized intervention: referable indexed operations
+\(O_i\) in actual forward execution; explicit applicability \(c_i(x)\); separately
+accessible controlled contributions \(c_i(x)O_i(x)\); specified composition
+semantics \(\Gamma\); and intervention semantics stating what changes and what is
+held fixed. These are properties of the tested exposure, not universal axioms or
+necessary conditions.
 
-Conceptually, the State-Conditioned Program is one program-oriented formulation
-of the broader problem of explicit learned state-transition organization; its
-continuous-composition mathematics has strong precedent in dynamical systems,
-without implying formal operational semantics or mathematical equivalence.
+\paragraph{Exposure and intervention.}
+Exposure does not guarantee useful causal manipulability. The experiments use a
+\emph{contribution intervention}: selected realized numerator terms are suppressed
+or restored with \(Z_a(x)\) fixed. A \emph{control intervention} would alter
+applicability or control and recompute downstream composition; it is not tested.
+Control-profile transplant and recomposed counterfactual execution remain open.
 
 \subsection{From the Computational Question to an Open Design Space}
 
 Making learned state-transition organization explicit exposes four design axes:
 control and applicability, operation and identity, coupling and composition, and
-candidate scope and physical execution. The State-Conditioned Program supplies
-the current program-oriented formulation, and \DAWN{} supplies one tested
-point---rank-1 RW operators, an operation-address space, cross-depth persistence,
-full candidate scope, dense execution, and normalized additive
-composition---rather than requirements for the broader design space.
+candidate scope and physical execution. \DAWN{} supplies one tested point, not
+requirements for this broader design space.
 
 \paragraph{Control and applicability.}
-How should state--operation applicability be represented? \DAWN{} derives
-\(C_a(x)\) in a learned \(d_c=256\) operation-address space. Alternatives could
-use functional parameters, intrinsic read activation, separate control
-representations, or no geometry. The evaluated spherical realization induces
-state-dependent angular neighborhoods, but it is unestablished whether this
-geometry predicts functional or causal computation. A central open question is
-whether learned control geometry recovers a geometry of transition requirements
-rather than merely a convenient routing substrate.
+Does control geometry encode transition requirements or merely useful
+applicability? The \(d_c=256\) sphere is one option, not an established functional
+or causal geometry.
 
 \paragraph{Operation and identity.}
-What should constitute a reusable learned operation? Rank-1 RW operators are
-one granularity; alternatives could be finer, coarser, structured, or
-hierarchical. \DAWN{} persists type-specific identities across depth, while other
-scopes could be layer-local or recurrent. Persistence makes reuse measurable; it
-does not establish that broad reuse emerges, guarantee a single function, or
-imply semantic purity. Operations may remain distributed or polysemantic.
+What granularity and persistence should operations have? Identity makes reuse
+measurable but establishes neither broad reuse, a single function, nor semantic
+purity.
 
 \paragraph{Coupling and composition.}
-After control and operations are made explicit, how should their controlled
-contributions combine into a transition? \DAWN{} derives addresses from
-read/write parameters without identifying control variables with RW operations,
-multiplies each response by its applicability, and uses normalized additive
-composition partly to preserve exact operator-wise terms. Interactive or
-nonlinear composition could trade separability for cross-operation structure;
-sequential, hierarchical, recurrent, or more tightly coupled designs remain
-possible. Whether an exactly additive decomposition is necessary for useful
-causal access is itself an open question.
+How much interaction can composition add while preserving operation-wise
+measurement and intervention? Normalized addition offers high separability;
+structured nonlinear interaction trades some attribution for interaction; opaque
+mixing can retain identities while obscuring individual contributions. Sequential
+or hierarchical composition may also have noncommutative semantics.
 
 \paragraph{Candidate scope and physical execution.}
-How much of an operator pool should candidate scope include? \DAWN{} uses the full
-type-specific operator pool. Restricted or state-dependent retrieval, sparse
-candidate selection, and sparse physical RW execution pose distinct
-compute/quality questions; none is established by exact applicability support.
+How narrowly can candidate scope and execution be restricted without losing
+quality or organization? Exact applicability support does not imply sparse
+execution: the evaluated model considers the full operator pool and executes RW
+densely. Hardware-exploitable sparse retrieval or execution remains open.
 
 \subsection{Structural Questions Exposed by the Organization}
 
-These questions concern explicit learned transition organization generally; the
-present \DAWN{} geometry and language-model evidence instantiate but do not settle
-them.
-
-\paragraph{Dimension.}
-The architecture distinguishes the representation dimension \(D\), control
-dimension \(d_c\), the local span of an RW update, and the full operator pool.
-The evaluated model is viable with \(d_c=256\ll D\), while RW responses still
-read and write in full \(D\). This does not establish that \(d_c\) is minimal or
-sufficient, that useful local execution is generally low-dimensional, or that
-computation-selection complexity is intrinsically separate from state-content
-complexity. A concrete question is how much of the ambient representation space
-the applicable write directions and the full learned population must span.
-
-\paragraph{Regime and geometry.}
-Do applicability profiles define overlapping computational regimes, and does
-proximity in control geometry predict similar transition requirements or causal
-effects? The present study measures exact applicability support but not regime
-equivalence, program similarity, or geometry--function correspondence.
-
-\paragraph{Reuse and composition.}
-Persistent identities could become state-specific specialists, locally reused
-operations, cross-context reusable operations, or recurring higher-order
-motifs. Which organization emerges is unmeasured. It is likewise open whether
-applicability depends primarily on what an operation reads, on the effect it
-writes, or on their joint read--write identity; the present architecture uses
-the joint construction but does not compare alternatives.
-
-\paragraph{Causal invariance and counterfactual intervention.}
-The present causal protocol validates suppression and exact same-example
-restoration of one discovery-frozen circuit. Whether similarity in
-state-conditioned operation organization predicts similar intervention effects,
-and whether control-profile transplant, operation transfer, or counterfactual
-transition execution is meaningful, remain future questions rather than
-demonstrated capabilities.
-
-\subsection{From Applicability Support to Physical Execution}
-\label{sec:future-execution}
-
-For a given representation state, many operators have exactly zero
-applicability, but this does not establish restricted candidate scope or sparse
-physical execution. In \DAWN{},
-\[
-\mathcal{I}_a(x)\subseteq\{1,\ldots,N_a\},
-\]
-so the candidate scope is the full type-specific operator pool and physical RW
-execution is dense. Applicability support specifies which operators contribute;
-candidate scope specifies which operators control considers; physical execution
-specifies how computation maps to hardware. \textbf{Sparse
-applicability support does not by itself imply hardware-exploitable sparse
-computation.} The open problem is to restrict candidate scope and physical
-execution while preserving language-model quality and conditional organization.
+The evaluated model uses \(d_c=256\) control while RW responses act in full
+\(D\). How small can control geometry be? Does spherical applicability recover
+transition regimes? Do persistent identities become specialist, reusable, or
+recombinable? Does similar organization predict similar causal effects? These
+remain open; neither minimal control dimension nor geometry--function or
+geometry--causality correspondence is established.
 
 \subsection{Limitations}
 
-Global candidate evaluation and dense RW execution remain expensive,
-and performance may depend partly on the capacity of the full operator pool.
-Even static accounting with RW execution restricted to exact applicability
-support remains 2.1168 times the matched dense control's backbone. No
-production latency, energy, or hardware advantage is measured.
+Global candidate evaluation and dense RW execution remain expensive; even static
+accounting restricted to exact applicability support is 2.1168 times the matched
+dense control's backbone. No production latency, energy, or hardware advantage
+is measured.
 
-The familiar state--condition--operation motif is not claimed as novel, and an
-arbitrary post-hoc functional decomposition does not establish computational
-organization. The study does not establish that the State-Conditioned Program
-organization or its control--operation factorization is intrinsic, unique,
-necessary, privileged, or optimal. Nor are the spherical geometry,
-\(d_c=256\) control dimension, or correspondence between geometric and
-functional organization shown to be intrinsic. In particular, the low-
-dimensional applicability path is not shown to be minimal, sufficient, a
-statistical quotient of the representation, or evidence that local execution is
-generally low-dimensional; the geometry may instead be a high-capacity control
-substrate for broadly distributed full-dimensional operations. Persistence of
-operator identity likewise makes reuse measurable but does not establish broad
-cross-context reuse.
+The state--condition--operation motif is not novel, and post-hoc functional
+decomposition is insufficient. Neither the State-Conditioned Program, its
+control--operation factorization, spherical geometry, \(d_c=256\), nor
+geometry--function correspondence is claimed to be intrinsic, unique, necessary,
+privileged, or optimal. The low-dimensional applicability path is not shown to be
+minimal, sufficient, a statistical quotient, or evidence that local execution is
+generally low-dimensional; it may control broadly distributed full-dimensional
+operations. Persistence makes reuse measurable but does not establish it.
 
-Causal evidence is confined to the specified IOI setting. Fail-closed results on
-RAVEL, ARC, and 1.3B IOI delimit mechanistic generalization; the differently
-budgeted 400M and 1.3B checkpoints do not define a controlled scaling curve; and
-individual operators need not map one-to-one to human-readable concepts.
-Suppression/restoration establishes causal accessibility only for the specified
-terms and behavior; it does not establish arbitrary program editing, semantic
-interpretability, operator replacement, or control transplant.
+Causal evidence is confined to the specified IOI behavior. Fail-closed RAVEL,
+ARC, and 1.3B IOI results delimit mechanistic generalization; the differently
+budgeted 400M and 1.3B checkpoints are not a controlled scaling curve; and
+operators need not map one-to-one to human-readable concepts.
+Suppression/restoration establishes neither arbitrary program editing, semantic
+interpretability, operator replacement, nor control transplant.
 
-\newpage
 \balance
 \section{Conclusion}
 
 Learned state-transition computation is usually organizationally implicit. The
-coordinates \(\mathcal P=(\mathcal O,C,\Gamma)\) provide a minimal description of
-one family of explicit organizations, not a universal or necessary decomposition.
-A State-Conditioned Program is one program-oriented formulation requiring these
-roles to participate in actual forward execution. The architectural hypothesis
-is that learned transition-producing computation can realize such organization
-through stable learned operations under explicit state-conditioned control over
-their contributions. \DAWN{} tests one concrete rank-1 RW realization in the
-present constructive domain of autoregressive language modeling:
-applicability is computed in \(d_c=256\), while each operation reads a scalar
-from and writes a direction into the full \(D\)-dimensional representation.
+broader problem is explicit learned state-transition organization; the coordinates
+\(\mathcal P=(\mathcal O,C,\Gamma)\) describe one minimal family, and a
+State-Conditioned Program is one program-oriented actual-execution formulation.
+The architectural hypothesis is that learned forward computation can organize as
+state-conditioned operator composition over persistent learned operations.
+\DAWN{} tests one geometric rank-1 RW realization in autoregressive language
+modeling: a state-derived \(d_c=256\) spherical neighborhood supplies continuous
+applicability, persistent RW operations retain full-\(D\) read--write access, and
+normalized addition explicitly composes the transition-producing output.
 
 The evidence is bounded: measured 400M viability, descriptive 1.3B results,
 evidence of conditional organization from state-conditioned exact applicability
@@ -1024,13 +881,14 @@ support, and causal accessibility through a
 discovery-frozen IOI circuit tested by suppression, matched controls, and exact
 restoration. Fail-closed results mark where localization did not succeed.
 
-The main interpretation is that one learned high-dimensional state-transition
-system can expose referable operation contributions while retaining viability,
-not that its decomposition or geometry is intrinsic, unique, semantically pure,
-or computationally optimal. The broader question is how learned state-transition
-computation can retain the flexibility of continuous neural representations while
-organizing the conditions, operations, and transition effects that constitute its
-execution as explicit objects of measurement and intervention.
+The main interpretation is not that the decomposition or geometry is intrinsic,
+unique, semantically pure, or computationally optimal. \DAWN{} provides one
+constructive instance in which a high-dimensional state defines a low-dimensional
+geometric condition over persistent operations, while applicable operations retain
+full-dimensional read--write access and compose the transition. The broader
+question is how learned computation can preserve continuous neural flexibility
+while exposing referable operations, applicability, controlled contributions,
+and composition semantics for measurement and intervention.
 
 \clearpage
 \appendix
@@ -1084,6 +942,28 @@ Operator rows are sharded over the model axis; local numerators and local sums o
 applicability values are reduced across shards to produce the global numerator
 and normalization factor. Chunking changes the contraction schedule, not the
 equation.
+
+\paragraph{Relative composition, convex hull, and pointwise norm.}
+For \(S_a(x)=\sum_i c_{a,i}(x)>0\), let
+\(\pi_{a,i}(x)=c_{a,i}(x)/S_a(x)\),
+\(A_{a,i}=\bar w_{a,i}\bar r_{a,i}^{\top}\), and
+\(\widetilde A_a(x)=\sum_i\pi_{a,i}(x)A_{a,i}\). Then
+\[
+\begin{aligned}
+\widetilde A_a(x)&\in
+\operatorname{conv}\{A_{a,i}:i\in\mathcal I_a(x)\},\\
+A_{a,\mathrm{eff}}(x)&=g_a(x)\widetilde A_a(x).
+\end{aligned}
+\]
+Thus applicability support selects participating operators, relative weights
+choose their convex mixture in matrix space, and \(g_a(x)\) supplies transition
+gain. Because \(\operatorname{unit}(z)=z/\max(\norm{z}_2,\epsilon)\) has norm at
+most one, \(\norm{A_{a,i}}_2\leq1\), hence
+\(\norm{\widetilde A_a(x)}_2\leq1\) and
+\(\norm{A_{a,\mathrm{eff}}(x)}_2\leq g_a(x)\). These are pointwise fixed-state
+facts, not a global Lipschitz bound on \(x\mapsto F_a(x)\); they also imply no
+correspondence between address-space and matrix-space proximity. When
+\(S_a(x)=0\), \(A_{a,\mathrm{eff}}(x)=0\) and the relative weights are undefined.
 
 \paragraph{Local Jacobian and update-span consequence.}
 Fix \(x\) and abbreviate \(\alpha=\sqrt{D/L}\), \(c_i=c_{a,i}(x)\),
